@@ -28,8 +28,7 @@ def instrument_pydantic_ai(
             "Respan telemetry is not initialized. "
             "Please initialize RespanTelemetry before calling instrument_pydantic_ai()."
         )
-        # Even if not initialized yet, we can set up the settings using the global tracer provider
-        # which might be set later, but it's better to warn.
+        return
     
     tracer = RespanTracer()
     
