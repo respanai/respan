@@ -1,0 +1,24 @@
+[tool.poetry]
+name = "respan-exporter-pydantic-ai"
+version = "0.1.0"
+description = "Respan exporter for Pydantic AI SDK"
+authors = ["Respan <team@respan.ai>"]
+license = "Apache-2.0"
+readme = "README.md"
+packages = [
+    { include = "respan_exporter_pydantic_ai", from = "src" },
+]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.14"
+pydantic-ai = ">=0.0.1"
+respan-sdk = "^2.3.0"
+respan-tracing = "^2.0.2"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.4"
+pytest-asyncio = "^0.25.3"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
