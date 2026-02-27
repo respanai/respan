@@ -32,8 +32,8 @@ def instrument_pydantic_ai(
     
     tracer = RespanTracer()
     
-    if not getattr(tracer, "is_enabled", True):
-        logger.info("Respan tracing is disabled, skipping Pydantic AI instrumentation")
+    if not tracer.is_enabled:
+        logger.warning("Respan telemetry is disabled.")
         return
     
     settings = InstrumentationSettings(
