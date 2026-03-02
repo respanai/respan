@@ -113,31 +113,32 @@ class RespanPydanticAIGatewayIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         instrument_pydantic_ai(agent=agent)
 
-        result = await agent.run('Reply with exactly "gateway_ok".')
+        try:
+            result = await agent.run('Reply with exactly "gateway_ok".')
 
-        self.assertIsNotNone(
-            result.output,
-            "Expected an output from the real gateway-backed query.",
-        )
+            self.assertIsNotNone(
+                result.output,
+                "Expected an output from the real gateway-backed query.",
+            )
 
-        telemetry.flush()
+            telemetry.flush()
 
-        spans = span_exporter.get_finished_spans()
-        self.assertTrue(
-            len(spans) > 0,
-            "Instrumentation did not produce any spans.",
-        )
+            spans = span_exporter.get_finished_spans()
+            self.assertTrue(
+                len(spans) > 0,
+                "Instrumentation did not produce any spans.",
+            )
 
-        # Verify at least one span has gen_ai attributes from Pydantic AI
-        span_attrs = {
-            k for s in spans for k in (s.attributes or {}).keys()
-        }
-        self.assertTrue(
-            any("gen_ai" in attr for attr in span_attrs),
-            f"No gen_ai attributes found in spans. Span names: {[s.name for s in spans]}",
-        )
-
-        RespanTracer.reset_instance()
+            # Verify at least one span has gen_ai attributes from Pydantic AI
+            span_attrs = {
+                k for s in spans for k in (s.attributes or {}).keys()
+            }
+            self.assertTrue(
+                any("gen_ai" in attr for attr in span_attrs),
+                f"No gen_ai attributes found in spans. Span names: {[s.name for s in spans]}",
+            )
+        finally:
+            RespanTracer.reset_instance()
 
 
 if __name__ == "__main__":
