@@ -104,6 +104,10 @@ class RespanConnector:
                 # Only set it if it's not already our tracer to avoid conflicts in multi-connector setups
                 current_tracer = getattr(tracing.tracer, "actual_tracer", None)
                 if not isinstance(current_tracer, RespanTracer):
+                    if current_tracer is not None:
+                        logger.warning(
+                            f"Replacing existing tracer {type(current_tracer).__name__} with RespanTracer"
+                        )
                     tracing.enable_tracing(self.tracer)
                     logger.info(f"Respan tracer registered for '{self.name}'")
             except Exception as e:
