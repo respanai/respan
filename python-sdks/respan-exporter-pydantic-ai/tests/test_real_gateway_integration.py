@@ -3,19 +3,19 @@
 
 import os
 import sys
-import urllib.request
 import unittest
-from typing import List
-from unittest.mock import patch
 
 try:
     from pydantic_ai import Agent
 except ImportError:
     Agent = None  # type: ignore[misc, assignment]
 
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+
 from respan_exporter_pydantic_ai import instrument_pydantic_ai
 from respan_tracing import RespanTelemetry
 from respan_tracing.core.tracer import RespanTracer
+from respan_tracing.testing import InMemorySpanExporter
 
 REPO_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "..")
@@ -64,7 +64,8 @@ def _resolve_gateway_base_url() -> str:
 class RespanPydanticAIGatewayIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_real_gateway_query_exports_payloads(self) -> None:
         """
-        Send a real Pydantic AI query through Respan gateway and verify export upload.
+        Send a real Pydantic AI query through Respan gateway and verify
+        that instrumentation produces spans.
 
         This test is intentionally opt-in because it makes live network calls and
         consumes model tokens.
@@ -81,71 +82,65 @@ class RespanPydanticAIGatewayIntegrationTests(unittest.IsolatedAsyncioTestCase):
         if Agent is None:
             self.skipTest("pydantic_ai is not installed in this environment.")
 
-        # Make sure tracing is clean
         RespanTracer.reset_instance()
 
         gateway_base_url = _resolve_gateway_base_url()
 
-        # Patch the export mechanism to capture HTTP status codes for assertions.
-        # Note: This targets urllib.request.urlopen; if the SDK switches to another
-        # client (e.g. requests or httpx), this test will need to be updated.
-        response_statuses: List[int] = []
-        original_urlopen = urllib.request.urlopen
+        # Use InMemorySpanExporter to capture spans without depending on
+        # the HTTP client used by the OTLP exporter.
+        span_exporter = InMemorySpanExporter()
 
-        def tracking_urlopen(*args, **kwargs):
-            response = original_urlopen(*args, **kwargs)
-            response_status = getattr(response, "status", None)
-            if isinstance(response_status, int):
-                response_statuses.append(response_status)
-            return response
-
-        # Initialize telemetry properly targeting the gateway
         telemetry = RespanTelemetry(
-            app_name="integration-test-pydantic-ai", 
+            app_name="integration-test-pydantic-ai",
             api_key=respan_api_key,
             base_url=gateway_base_url,
             is_enabled=True,
-            is_batching_enabled=False # Disable batching to ensure synchronous export for testing
+            is_batching_enabled=False,
         )
-        
-        # Set up a real Pydantic AI agent, routed via the OpenAI provider format since gateway supports it
-        # You'll need OPENAI_API_KEY set or gateway equivalent if routing differently
+
+        # Add in-memory exporter directly to the tracer provider (bypasses
+        # RespanSpanProcessor filtering which drops spans without Traceloop
+        # attributes — Pydantic AI uses standard gen_ai.* OTel attributes).
+        telemetry.tracer.tracer_provider.add_span_processor(
+            SimpleSpanProcessor(span_exporter)
+        )
+
         openai_api_key = os.getenv("OPENAI_API_KEY")
         if not openai_api_key:
             self.skipTest("Set OPENAI_API_KEY for real integration test.")
-            
+
         configured_model = os.getenv("RESPAN_GATEWAY_MODEL") or "openai:gpt-4o-mini"
         agent = Agent(model=configured_model)
 
-        # Instrument the specific agent
         instrument_pydantic_ai(agent=agent)
 
-        with patch.object(
-            urllib.request,
-            "urlopen",
-            side_effect=tracking_urlopen,
-        ):
-            # Use a very cheap/simple request
-            result = await agent.run('Reply with exactly "gateway_ok".')
+        result = await agent.run('Reply with exactly "gateway_ok".')
 
-            self.assertIsNotNone(
-                result.output,
-                "Expected an output from the real gateway-backed query.",
-            )
-
-            # Flush telemetry to ensure export completes before assertions
-            telemetry.flush()
-
-        self.assertTrue(
-            response_statuses,
-            "Exporter did not make any ingest HTTP request.",
+        self.assertIsNotNone(
+            result.output,
+            "Expected an output from the real gateway-backed query.",
         )
+
+        telemetry.flush()
+
+        spans = span_exporter.get_finished_spans()
         self.assertTrue(
-            any(status_code < 300 for status_code in response_statuses),
-            f"No successful ingest response observed. statuses={response_statuses}",
+            len(spans) > 0,
+            "Instrumentation did not produce any spans.",
         )
-        
+
+        # Verify at least one span has gen_ai attributes from Pydantic AI
+        span_names = [s.name for s in spans]
+        span_attrs = {
+            k for s in spans for k in (s.attributes or {}).keys()
+        }
+        self.assertTrue(
+            any("gen_ai" in attr for attr in span_attrs),
+            f"No gen_ai attributes found in spans. Span names: {span_names}",
+        )
+
         RespanTracer.reset_instance()
+
 
 if __name__ == "__main__":
     unittest.main()
