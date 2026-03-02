@@ -44,7 +44,7 @@ from respan_sdk.constants.otlp_constants import (
 )
 
 from ..utils.logging import get_respan_logger, build_spans_export_preview
-from ..utils.preprocessing.span_processing import should_make_root_span
+from ..utils.preprocessing.span_processing import is_root_span_candidate
 from ..constants.generic_constants import LOGGER_NAME_EXPORTER
 
 logger = get_respan_logger(LOGGER_NAME_EXPORTER)
@@ -288,7 +288,7 @@ class RespanSpanExporter:
         # Apply root-span promotion logic
         modified_spans: List[ReadableSpan] = []
         for span in spans:
-            if should_make_root_span(span):
+            if is_root_span_candidate(span):
                 logger.debug("Making span a root span: %s", span.name)
                 modified_spans.append(ModifiedSpan(span))
             else:

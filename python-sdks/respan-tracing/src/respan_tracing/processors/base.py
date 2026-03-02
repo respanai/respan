@@ -14,7 +14,7 @@ from respan_tracing.constants.context_constants import (
     TRACE_GROUP_ID_KEY, 
     PARAMS_KEY
 )
-from respan_tracing.utils.preprocessing.span_processing import should_process_span
+from respan_tracing.utils.preprocessing.span_processing import is_processable_span
 from respan_tracing.utils.context import get_entity_path
 
 logger = logging.getLogger(__name__)
@@ -81,7 +81,7 @@ class RespanSpanProcessor:
     def on_end(self, span: ReadableSpan):
         """Called when a span ends - filter spans based on Respan attributes"""
         # Apply filtering logic using shared function
-        if should_process_span(span):
+        if is_processable_span(span):
             self.processor.on_end(span)
         else:
             logger.debug(f"[Respan Debug] Skipping filtered span: {span.name}")
