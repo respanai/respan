@@ -11,7 +11,7 @@ packages = [
 
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
-pydantic-ai = ">=0.0.1"
+pydantic-ai = ">=0.0.36"
 respan-sdk = "^2.3.0"
 respan-tracing = "^2.0.2"
 

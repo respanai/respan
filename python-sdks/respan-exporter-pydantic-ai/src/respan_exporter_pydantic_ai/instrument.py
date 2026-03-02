@@ -36,10 +36,11 @@ def instrument_pydantic_ai(
         logger.warning("Respan telemetry is disabled.")
         return
     
-    # None is valid: Pydantic AI uses the global tracer provider (get_tracer_provider()),
-    # which Respan sets during init, so instrumentation still works when tracer_provider is None.
+    # tracer_provider is guaranteed to exist here: is_initialized() and is_enabled
+    # guards above ensure _setup_tracer_provider() has run. Pydantic AI also accepts
+    # None (falls back to global provider), but we always have the explicit one.
     settings = InstrumentationSettings(
-        tracer_provider=getattr(tracer, "tracer_provider", None),
+        tracer_provider=tracer.tracer_provider,
         include_content=include_content,
         include_binary_content=include_binary_content,
         # We use version 2 by default to support standard OTel semantic conventions

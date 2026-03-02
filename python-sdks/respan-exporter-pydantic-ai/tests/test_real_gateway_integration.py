@@ -125,20 +125,16 @@ class RespanPydanticAIGatewayIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "urlopen",
             side_effect=tracking_urlopen,
         ):
-            try:
-                # Use a very cheap/simple request
-                result = await agent.run('Reply with exactly "gateway_ok".')
-                
-                self.assertIsNotNone(
-                    result.output,
-                    "Expected an output from the real gateway-backed query.",
-                )
-                
-                # Give telemetry a moment to flush if batching was accidentally enabled
-                telemetry.flush()
-                
-            except Exception as error:
-                self.fail(f"Agent execution failed: {error}")
+            # Use a very cheap/simple request
+            result = await agent.run('Reply with exactly "gateway_ok".')
+
+            self.assertIsNotNone(
+                result.output,
+                "Expected an output from the real gateway-backed query.",
+            )
+
+            # Flush telemetry to ensure export completes before assertions
+            telemetry.flush()
 
         self.assertTrue(
             response_statuses,
