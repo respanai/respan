@@ -56,7 +56,7 @@ def _resolve_gateway_base_url() -> str:
     raw_base_url = (
         os.getenv("RESPAN_GATEWAY_BASE_URL")
         or os.getenv("RESPAN_BASE_URL")
-        or "https://api.respan.ai"
+        or "https://api.respan.ai/api"
     )
     return raw_base_url.rstrip("/")
 
