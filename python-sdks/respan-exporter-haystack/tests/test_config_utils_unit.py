@@ -16,9 +16,13 @@ from respan_exporter_haystack.utils.config_utils import (
 class TestResolveBaseUrl:
     """Unit tests for resolve_base_url."""
 
-    def test_returns_explicit_base_url(self):
+    def test_returns_explicit_base_url_normalized(self):
+        # include_api_path=False (default): strip /api if present
         assert resolve_base_url(base_url="https://custom.respan.ai") == "https://custom.respan.ai"
-        assert resolve_base_url(base_url="https://custom.respan.ai/api") == "https://custom.respan.ai/api"
+        assert resolve_base_url(base_url="https://custom.respan.ai/api") == "https://custom.respan.ai"
+        # include_api_path=True: ensure URL ends with /api
+        assert resolve_base_url(base_url="https://custom.respan.ai", include_api_path=True) == "https://custom.respan.ai/api"
+        assert resolve_base_url(base_url="https://custom.respan.ai/api", include_api_path=True) == "https://custom.respan.ai/api"
 
     def test_without_api_path_returns_base_without_api_suffix(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.delenv("RESPAN_BASE_URL", raising=False)
@@ -34,10 +38,13 @@ class TestResolveBaseUrl:
     def test_prefers_env_over_default(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("RESPAN_BASE_URL", "https://env.respan.ai")
         assert resolve_base_url(base_url=None) == "https://env.respan.ai"
+        monkeypatch.setenv("RESPAN_BASE_URL", "https://env.respan.ai/api")
+        assert resolve_base_url(base_url=None, include_api_path=False) == "https://env.respan.ai"
 
-    def test_explicit_overrides_env(self, monkeypatch: pytest.MonkeyPatch):
+    def test_explicit_overrides_env_normalized_by_include_api_path(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("RESPAN_BASE_URL", "https://env.respan.ai")
         assert resolve_base_url(base_url="https://explicit.respan.ai") == "https://explicit.respan.ai"
+        assert resolve_base_url(base_url="https://explicit.respan.ai/api", include_api_path=True) == "https://explicit.respan.ai/api"
 
 
 class TestResolveApiKey:

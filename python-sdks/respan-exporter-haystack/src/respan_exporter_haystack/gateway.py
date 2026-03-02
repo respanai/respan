@@ -86,7 +86,7 @@ class _BaseRespanGenerator(object):
         }
         
         try:
-            logger.debug(f"Calling Respan gateway with model {self.model}")
+            logger.debug("Calling Respan gateway with model %s", self.model)
             response = requests.post(
                 url=self.endpoint,
                 headers=headers,
@@ -261,7 +261,7 @@ class RespanGenerator(_BaseRespanGenerator):
             for choice in choices
         ]
         
-        logger.debug(f"Successfully generated {len(replies)} replies")
+        logger.debug("Successfully generated %s replies", len(replies))
         
         return {
             "replies": replies,
@@ -378,7 +378,7 @@ class RespanChatGenerator(_BaseRespanGenerator):
             msg_data = choice.get("message", {})
             replies.append(to_chat_message(message_payload=msg_data))
         
-        logger.debug(f"Successfully generated {len(replies)} replies")
+        logger.debug("Successfully generated %s replies", len(replies))
         
         return {
             "replies": replies,

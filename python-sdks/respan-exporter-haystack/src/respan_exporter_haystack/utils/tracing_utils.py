@@ -22,11 +22,13 @@ def format_span_for_api(
     tags = span_data.get("tags", {})
     data = span_data.get("data", {})
 
-    component_name = tags.get("haystack.component.name", "")
-    component_type = tags.get("haystack.component.type", "")
+    component_name = tags.get("haystack.component.name", "") or ""
+    component_type = tags.get("haystack.component.type", "") or ""
+    component_type_lower = component_type.lower()
+    component_name_lower = component_name.lower()
 
     # Skip internal tracer component from user-visible traces.
-    if "RespanConnector" in component_type:
+    if "respanconnector" in component_type_lower:
         return None
 
     start_time = datetime.fromtimestamp(
@@ -41,9 +43,9 @@ def format_span_for_api(
     else:
         span_name = operation_name
 
-    if "Generator" in component_type or "llm" in component_name.lower():
+    if "generator" in component_type_lower or "llm" in component_name_lower:
         log_type = LOG_TYPE_CHAT
-    elif "Builder" in component_type or "prompt" in component_name.lower():
+    elif "builder" in component_type_lower or "prompt" in component_name_lower:
         log_type = LOG_TYPE_TASK
     elif operation_name == "haystack.pipeline.run":
         log_type = LOG_TYPE_WORKFLOW

@@ -26,14 +26,24 @@ def resolve_api_key(api_key: Optional[str] = None) -> Optional[str]:
 
 
 def resolve_base_url(base_url: Optional[str] = None, include_api_path: bool = False) -> str:
-    """Resolve base URL from explicit value or RESPAN_BASE_URL environment variable."""
+    """Resolve base URL from explicit value or RESPAN_BASE_URL environment variable.
+    When include_api_path is True, the returned URL is normalized to end with /api (for API calls).
+    When False, the trailing /api is stripped (e.g. for platform/logs URLs).
+    """
     if base_url:
-        return base_url
+        resolved = base_url
+    else:
+        resolved = os.getenv("RESPAN_BASE_URL")
+        if not resolved:
+            resolved = (
+                DEFAULT_RESPAN_API_BASE_URL if include_api_path else DEFAULT_RESPAN_BASE_URL
+            )
 
-    resolved = os.getenv("RESPAN_BASE_URL")
-    if resolved:
-        return resolved
-
+    resolved = resolved.rstrip("/")
     if include_api_path:
-        return DEFAULT_RESPAN_API_BASE_URL
-    return DEFAULT_RESPAN_BASE_URL
+        if not resolved.endswith("/api"):
+            resolved = f"{resolved}/api"
+    else:
+        if resolved.endswith("/api"):
+            resolved = resolved.removesuffix("/api")
+    return resolved
