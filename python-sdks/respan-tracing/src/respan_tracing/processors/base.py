@@ -100,7 +100,10 @@ class RespanSpanProcessor:
                     logger.debug(f"[Respan Debug] Export filter dropped span: {span.name}")
                     return
             except (json.JSONDecodeError, Exception) as e:
-                logger.warning(f"[Respan Debug] Failed to evaluate export filter: {e}")
+                # Fail-open: invalid/malformed filters still export the span.
+                # This matches the codebase's infrastructure fail-open principle —
+                # a broken filter should not silently drop telemetry data.
+                logger.warning(f"[Respan Debug] Failed to evaluate export filter, exporting span anyway: {e}")
 
         self.processor.on_end(span)
 

@@ -95,7 +95,11 @@ def _setup_span(
 
     # Store export filter as JSON string on span attribute
     if export_filter is not None:
-        span.set_attribute(EXPORT_FILTER_ATTR, json.dumps(export_filter))
+        try:
+            span.set_attribute(EXPORT_FILTER_ATTR, json.dumps(export_filter))
+        except (TypeError, ValueError):
+            # Skip if serialization fails — filter won't be applied
+            pass
 
     # Set span in context
     ctx = trace.set_span_in_context(span)
