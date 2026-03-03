@@ -7,6 +7,7 @@ from opentelemetry.sdk.trace import SpanProcessor, ReadableSpan
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor, SpanExporter, SpanExportResult
 from opentelemetry.context import Context
 from opentelemetry.semconv_ai import SpanAttributes
+from opentelemetry.trace.status import StatusCode
 
 from respan_sdk.respan_types.span_types import RespanSpanAttributes
 from respan_tracing.constants.generic_constants import SDK_PREFIX
@@ -14,6 +15,7 @@ from respan_tracing.constants.context_constants import (
     TRACE_GROUP_ID_KEY, 
     PARAMS_KEY
 )
+from respan_tracing.constants.tracing import ERRORS_ONLY_ATTR
 from respan_tracing.utils.preprocessing.span_processing import is_processable_span
 from respan_tracing.utils.context import get_entity_path
 
@@ -80,6 +82,12 @@ class RespanSpanProcessor:
 
     def on_end(self, span: ReadableSpan):
         """Called when a span ends - filter spans based on Respan attributes"""
+        # errors_only: drop non-error spans that opted into errors-only mode
+        if span.attributes.get(ERRORS_ONLY_ATTR):
+            if span.status.status_code != StatusCode.ERROR:
+                logger.debug(f"[Respan Debug] Dropping non-error span (errors_only): {span.name}")
+                return
+
         # Apply filtering logic using shared function
         if is_processable_span(span):
             self.processor.on_end(span)
