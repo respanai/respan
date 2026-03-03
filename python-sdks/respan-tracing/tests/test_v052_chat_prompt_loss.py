@@ -118,8 +118,12 @@ def _apply_sync_patch():
     cw._handle_request = _patched_handle_request
 
 
-class TestReproduction(unittest.TestCase):
-    """Reproduce the original bug with unpatched code, then verify the fix."""
+class TestOtelOpenAIv052_ChatPromptLoss(unittest.TestCase):
+    """
+    Reproduce: opentelemetry-instrumentation-openai v0.52.6 chat spans lose
+    gen_ai.prompt.* attributes when _set_request_attributes raises.
+    Fixed in respan-tracing v2.1.3 via sync fault-isolation patch.
+    """
 
     def setUp(self):
         self.provider = TracerProvider()
@@ -138,16 +142,11 @@ class TestReproduction(unittest.TestCase):
     # Theory A: response_format exception kills prompts
     # ──────────────────────────────────────────────────────────────
 
-    def test_original_loses_prompts_on_response_format_exception(self):
+    def test_v052_response_format_exception_kills_all_prompts(self):
         """
-        REPRODUCTION: Unpatched _handle_request loses ALL prompt attributes
-        when _set_request_attributes raises on response_format.
-
-        _set_request_attributes (shared/__init__.py:104) is NOT @dont_throw.
-        Lines 159-170 call response_format.model_json_schema() without
-        try/except. If it raises, the exception propagates to _handle_request's
-        @dont_throw async_wrapper, which silently catches it.
-        _set_client_attributes and _set_prompts are never called.
+        BUG: _set_request_attributes (NOT @dont_throw) raises on response_format
+        → propagates to _handle_request's @dont_throw → silently caught
+        → _set_prompts never runs → gen_ai.prompt.* absent from span.
         """
         span = self._make_span()
 
@@ -201,10 +200,8 @@ class TestReproduction(unittest.TestCase):
             "BUG REPRODUCED: prompt.1.content should be absent",
         )
 
-    def test_original_loses_prompts_via_run_async(self):
-        """
-        Same as above, but through run_async() — the actual call path in chat_wrapper.
-        """
+    def test_v052_response_format_exception_kills_prompts_via_run_async(self):
+        """Same bug through run_async() — the actual call path in chat_wrapper."""
         span = self._make_span()
 
         class BrokenResponseFormat:
@@ -231,11 +228,8 @@ class TestReproduction(unittest.TestCase):
         self.assertEqual(attrs.get("gen_ai.request.model"), "test-model")
         self.assertNotIn("gen_ai.prompt.0.role", attrs, "BUG: prompts lost via run_async")
 
-    def test_original_loses_prompts_via_run_async_with_running_loop(self):
-        """
-        Same, but with a running event loop — forces the thread path in run_async().
-        This is what happens in FastAPI, Jupyter, or some Lambda configs.
-        """
+    def test_v052_response_format_exception_kills_prompts_thread_path(self):
+        """Same bug with running event loop — forces run_async thread path."""
         span = self._make_span()
 
         class BrokenResponseFormat:
@@ -264,13 +258,8 @@ class TestReproduction(unittest.TestCase):
     # Theory A verification: confirm the chain of causation
     # ──────────────────────────────────────────────────────────────
 
-    def test_original_also_loses_client_attributes(self):
-        """
-        Verify that _set_client_attributes (called AFTER _set_request_attributes)
-        is also lost when _set_request_attributes raises.
-
-        This matches the customer trace: gen_ai.openai.api_base is absent.
-        """
+    def test_v052_response_format_exception_also_kills_client_attrs(self):
+        """api_base also lost — matches mem0 trace where gen_ai.openai.api_base absent."""
         span = self._make_span()
 
         class BrokenResponseFormat:
@@ -298,11 +287,8 @@ class TestReproduction(unittest.TestCase):
             "Client attributes should also be lost (called after _set_request_attributes)",
         )
 
-    def test_original_request_attrs_before_response_format_survive(self):
-        """
-        Verify that attributes set BEFORE the response_format handling
-        in _set_request_attributes DO survive — they were set before the raise.
-        """
+    def test_v052_attrs_before_response_format_survive_after_attrs_lost(self):
+        """model/temperature survive (set before raise), prompts lost (set after)."""
         span = self._make_span()
 
         class BrokenResponseFormat:
@@ -334,11 +320,8 @@ class TestReproduction(unittest.TestCase):
     # Patch fixes the bug
     # ──────────────────────────────────────────────────────────────
 
-    def test_patched_captures_prompts_despite_response_format_exception(self):
-        """
-        After applying the sync patch, prompts survive even when
-        _set_request_attributes raises on response_format.
-        """
+    def test_v214_sync_patch_captures_prompts_despite_response_format_exception(self):
+        """respan-tracing v2.1.3+ sync patch: prompts survive response_format explosion."""
         _apply_sync_patch()
 
         span = self._make_span()
@@ -369,10 +352,8 @@ class TestReproduction(unittest.TestCase):
         self.assertEqual(attrs.get("gen_ai.prompt.1.role"), "user")
         self.assertEqual(attrs.get("gen_ai.prompt.1.content"), "Hello world")
 
-    def test_patched_captures_prompts_via_run_async_despite_exception(self):
-        """
-        Through run_async — same as chat_wrapper uses.
-        """
+    def test_v214_sync_patch_captures_prompts_via_run_async_despite_exception(self):
+        """Same fix verified through run_async call path."""
         _apply_sync_patch()
 
         span = self._make_span()
@@ -406,11 +387,8 @@ class TestReproduction(unittest.TestCase):
     # Proves the thread path works when no exception is raised.
     # ──────────────────────────────────────────────────────────────
 
-    def test_original_works_without_response_format(self):
-        """
-        Control test: without response_format, the original async code
-        DOES capture prompts correctly (no exception, no data loss).
-        """
+    def test_v052_no_response_format_prompts_captured_correctly(self):
+        """Control: without response_format, v0.52 async path works fine."""
         span = self._make_span()
 
         kwargs = {
@@ -429,11 +407,8 @@ class TestReproduction(unittest.TestCase):
         self.assertEqual(attrs.get("gen_ai.prompt.0.role"), "user")
         self.assertEqual(attrs.get("gen_ai.prompt.0.content"), "Hello")
 
-    def test_original_works_via_run_async_with_running_loop_no_exception(self):
-        """
-        Control: run_async thread path works when _set_request_attributes
-        doesn't raise. Proves the thread path itself is not the root cause.
-        """
+    def test_v052_run_async_thread_path_works_without_exception(self):
+        """Control: run_async thread path is not root cause — works when no exception."""
         span = self._make_span()
 
         kwargs = {

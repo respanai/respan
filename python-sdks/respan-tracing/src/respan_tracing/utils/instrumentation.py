@@ -238,8 +238,10 @@ def _patch_chat_prompt_capture():
             try:
                 _set_request_attributes(span, kwargs, instance)
             except Exception:
-                logging.debug(
-                    "respan-tracing: chat _set_request_attributes failed: %s",
+                logging.warning(
+                    "respan-tracing: _set_request_attributes failed (response_format may be incompatible). "
+                    "Request attributes like model/temperature may be incomplete on this span. "
+                    "Error: %s",
                     traceback.format_exc(),
                 )
 
@@ -271,8 +273,10 @@ def _patch_chat_prompt_capture():
                         elif kwargs.get("tools"):
                             set_tools_attributes(span, kwargs.get("tools"))
             except Exception:
-                logging.debug(
-                    "respan-tracing: chat prompt capture failed: %s",
+                logging.warning(
+                    "respan-tracing: chat prompt capture failed. "
+                    "Input messages may not appear on the dashboard for this span. "
+                    "Error: %s",
                     traceback.format_exc(),
                 )
 
