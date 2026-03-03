@@ -52,7 +52,7 @@ class InlineThread:
 @pytest.mark.asyncio
 async def test_guard_call_sends_validated_log_to_respan_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     requests_capture = CapturingRequests()
-    monkeypatch.setattr("respan_exporter_superagent.utils.requests", requests_capture)
+    monkeypatch.setattr("respan_sdk.utils.export.requests", requests_capture)
     monkeypatch.setattr(threading, "Thread", InlineThread)
 
     client = create_client(
@@ -94,7 +94,7 @@ async def test_guard_call_sends_validated_log_to_respan_endpoint(monkeypatch: py
 @pytest.mark.asyncio
 async def test_disable_log_does_not_send(monkeypatch: pytest.MonkeyPatch) -> None:
     requests_capture = CapturingRequests()
-    monkeypatch.setattr("respan_exporter_superagent.utils.requests", requests_capture)
+    monkeypatch.setattr("respan_sdk.utils.export.requests", requests_capture)
     monkeypatch.setattr(threading, "Thread", InlineThread)
 
     client = create_client(
@@ -145,7 +145,7 @@ async def test_live_redact_openai_provider_sends_log(monkeypatch: pytest.MonkeyP
             pass
 
     requests_capture = CapturingRequests()
-    monkeypatch.setattr("respan_exporter_superagent.utils.requests", requests_capture)
+    monkeypatch.setattr("respan_sdk.utils.export.requests", requests_capture)
     monkeypatch.setattr(threading, "Thread", InlineThread)
 
     real_superagent_client = superagent_create_client()
@@ -222,7 +222,7 @@ async def test_live_guard_superagent_provider_posts_to_respan(monkeypatch: pytes
         post_results.append({"url": url, "status_code": response.status_code, "text": response.text})
         return response
 
-    monkeypatch.setattr("respan_exporter_superagent.utils.requests.post", recording_post)
+    monkeypatch.setattr("respan_sdk.utils.export.requests.post", recording_post)
 
     exporter_client = create_client(
         api_key=os.environ["RESPAN_API_KEY"],

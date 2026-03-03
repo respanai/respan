@@ -1,0 +1,25 @@
+[tool.poetry]
+name = "respan-exporter-dify"
+version = "0.1.0"
+description = "Respan exporter for Dify Python SDK"
+authors = ["Respan <team@respan.ai>"]
+license = "Apache-2.0"
+readme = "README.md"
+packages = [
+    { include = "respan_exporter_dify", from = "src" },
+]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<4.0"
+requests = "^2.32.5"
+respan-sdk = "^2.4.0"
+respan-tracing = "^2.1.0"
+dify-client-python = "^1.0.1"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.4"
+pytest-asyncio = "^0.25.3"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

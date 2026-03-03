@@ -1,15 +1,12 @@
 import logging
 import os
-import threading
-from typing import Any
-from typing import Optional
+from typing import Any, Optional
 
 from respan_sdk.constants import RESPAN_TRACING_INGEST_ENDPOINT
 from respan_sdk.respan_types import RespanParams
+from respan_sdk.utils.export import send_payloads, validate_payload
+from respan_sdk.utils.time import now_utc
 from respan_exporter_superagent.utils import build_payload
-from respan_exporter_superagent.utils import now_utc
-from respan_exporter_superagent.utils import send_payloads
-from respan_exporter_superagent.utils import validate_payload
 
 try:
     from safety_agent import create_client as superagent_create_client
@@ -115,16 +112,13 @@ class RespanSuperagentClient:
                 logger.exception("Failed to validate Respan payload: %s", exc)
                 return
 
-            threading.Thread(
-                target=send_payloads,
-                kwargs={
-                    "api_key": self.api_key,
-                    "endpoint": self.endpoint,
-                    "timeout": self.timeout,
-                    "payloads": [validated_payload],
-                },
-                daemon=True,
-            ).start()
+            send_payloads(
+                api_key=self.api_key,
+                endpoint=self.endpoint,
+                timeout=self.timeout,
+                payloads=[validated_payload],
+                context="respan superagent ingest",
+            )
 
         try:
             method = getattr(self._client, method_name)

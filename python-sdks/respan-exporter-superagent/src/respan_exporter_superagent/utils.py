@@ -1,27 +1,15 @@
-import json
 import logging
 from datetime import datetime
-from datetime import timezone
 from typing import Any, Dict, Optional
 
-import requests
-from respan_sdk.respan_types import RespanFullLogParams
+from respan_sdk.constants.llm_logging import LOG_TYPE_TOOL
 from respan_sdk.respan_types import RespanParams
-from respan_sdk.utils import RetryHandler
+from respan_sdk.utils.export import send_payloads, validate_payload
+from respan_sdk.utils.serialization import safe_json_dumps
+from respan_sdk.utils.time import now_utc
 
 
 logger = logging.getLogger(__name__)
-
-
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def safe_json_dumps(value: Any) -> str:
-    try:
-        return json.dumps(value, default=str)
-    except Exception:
-        return str(value)
 
 
 def build_payload(
@@ -40,7 +28,7 @@ def build_payload(
     payload: Dict[str, Any] = {
         "span_workflow_name": params.span_workflow_name or "superagent",
         "span_name": params.span_name or f"superagent.{method_name}",
-        "log_type": params.log_type or "tool",
+        "log_type": params.log_type or LOG_TYPE_TOOL,
         "start_time": start_time.isoformat(),
         "timestamp": end_time.isoformat(),
         "latency": (end_time - start_time).total_seconds(),
@@ -79,39 +67,4 @@ def build_payload(
         payload["metadata"] = metadata
 
     return payload
-
-
-def validate_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    validated = RespanFullLogParams(**payload)
-    return validated.model_dump(mode="json", exclude_none=True)
-
-
-def send_payloads(
-    *,
-    api_key: str,
-    endpoint: str,
-    timeout: int,
-    payloads: list[Dict[str, Any]],
-) -> None:
-    handler = RetryHandler(max_retries=3, retry_delay=1.0, backoff_multiplier=2.0, max_delay=30.0)
-
-    def _post() -> None:
-        response = requests.post(
-            endpoint,
-            json=payloads,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            timeout=timeout,
-        )
-        if response.status_code >= 500:
-            raise RuntimeError(f"Respan ingest server error status_code={response.status_code}")
-        if response.status_code >= 300:
-            logger.warning("Respan ingest client error status_code=%s", response.status_code)
-
-    try:
-        handler.execute(func=_post, context="respan superagent ingest")
-    except Exception as exc:
-        logger.exception("Respan ingest failed after retries: %s", exc)
 

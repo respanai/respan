@@ -1,5 +1,14 @@
 from datetime import datetime
+from datetime import timezone
 from typing import Union
+
+
+def now_utc() -> datetime:
+    """Return current UTC time. Use for start_time/end_time in export payloads."""
+    return datetime.now(timezone.utc)
+
+
+# NOTE: PR #46 adds now_iso and format_timestamp; merge order may cause conflicts here.
 
 
 def parse_datetime(v: Union[str, datetime]) -> datetime:
