@@ -29,6 +29,20 @@ from ._internal_types import (
 )
 from .exporter_session_types import ExporterSessionState, PendingToolState
 
+# Filter types
+from .filter_types import (
+    MetricFilterParam,
+    FilterBundle,
+    FilterParamDict,
+    MetricFilterParamModel,
+    FilterBundleModel,
+    FilterParamDictModel,
+    MetricFilterParamPydantic,
+    FilterBundlePydantic,
+    FilterParamDictPydantic,
+)
+from .mixin_types.filter_mixin import MetricFilterValueType
+
 # Prompt types
 from .prompt_types import (
     Prompt,
@@ -70,6 +84,19 @@ __all__ = [
     "BasicEmbeddingParams",
     "ExporterSessionState",
     "PendingToolState",
+
+    # Filter types (TypedDict versions)
+    "MetricFilterParam",
+    "FilterBundle",
+    "FilterParamDict",
+    "MetricFilterValueType",
+    # Filter types (Pydantic versions)
+    "MetricFilterParamModel",
+    "FilterBundleModel",
+    "FilterParamDictModel",
+    "MetricFilterParamPydantic",
+    "FilterBundlePydantic",
+    "FilterParamDictPydantic",
 
     # Prompt types
     "Prompt",
