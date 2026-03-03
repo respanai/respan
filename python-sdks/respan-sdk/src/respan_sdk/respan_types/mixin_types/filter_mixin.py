@@ -134,7 +134,18 @@ class FilterParamDictPydantic(RespanBaseModel):
     """
     Pydantic model for FilterParamDict.
     A dictionary that maps metric names to their filter parameters.
+
+    Each key is a metric name (str), and each value can be:
+    - A single MetricFilterParamPydantic (one condition)
+    - A List[MetricFilterParamPydantic] (multiple conditions for same metric)
+    - A FilterBundlePydantic (nested filter bundle with connector)
+
+    Note: Uses extra="allow" for dynamic metric name fields.
+    The __pydantic_extra__ annotation tells Pydantic what types to expect for
+    extra fields, and generates typed additionalProperties in JSON Schema.
     """
+
+    __pydantic_extra__: Dict[str, Union["MetricFilterParamPydantic", List["MetricFilterParamPydantic"], "FilterBundlePydantic"]]
 
     model_config = ConfigDict(
         extra="allow",  # Allow dynamic field names (metric names)
@@ -211,6 +222,7 @@ class FilterParamDictPydantic(RespanBaseModel):
 
 # Update forward references
 FilterBundlePydantic.model_rebuild()
+FilterParamDictPydantic.model_rebuild()
 
 
 # Convenient aliases for backward compatibility and easier imports
