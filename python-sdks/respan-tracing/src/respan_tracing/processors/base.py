@@ -1,3 +1,4 @@
+import json
 from typing import Optional, Callable, Dict, Any, List
 from contextvars import ContextVar
 import logging
@@ -10,10 +11,12 @@ from opentelemetry.semconv_ai import SpanAttributes
 
 from respan_sdk.respan_types.span_types import RespanSpanAttributes
 from respan_tracing.constants.generic_constants import SDK_PREFIX
+from respan_tracing.constants.tracing import EXPORT_FILTER_ATTR
 from respan_tracing.constants.context_constants import (
-    TRACE_GROUP_ID_KEY, 
+    TRACE_GROUP_ID_KEY,
     PARAMS_KEY
 )
+from respan_tracing.filters import evaluate_export_filter
 from respan_tracing.utils.preprocessing.span_processing import is_processable_span
 from respan_tracing.utils.context import get_entity_path
 
@@ -80,11 +83,26 @@ class RespanSpanProcessor:
 
     def on_end(self, span: ReadableSpan):
         """Called when a span ends - filter spans based on Respan attributes"""
-        # Apply filtering logic using shared function
-        if is_processable_span(span):
-            self.processor.on_end(span)
-        else:
+        # Apply standard filtering logic (processable span check)
+        if not is_processable_span(span):
             logger.debug(f"[Respan Debug] Skipping filtered span: {span.name}")
+            return
+
+        # Apply export_filter if present on this span
+        filter_json = span.attributes.get(EXPORT_FILTER_ATTR) if span.attributes else None
+        if filter_json:
+            try:
+                export_filter = json.loads(filter_json)
+                span_data = dict(span.attributes) if span.attributes else {}
+                span_data["status_code"] = span.status.status_code.name if span.status else "UNSET"
+                span_data["name"] = span.name
+                if not evaluate_export_filter(span_data=span_data, export_filter=export_filter):
+                    logger.debug(f"[Respan Debug] Export filter dropped span: {span.name}")
+                    return
+            except (json.JSONDecodeError, Exception) as e:
+                logger.warning(f"[Respan Debug] Failed to evaluate export filter: {e}")
+
+        self.processor.on_end(span)
 
     def _wrapped_on_end(self, span: ReadableSpan):
         """Wrapped on_end method that calls custom callback first"""
