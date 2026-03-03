@@ -65,6 +65,13 @@ exporter = RespanAnthropicAgentsExporter(
 )
 ```
 
+## Examples
+
+Runnable examples with full setup instructions:
+
+- **Python:** [anthropic_agents_python_example](https://github.com/Keywords-AI/keywordsai-example-projects/tree/main/anthropic_agents_python_example)
+- **TypeScript:** [anthropic_agents_typescript_example](https://github.com/Keywords-AI/keywordsai-example-projects/tree/main/anthropic_agents_typescript_example)
+
 ## Dev Guide
 
 ### Running Tests
