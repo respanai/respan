@@ -18,36 +18,36 @@ from respan_exporter_crewai.utils import is_crewai_span, otel_span_to_dict
 
 def test_dedupe_cache_add_new_returns_true():
     cache = _SpanDedupeCache(max_size=100)
-    assert cache.add("trace1", "span1") is True
+    assert cache.add(trace_id="trace1", span_id="span1") is True
 
 
 def test_dedupe_cache_add_duplicate_returns_false():
     cache = _SpanDedupeCache(max_size=100)
-    assert cache.add("trace1", "span1") is True
-    assert cache.add("trace1", "span1") is False
+    assert cache.add(trace_id="trace1", span_id="span1") is True
+    assert cache.add(trace_id="trace1", span_id="span1") is False
 
 
 def test_dedupe_cache_different_spans_both_added():
     cache = _SpanDedupeCache(max_size=100)
-    assert cache.add("trace1", "span1") is True
-    assert cache.add("trace1", "span2") is True
-    assert cache.add("trace2", "span1") is True
+    assert cache.add(trace_id="trace1", span_id="span1") is True
+    assert cache.add(trace_id="trace1", span_id="span2") is True
+    assert cache.add(trace_id="trace2", span_id="span1") is True
 
 
 def test_dedupe_cache_none_trace_id_returns_true():
     """Missing trace_id is not cached; allows through."""
     cache = _SpanDedupeCache(max_size=100)
-    assert cache.add(None, "span1") is True
-    assert cache.add(None, "span1") is True
+    assert cache.add(trace_id=None, span_id="span1") is True
+    assert cache.add(trace_id=None, span_id="span1") is True
 
 
 def test_dedupe_cache_evicts_when_over_max_size():
     cache = _SpanDedupeCache(max_size=2)
-    cache.add("t1", "s1")
-    cache.add("t2", "s2")
-    cache.add("t3", "s3")  # evicts t1:s1
+    cache.add(trace_id="t1", span_id="s1")
+    cache.add(trace_id="t2", span_id="s2")
+    cache.add(trace_id="t3", span_id="s3")  # evicts t1:s1
     # t1:s1 should be evicted, so adding again returns True
-    assert cache.add("t1", "s1") is True
+    assert cache.add(trace_id="t1", span_id="s1") is True
 
 
 # --- _export_crewai_spans ---

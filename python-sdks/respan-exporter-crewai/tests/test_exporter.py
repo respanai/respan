@@ -12,17 +12,17 @@ from respan_exporter_crewai.exporter import RespanCrewAIExporter
 
 def test_build_payload_empty_list_returns_empty():
     exporter = RespanCrewAIExporter(api_key="test")
-    assert exporter.build_payload([]) == []
+    assert exporter.build_payload(trace_or_spans=[]) == []
 
 
 def test_build_payload_none_returns_empty():
     exporter = RespanCrewAIExporter(api_key="test")
-    assert exporter.build_payload(None) == []
+    assert exporter.build_payload(trace_or_spans=None) == []
 
 
 def test_build_payload_dict_with_empty_spans_returns_empty():
     exporter = RespanCrewAIExporter(api_key="test")
-    assert exporter.build_payload({"spans": []}) == []
+    assert exporter.build_payload(trace_or_spans={"spans": []}) == []
 
 
 def test_build_payload_dict_with_spans_key():
@@ -37,7 +37,7 @@ def test_build_payload_dict_with_spans_key():
     }
     with patch.object(exporter, "_span_to_respan", return_value=None):
         # If _span_to_respan returns None (e.g. validation fails), payloads can be empty
-        payloads = exporter.build_payload({"spans": [minimal_span]})
+        payloads = exporter.build_payload(trace_or_spans={"spans": [minimal_span]})
     # Either empty (validation failed) or one payload
     assert isinstance(payloads, list)
     assert len(payloads) <= 1
@@ -46,7 +46,7 @@ def test_build_payload_dict_with_spans_key():
 def test_normalize_trace_list_input():
     """List input is normalized to (None, list)."""
     exporter = RespanCrewAIExporter(api_key="test")
-    trace_obj, spans = exporter._normalize_trace([{"span_id": "1"}, {"span_id": "2"}])
+    trace_obj, spans = exporter._normalize_trace(trace_or_spans=[{"span_id": "1"}, {"span_id": "2"}])
     assert trace_obj is None
     assert len(spans) == 2
 
@@ -54,7 +54,7 @@ def test_normalize_trace_list_input():
 def test_normalize_trace_dict_with_spans():
     exporter = RespanCrewAIExporter(api_key="test")
     d = {"spans": [{"span_id": "1"}]}
-    trace_obj, spans = exporter._normalize_trace(d)
+    trace_obj, spans = exporter._normalize_trace(trace_or_spans=d)
     assert trace_obj is d
     assert len(spans) == 1
 
@@ -62,7 +62,7 @@ def test_normalize_trace_dict_with_spans():
 def test_normalize_trace_single_dict_treated_as_single_span():
     exporter = RespanCrewAIExporter(api_key="test")
     d = {"span_id": "1"}
-    trace_obj, spans = exporter._normalize_trace(d)
+    trace_obj, spans = exporter._normalize_trace(trace_or_spans=d)
     assert trace_obj is None
     assert len(spans) == 1
     assert spans[0] == d
@@ -107,10 +107,10 @@ def test_send_handles_request_exception():
 
 def test_export_without_api_key_returns_payloads_without_sending():
     """When api_key is missing, export still builds payloads but send is not called."""
-    exporter = RespanCrewAIExporter(api_key=None)
-    # Build payloads that would be returned
+    with patch.dict("os.environ", {"RESPAN_API_KEY": ""}, clear=False):
+        exporter = RespanCrewAIExporter(api_key=None)
     with patch.object(exporter, "build_payload", return_value=[{"x": 1}]) as mock_build:
         with patch.object(exporter, "send") as mock_send:
-            result = exporter.export([{"span_id": "1" * 16, "trace_id": "2" * 32, "name": "s"}])
+            result = exporter.export(trace_or_spans=[{"span_id": "1" * 16, "trace_id": "2" * 32, "name": "s"}])
             mock_send.assert_not_called()
             assert result == [{"x": 1}]

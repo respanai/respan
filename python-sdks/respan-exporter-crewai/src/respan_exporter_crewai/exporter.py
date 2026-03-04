@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import requests
 
 from respan_sdk.constants import RESPAN_DOGFOOD_HEADER
+from respan_sdk.constants.llm_logging import LogMethodChoices
 
 from respan_exporter_crewai.types import TraceContext
 from respan_exporter_crewai.utils import (
@@ -411,8 +412,9 @@ class RespanCrewAIExporter:
                 usage = {
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
-                    "total_tokens": total_tokens,
                 }
+                if not (prompt_tokens is not None and completion_tokens is not None):
+                    usage["total_tokens"] = total_tokens
 
         error = get_attr(span, "error", "exception", "err")
         if error is None and isinstance(span_metadata, dict) and "error" in span_metadata:
@@ -484,6 +486,7 @@ class RespanCrewAIExporter:
         output_value = serialize_value(value=span_output) if span_output is not None else None
 
         payload = {
+            "log_method": LogMethodChoices.TRACING_INTEGRATION.value,
             "trace_unique_id": trace_hex_id,
             "trace_name": trace_context.trace_name,
             "span_unique_id": span_hex_id,
@@ -524,19 +527,13 @@ class RespanCrewAIExporter:
 
             payload["prompt_tokens"] = prompt_tokens
             payload["completion_tokens"] = completion_tokens
-            payload["total_request_tokens"] = total_tokens
-
-            coerced_total = coerce_token_count(value=total_tokens)
-            if coerced_total is None or coerced_total == 0:
-                prompt_tokens_value = coerce_token_count(value=prompt_tokens)
-                completion_tokens_value = coerce_token_count(value=completion_tokens)
-                coerced_prompt = prompt_tokens_value or 0
-                coerced_completion = completion_tokens_value or 0
-                if coerced_prompt or coerced_completion:
-                    payload["total_request_tokens"] = coerced_prompt + coerced_completion
-            else:
-                prompt_tokens_value = coerce_token_count(value=prompt_tokens)
-                completion_tokens_value = coerce_token_count(value=completion_tokens)
+            # Do not set total_request_tokens when prompt_tokens and completion_tokens
+            # are present; Respan backend calculates total from them.
+            prompt_tokens_value = coerce_token_count(value=prompt_tokens)
+            completion_tokens_value = coerce_token_count(value=completion_tokens)
+            has_both = (prompt_tokens_value or 0) > 0 or (completion_tokens_value or 0) > 0
+            if not has_both and coerce_token_count(value=total_tokens) is not None:
+                payload["total_request_tokens"] = total_tokens
 
         if error:
             payload["error_message"] = str(error)
