@@ -399,8 +399,6 @@ class RespanCrewAIExporter:
         if usage is None and isinstance(span_metadata, dict) and "usage" in span_metadata:
             usage = span_metadata.pop("usage")
         usage = as_dict(value=usage)
-        prompt_tokens_value: Optional[int] = None
-        completion_tokens_value: Optional[int] = None
         if usage is None and isinstance(span_metadata, dict):
             prompt_tokens = span_metadata.get("llm.token_count.prompt")
             completion_tokens = span_metadata.get("llm.token_count.completion")
