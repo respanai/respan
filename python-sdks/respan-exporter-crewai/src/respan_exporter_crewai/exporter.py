@@ -531,7 +531,7 @@ class RespanCrewAIExporter:
             # are present; Respan backend calculates total from them.
             prompt_tokens_value = coerce_token_count(value=prompt_tokens)
             completion_tokens_value = coerce_token_count(value=completion_tokens)
-            has_both = (prompt_tokens_value or 0) > 0 or (completion_tokens_value or 0) > 0
+            has_token_count = (prompt_tokens_value or 0) > 0 or (completion_tokens_value or 0) > 0
             if not has_both and coerce_token_count(value=total_tokens) is not None:
                 payload["total_request_tokens"] = total_tokens
 
