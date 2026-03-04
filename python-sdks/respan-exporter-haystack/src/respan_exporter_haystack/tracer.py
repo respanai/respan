@@ -14,6 +14,8 @@ from respan_exporter_haystack.utils.tracing_utils import format_span_for_api
 logger = logging.getLogger(__name__)
 
 
+import threading
+
 class RespanTracer(Tracer):
     """
     Custom tracer implementation for Respan that integrates with Haystack's tracing system.
@@ -191,22 +193,28 @@ class RespanTracer(Tracer):
             logger.debug("Trace already sent")
             return
             
-        try:
-            logger.debug(f"Sending trace with {len(self.completed_spans)} spans to Respan")
-            response = self.kw_logger.send_trace(spans=self.completed_spans)
-            
-            if response:
-                logger.debug(f"Trace sent successfully: {response}")
-                # Extract trace info from response
-                if "trace_ids" in response and response["trace_ids"]:
-                    trace_id = response["trace_ids"][0]
-                    self.trace_url = f"{self.platform_logs_base}?trace_id={trace_id}"
-                    
-            self.pipeline_finished = True
-            self.completed_spans.clear()  # Free memory after sending
-            self.spans.clear() # Free span lookup memory
-        except Exception as e:
-            logger.warning(f"Failed to send trace to Respan: {e}")
+        spans_to_send = list(self.completed_spans)
+        
+        def _send():
+            try:
+                logger.debug(f"Sending trace with {len(spans_to_send)} spans to Respan")
+                response = self.kw_logger.send_trace(spans=spans_to_send)
+                
+                if response:
+                    logger.debug(f"Trace sent successfully: {response}")
+                    # Extract trace info from response
+                    if "trace_ids" in response and response["trace_ids"]:
+                        trace_id = response["trace_ids"][0]
+                        self.trace_url = f"{self.platform_logs_base}?trace_id={trace_id}"
+            except Exception as e:
+                logger.warning(f"Failed to send trace to Respan: {e}")
+
+        # Use a daemon thread to avoid blocking the main execution
+        threading.Thread(target=_send, daemon=True).start()
+        
+        self.pipeline_finished = True
+        self.completed_spans.clear()  # Free memory after sending
+        self.spans.clear() # Free span lookup memory
 
     def get_trace_url(self) -> Optional[str]:
         """Get the URL to view this trace in Respan dashboard."""

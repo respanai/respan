@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 import requests
 from haystack import logging
 
-from respan_sdk.constants import resolve_tracing_ingest_endpoint
+from respan_sdk.constants import RESPAN_DOGFOOD_HEADER, resolve_tracing_ingest_endpoint
 from respan_sdk.utils import RetryHandler
 
 logger = logging.getLogger(__name__)
@@ -63,6 +63,7 @@ class RespanLogger:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
+            RESPAN_DOGFOOD_HEADER: "1",
         }
 
         handler = RetryHandler(

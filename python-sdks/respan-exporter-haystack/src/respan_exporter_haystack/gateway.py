@@ -6,7 +6,8 @@ import requests
 from haystack import component, default_from_dict, default_to_dict, logging
 from haystack.dataclasses import ChatMessage
 
-from respan_sdk.constants import resolve_chat_completions_endpoint
+from respan_sdk.constants import RESPAN_DOGFOOD_HEADER, resolve_chat_completions_endpoint
+from respan_sdk.utils import RetryHandler
 
 from respan_exporter_haystack.utils.chat_utils import (
     extract_response_text,
@@ -83,10 +84,18 @@ class _BaseRespanGenerator(object):
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
+            RESPAN_DOGFOOD_HEADER: "1",
         }
         
-        try:
-            logger.debug("Calling Respan gateway with model %s", self.model)
+        handler = RetryHandler(
+            max_retries=3,
+            retry_delay=1.0,
+            backoff_multiplier=2.0,
+            max_delay=30.0,
+        )
+
+        def _post() -> Dict[str, Any]:
+            logger.debug(f"Calling Respan gateway with model {self.model}")
             response = requests.post(
                 url=self.endpoint,
                 headers=headers,
@@ -95,7 +104,9 @@ class _BaseRespanGenerator(object):
             )
             response.raise_for_status()
             return response.json()
-            
+
+        try:
+            return handler.execute(func=_post, context="respan haystack gateway")
         except requests.exceptions.HTTPError as e:
             error_msg = f"HTTP error from Respan: {e.response.status_code} - {e.response.text}"
             logger.error(error_msg)
@@ -261,7 +272,7 @@ class RespanGenerator(_BaseRespanGenerator):
             for choice in choices
         ]
         
-        logger.debug("Successfully generated %s replies", len(replies))
+        logger.debug(f"Successfully generated {len(replies)} replies")
         
         return {
             "replies": replies,
@@ -378,7 +389,7 @@ class RespanChatGenerator(_BaseRespanGenerator):
             msg_data = choice.get("message", {})
             replies.append(to_chat_message(message_payload=msg_data))
         
-        logger.debug("Successfully generated %s replies", len(replies))
+        logger.debug(f"Successfully generated {len(replies)} replies")
         
         return {
             "replies": replies,

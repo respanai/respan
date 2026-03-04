@@ -4,43 +4,13 @@
 
 Respan integration for Haystack pipelines with tracing and logging support.
 
-## Features
+## Configuration
 
-### Gateway Mode
-Route LLM calls through Respan gateway:
-- Automatic logging (zero config)
-- Model fallbacks & retries
-- Load balancing
-- Cost optimization
-- Rate limiting & caching
-
-### Tracing Mode
-Capture full workflow execution:
-- Multi-component pipelines
-- Parent-child span relationships
-- Timing per component
-- Input/output tracking
-- RAG + Agent workflows
-
-### Combined Mode (Recommended)
-Use both together for:
-- Gateway reliability + Tracing visibility
-- Production-ready monitoring
-
----
-
-## Installation
+### 1. Install
 
 ```bash
 pip install respan-exporter-haystack
 ```
-
-## Quick Start
-
-### 1. Get API Keys
-
-- [Respan API Key](https://platform.respan.ai/)
-- OpenAI API Key (for examples)
 
 ### 2. Set Environment Variables
 
@@ -50,13 +20,11 @@ export OPENAI_API_KEY="your-openai-key"
 export HAYSTACK_CONTENT_TRACING_ENABLED="true"  # For tracing mode
 ```
 
----
+## Quickstart
 
-## Usage Examples
+### 3. Run Script
 
-### Gateway Mode (Auto-Logging)
-
-**Just replace `OpenAIGenerator` with `RespanGenerator`:**
+**Gateway Mode (Auto-Logging):** Just replace `OpenAIGenerator` with `RespanGenerator`:
 
 ```python
 import os
@@ -78,11 +46,39 @@ result = pipeline.run({"prompt": {"topic": "machine learning"}})
 print(result["llm"]["replies"][0])
 ```
 
-**That's it!** All LLM calls are automatically logged to Respan with no additional code.
+### 4. View Dashboard
 
-**See:** [`examples/gateway_example.py`](examples/gateway_example.py)
+All logs and traces appear in your Respan dashboard:
 
----
+**Dashboard:** https://platform.respan.ai/logs
+
+- **Logs view:** Individual LLM calls
+- **Traces view:** Full pipeline workflows with tree visualization
+
+## Further Reading
+
+### Features
+
+#### Gateway Mode
+Route LLM calls through Respan gateway:
+- Automatic logging (zero config)
+- Model fallbacks & retries
+- Load balancing
+- Cost optimization
+- Rate limiting & caching
+
+#### Tracing Mode
+Capture full workflow execution:
+- Multi-component pipelines
+- Parent-child span relationships
+- Timing per component
+- Input/output tracking
+- RAG + Agent workflows
+
+#### Combined Mode (Recommended)
+Use both together for:
+- Gateway reliability + Tracing visibility
+- Production-ready monitoring
 
 ### Prompt Management
 
@@ -140,8 +136,6 @@ result = generator.run(prompt_variables={"user_input": "Hello"})
 
 **See:** [`examples/prompt_example.py`](examples/prompt_example.py)
 
----
-
 ### Tracing Mode (Workflow Monitoring)
 
 **Add `RespanConnector` to capture the entire pipeline:**
@@ -175,8 +169,6 @@ print(f"\nTrace URL: {result['tracer']['trace_url']}")
 - LLM (generation with tokens + cost)
 
 **See:** [`examples/tracing_example.py`](examples/tracing_example.py)
-
----
 
 ### Combined Mode (Recommended for Production)
 
@@ -217,18 +209,16 @@ print(f"Trace URL: {result['tracer']['trace_url']}")
 
 **See:** [`examples/combined_example.py`](examples/combined_example.py)
 
----
+### What Gets Logged
 
-## What Gets Logged
-
-### Gateway Mode
+#### Gateway Mode
 - Model used
 - Prompt & completion
 - Tokens & cost
 - Latency
 - Request metadata
 
-### Tracing Mode
+#### Tracing Mode
 Each span includes:
 - Component name & type
 - Input data
@@ -241,26 +231,11 @@ For LLM spans, additionally:
 - Token counts
 - Calculated cost (auto-computed)
 
----
-
-## View Your Data
-
-All logs and traces appear in your Respan dashboard:
-
-**Dashboard:** https://platform.respan.ai/logs
-
-- **Logs view:** Individual LLM calls
-- **Traces view:** Full pipeline workflows with tree visualization
-
----
-
-## API Reference
+### API Reference
 
 **Important:** There is **no default model**. You must pass either `model` or `prompt_id`. Code that relied on a previous default (e.g. `gpt-3.5-turbo`) will raise `ValueError: Either 'model' or 'prompt_id' must be provided` — pass `model` explicitly or use `prompt_id` for platform-managed prompts.
 
----
-
-### `RespanGenerator`
+#### `RespanGenerator`
 
 Gateway component for LLM calls (text completion / non-chat).
 
@@ -283,9 +258,7 @@ RespanGenerator(
 
 **Serialization:** The API key is never written when saving pipelines (e.g. `to_dict`); it is resolved from `RESPAN_API_KEY` when the pipeline is loaded.
 
----
-
-### `RespanChatGenerator`
+#### `RespanChatGenerator`
 
 Chat-oriented gateway component with `ChatMessage` support. Same constructor contract as `RespanGenerator`: **no default model** — you must pass either `model` or `prompt_id`. Supports **prompt management** via `prompt_id` (see [Prompt Management](#prompt-management)).
 
@@ -315,9 +288,7 @@ Returns `{"replies": List[ChatMessage], "meta": List[Dict]}`.
 
 **Serialization:** The API key is never written when saving pipelines; it is resolved from `RESPAN_API_KEY` when the pipeline is loaded.
 
----
-
-### `RespanConnector`
+#### `RespanConnector`
 
 Tracing component for workflow monitoring.
 
@@ -342,9 +313,7 @@ RespanConnector(
 
 **Serialization:** The API key is never written when saving pipelines; it is resolved from `RESPAN_API_KEY` when the pipeline is loaded.
 
----
-
-## Examples
+### Examples
 
 Run the examples:
 
@@ -367,34 +336,26 @@ python examples/prompt_example.py
 python examples/combined_example.py
 ```
 
----
-
-## Breaking changes
+### Breaking changes
 
 - **`RespanChatGenerator` / `RespanGenerator`: no default model.** Either `model` or `prompt_id` must be provided. If you previously relied on a default (e.g. `gpt-3.5-turbo`), pass `model` explicitly or use `prompt_id` for platform-managed prompts.
 - **`RespanGenerator`: `streaming_callback` removed.** The constructor no longer accepts `streaming_callback`. Passing it will raise a `TypeError`. Remove the argument when upgrading.
 
 See [CHANGELOG.md](CHANGELOG.md) for full details.
 
----
-
-## Requirements
+### Requirements
 
 - Python 3.10+
 - `haystack-ai >= 2.24.1`
 - `requests >= 2.32.5`
 - `respan-sdk >= 2.3.1`
 
----
-
-## Support
+### Support
 
 - **Documentation:** https://docs.respan.ai/
 - **Dashboard:** https://platform.respan.ai/
 - **Issues:** [GitHub Issues](https://github.com/Repsan/respan/issues)
 
----
-
-## License
+### License
 
 MIT License - see [LICENSE](LICENSE) file for details.
