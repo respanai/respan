@@ -16,11 +16,10 @@ pip install respan-exporter-pydantic-ai
 
 ### 2. Set Environment Variables
 
-| Variable | Description |
-|----------|-------------|
-| `RESPAN_API_KEY` | Respan API key (used when `api_key` is not passed to `RespanTelemetry`) |
-| `RESPAN_BASE_URL` | Respan API base URL (default: `https://api.respan.ai/api`) |
-| `RESPAN_GATEWAY_BASE_URL` | Same as `RESPAN_BASE_URL`; use when routing LLM calls through Respan gateway |
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `RESPAN_API_KEY` | Yes | Respan API key (used when `api_key` is not passed to `RespanTelemetry`) |
+| `RESPAN_BASE_URL` | No | Respan API base URL (default: `https://api.respan.ai/api`) |
 
 Example: `export RESPAN_API_KEY="your-respan-key"` so you don’t need to pass `api_key` in code.
 
@@ -42,7 +41,7 @@ Initialize once before calling `instrument_pydantic_ai()`:
 | `include_content` | Include message content in telemetry (default: `True`). |
 | `include_binary_content` | Include binary content in telemetry (default: `True`). |
 
-**Using Respan as LLM gateway** (no OpenAI key): set `OPENAI_BASE_URL` and `OPENAI_API_KEY` to your Respan gateway URL and Respan API key so Pydantic AI’s OpenAI client talks to Respan instead of OpenAI directly.
+**Using Respan as LLM gateway**: Point your LLM client at Respan by setting `OPENAI_BASE_URL` and `OPENAI_API_KEY` from your Respan credentials in code—see Quickstart below.
 
 ---
 
@@ -50,15 +49,22 @@ Initialize once before calling `instrument_pydantic_ai()`:
 
 ### 3. Run Script
 
-This quickstart sends LLM calls directly to the provider (e.g. OpenAI), not through the Respan gateway. You need a **provider API key** (e.g. an [OpenAI API key](https://platform.openai.com/api-keys)) and must set it before running. For OpenAI: `export OPENAI_API_KEY="your-openai-key"`.
+Use your Respan API key and base URL to configure the LLM client (no separate OpenAI key needed):
 
 ```python
+import os
 from pydantic_ai import Agent
 from respan_tracing import RespanTelemetry
 from respan_exporter_pydantic_ai import instrument_pydantic_ai
 
+# Use Respan as the LLM gateway (no separate OpenAI key needed)
+respan_api_key = os.environ["RESPAN_API_KEY"]
+respan_base_url = os.getenv("RESPAN_BASE_URL", "https://api.respan.ai")
+os.environ["OPENAI_BASE_URL"] = f"{respan_base_url}/api"
+os.environ["OPENAI_API_KEY"] = respan_api_key
+
 # 1. Initialize Respan (pass api_key or set RESPAN_API_KEY)
-telemetry = RespanTelemetry(app_name="my-app", api_key="YOUR_RESPAN_API_KEY")
+telemetry = RespanTelemetry(app_name="my-app", api_key=respan_api_key)
 
 # 2. Instrument Pydantic AI (global: all agents)
 instrument_pydantic_ai()
