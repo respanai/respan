@@ -1,17 +1,18 @@
 """Respan Tracer implementation for Haystack content tracing."""
 
-import json
+import threading
 import time
 import uuid
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+
 from haystack import logging
 from haystack.tracing import Span, Tracer
 
-from .logger import RespanLogger
+from respan_exporter_haystack.logger import RespanLogger
+from respan_exporter_haystack.utils.config_utils import resolve_platform_logs_url
+from respan_exporter_haystack.utils.tracing_utils import format_span_for_api
 
 logger = logging.getLogger(__name__)
-
 
 class RespanTracer(Tracer):
     """
@@ -27,6 +28,11 @@ class RespanTracer(Tracer):
         api_key: str,
         base_url: str,
         metadata: Optional[Dict[str, Any]] = None,
+        max_retries: int = 3,
+        base_delay: float = 1.0,
+        max_delay: float = 30.0,
+        platform_url: Optional[str] = None,
+        timeout: float = 10.0,
     ):
         """
         Initialize the Respan tracer.
@@ -36,20 +42,44 @@ class RespanTracer(Tracer):
             api_key: Respan API key
             base_url: Respan API base URL
             metadata: Additional metadata to attach to traces
+            max_retries: Maximum number of attempts for sending traces
+            base_delay: Base delay in seconds between retries
+            max_delay: Maximum delay in seconds between retries
+            platform_url: Optional URL for the logs UI (defaults derived from base_url)
+            timeout: Timeout in seconds for HTTP requests
         """
         self.name = name
         self.api_key = api_key
         self.base_url = base_url
         self.metadata = metadata or {}
+        self.platform_logs_base = resolve_platform_logs_url(base_url=base_url, platform_url=platform_url)
         
         # Initialize the logger for sending data
-        self.kw_logger = RespanLogger(api_key=api_key, base_url=base_url)
+        self.kw_logger = RespanLogger(
+            api_key=api_key,
+            base_url=base_url,
+            max_retries=max_retries,
+            base_delay=base_delay,
+            max_delay=max_delay,
+            timeout=timeout,
+        )
         
         # Trace state
         self.trace_id = str(uuid.uuid4())
         self.spans: Dict[str, Dict[str, Any]] = {}
+        self.span_objects: Dict[str, "RespanSpan"] = {}  # Registry of active span objects
         self.completed_spans: List[Dict[str, Any]] = []  # Collect spans for batch submission
         self.trace_url: Optional[str] = None
+        self.start_time = None
+        self.pipeline_finished = False
+
+    def _reset_for_new_run(self) -> None:
+        """Reset tracer state for a new pipeline run so multiple runs send traces."""
+        self.trace_id = str(uuid.uuid4())
+        self.spans = {}
+        self.span_objects = {}
+        self.completed_spans = []
+        self.trace_url = None
         self.start_time = None
         self.pipeline_finished = False
 
@@ -65,12 +95,16 @@ class RespanTracer(Tracer):
         Returns:
             A new RespanSpan instance
         """
+        # New pipeline run: reset state so this run sends its own trace
+        if self.pipeline_finished:
+            self._reset_for_new_run()
         if self.start_time is None:
             self.start_time = time.time()
             
         span_id = str(uuid.uuid4())
         parent_id = parent_span.span_id if parent_span else None
         
+        # Keep track of component name if available, often added via tag later but initializing it 
         span = RespanSpan(
             tracer=self,
             operation_name=operation_name,
@@ -90,21 +124,16 @@ class RespanTracer(Tracer):
             "data": {},
         }
         
+        self.span_objects[span_id] = span
+        
         return span
 
     def current_span(self) -> Optional["RespanSpan"]:
         """Get the current active span."""
-        # Return the most recently created span
-        if self.spans:
-            span_id = list(self.spans.keys())[-1]
-            span_data = self.spans[span_id]
-            return RespanSpan(
-                tracer=self,
-                operation_name=span_data["operation_name"],
-                span_id=span_id,
-                trace_id=self.trace_id,
-                tags=span_data.get("tags", {}),
-            )
+        # Return reference to existing span object if available
+        if self.span_objects:
+            span_id = list(self.span_objects.keys())[-1]
+            return self.span_objects[span_id]
         return None
 
     def finalize_span(
@@ -140,161 +169,31 @@ class RespanTracer(Tracer):
         
         # Format span for Respan traces API
         try:
-            formatted_span = self._format_span_for_api(span_data)
+            formatted_span = format_span_for_api(
+                span_data=span_data,
+                workflow_name=self.name,
+                workflow_metadata=self.metadata,
+            )
             if formatted_span is not None:  # Skip None (filtered spans)
                 self.completed_spans.append(formatted_span)
             
             # If this is the root span (no parent), send the entire trace
-            if span_data.get("parent_id") is None and span_data["operation_name"] == "haystack.pipeline.run":
+            # Components nested in a pipeline will have a parent_id, but if run isolated,
+            # they might have no parent. We send the trace when the top-level span finishes.
+            is_root = span_data.get("parent_id") is None
+            if is_root:
                 logger.debug(f"Root span complete - sending trace with {len(self.completed_spans)} spans")
                 self.send_trace()
         except Exception as e:
             logger.warning(f"Failed to format span: {e}")
+            
+        # Clean up references to prevent memory leaks in long-running pipelines
+        # BUT DO NOT remove from self.spans here since they are needed for formatting
+        # later or when formatting the root span that sends the batch.
+        # Spans are cleared in `self.send_trace()`
+        if span_id in self.span_objects:
+            del self.span_objects[span_id]
 
-    def _format_span_for_api(self, span_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Format span data for Respan traces API."""
-        operation_name = span_data["operation_name"]
-        tags = span_data.get("tags", {})
-        data = span_data.get("data", {})
-        
-        # Extract component info
-        component_name = tags.get("haystack.component.name", "")
-        component_type = tags.get("haystack.component.type", "")
-        
-        # Skip the tracer component itself (it's infrastructure, not business logic)
-        if "RespanConnector" in component_type:
-            logger.debug(f"Skipping tracer component from trace")
-            return None
-        
-        # Convert timestamps to RFC3339 format with UTC timezone
-        start_time = datetime.fromtimestamp(span_data["start_time"], tz=timezone.utc).isoformat()
-        end_time = datetime.fromtimestamp(span_data["end_time"], tz=timezone.utc).isoformat()
-        
-        # Determine span name and log type
-        if component_name:
-            span_name = component_name
-        else:
-            span_name = self.name if operation_name == "haystack.pipeline.run" else operation_name
-            
-        # Determine log_type based on component type
-        log_type = "workflow"  # default
-        if "Generator" in component_type or "llm" in component_name.lower():
-            log_type = "chat"
-        elif "Builder" in component_type or "prompt" in component_name.lower():
-            log_type = "task"
-        elif operation_name == "haystack.pipeline.run":
-            log_type = "workflow"
-        else:
-            log_type = "task"
-        
-        # Build minimal metadata (only user-provided, not Haystack internals)
-        metadata = {**self.metadata}
-        if component_name:
-            metadata["component_name"] = component_name
-        if component_type:
-            metadata["component_type"] = component_type
-        
-        # Build the span payload for traces API
-        payload = {
-            "trace_unique_id": span_data["trace_id"],
-            "span_unique_id": span_data["span_id"],
-            "span_parent_id": span_data.get("parent_id"),
-            "span_name": span_name,
-            "span_workflow_name": self.name,
-            "log_type": log_type,
-            "start_time": start_time,
-            "timestamp": end_time,
-            "latency": span_data.get("latency", 0),
-            "metadata": metadata,
-            "disable_log": False,
-        }
-        
-        # Extract INPUT data
-        input_data = data.get("haystack.component.input") or tags.get("haystack.pipeline.input_data")
-        if input_data is not None:
-            payload["input"] = self._serialize_data(input_data)
-        
-        # Extract OUTPUT data
-        output_data = data.get("haystack.component.output") or tags.get("haystack.pipeline.output_data")
-        
-        if output_data is not None:
-            # For pipeline root span, simplify output to just the final answer
-            if operation_name == "haystack.pipeline.run" and isinstance(output_data, dict):
-                # Try to extract the final LLM response
-                for key in ["llm", "generator", "chat"]:
-                    if key in output_data and isinstance(output_data[key], dict):
-                        component_output = output_data[key]
-                        if "replies" in component_output:
-                            replies = component_output["replies"]
-                            if replies and len(replies) > 0:
-                                first_reply = replies[0]
-                                if hasattr(first_reply, "text"):
-                                    payload["output"] = first_reply.text
-                                elif hasattr(first_reply, "content"):
-                                    payload["output"] = first_reply.content
-                                elif isinstance(first_reply, str):
-                                    payload["output"] = first_reply
-                                break
-                
-                # If no output extracted yet, serialize but remove infrastructure keys
-                if "output" not in payload:
-                    cleaned_output = {k: v for k, v in output_data.items() if k != "tracer"}
-                    payload["output"] = self._serialize_data(cleaned_output)
-            
-            # Handle different output types
-            elif isinstance(output_data, dict):
-                # Check for Haystack component output with replies (LLM response)
-                if "replies" in output_data:
-                    replies = output_data["replies"]
-                    if replies and len(replies) > 0:
-                        first_reply = replies[0]
-                        # ChatMessage object - try .text first (new API), fallback to .content (old API)
-                        if hasattr(first_reply, "text"):
-                            payload["output"] = first_reply.text
-                            payload["log_type"] = "chat"
-                        elif hasattr(first_reply, "content"):
-                            payload["output"] = first_reply.content
-                            payload["log_type"] = "chat"
-                        elif isinstance(first_reply, str):
-                            payload["output"] = first_reply
-                        else:
-                            payload["output"] = str(first_reply)
-                            
-                # Check for LLM metadata
-                if "meta" in output_data:
-                    meta = output_data["meta"]
-                    if isinstance(meta, list) and len(meta) > 0:
-                        first_meta = meta[0]
-                        model_name = first_meta.get("model", "")
-                        if model_name:
-                            payload["model"] = model_name
-                        if "usage" in first_meta:
-                            usage = first_meta["usage"]
-                            prompt_tokens = usage.get("prompt_tokens", 0)
-                            completion_tokens = usage.get("completion_tokens", 0)
-                            payload["prompt_tokens"] = prompt_tokens
-                            payload["completion_tokens"] = completion_tokens
-                            
-                            # Calculate cost
-                            if model_name and prompt_tokens and completion_tokens:
-                                cost = self._calculate_cost(model_name, prompt_tokens, completion_tokens)
-                                payload["cost"] = cost
-                            
-                # If no specific field extracted yet, serialize entire output
-                if "output" not in payload:
-                    payload["output"] = self._serialize_data(output_data)
-            else:
-                payload["output"] = self._serialize_data(output_data)
-        
-        # Handle errors
-        if "error" in span_data:
-            payload["warnings"] = span_data["error"]
-        
-        # Add status code
-        payload["status_code"] = span_data.get("status_code", 200)
-            
-        return payload
-    
     def send_trace(self):
         """Send all collected spans to Respan as a batch."""
         if not self.completed_spans:
@@ -305,61 +204,35 @@ class RespanTracer(Tracer):
             logger.debug("Trace already sent")
             return
             
-        try:
-            logger.debug(f"Sending trace with {len(self.completed_spans)} spans to Respan")
-            response = self.kw_logger.send_trace(self.completed_spans)
-            
-            if response:
-                logger.debug(f"Trace sent successfully: {response}")
-                # Extract trace info from response
-                if "trace_ids" in response and response["trace_ids"]:
-                    trace_id = response["trace_ids"][0]
-                    self.trace_url = f"https://platform.respan.ai/logs?trace_id={trace_id}"
-                    
-            self.pipeline_finished = True
-        except Exception as e:
-            logger.warning(f"Failed to send trace to Respan: {e}")
+        spans_to_send = list(self.completed_spans)
+        
+        def _send():
+            try:
+                logger.debug(f"Sending trace with {len(spans_to_send)} spans to Respan")
+                response = self.kw_logger.send_trace(spans=spans_to_send)
+                
+                if response:
+                    logger.debug(f"Trace sent successfully: {response}")
+                    # Extract trace info from response
+                    if "trace_ids" in response and response["trace_ids"]:
+                        trace_id = response["trace_ids"][0]
+                        self.trace_url = f"{self.platform_logs_base}?trace_id={trace_id}"
+            except Exception as e:
+                logger.warning(f"Failed to send trace to Respan: {e}")
 
-    def _calculate_cost(self, model: str, prompt_tokens: int, completion_tokens: int) -> float:
-        """Calculate cost based on model pricing."""
-        # Pricing per 1M tokens (as of 2026)
-        pricing = {
-            "gpt-4o": {"prompt": 2.50, "completion": 10.00},
-            "gpt-4o-mini": {"prompt": 0.150, "completion": 0.600},
-            "gpt-4o-2024-11-20": {"prompt": 2.50, "completion": 10.00},
-            "gpt-4o-2024-08-06": {"prompt": 2.50, "completion": 10.00},
-            "gpt-4o-2024-05-13": {"prompt": 5.00, "completion": 15.00},
-            "gpt-4o-mini-2024-07-18": {"prompt": 0.150, "completion": 0.600},
-            "gpt-4-turbo": {"prompt": 10.00, "completion": 30.00},
-            "gpt-4": {"prompt": 30.00, "completion": 60.00},
-            "gpt-3.5-turbo": {"prompt": 0.50, "completion": 1.50},
-            "gpt-3.5-turbo-0125": {"prompt": 0.50, "completion": 1.50},
-        }
+        # Use a non-daemon thread to avoid blocking the main execution but ensure it finishes
+        # before the main program exits.
+        threading.Thread(target=_send, daemon=False).start()
         
-        # Get pricing for model (default to gpt-3.5-turbo if not found)
-        model_pricing = pricing.get(model, pricing["gpt-3.5-turbo"])
-        
-        # Calculate cost (pricing is per 1M tokens)
-        prompt_cost = (prompt_tokens / 1_000_000) * model_pricing["prompt"]
-        completion_cost = (completion_tokens / 1_000_000) * model_pricing["completion"]
-        
-        return prompt_cost + completion_cost
-    
-    def _serialize_data(self, data: Any) -> str:
-        """Serialize data to string for logging."""
-        try:
-            if isinstance(data, (str, int, float, bool)):
-                return str(data)
-            return json.dumps(data, default=str)
-        except Exception:
-            return str(data)
+        self.pipeline_finished = True
+        self.completed_spans.clear()  # Free memory after sending
+        self.spans.clear() # Free span lookup memory
 
     def get_trace_url(self) -> Optional[str]:
         """Get the URL to view this trace in Respan dashboard."""
         if self.trace_url:
             return self.trace_url
-        # Return a default URL pattern if not set yet
-        return f"https://platform.respan.ai/logs?trace_id={self.trace_id}"
+        return f"{self.platform_logs_base}?trace_id={self.trace_id}"
 
 
 class RespanSpan(Span):
@@ -398,7 +271,7 @@ class RespanSpan(Span):
     def set_tags(self, tags: Dict[str, Any]) -> "RespanSpan":
         """Set multiple tags on the span."""
         for key, value in tags.items():
-            self.set_tag(key, value)
+            self.set_tag(key=key, value=value)
         return self
 
     def set_content_tag(self, key: str, value: Any) -> "RespanSpan":
@@ -416,11 +289,17 @@ class RespanSpan(Span):
     def finish(self, output: Any = None, error: Optional[Exception] = None):
         """Finish the span and send to Respan."""
         if not self._is_finished:
-            self.tracer.finalize_span(self.span_id, output=output, error=error)
-            self._is_finished = True
+            try:
+                self.tracer.finalize_span(span_id=self.span_id, output=output, error=error)
+            except Exception as e:
+                logger.warning(f"Error finalizing span {self.span_id}: {e}")
+            finally:
+                self._is_finished = True
 
     def __enter__(self) -> "RespanSpan":
         """Context manager entry."""
+        # NOTE: Do NOT use RespanSpan as a context manager natively if you don't control the flow,
+        # but since Haystack controls it we just yield it back as the active context if requested.
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):

@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "respan-exporter-haystack"
-version = "1.0.1"
+version = "1.0.0"
 description = "Respan integration for Haystack pipelines with tracing and logging support"
 authors = ["Respan <team@respan.ai>"]
 readme = "README.md"
@@ -12,14 +12,15 @@ documentation = "https://docs.respan.ai"
 keywords = ["haystack", "respan", "llm", "observability", "tracing", "monitoring"]
 
 [tool.poetry.dependencies]
-python = "^3.9"
-requests = "^2.31.0"
-haystack-ai = "^2.0.0"
+python = ">=3.10,<4.0"
+requests = "^2.32.5"
+haystack-ai = "^2.24.1"
+respan-sdk = "^2.3.1"
 
 [tool.poetry.group.dev.dependencies]
-pytest = "^8.3.0"
-python-dotenv = "^1.0.0"
-sentence-transformers = "^2.0.0"
+pytest = "^9.0.2"
+python-dotenv = "^1.2.1"
+sentence-transformers = "^5.2.3"
 
 [build-system]
 requires = ["poetry-core"]

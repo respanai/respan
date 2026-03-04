@@ -2,13 +2,13 @@
 
 import os
 from haystack import Pipeline
-from respan_exporter_haystack import RespanGenerator
+from respan_exporter_haystack.gateway import RespanGenerator
 
 # Create pipeline with platform prompt
 pipeline = Pipeline()
-pipeline.add_component("llm", RespanGenerator(
+pipeline.add_component(name="llm", instance=RespanGenerator(
     prompt_id="1210b368ce2f4e5599d307bc591d9b7a",
-    api_key=os.getenv("RESPAN_API_KEY")
+    api_key=os.getenv(key="RESPAN_API_KEY")
 ))
 
 # Run with prompt variables

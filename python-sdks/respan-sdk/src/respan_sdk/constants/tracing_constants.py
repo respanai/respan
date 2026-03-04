@@ -2,8 +2,13 @@
 
 from typing import Optional
 
+from respan_sdk.constants.api_constants import (
+    TRACES_INGEST_PATH,
+    build_api_endpoint,
+    DEFAULT_RESPAN_API_BASE_URL,
+)
 
-RESPAN_TRACING_INGEST_ENDPOINT = "https://api.respan.ai/api/v1/traces/ingest"
+RESPAN_TRACING_INGEST_ENDPOINT = f"{DEFAULT_RESPAN_API_BASE_URL}/{TRACES_INGEST_PATH}"
 
 # Anti-recursion header: SDK exporter sends this on every export request.
 # Server-side tracing decorators MUST check for this header and skip
@@ -17,9 +22,4 @@ def resolve_tracing_ingest_endpoint(base_url: Optional[str] = None) -> str:
     """Build tracing ingest endpoint from an optional base URL."""
     if not base_url:
         return RESPAN_TRACING_INGEST_ENDPOINT
-
-    normalized_base_url = base_url.rstrip("/")
-    if normalized_base_url.endswith("/api"):
-        return f"{normalized_base_url}/v1/traces/ingest"
-
-    return f"{normalized_base_url}/api/v1/traces/ingest"
+    return build_api_endpoint(base_url, TRACES_INGEST_PATH)

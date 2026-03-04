@@ -10,18 +10,21 @@ Tests all 5 integration modes:
 """
 
 import os
+import time
+import traceback
 from haystack import Pipeline
 from haystack.components.builders import PromptBuilder
 from haystack.components.generators import OpenAIGenerator
-from respan_exporter_haystack import RespanConnector, RespanGenerator
+from respan_exporter_haystack.connector import RespanConnector
+from respan_exporter_haystack.gateway import RespanGenerator
 
 
 def check_env():
     """Check required environment variables."""
-    if not os.getenv("RESPAN_API_KEY"):
+    if not os.getenv(key="RESPAN_API_KEY"):
         print("ERROR: RESPAN_API_KEY not set")
         return False
-    if not os.getenv("OPENAI_API_KEY"):
+    if not os.getenv(key="OPENAI_API_KEY"):
         print("ERROR: OPENAI_API_KEY not set")
         return False
     return True
@@ -36,9 +39,9 @@ def test_1_gateway_only():
     print("-"*80)
     
     pipeline = Pipeline()
-    pipeline.add_component("prompt", PromptBuilder(template="Tell me a joke about {{topic}}."))
-    pipeline.add_component("llm", RespanGenerator(model="gpt-4o-mini"))
-    pipeline.connect("prompt", "llm")
+    pipeline.add_component(name="prompt", instance=PromptBuilder(template="Tell me a joke about {{topic}}."))
+    pipeline.add_component(name="llm", instance=RespanGenerator(model="gpt-4o-mini"))
+    pipeline.connect(sender="prompt", receiver="llm")
     
     result = pipeline.run({"prompt": {"topic": "Python"}})
     
@@ -66,7 +69,7 @@ def test_2_gateway_with_prompt():
     PROMPT_ID = "1210b368ce2f4e5599d307bc591d9b7a"
     
     pipeline = Pipeline()
-    pipeline.add_component("llm", RespanGenerator(
+    pipeline.add_component(name="llm", instance=RespanGenerator(
         model="gpt-4o-mini",
         prompt_id=PROMPT_ID
     ))
@@ -103,10 +106,10 @@ def test_3_trace_only():
     os.environ["HAYSTACK_CONTENT_TRACING_ENABLED"] = "true"
     
     pipeline = Pipeline()
-    pipeline.add_component("tracer", RespanConnector("Test 3: Trace Only"))
-    pipeline.add_component("prompt", PromptBuilder(template="Tell me about {{topic}}."))
-    pipeline.add_component("llm", OpenAIGenerator(model="gpt-4o-mini"))
-    pipeline.connect("prompt", "llm")
+    pipeline.add_component(name="tracer", instance=RespanConnector(name="Test 3: Trace Only"))
+    pipeline.add_component(name="prompt", instance=PromptBuilder(template="Tell me about {{topic}}."))
+    pipeline.add_component(name="llm", instance=OpenAIGenerator(model="gpt-4o-mini"))
+    pipeline.connect(sender="prompt", receiver="llm")
     
     result = pipeline.run({"prompt": {"topic": "machine learning"}})
     
@@ -138,10 +141,10 @@ def test_4_trace_with_gateway():
     os.environ["HAYSTACK_CONTENT_TRACING_ENABLED"] = "true"
     
     pipeline = Pipeline()
-    pipeline.add_component("tracer", RespanConnector("Test 4: Gateway + Trace"))
-    pipeline.add_component("prompt", PromptBuilder(template="Explain {{topic}} in one sentence."))
-    pipeline.add_component("llm", RespanGenerator(model="gpt-4o-mini"))
-    pipeline.connect("prompt", "llm")
+    pipeline.add_component(name="tracer", instance=RespanConnector(name="Test 4: Gateway + Trace"))
+    pipeline.add_component(name="prompt", instance=PromptBuilder(template="Explain {{topic}} in one sentence."))
+    pipeline.add_component(name="llm", instance=RespanGenerator(model="gpt-4o-mini"))
+    pipeline.connect(sender="prompt", receiver="llm")
     
     result = pipeline.run({"prompt": {"topic": "neural networks"}})
     
@@ -175,8 +178,8 @@ def test_5_full_stack():
     os.environ["HAYSTACK_CONTENT_TRACING_ENABLED"] = "true"
     
     pipeline = Pipeline()
-    pipeline.add_component("tracer", RespanConnector("Test 5: Full Stack"))
-    pipeline.add_component("llm", RespanGenerator(
+    pipeline.add_component(name="tracer", instance=RespanConnector(name="Test 5: Full Stack"))
+    pipeline.add_component(name="llm", instance=RespanGenerator(
         model="gpt-4o-mini",
         prompt_id=PROMPT_ID
     ))
@@ -239,12 +242,10 @@ def main():
             results.append((name, "PASS" if success else "FAIL"))
             print(f"\n>>> {name} completed. Check dashboard before next test.\n")
             print("Waiting 3 seconds...")
-            import time
             time.sleep(3)
         except Exception as e:
             print(f"\n[ERROR] {name} failed: {e}")
             results.append((name, "FAIL"))
-            import traceback
             traceback.print_exc()
     
     # Summary

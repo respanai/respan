@@ -1,3 +1,4 @@
+from respan_sdk.constants.api_constants import resolve_chat_completions_endpoint
 from respan_sdk.constants.tracing_constants import (
     RESPAN_DOGFOOD_HEADER,
     RESPAN_TRACING_INGEST_ENDPOINT,
@@ -58,6 +59,7 @@ __all__ = [
     "RESPAN_DOGFOOD_HEADER",
     "RESPAN_TRACING_INGEST_ENDPOINT",
     "resolve_tracing_ingest_endpoint",
+    "resolve_chat_completions_endpoint",
     # OTLP JSON format constants
     "OTLP_STRING_VALUE",
     "OTLP_INT_VALUE",
