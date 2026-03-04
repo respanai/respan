@@ -44,10 +44,26 @@ asyncio.run(main())
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `RESPAN_API_KEY` | Yes | Your Respan API key. |
-| `RESPAN_BASE_URL` | No | Base URL for all Respan services. Defaults to `https://api.respan.ai`. |
+| `RESPAN_API_KEY` | Yes | Respan API key used for telemetry export. |
+| `RESPAN_BASE_URL` | No | Respan base URL for telemetry export. Defaults to `https://api.respan.ai`. |
+| `ANTHROPIC_BASE_URL` | No | Inference/proxy base URL used by the Anthropic SDK. |
+| `ANTHROPIC_API_KEY` | Usually | Key used by the Anthropic SDK for inference calls. |
+| `ANTHROPIC_AUTH_TOKEN` | Optional | Alternate auth token used by some Anthropic client flows. |
 
-`RESPAN_BASE_URL` is the single base URL that controls where telemetry is exported. The exporter automatically appends `/api/v1/traces/ingest` to build the full endpoint.
+Set both groups together when needed. `RESPAN_*` controls tracing export, while `ANTHROPIC_*` controls where model requests are sent.
+
+```bash
+# Tracing export (Respan telemetry)
+RESPAN_API_KEY=your_respan_key
+RESPAN_BASE_URL=https://api.respan.ai/api
+
+# Inference/proxy routing (Anthropic SDK)
+ANTHROPIC_BASE_URL=http://localhost:8000/api
+ANTHROPIC_API_KEY=your_inference_key
+ANTHROPIC_AUTH_TOKEN=your_inference_key
+```
+
+`RESPAN_BASE_URL` controls telemetry export only. The exporter automatically appends `/api/v1/traces/ingest` to build the full ingest endpoint.
 
 ### Tracing vs Inference URLs (Important)
 
