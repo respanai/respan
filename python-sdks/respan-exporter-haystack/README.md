@@ -30,7 +30,7 @@ export HAYSTACK_CONTENT_TRACING_ENABLED="true"  # For tracing mode
 import os
 from haystack import Pipeline
 from haystack.components.builders import PromptBuilder
-from respan_exporter_haystack import RespanGenerator
+from respan_exporter_haystack.gateway import RespanGenerator
 
 # Create pipeline
 pipeline = Pipeline()
@@ -87,7 +87,7 @@ Use both together for:
 ```python
 import os
 from haystack import Pipeline
-from respan_exporter_haystack import RespanGenerator
+from respan_exporter_haystack.gateway import RespanGenerator
 
 # Create prompt on platform: https://platform.respan.ai/platform/prompts
 # Get your prompt_id from the platform
@@ -124,7 +124,7 @@ print(f"Tokens: {result['llm']['meta'][0]['usage']['total_tokens']}")
 
 ```python
 from haystack.dataclasses import ChatMessage
-from respan_exporter_haystack import RespanChatGenerator
+from respan_exporter_haystack.gateway import RespanChatGenerator
 
 generator = RespanChatGenerator(
     prompt_id="1210b368ce2f4e5599d307bc591d9b7a",
@@ -145,13 +145,13 @@ import os
 from haystack import Pipeline
 from haystack.components.builders import PromptBuilder
 from haystack.components.generators import OpenAIGenerator
-from respan_exporter_haystack import RespanConnector
+from respan_exporter_haystack.connector import RespanConnector
 
 os.environ["HAYSTACK_CONTENT_TRACING_ENABLED"] = "true"
 
 # Create pipeline with tracing
 pipeline = Pipeline()
-pipeline.add_component("tracer", RespanConnector("My Workflow"))
+pipeline.add_component("tracer", RespanConnector(name="My Workflow"))
 pipeline.add_component("prompt", PromptBuilder(template="Tell me about {{topic}}."))
 pipeline.add_component("llm", OpenAIGenerator(model="gpt-4o-mini"))
 pipeline.connect("prompt", "llm")
@@ -177,13 +177,14 @@ print(f"\nTrace URL: {result['tracer']['trace_url']}")
 ```python
 import os
 from haystack import Pipeline
-from respan_exporter_haystack import RespanConnector, RespanGenerator
+from respan_exporter_haystack.connector import RespanConnector
+from respan_exporter_haystack.gateway import RespanGenerator
 
 os.environ["HAYSTACK_CONTENT_TRACING_ENABLED"] = "true"
 
 # Create pipeline with gateway, prompt management, and tracing
 pipeline = Pipeline()
-pipeline.add_component("tracer", RespanConnector("Full Stack: Gateway + Prompt + Tracing"))
+pipeline.add_component("tracer", RespanConnector(name="Full Stack: Gateway + Prompt + Tracing"))
 pipeline.add_component("llm", RespanGenerator(
     prompt_id="1210b368ce2f4e5599d307bc591d9b7a",  # Platform-managed prompt
     api_key=os.getenv("RESPAN_API_KEY")

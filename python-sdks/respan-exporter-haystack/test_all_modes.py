@@ -15,7 +15,8 @@ import traceback
 from haystack import Pipeline
 from haystack.components.builders import PromptBuilder
 from haystack.components.generators import OpenAIGenerator
-from respan_exporter_haystack import RespanConnector, RespanGenerator
+from respan_exporter_haystack.connector import RespanConnector
+from respan_exporter_haystack.gateway import RespanGenerator
 
 
 def check_env():

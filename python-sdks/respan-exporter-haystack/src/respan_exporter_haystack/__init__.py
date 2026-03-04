@@ -1,15 +1,11 @@
-"""Respan integration for Haystack pipelines."""
+"""Respan integration for Haystack pipelines.
 
-from respan_exporter_haystack.connector import RespanConnector
-from respan_exporter_haystack.tracer import RespanTracer
-from respan_exporter_haystack.gateway import RespanGenerator, RespanChatGenerator
+Import directly from source modules:
+
+    from respan_exporter_haystack.connector import RespanConnector
+    from respan_exporter_haystack.tracer import RespanTracer
+    from respan_exporter_haystack.gateway import RespanGenerator, RespanChatGenerator
+    from respan_exporter_haystack.logger import RespanLogger
+"""
 
 __version__ = "1.0.0"
-__all__ = [
-    # Tracing (track workflow spans)
-    "RespanConnector",
-    "RespanTracer",
-    # Gateway (route LLM calls through Respan)
-    "RespanGenerator",
-    "RespanChatGenerator",
-]

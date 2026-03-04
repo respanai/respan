@@ -1,5 +1,6 @@
 """Respan Tracer implementation for Haystack content tracing."""
 
+import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -12,9 +13,6 @@ from respan_exporter_haystack.utils.config_utils import resolve_platform_logs_ur
 from respan_exporter_haystack.utils.tracing_utils import format_span_for_api
 
 logger = logging.getLogger(__name__)
-
-
-import threading
 
 class RespanTracer(Tracer):
     """
@@ -75,6 +73,16 @@ class RespanTracer(Tracer):
         self.start_time = None
         self.pipeline_finished = False
 
+    def _reset_for_new_run(self) -> None:
+        """Reset tracer state for a new pipeline run so multiple runs send traces."""
+        self.trace_id = str(uuid.uuid4())
+        self.spans = {}
+        self.span_objects = {}
+        self.completed_spans = []
+        self.trace_url = None
+        self.start_time = None
+        self.pipeline_finished = False
+
     def trace(self, operation_name: str, tags: Optional[Dict[str, Any]] = None, parent_span: Optional["RespanSpan"] = None) -> "RespanSpan":
         """
         Start a new span for tracing an operation.
@@ -87,6 +95,9 @@ class RespanTracer(Tracer):
         Returns:
             A new RespanSpan instance
         """
+        # New pipeline run: reset state so this run sends its own trace
+        if self.pipeline_finished:
+            self._reset_for_new_run()
         if self.start_time is None:
             self.start_time = time.time()
             

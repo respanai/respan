@@ -86,24 +86,30 @@ class TestSdkEndpointResolution:
     """Unit tests for SDK endpoint resolution (build_api_endpoint / resolve_chat_completions_endpoint)."""
 
     def test_resolve_chat_completions_base_without_api(self):
-        assert resolve_chat_completions_endpoint("https://api.respan.ai") == "https://api.respan.ai/api/chat/completions"
+        assert (
+            resolve_chat_completions_endpoint(base_url="https://api.respan.ai")
+            == "https://api.respan.ai/api/chat/completions"
+        )
 
     def test_resolve_chat_completions_base_with_api(self):
         assert (
-            resolve_chat_completions_endpoint("https://api.respan.ai/api")
+            resolve_chat_completions_endpoint(base_url="https://api.respan.ai/api")
             == "https://api.respan.ai/api/chat/completions"
         )
 
     def test_resolve_chat_completions_none_returns_default(self):
-        url = resolve_chat_completions_endpoint(None)
+        url = resolve_chat_completions_endpoint(base_url=None)
         assert "/chat/completions" in url
         assert "api.respan.ai" in url
 
     def test_build_api_endpoint_normalizes_trailing_slash(self):
-        assert build_api_endpoint("https://api.respan.ai/", "chat/completions") == "https://api.respan.ai/api/chat/completions"
+        assert (
+            build_api_endpoint(base_url="https://api.respan.ai/", relative_path="chat/completions")
+            == "https://api.respan.ai/api/chat/completions"
+        )
 
     def test_build_api_endpoint_with_api_suffix_appends_path_only(self):
         assert (
-            build_api_endpoint("https://api.respan.ai/api", "v1/traces/ingest")
+            build_api_endpoint(base_url="https://api.respan.ai/api", relative_path="v1/traces/ingest")
             == "https://api.respan.ai/api/v1/traces/ingest"
         )

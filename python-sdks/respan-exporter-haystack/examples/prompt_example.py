@@ -2,7 +2,7 @@
 
 import os
 from haystack import Pipeline
-from respan_exporter_haystack import RespanGenerator
+from respan_exporter_haystack.gateway import RespanGenerator
 
 # Create pipeline with platform prompt
 pipeline = Pipeline()

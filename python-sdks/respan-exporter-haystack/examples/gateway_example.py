@@ -3,7 +3,7 @@
 import os
 from haystack import Pipeline
 from haystack.components.builders import PromptBuilder
-from respan_exporter_haystack import RespanGenerator
+from respan_exporter_haystack.gateway import RespanGenerator
 
 # Create pipeline
 pipeline = Pipeline()

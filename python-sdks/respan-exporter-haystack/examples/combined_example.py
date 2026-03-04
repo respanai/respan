@@ -2,7 +2,8 @@
 
 import os
 from haystack import Pipeline
-from respan_exporter_haystack import RespanConnector, RespanGenerator
+from respan_exporter_haystack.connector import RespanConnector
+from respan_exporter_haystack.gateway import RespanGenerator
 
 os.environ["HAYSTACK_CONTENT_TRACING_ENABLED"] = "true"
 

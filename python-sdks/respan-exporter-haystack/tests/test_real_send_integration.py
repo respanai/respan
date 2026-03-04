@@ -10,16 +10,23 @@ from pathlib import Path
 
 import pytest
 
+from haystack import Pipeline
+from haystack.components.builders import PromptBuilder
+
+from respan_exporter_haystack.connector import RespanConnector
+from respan_exporter_haystack.gateway import RespanGenerator
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
 # Load .env from repo root (respan) so tests can use RESPAN_API_KEY, OPENAI_API_KEY, etc.
 # Path: tests/ -> respan-exporter-haystack/ -> python-sdks/ -> respan/
 _repo_root = Path(__file__).resolve().parent.parent.parent.parent
 _env_path = _repo_root / ".env"
-if _env_path.exists():
-    try:
-        from dotenv import load_dotenv
-        load_dotenv(_env_path)
-    except ImportError:
-        pass
+if _env_path.exists() and load_dotenv is not None:
+    load_dotenv(_env_path)
 
 
 def _respan_api_key() -> str | None:
@@ -47,10 +54,6 @@ def test_real_send_trace_via_connector(respan_api_key: str):
     os.environ["RESPAN_API_KEY"] = respan_api_key
     os.environ["HAYSTACK_CONTENT_TRACING_ENABLED"] = "true"
 
-    from haystack import Pipeline
-    from haystack.components.builders import PromptBuilder
-    from respan_exporter_haystack.connector import RespanConnector
-
     pipeline = Pipeline()
     pipeline.add_component("tracer", RespanConnector(name="real_send_test_trace"))
     pipeline.add_component("prompt", PromptBuilder(template="Say hello to {{name}}."))
@@ -73,10 +76,6 @@ def test_real_send_gateway_request(respan_api_key: str):
     Requires both RESPAN_API_KEY and OPENAI_API_KEY in .env.
     """
     os.environ["RESPAN_API_KEY"] = respan_api_key
-
-    from haystack import Pipeline
-    from haystack.components.builders import PromptBuilder
-    from respan_exporter_haystack.gateway import RespanGenerator
 
     pipeline = Pipeline()
     pipeline.add_component("prompt", PromptBuilder(template="Reply with one word: {{word}}."))
