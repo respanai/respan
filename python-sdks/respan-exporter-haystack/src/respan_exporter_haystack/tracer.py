@@ -209,8 +209,9 @@ class RespanTracer(Tracer):
             except Exception as e:
                 logger.warning(f"Failed to send trace to Respan: {e}")
 
-        # Use a daemon thread to avoid blocking the main execution
-        threading.Thread(target=_send, daemon=True).start()
+        # Use a non-daemon thread to avoid blocking the main execution but ensure it finishes
+        # before the main program exits.
+        threading.Thread(target=_send, daemon=False).start()
         
         self.pipeline_finished = True
         self.completed_spans.clear()  # Free memory after sending
