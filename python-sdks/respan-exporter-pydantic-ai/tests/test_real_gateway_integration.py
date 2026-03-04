@@ -32,17 +32,9 @@ PYTHON_EXPORTER_SRC = os.path.join(
     "respan-exporter-pydantic-ai",
     "src",
 )
-PYTHON_SDK_SRC = os.path.join(
-    REPO_ROOT,
-    "python-sdks",
-    "respan-sdk",
-    "src",
-)
 
 if PYTHON_EXPORTER_SRC not in sys.path:
     sys.path.insert(0, PYTHON_EXPORTER_SRC)
-if PYTHON_SDK_SRC not in sys.path:
-    sys.path.insert(0, PYTHON_SDK_SRC)
 
 
 def _load_env_from_dotenv() -> None:
