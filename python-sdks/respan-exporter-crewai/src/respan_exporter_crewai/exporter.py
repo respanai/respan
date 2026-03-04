@@ -519,9 +519,15 @@ class RespanCrewAIExporter:
         payload["disable_log"] = False
 
         if usage:
-            prompt_tokens = usage.get("prompt_tokens") or usage.get("input_tokens")
-            completion_tokens = usage.get("completion_tokens") or usage.get("output_tokens")
-            total_tokens = usage.get("total_tokens") or usage.get("total")
+            prompt_tokens = usage.get("prompt_tokens")
+            if prompt_tokens is None:
+                prompt_tokens = usage.get("input_tokens")
+            completion_tokens = usage.get("completion_tokens")
+            if completion_tokens is None:
+                completion_tokens = usage.get("output_tokens")
+            total_tokens = usage.get("total_tokens")
+            if total_tokens is None:
+                total_tokens = usage.get("total")
 
             payload["prompt_tokens"] = prompt_tokens
             payload["completion_tokens"] = completion_tokens
