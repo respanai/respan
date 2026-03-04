@@ -64,8 +64,13 @@ const exporter = new RespanAnthropicAgentsExporter({
 
 Runnable examples with full setup instructions:
 
-- **Python:** [anthropic_agents_python_example](https://github.com/Keywords-AI/keywordsai-example-projects/tree/main/anthropic_agents_python_example)
-- **TypeScript:** [anthropic_agents_typescript_example](https://github.com/Keywords-AI/keywordsai-example-projects/tree/main/anthropic_agents_typescript_example)
+- **TypeScript examples root:** [anthropic_agents_typescript_example](https://github.com/Keywords-AI/keywordsai-example-projects/tree/main/anthropic_agents_typescript_example)
+- **TypeScript basic scripts:**
+  - [hello_world.ts](https://github.com/Keywords-AI/keywordsai-example-projects/blob/main/anthropic_agents_typescript_example/hello_world.ts)
+  - [wrapped_query.ts](https://github.com/Keywords-AI/keywordsai-example-projects/blob/main/anthropic_agents_typescript_example/wrapped_query.ts)
+  - [tool_use.ts](https://github.com/Keywords-AI/keywordsai-example-projects/blob/main/anthropic_agents_typescript_example/tool_use.ts)
+  - [gateway.ts](https://github.com/Keywords-AI/keywordsai-example-projects/blob/main/anthropic_agents_typescript_example/gateway.ts)
+- **Python examples root:** [anthropic_agents_python_example](https://github.com/Keywords-AI/keywordsai-example-projects/tree/main/anthropic_agents_python_example)
 
 ## Dev Guide
 
