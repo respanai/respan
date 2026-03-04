@@ -148,6 +148,7 @@ class RespanLogParams(PreprocessLogDataMixin, RespanBaseModel):
     # endregion: user analytics
 
     # region: model information
+    provider: Optional[str] = None  # Top-level provider name (backward-compatible with API)
     provider_id: Optional[str] = None  # The provider id of the embedding model
     # endregion: model information
 

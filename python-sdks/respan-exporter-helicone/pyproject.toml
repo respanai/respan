@@ -1,0 +1,21 @@
+[tool.poetry]
+name = "respan-exporter-helicone"
+version = "0.1.0"
+description = "Respan exporter for Helicone logs"
+authors = ["Respan <team@respan.ai>"]
+readme = "README.md"
+packages = [{include = "respan_exporter_helicone", from = "src"}]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<4.0"
+requests = "^2.32.5"
+helicone-helpers = "^1.0.0"
+wrapt = "^1.16.0"
+respan-sdk = "^2.4.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
