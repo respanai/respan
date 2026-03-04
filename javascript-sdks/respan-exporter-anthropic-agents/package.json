@@ -1,6 +1,6 @@
 {
   "name": "@respan/exporter-anthropic-agents",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "description": "Exporter for Anthropic Agent SDK traces to Respan",
   "author": "Respan <team@respan.ai>",
   "type": "module",

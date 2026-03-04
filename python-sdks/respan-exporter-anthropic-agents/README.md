@@ -4,13 +4,73 @@
 
 Exporter for Anthropic Agent SDK telemetry to Respan.
 
-## Installation
+## Configuration
+
+### 1. Install
 
 ```bash
-pip install respan-exporter-anthropic-agents
+pip install claude-agent-sdk respan-exporter-anthropic-agents
 ```
 
+### 2. Set Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `RESPAN_API_KEY` | Yes | Respan API key used for telemetry export. |
+| `RESPAN_BASE_URL` | No | Respan base URL for telemetry export. Defaults to `https://api.respan.ai`. |
+| `ANTHROPIC_BASE_URL` | No | Inference/proxy base URL used by the Anthropic SDK. |
+| `ANTHROPIC_API_KEY` | Usually | Key used by the Anthropic SDK for inference calls. |
+| `ANTHROPIC_AUTH_TOKEN` | Optional | Alternate auth token used by some Anthropic client flows. |
+
+Set both groups together when needed. `RESPAN_*` controls tracing export, while `ANTHROPIC_*` controls where model requests are sent.
+
+```bash
+# Tracing export (Respan telemetry)
+RESPAN_API_KEY=your_respan_key
+RESPAN_BASE_URL=https://api.respan.ai/api
+
+# Inference/proxy routing (Anthropic SDK)
+ANTHROPIC_BASE_URL=http://localhost:8000/api
+ANTHROPIC_API_KEY=your_inference_key
+ANTHROPIC_AUTH_TOKEN=your_inference_key
+```
+
+`RESPAN_BASE_URL` controls telemetry export only. The exporter automatically appends `/api/v1/traces/ingest` to build the full ingest endpoint.
+
+### Constructor Parameters (Optional)
+
+All configuration can also be passed directly to the constructor.
+
+Recommended pattern (matches the runnable examples):
+
+```python
+exporter = RespanAnthropicAgentsExporter(
+    api_key="your_respan_key",        # Optional; falls back to RESPAN_API_KEY
+    base_url="https://api.respan.ai", # Optional; falls back to RESPAN_BASE_URL
+)
+```
+
+Local gateway/proxy override:
+
+```python
+exporter = RespanAnthropicAgentsExporter(
+    api_key="your_respan_key",
+    base_url="http://localhost:8000/api",
+)
+```
+
+Resolution order:
+- `api_key`: constructor `api_key` -> `RESPAN_API_KEY`
+- `endpoint`: constructor `endpoint` -> derived from constructor `base_url` -> derived from `RESPAN_BASE_URL`
+
+In normal usage you should set `base_url` (or `RESPAN_BASE_URL`) and let the exporter derive the ingest endpoint automatically.
+`endpoint` exists for internal/advanced cases and takes precedence over `base_url` if both are set.
+
 ## Quickstart
+
+### 3. Run Script
+
+Save this as `quickstart.py`:
 
 ```python
 import asyncio
@@ -52,93 +112,19 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-## Configuration
-
-### Environment Variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `RESPAN_API_KEY` | Yes | Respan API key used for telemetry export. |
-| `RESPAN_BASE_URL` | No | Respan base URL for telemetry export. Defaults to `https://api.respan.ai`. |
-| `ANTHROPIC_BASE_URL` | No | Inference/proxy base URL used by the Anthropic SDK. |
-| `ANTHROPIC_API_KEY` | Usually | Key used by the Anthropic SDK for inference calls. |
-| `ANTHROPIC_AUTH_TOKEN` | Optional | Alternate auth token used by some Anthropic client flows. |
-
-Set both groups together when needed. `RESPAN_*` controls tracing export, while `ANTHROPIC_*` controls where model requests are sent.
+Run it:
 
 ```bash
-# Tracing export (Respan telemetry)
-RESPAN_API_KEY=your_respan_key
-RESPAN_BASE_URL=https://api.respan.ai/api
-
-# Inference/proxy routing (Anthropic SDK)
-ANTHROPIC_BASE_URL=http://localhost:8000/api
-ANTHROPIC_API_KEY=your_inference_key
-ANTHROPIC_AUTH_TOKEN=your_inference_key
+python quickstart.py
 ```
 
-`RESPAN_BASE_URL` controls telemetry export only. The exporter automatically appends `/api/v1/traces/ingest` to build the full ingest endpoint.
+### 4. View Dashboard
 
-### Tracing vs Inference URLs (Important)
+Open:
 
-There are two independent URL planes:
+- `https://platform.respan.ai/platform/traces`
 
-- **Tracing export URL** (Respan telemetry ingest): controlled by exporter `base_url` / `RESPAN_BASE_URL`.
-- **Inference/proxy URL** (where Claude requests are sent): controlled by Anthropic SDK env/options such as `ANTHROPIC_BASE_URL`.
-
-Using **Respan tracing + Respan gateway** together:
-
-```python
-from claude_agent_sdk import ClaudeAgentOptions
-from respan_exporter_anthropic_agents import RespanAnthropicAgentsExporter
-
-api_key = "your_respan_key"
-respan_base_url = "https://api.respan.ai/api"
-
-exporter = RespanAnthropicAgentsExporter(
-    api_key=api_key,
-    base_url=respan_base_url,  # tracing export
-)
-
-options = ClaudeAgentOptions(
-    env={
-        "ANTHROPIC_BASE_URL": f"{respan_base_url.rstrip('/')}/anthropic",  # inference proxy
-        "ANTHROPIC_API_KEY": api_key,
-        "ANTHROPIC_AUTH_TOKEN": api_key,
-    }
-)
-```
-
-### Constructor Parameters
-
-All configuration can also be passed directly to the constructor.
-
-Recommended pattern (matches the runnable examples):
-
-```python
-exporter = RespanAnthropicAgentsExporter(
-    api_key="your_respan_key",        # Optional; falls back to RESPAN_API_KEY
-    base_url="https://api.respan.ai", # Optional; falls back to RESPAN_BASE_URL
-)
-```
-
-Local gateway/proxy override:
-
-```python
-exporter = RespanAnthropicAgentsExporter(
-    api_key="your_respan_key",
-    base_url="http://localhost:8000/api",
-)
-```
-
-Resolution order:
-- `api_key`: constructor `api_key` -> `RESPAN_API_KEY`
-- `endpoint`: constructor `endpoint` -> derived from constructor `base_url` -> derived from `RESPAN_BASE_URL`
-
-In normal usage you should set `base_url` (or `RESPAN_BASE_URL`) and let the exporter derive the ingest endpoint automatically.
-`endpoint` exists for internal/advanced cases and takes precedence over `base_url` if both are set.
-
-## Examples
+## Further Reading
 
 Runnable examples with full setup instructions:
 
