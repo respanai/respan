@@ -34,7 +34,7 @@ for await (const message of exporter.query({
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `RESPAN_API_KEY` | Yes | Your Respan API key. Falls back to `RESPAN_API_KEY`. |
+| `RESPAN_API_KEY` | Yes | Your Respan API key. |
 | `RESPAN_BASE_URL` | No | Base URL for all Respan services. Defaults to `https://api.respan.ai`. Pass as `endpoint` constructor param with `/api/v1/traces/ingest` appended. |
 
 `RESPAN_BASE_URL` is the single base URL for all Respan services. To use it with the TypeScript exporter, pass it as the `endpoint` constructor param:
@@ -44,6 +44,35 @@ const baseUrl = process.env.RESPAN_BASE_URL || "https://api.respan.ai";
 
 const exporter = new RespanAnthropicAgentsExporter({
   endpoint: `${baseUrl}/api/v1/traces/ingest`,
+});
+```
+
+### Tracing vs Inference URLs (Important)
+
+There are two independent URL planes:
+
+- **Tracing export URL** (Respan telemetry ingest): controlled by exporter `endpoint` (typically derived from `RESPAN_BASE_URL`).
+- **Inference/proxy URL** (where Claude requests are sent): controlled by Anthropic SDK env/options such as `ANTHROPIC_BASE_URL`.
+
+Using **Respan tracing + Respan gateway** together:
+
+```typescript
+import { RespanAnthropicAgentsExporter } from "@respan/exporter-anthropic-agents";
+
+const apiKey = process.env.RESPAN_API_KEY!;
+const respanBaseUrl = (process.env.RESPAN_BASE_URL ?? "https://api.respan.ai/api").replace(/\/+$/, "");
+
+const exporter = new RespanAnthropicAgentsExporter({
+  apiKey,
+  endpoint: `${respanBaseUrl}/v1/traces/ingest`, // tracing export
+});
+
+const options = exporter.withOptions({
+  env: {
+    ANTHROPIC_BASE_URL: `${respanBaseUrl}/anthropic`, // inference proxy
+    ANTHROPIC_API_KEY: apiKey,
+    ANTHROPIC_AUTH_TOKEN: apiKey,
+  },
 });
 ```
 

@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "respan-exporter-anthropic-agents"
-version = "1.0.11"
+version = "1.0.12"
 description = "Exporter for Anthropic Agent SDK telemetry to Respan"
 authors = ["Respan <team@respan.ai>"]
 license = "Apache 2.0"

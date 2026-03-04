@@ -49,6 +49,36 @@ asyncio.run(main())
 
 `RESPAN_BASE_URL` is the single base URL that controls where telemetry is exported. The exporter automatically appends `/api/v1/traces/ingest` to build the full endpoint.
 
+### Tracing vs Inference URLs (Important)
+
+There are two independent URL planes:
+
+- **Tracing export URL** (Respan telemetry ingest): controlled by exporter `base_url` / `RESPAN_BASE_URL`.
+- **Inference/proxy URL** (where Claude requests are sent): controlled by Anthropic SDK env/options such as `ANTHROPIC_BASE_URL`.
+
+Using **Respan tracing + Respan gateway** together:
+
+```python
+from claude_agent_sdk import ClaudeAgentOptions
+from respan_exporter_anthropic_agents import RespanAnthropicAgentsExporter
+
+api_key = "your_respan_key"
+respan_base_url = "https://api.respan.ai/api"
+
+exporter = RespanAnthropicAgentsExporter(
+    api_key=api_key,
+    base_url=respan_base_url,  # tracing export
+)
+
+options = ClaudeAgentOptions(
+    env={
+        "ANTHROPIC_BASE_URL": f"{respan_base_url.rstrip('/')}/anthropic",  # inference proxy
+        "ANTHROPIC_API_KEY": api_key,
+        "ANTHROPIC_AUTH_TOKEN": api_key,
+    }
+)
+```
+
 ### Constructor Parameters
 
 All configuration can also be passed directly to the constructor.
