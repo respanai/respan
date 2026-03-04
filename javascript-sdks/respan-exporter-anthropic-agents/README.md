@@ -15,13 +15,26 @@ npm install @respan/exporter-anthropic-agents
 ```typescript
 import { RespanAnthropicAgentsExporter } from "@respan/exporter-anthropic-agents";
 
-const exporter = new RespanAnthropicAgentsExporter();
+const respanApiKey = process.env.RESPAN_API_KEY!;
+const respanBaseUrl = (process.env.RESPAN_BASE_URL ?? "https://api.respan.ai/api").replace(/\/+$/, "");
+const anthropicBaseUrl = process.env.ANTHROPIC_BASE_URL ?? `${respanBaseUrl}/anthropic`;
+const anthropicApiKey = process.env.ANTHROPIC_API_KEY ?? respanApiKey;
+
+const exporter = new RespanAnthropicAgentsExporter({
+  apiKey: respanApiKey,
+  endpoint: `${respanBaseUrl}/v1/traces/ingest`,
+});
 
 for await (const message of exporter.query({
   prompt: "Review this repository and summarize architecture.",
   options: {
     allowedTools: ["Read", "Glob", "Grep"],
     permissionMode: "acceptEdits",
+    env: {
+      ANTHROPIC_BASE_URL: anthropicBaseUrl,
+      ANTHROPIC_API_KEY: anthropicApiKey,
+      ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN ?? anthropicApiKey,
+    },
   },
 })) {
   console.log(message);

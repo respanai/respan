@@ -14,18 +14,32 @@ pip install respan-exporter-anthropic-agents
 
 ```python
 import asyncio
+import os
 from claude_agent_sdk import ClaudeAgentOptions
 from respan_exporter_anthropic_agents.respan_anthropic_agents_exporter import (
     RespanAnthropicAgentsExporter,
 )
 
-exporter = RespanAnthropicAgentsExporter()
+respan_api_key = os.environ["RESPAN_API_KEY"]
+respan_base_url = os.getenv("RESPAN_BASE_URL", "https://api.respan.ai/api").rstrip("/")
+anthropic_base_url = os.getenv("ANTHROPIC_BASE_URL", f"{respan_base_url}/anthropic")
+anthropic_api_key = os.getenv("ANTHROPIC_API_KEY", respan_api_key)
+
+exporter = RespanAnthropicAgentsExporter(
+    api_key=respan_api_key,
+    base_url=respan_base_url,
+)
 
 async def main() -> None:
     options = exporter.with_options(
         options=ClaudeAgentOptions(
             allowed_tools=["Read", "Glob", "Grep"],
             permission_mode="acceptEdits",
+            env={
+                "ANTHROPIC_BASE_URL": anthropic_base_url,
+                "ANTHROPIC_API_KEY": anthropic_api_key,
+                "ANTHROPIC_AUTH_TOKEN": os.getenv("ANTHROPIC_AUTH_TOKEN", anthropic_api_key),
+            },
         )
     )
 
