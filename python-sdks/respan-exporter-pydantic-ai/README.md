@@ -19,7 +19,7 @@ pip install respan-exporter-pydantic-ai
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `RESPAN_API_KEY` | Yes | Respan API key (used when `api_key` is not passed to `RespanTelemetry`) |
-| `RESPAN_BASE_URL` | No | Respan API base URL (default: `https://api.respan.ai/api`) |
+| `RESPAN_BASE_URL` | No | Respan API base URL (default: `https://api.respan.ai`) |
 
 Example: `export RESPAN_API_KEY="your-respan-key"` so you don’t need to pass `api_key` in code.
 
@@ -59,8 +59,8 @@ from respan_exporter_pydantic_ai import instrument_pydantic_ai
 
 # Use Respan as the LLM gateway (no separate OpenAI key needed)
 respan_api_key = os.environ["RESPAN_API_KEY"]
-respan_base_url = os.getenv("RESPAN_BASE_URL", "https://api.respan.ai/api")
-os.environ["OPENAI_BASE_URL"] = respan_base_url
+respan_base_url = os.getenv("RESPAN_BASE_URL", "https://api.respan.ai")
+os.environ["OPENAI_BASE_URL"] = f"{respan_base_url}/api"
 os.environ["OPENAI_API_KEY"] = respan_api_key
 
 # 1. Initialize Respan (pass api_key or set RESPAN_API_KEY)
@@ -90,6 +90,7 @@ Traces appear in the [Respan dashboard](https://app.respan.ai) (or your configur
 
 ## Further Reading
 
+- **Examples:** [Pydantic AI Python example](https://github.com/respanai/respan-example-projects/python/tracing/pydantic-ai) — runnable integration in the Respan example projects repo
 - **Respan:** [respan.ai](https://respan.ai), [Documentation](https://docs.respan.ai)
 - **Pydantic AI:** [ai.pydantic.dev](https://ai.pydantic.dev/), [Models (OpenAI)](https://ai.pydantic.dev/models/openai/)
 - **respan-tracing:** [PyPI](https://pypi.org/project/respan-tracing/), [GitHub](https://github.com/respanai/respan) — decorators (`@workflow`, `@task`), manual spans, and export options
@@ -126,7 +127,7 @@ IS_REAL_GATEWAY_TESTING_ENABLED=1 RESPAN_API_KEY="your-respan-key" \
   poetry run pytest tests/test_real_gateway_integration.py -v -s
 ```
 
-Optional env: `RESPAN_GATEWAY_BASE_URL` or `RESPAN_BASE_URL` (default `https://api.respan.ai/api`), `RESPAN_GATEWAY_MODEL` (default `openai:gpt-4o-mini`). The test is skipped unless `IS_REAL_GATEWAY_TESTING_ENABLED=1`.
+Optional env: `RESPAN_GATEWAY_BASE_URL` or `RESPAN_BASE_URL` (default `https://api.respan.ai`), `RESPAN_GATEWAY_MODEL` (default `openai:gpt-4o-mini`). The test is skipped unless `IS_REAL_GATEWAY_TESTING_ENABLED=1`.
 
 ### Run script (trace tree)
 
