@@ -62,15 +62,12 @@ exporter = RespanAnthropicAgentsExporter(
 )
 ```
 
-Optional advanced override:
+Local gateway/proxy override:
 
 ```python
 exporter = RespanAnthropicAgentsExporter(
-    endpoint="https://custom-host/api/v1/traces/ingest",  # Full ingest URL
-    timeout_seconds=15,
-    max_retries=3,
-    base_delay_seconds=1.0,
-    max_delay_seconds=30.0,
+    api_key="your_respan_key",
+    base_url="http://localhost:8000/api",
 )
 ```
 
@@ -78,7 +75,8 @@ Resolution order:
 - `api_key`: constructor `api_key` -> `RESPAN_API_KEY`
 - `endpoint`: constructor `endpoint` -> derived from constructor `base_url` -> derived from `RESPAN_BASE_URL`
 
-Note: if both `endpoint` and `base_url` are provided, `endpoint` takes precedence.
+In normal usage you should set `base_url` (or `RESPAN_BASE_URL`) and let the exporter derive the ingest endpoint automatically.
+`endpoint` exists for internal/advanced cases and takes precedence over `base_url` if both are set.
 
 ## Examples
 
