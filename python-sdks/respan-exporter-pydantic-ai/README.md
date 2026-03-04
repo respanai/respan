@@ -59,8 +59,8 @@ from respan_exporter_pydantic_ai import instrument_pydantic_ai
 
 # Use Respan as the LLM gateway (no separate OpenAI key needed)
 respan_api_key = os.environ["RESPAN_API_KEY"]
-respan_base_url = os.getenv("RESPAN_BASE_URL", "https://api.respan.ai")
-os.environ["OPENAI_BASE_URL"] = f"{respan_base_url}/api"
+respan_base_url = os.getenv("RESPAN_BASE_URL", "https://api.respan.ai/api")
+os.environ["OPENAI_BASE_URL"] = respan_base_url
 os.environ["OPENAI_API_KEY"] = respan_api_key
 
 # 1. Initialize Respan (pass api_key or set RESPAN_API_KEY)
