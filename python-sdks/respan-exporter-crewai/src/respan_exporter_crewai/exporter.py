@@ -77,8 +77,7 @@ class RespanCrewAIExporter:
         )
         self.customer_identifier = (
             customer_identifier
-            if customer_identifier is not None
-            else os.getenv("RESPAN_CUSTOMER_IDENTIFIER")
+            or os.getenv("RESPAN_CUSTOMER_IDENTIFIER")
         )
         self.timeout = timeout
 
@@ -249,7 +248,7 @@ class RespanCrewAIExporter:
         if not workflow_name:
             workflow_name = trace_name
 
-        if session_identifier is None:
+        if not session_identifier:
             session_identifier = pick_metadata_value(
                 root_metadata,
                 "session.id",
@@ -257,7 +256,7 @@ class RespanCrewAIExporter:
                 "session",
             )
 
-        if trace_group_identifier is None:
+        if not trace_group_identifier:
             trace_group_identifier = pick_metadata_value(
                 root_metadata,
                 "trace_group_identifier",
@@ -265,20 +264,24 @@ class RespanCrewAIExporter:
                 "group_id",
             )
 
-if customer_identifier is None:
-    customer_identifier = pick_metadata_value(
-        root_metadata,
-        "user.id",
         if customer_identifier is None:
             customer_identifier = pick_metadata_value(
                 root_metadata,
-                "respan.customer_params.customer_identifier",
                 "user.id",
                 "user_id",
                 "customer_identifier",
                 "customer_id",
                 "user",
             )
+        if customer_identifier is None:
+            customer_identifier = pick_metadata_value(
+                root_metadata,
+                "respan.customer_params.customer_identifier",
+            )
+
+        if not trace_start_time:
+            trace_start_time = infer_trace_start_time(spans=spans)
+
         return TraceContext(
             trace_id=str(trace_id),
             trace_name=str(trace_name) if trace_name else None,
@@ -552,7 +555,10 @@ if customer_identifier is None:
             payload["error_message"] = str(error)
             payload["status_code"] = 500
         else:
-            payload["status_code"] = get_attr(span, "status_code") or 200
+            status_code = get_attr(span, "status_code")
+            if status_code is None:
+                status_code = 200
+            payload["status_code"] = status_code
 
         tool_name = (
             get_attr(span, "tool_name", "tool")
@@ -635,12 +641,9 @@ if customer_identifier is None:
                     )
                     return
             except Exception as exc:
+                last_exc = exc
                 if attempt == max_retries - 1:
-                    logger.warning(
-                        "Respan export failed after %s retries: %s",
-                        max_retries,
-                        exc,
-                    )
+                    logger.warning("Respan export request failed: %s", exc)
                     return
                 delay = min(
                     retry_delay * (backoff_multiplier ** attempt),

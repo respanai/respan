@@ -63,11 +63,10 @@ def test_crewai_tracing_exporter_basic(monkeypatch):
         agent=agent,
     )
     crew = Crew(agents=[agent], tasks=[task])
-    result = crew.kickoff()
-
-    tracer_provider.force_flush()
-
-    assert result is not None
-
-    RespanCrewAIInstrumentor().uninstrument()
-    CrewAIInstrumentor().uninstrument()
+    try:
+        result = crew.kickoff()
+        tracer_provider.force_flush()
+        assert result is not None
+    finally:
+        RespanCrewAIInstrumentor().uninstrument()
+        CrewAIInstrumentor().uninstrument()
