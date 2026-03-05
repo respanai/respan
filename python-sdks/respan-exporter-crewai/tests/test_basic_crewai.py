@@ -19,7 +19,7 @@ from respan_exporter_crewai import RespanCrewAIInstrumentor
 from respan_exporter_crewai.utils import normalize_respan_base_url_for_gateway
 
 
-def test_crewai_tracing_exporter_basic():
+def test_crewai_tracing_exporter_basic(monkeypatch):
     """Run an CrewAI agent and send traces to Respan."""
 
     respan_api_key = os.getenv("RESPAN_API_KEY")
@@ -49,8 +49,8 @@ def test_crewai_tracing_exporter_basic():
     )
     CrewAIInstrumentor().instrument()
 
-    os.environ["OPENAI_BASE_URL"] = _gateway_base_url()
-    os.environ["OPENAI_API_KEY"] = respan_api_key
+    monkeypatch.setenv("OPENAI_BASE_URL", _gateway_base_url())
+    monkeypatch.setenv("OPENAI_API_KEY", respan_api_key)
 
     agent = Agent(
         role="Test Agent",

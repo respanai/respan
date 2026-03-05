@@ -611,18 +611,22 @@ class RespanCrewAIExporter:
                     headers=headers,
                     timeout=self.timeout,
                 )
+                if response.status_code == 429:
+                    raise RuntimeError("Respan rate limited (429)")
                 if response.status_code >= 500:
                     raise RuntimeError(
                         "Respan ingest server error status_code=%s"
                         % (response.status_code,)
                     )
-                if response.status_code not in (200, 201):
+                if 200 <= response.status_code < 300:
+                    return
+                else:
                     logger.warning(
                         "Respan export failed with status %s: %s",
                         response.status_code,
                         response.text,
                     )
-                return
+                    return
             except Exception as exc:
                 last_exc = exc
                 if attempt == max_retries - 1:
