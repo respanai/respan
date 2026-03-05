@@ -607,6 +607,12 @@ class RespanCrewAIExporter:
         Uses inline retry (same policy as respan_sdk.utils.RetryHandler). Prefer
         RetryHandler when respan-sdk exports it for consistency with other exporters.
         """
+        if not self.api_key:
+            logger.warning(
+                "Respan API key is not set; skipping send to %s",
+                self.endpoint,
+            )
+            return
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
