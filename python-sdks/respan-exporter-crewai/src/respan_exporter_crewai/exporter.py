@@ -601,7 +601,7 @@ class RespanCrewAIExporter:
         retry_delay = 1.0
         backoff_multiplier = 2.0
         max_delay = 30.0
-        last_exc: Optional[Exception] = None
+        for attempt in range(max_retries):
         for attempt in range(max_retries):
             try:
                 response = requests.post(
