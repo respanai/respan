@@ -19,6 +19,7 @@ from respan_exporter_crewai.instrumentor import RespanCrewAIInstrumentor
 from respan_exporter_crewai.utils import normalize_respan_base_url_for_gateway
 
 
+@pytest.mark.integration
 def test_crewai_tracing_exporter_basic(monkeypatch):
     """Run a CrewAI agent and send traces to Respan."""
     respan_api_key = os.getenv("RESPAN_API_KEY")
