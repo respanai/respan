@@ -207,8 +207,7 @@ class RespanCrewAIInstrumentor(BaseInstrumentor):
                     logger.debug("Failed to unwrap SimpleSpanProcessor.on_end: %s", exc)
                 _PATCHED = False
                 _PATCHED_BATCH_NAME = None
-
-        logger.info("Respan CrewAI instrumentation disabled")
+                logger.info("Respan CrewAI instrumentation disabled")
 
     def _patch_span_processors(self) -> None:
         global _PATCHED, _PATCHED_BATCH_NAME
