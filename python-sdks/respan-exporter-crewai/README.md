@@ -33,9 +33,11 @@ This pulls in `openinference-instrumentation-crewai` so the instrumentor can cap
 ```python
 import os
 from crewai import Agent, Task, Crew
+from openinference.instrumentation.crewai import CrewAIInstrumentor
 from respan_exporter_crewai.instrumentor import RespanCrewAIInstrumentor
 
 RespanCrewAIInstrumentor().instrument(api_key=os.getenv("RESPAN_API_KEY"))
+CrewAIInstrumentor().instrument()
 
 agent = Agent(
     role="Example Agent",
