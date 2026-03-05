@@ -216,7 +216,7 @@ class RespanCrewAIInstrumentor(BaseInstrumentor):
 
             on_end_wrapper = _make_on_end_wrapper(
                 exporter=self._exporter,
-                dedupe=self._dedupe,
+                dedupe=_SpanDedupeCache(max_size=self._dedupe._max_size),
                 passthrough=self._passthrough,
             )
 
@@ -225,7 +225,7 @@ class RespanCrewAIInstrumentor(BaseInstrumentor):
                 if hasattr(export.BatchSpanProcessor, "_export"):
                     batch_wrapper = _make_batch_export_wrapper(
                         exporter=self._exporter,
-                        dedupe=self._dedupe,
+                        dedupe=_SpanDedupeCache(max_size=self._dedupe._max_size),
                         passthrough=self._passthrough,
                     )
                     wrapt.wrap_function_wrapper(
@@ -238,7 +238,7 @@ class RespanCrewAIInstrumentor(BaseInstrumentor):
                 else:
                     batch_on_end_wrapper = _make_on_end_wrapper(
                         exporter=self._exporter,
-                        dedupe=self._dedupe,
+                        dedupe=_SpanDedupeCache(max_size=self._dedupe._max_size),
                         passthrough=self._passthrough,
                     )
                     wrapt.wrap_function_wrapper(
