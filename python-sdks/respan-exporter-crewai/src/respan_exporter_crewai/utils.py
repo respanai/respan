@@ -372,7 +372,11 @@ def find_root_span(spans: Sequence[Any]) -> Optional[Any]:
             span_ids.add(str(span_id))
     for span in spans:
         parent_id = get_attr(span, "parent_id", "parent_span_id", "parentId")
-        if not parent_id or str(parent_id) not in span_ids:
+        if not parent_id:
+            return span
+    for span in spans:
+        parent_id = get_attr(span, "parent_id", "parent_span_id", "parentId")
+        if str(parent_id) not in span_ids:
             return span
     return spans[0]
 

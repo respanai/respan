@@ -61,6 +61,9 @@ def _export_crewai_spans(
     """Export CrewAI spans to Respan using the given exporter and dedupe cache."""
     if exporter is None:
         return SpanExportResult.SUCCESS
+    if not exporter.api_key:
+        logger.warning("Respan API key is not set; skipping CrewAI export")
+        return SpanExportResult.SUCCESS
 
     crewai_span_dicts: List[Dict[str, object]] = []
     for span in spans:
@@ -83,10 +86,6 @@ def _export_crewai_spans(
         payloads.extend(exporter.build_payload(trace_or_spans=trace_spans))
 
     if not payloads:
-        return SpanExportResult.SUCCESS
-
-    if not exporter.api_key:
-        logger.warning("Respan API key is not set; skipping CrewAI export")
         return SpanExportResult.SUCCESS
 
     exporter.send(payloads=payloads)
@@ -152,7 +151,7 @@ def _make_on_end_wrapper(
             return wrapped(*args, **kwargs)
 
         try:
-            _export_crewai_spans(spans=[span], exporter=exporter, dedupe=dedupe, pre_filtered=True)
+            _export_crewai_spans(spans=[span], exporter=exporter, dedupe=dedupe)
         except Exception as exc:
             logger.warning("Failed to export CrewAI span: %s", exc, exc_info=True)
             return wrapped(*args, **kwargs)

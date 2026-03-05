@@ -424,6 +424,8 @@ class RespanCrewAIExporter:
                 }
                 if not (prompt_tokens is not None and completion_tokens is not None):
                     usage["total_tokens"] = total_tokens
+            else:
+                usage = None
 
         error = get_attr(span, "error", "exception", "err")
         if error is None and isinstance(span_metadata, dict) and "error" in span_metadata:
