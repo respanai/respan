@@ -151,8 +151,7 @@ def _make_on_end_wrapper(
         if span is None or not is_crewai_span(span=span):
             return wrapped(*args, **kwargs)
 
-        try:
-            _export_crewai_spans(spans=[span], exporter=exporter, dedupe=dedupe)
+            _export_crewai_spans(spans=[span], exporter=exporter, dedupe=dedupe, pre_filtered=True)
         except Exception as exc:
             logger.warning("Failed to export CrewAI span: %s", exc, exc_info=True)
             return wrapped(*args, **kwargs)
