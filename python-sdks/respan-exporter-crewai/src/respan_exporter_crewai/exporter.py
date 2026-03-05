@@ -465,13 +465,15 @@ class RespanCrewAIExporter:
                 span_id=span_id_str,
                 trace_id=trace_context.trace_id,
             )
-        parent_hex_id = (
-            span_id_map.get(str(parent_id))
-            if span_id_map and parent_id is not None
-            else normalize_span_id(span_id=str(parent_id), trace_id=trace_context.trace_id)
-            if parent_id
-            else None
-        )
+        if parent_id is not None:
+            parent_hex_id = span_id_map.get(str(parent_id)) if span_id_map else None
+            if parent_hex_id is None:
+                parent_hex_id = normalize_span_id(
+                    span_id=str(parent_id),
+                    trace_id=trace_context.trace_id,
+                )
+        else:
+            parent_hex_id = None
 
         if "crewai_trace_id" not in merged_metadata:
             merged_metadata["crewai_trace_id"] = trace_context.trace_id
