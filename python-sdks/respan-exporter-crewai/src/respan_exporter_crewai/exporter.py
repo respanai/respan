@@ -249,7 +249,7 @@ class RespanCrewAIExporter:
         if not workflow_name:
             workflow_name = trace_name
 
-        if not session_identifier:
+        if session_identifier is None:
             session_identifier = pick_metadata_value(
                 root_metadata,
                 "session.id",
@@ -257,7 +257,7 @@ class RespanCrewAIExporter:
                 "session",
             )
 
-        if not trace_group_identifier:
+        if trace_group_identifier is None:
             trace_group_identifier = pick_metadata_value(
                 root_metadata,
                 "trace_group_identifier",
@@ -265,7 +265,7 @@ class RespanCrewAIExporter:
                 "group_id",
             )
 
-        if not customer_identifier:
+        if customer_identifier is None:
             customer_identifier = (
                 pick_metadata_value(
                     root_metadata,
