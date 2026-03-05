@@ -151,7 +151,8 @@ def _make_on_end_wrapper(
         if span is None or not is_crewai_span(span=span):
             return wrapped(*args, **kwargs)
 
-            _export_crewai_spans(spans=[span], exporter=exporter, dedupe=dedupe, pre_filtered=True)
+        try:
+            _export_crewai_spans(spans=[span], exporter=exporter, dedupe=dedupe)
         except Exception as exc:
             logger.warning("Failed to export CrewAI span: %s", exc, exc_info=True)
             return wrapped(*args, **kwargs)
@@ -204,10 +205,9 @@ class RespanCrewAIInstrumentor(BaseInstrumentor):
                     unwrap(export.SimpleSpanProcessor, "on_end")
                 except Exception as exc:
                     logger.debug("Failed to unwrap SimpleSpanProcessor.on_end: %s", exc)
+                logger.info("Respan CrewAI instrumentation disabled")
                 _PATCHED = False
                 _PATCHED_BATCH_NAME = None
-
-        logger.info("Respan CrewAI instrumentation disabled")
 
     def _patch_span_processors(self) -> None:
         global _PATCHED, _PATCHED_BATCH_NAME

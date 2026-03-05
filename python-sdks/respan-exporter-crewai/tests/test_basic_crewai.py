@@ -34,11 +34,9 @@ def test_crewai_tracing_exporter_basic(monkeypatch):
         )
         return normalize_respan_base_url_for_gateway(base_url)
 
-    tracer_provider = trace.get_tracer_provider()
-    if not isinstance(tracer_provider, TracerProvider):
-        tracer_provider = TracerProvider()
-        trace.set_tracer_provider(tracer_provider)
-
+    original_provider = trace.get_tracer_provider()
+    tracer_provider = TracerProvider()
+    trace.set_tracer_provider(tracer_provider)
     tracer_provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
 
     RespanCrewAIInstrumentor().instrument(
@@ -68,5 +66,6 @@ def test_crewai_tracing_exporter_basic(monkeypatch):
         tracer_provider.force_flush()
         assert result is not None
     finally:
+        trace.set_tracer_provider(original_provider)
         RespanCrewAIInstrumentor().uninstrument()
         CrewAIInstrumentor().uninstrument()
