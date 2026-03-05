@@ -125,7 +125,7 @@ def _make_batch_export_wrapper(
             )
         except Exception as exc:
             logger.warning("Failed to export CrewAI spans: %s", exc, exc_info=True)
-            export_result = SpanExportResult.FAILURE
+            return wrapped(*args, **kwargs)
 
         if passthrough:
             return wrapped(*args, **kwargs)
@@ -155,6 +155,7 @@ def _make_on_end_wrapper(
             _export_crewai_spans(spans=[span], exporter=exporter, dedupe=dedupe)
         except Exception as exc:
             logger.warning("Failed to export CrewAI span: %s", exc, exc_info=True)
+            return wrapped(*args, **kwargs)
 
         if passthrough:
             return wrapped(*args, **kwargs)

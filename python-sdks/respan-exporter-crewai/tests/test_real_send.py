@@ -7,6 +7,11 @@ from unittest.mock import patch
 import pytest
 import requests
 
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None  # type: ignore[misc, assignment]
+
 pytest.importorskip("respan_exporter_crewai")
 
 from respan_exporter_crewai.exporter import RespanCrewAIExporter
@@ -14,15 +19,12 @@ from respan_exporter_crewai.exporter import RespanCrewAIExporter
 
 def _load_dotenv_if_available() -> None:
     """Load .env when present (package dir or cwd) so RESPAN_API_KEY is set."""
-    try:
-        from dotenv import load_dotenv
-        load_dotenv(override=False)
-        # Also try package root (parent of tests/) when run from repo root
-        _tests_dir = os.path.dirname(os.path.abspath(__file__))
-        _package_root = os.path.dirname(_tests_dir)
-        load_dotenv(dotenv_path=os.path.join(_package_root, ".env"), override=False)
-    except ImportError:
-        pass
+    if load_dotenv is None:
+        return
+    load_dotenv(override=False)
+    _tests_dir = os.path.dirname(os.path.abspath(__file__))
+    _package_root = os.path.dirname(_tests_dir)
+    load_dotenv(dotenv_path=os.path.join(_package_root, ".env"), override=False)
 
 
 def _trace_tree_crewai_style() -> Dict[str, Any]:

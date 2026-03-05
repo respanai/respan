@@ -1,4 +1,7 @@
-from respan_exporter_crewai.exporter import RespanCrewAIExporter
-from respan_exporter_crewai.instrumentor import RespanCrewAIInstrumentor
+"""
+Respan Exporter for CrewAI.
 
-__all__ = ["RespanCrewAIExporter", "RespanCrewAIInstrumentor"]
+Import directly from submodules:
+    from respan_exporter_crewai.exporter import RespanCrewAIExporter
+    from respan_exporter_crewai.instrumentor import RespanCrewAIInstrumentor
+"""

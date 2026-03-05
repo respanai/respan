@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Sequence
 def ns_to_datetime(value: Optional[int]) -> Optional[datetime]:
     """Convert nanoseconds timestamp to datetime."""
     if value is None:
+        return None
     return datetime.fromtimestamp(value / 1e9, tz=timezone.utc)
 
 

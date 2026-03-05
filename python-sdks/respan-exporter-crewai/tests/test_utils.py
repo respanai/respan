@@ -110,8 +110,11 @@ def test_ns_to_datetime_none():
 
 
 def test_ns_to_datetime_zero():
-    # 0 is falsy, so implementation returns None
-    assert ns_to_datetime(0) is None
+    """Epoch zero (0 ns) converts to 1970-01-01 00:00:00 UTC."""
+    dt = ns_to_datetime(0)
+    assert dt is not None
+    assert dt.year == 1970 and dt.month == 1 and dt.day == 1
+    assert dt.hour == 0 and dt.minute == 0 and dt.second == 0
 
 
 def test_ns_to_datetime_conversion():

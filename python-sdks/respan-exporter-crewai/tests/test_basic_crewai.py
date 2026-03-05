@@ -15,7 +15,7 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import ConsoleSpanExporter, SimpleSpanProcessor
 
-from respan_exporter_crewai import RespanCrewAIInstrumentor
+from respan_exporter_crewai.instrumentor import RespanCrewAIInstrumentor
 from respan_exporter_crewai.utils import normalize_respan_base_url_for_gateway
 
 
