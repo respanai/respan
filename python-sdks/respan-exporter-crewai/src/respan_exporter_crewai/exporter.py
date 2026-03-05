@@ -637,7 +637,14 @@ class RespanCrewAIExporter:
                     )
                     return
             except Exception as exc:
+            except Exception as exc:
                 if attempt == max_retries - 1:
+                    logger.warning(
+                        "Respan export failed after %s retries: %s",
+                        max_retries,
+                        exc,
+                    )
+                    return
                 delay = min(
                     retry_delay * (backoff_multiplier ** attempt),
                     max_delay,
