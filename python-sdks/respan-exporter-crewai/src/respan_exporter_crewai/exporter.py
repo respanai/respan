@@ -77,7 +77,8 @@ class RespanCrewAIExporter:
         )
         self.customer_identifier = (
             customer_identifier
-            or os.getenv("RESPAN_CUSTOMER_IDENTIFIER")
+            if customer_identifier is not None
+            else os.getenv("RESPAN_CUSTOMER_IDENTIFIER")
         )
         self.timeout = timeout
 
