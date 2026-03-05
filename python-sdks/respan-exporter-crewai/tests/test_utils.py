@@ -4,54 +4,54 @@ import importlib.util
 import os
 import sys
 
-# Load utils module directly to avoid pulling in instrumentor/opentelemetry (pkg_resources).
+import pytest
+
 _here = os.path.dirname(os.path.abspath(__file__))
 _src = os.path.normpath(os.path.join(_here, "..", "src"))
-if _src not in sys.path:
-    sys.path.insert(0, _src)
-_pkg = type(sys)("respan_exporter_crewai")
-_pkg.__path__ = [os.path.join(_src, "respan_exporter_crewai")]
-sys.modules["respan_exporter_crewai"] = _pkg
-_spec = importlib.util.spec_from_file_location(
-    "respan_exporter_crewai.utils",
-    os.path.join(_src, "respan_exporter_crewai", "utils.py"),
-)
-_utils_mod = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_utils_mod)
-sys.modules["respan_exporter_crewai.utils"] = _utils_mod
 
-from respan_exporter_crewai.utils import (
-    as_dict,
-    build_traces_ingest_url,
-    clean_payload,
-    coerce_datetime,
-    coerce_token_count,
-    extract_metadata_payload,
-    extract_openinference_choice_texts,
-    extract_openinference_messages,
-    format_rfc3339,
-    format_span_id,
-    format_trace_id,
-    get_attr,
-    group_spans_by_trace,
-    infer_trace_start_time,
-    is_blank_value,
-    is_crewai_span,
-    is_hex_string,
-    merge_openinference_metadata,
-    messages_to_text,
-    normalize_respan_base_url_for_gateway,
-    normalize_span_id,
-    normalize_trace_id,
-    ns_to_datetime,
-    otel_span_to_dict,
-    parse_json_value,
-    pick_metadata_value,
-    serialize_value,
-    find_root_span,
-    to_completion_message,
-    to_prompt_messages,
-)
+
+@pytest.fixture(autouse=True, scope="module")
+def _isolated_utils_module(request):
+    """Load utils module in isolation and restore sys.modules after tests."""
+    if _src not in sys.path:
+        sys.path.insert(0, _src)
+    original_pkg = sys.modules.get("respan_exporter_crewai")
+    original_utils = sys.modules.get("respan_exporter_crewai.utils")
+
+    _pkg = type(sys)("respan_exporter_crewai")
+    _pkg.__path__ = [os.path.join(_src, "respan_exporter_crewai")]
+    sys.modules["respan_exporter_crewai"] = _pkg
+    _spec = importlib.util.spec_from_file_location(
+        "respan_exporter_crewai.utils",
+        os.path.join(_src, "respan_exporter_crewai", "utils.py"),
+    )
+    _utils_mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_utils_mod)
+    sys.modules["respan_exporter_crewai.utils"] = _utils_mod
+
+    _names = (
+        "as_dict", "build_traces_ingest_url", "clean_payload", "coerce_datetime",
+        "coerce_token_count", "extract_metadata_payload", "extract_openinference_choice_texts",
+        "extract_openinference_messages", "format_rfc3339", "format_span_id", "format_trace_id",
+        "get_attr", "group_spans_by_trace", "infer_trace_start_time", "is_blank_value",
+        "is_crewai_span", "is_hex_string", "merge_openinference_metadata", "messages_to_text",
+        "normalize_respan_base_url_for_gateway", "normalize_span_id", "normalize_trace_id",
+        "ns_to_datetime", "otel_span_to_dict", "parse_json_value", "pick_metadata_value",
+        "serialize_value", "find_root_span", "to_completion_message", "to_prompt_messages",
+    )
+    for name in _names:
+        setattr(request.module, name, getattr(_utils_mod, name))
+
+    yield
+
+    if original_pkg is None:
+        sys.modules.pop("respan_exporter_crewai", None)
+    else:
+        sys.modules["respan_exporter_crewai"] = original_pkg
+    if original_utils is None:
+        sys.modules.pop("respan_exporter_crewai.utils", None)
+    else:
+        sys.modules["respan_exporter_crewai.utils"] = original_utils
 
 
 # --- is_crewai_span ---

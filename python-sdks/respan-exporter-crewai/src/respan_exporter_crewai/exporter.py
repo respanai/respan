@@ -77,8 +77,7 @@ class RespanCrewAIExporter:
         )
         self.customer_identifier = (
             customer_identifier
-            if customer_identifier is not None
-            else os.getenv("RESPAN_CUSTOMER_IDENTIFIER")
+            or os.getenv("RESPAN_CUSTOMER_IDENTIFIER")
         )
         self.timeout = timeout
 
@@ -629,6 +628,7 @@ class RespanCrewAIExporter:
                     )
                     return
             except Exception as exc:
+                last_exc = exc
                 if attempt == max_retries - 1:
                     logger.warning("Respan export request failed: %s", exc)
                     return

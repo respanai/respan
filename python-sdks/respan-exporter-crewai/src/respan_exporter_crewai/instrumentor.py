@@ -55,6 +55,8 @@ def _export_crewai_spans(
     spans: Iterable[object],
     exporter: Optional[RespanCrewAIExporter],
     dedupe: _SpanDedupeCache,
+    *,
+    pre_filtered: bool = False,
 ) -> SpanExportResult:
     """Export CrewAI spans to Respan using the given exporter and dedupe cache."""
     if exporter is None:
@@ -62,7 +64,7 @@ def _export_crewai_spans(
 
     crewai_span_dicts: List[Dict[str, object]] = []
     for span in spans:
-        if not is_crewai_span(span=span):
+        if not pre_filtered and not is_crewai_span(span=span):
             continue
         span_dict = otel_span_to_dict(span=span)
         if dedupe and not dedupe.add(
@@ -115,7 +117,12 @@ def _make_batch_export_wrapper(
             return wrapped(*args, **kwargs)
 
         try:
-            export_result = _export_crewai_spans(spans=crewai_spans, exporter=exporter, dedupe=dedupe)
+            export_result = _export_crewai_spans(
+                spans=crewai_spans,
+                exporter=exporter,
+                dedupe=dedupe,
+                pre_filtered=True,
+            )
         except Exception as exc:
             logger.warning("Failed to export CrewAI spans: %s", exc, exc_info=True)
             export_result = SpanExportResult.FAILURE
@@ -208,11 +215,6 @@ class RespanCrewAIInstrumentor(BaseInstrumentor):
             if _PATCHED:
                 return
 
-            batch_wrapper = _make_batch_export_wrapper(
-                exporter=self._exporter,
-                dedupe=self._dedupe,
-                passthrough=self._passthrough,
-            )
             on_end_wrapper = _make_on_end_wrapper(
                 exporter=self._exporter,
                 dedupe=self._dedupe,
@@ -221,6 +223,11 @@ class RespanCrewAIInstrumentor(BaseInstrumentor):
 
             try:
                 if hasattr(export.BatchSpanProcessor, "_export"):
+                    batch_wrapper = _make_batch_export_wrapper(
+                        exporter=self._exporter,
+                        dedupe=self._dedupe,
+                        passthrough=self._passthrough,
+                    )
                     wrapt.wrap_function_wrapper(
                         module="opentelemetry.sdk.trace.export",
                         name="BatchSpanProcessor._export",
@@ -238,14 +245,11 @@ class RespanCrewAIInstrumentor(BaseInstrumentor):
                 logger.warning("Failed to patch BatchSpanProcessor: %s", exc)
                 _PATCHED_BATCH_NAME = None
 
-            try:
-                wrapt.wrap_function_wrapper(
-                    module="opentelemetry.sdk.trace.export",
-                    name="SimpleSpanProcessor.on_end",
-                    wrapper=on_end_wrapper,
-                )
-            except Exception as exc:
-                logger.warning("Failed to patch SimpleSpanProcessor.on_end: %s", exc)
+            wrapt.wrap_function_wrapper(
+                module="opentelemetry.sdk.trace.export",
+                name="SimpleSpanProcessor.on_end",
+                wrapper=on_end_wrapper,
+            )
 
             _PATCHED = True
             logger.debug("Patched OpenTelemetry span processors for CrewAI export")
