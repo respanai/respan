@@ -235,11 +235,14 @@ class RespanCrewAIInstrumentor(BaseInstrumentor):
             logger.warning("Failed to patch BatchSpanProcessor: %s", exc)
             _PATCHED_BATCH_NAME = None
 
-        wrapt.wrap_function_wrapper(
-            module="opentelemetry.sdk.trace.export",
-            name="SimpleSpanProcessor.on_end",
-            wrapper=on_end_wrapper,
-        )
+        try:
+            wrapt.wrap_function_wrapper(
+                module="opentelemetry.sdk.trace.export",
+                name="SimpleSpanProcessor.on_end",
+                wrapper=on_end_wrapper,
+            )
+        except Exception as exc:
+            logger.warning("Failed to patch SimpleSpanProcessor: %s", exc)
 
         _PATCHED = True
         logger.debug("Patched OpenTelemetry span processors for CrewAI export")
