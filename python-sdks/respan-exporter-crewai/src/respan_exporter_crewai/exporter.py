@@ -265,18 +265,15 @@ class RespanCrewAIExporter:
                 "group_id",
             )
 
-        if customer_identifier is None:
-            customer_identifier = (
-                pick_metadata_value(
-                    root_metadata,
-                    "user.id",
-                    "user_id",
-                    "customer_identifier",
-                    "customer_id",
-                    "user",
-                )
-                or customer_identifier
-            )
+if customer_identifier is None:
+    customer_identifier = pick_metadata_value(
+        root_metadata,
+        "user.id",
+        "user_id",
+        "customer_identifier",
+        "customer_id",
+        "user",
+    )
 
         if not trace_start_time:
             trace_start_time = infer_trace_start_time(spans=spans)
