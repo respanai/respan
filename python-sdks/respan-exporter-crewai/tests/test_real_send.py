@@ -1,6 +1,7 @@
 """Real send integration test for CrewAI exporter — sends data to Respan platform."""
 
 import os
+import uuid
 from typing import Any, Dict, List
 from unittest.mock import patch
 
@@ -36,10 +37,10 @@ def _trace_tree_crewai_style() -> Dict[str, Any]:
     - task: input/output
     - generation: input, output, usage (prompt_tokens, completion_tokens) for backend token calc
     """
-    trace_id_hex = "a1b2c3d4e5f6789012345678abcdef01"
-    root_span_id = "a1b2c3d4e5f60001"
-    task_span_id = "a1b2c3d4e5f60002"
-    gen_span_id = "a1b2c3d4e5f60003"
+    trace_id_hex = uuid.uuid4().hex
+    root_span_id = uuid.uuid4().hex[:16]
+    task_span_id = uuid.uuid4().hex[:16]
+    gen_span_id = uuid.uuid4().hex[:16]
     return {
         "spans": [
             {
