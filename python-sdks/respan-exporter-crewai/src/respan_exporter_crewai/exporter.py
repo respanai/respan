@@ -648,7 +648,6 @@ class RespanCrewAIExporter:
                     )
                     return
             except Exception as exc:
-                last_exc = exc
                 if attempt == max_retries - 1:
                     logger.warning("Respan export request failed: %s", exc)
                     return

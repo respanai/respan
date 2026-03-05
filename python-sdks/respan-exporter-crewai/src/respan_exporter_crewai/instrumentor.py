@@ -208,9 +208,7 @@ class RespanCrewAIInstrumentor(BaseInstrumentor):
                 _PATCHED = False
                 _PATCHED_BATCH_NAME = None
 
-                _PATCHED = False
-                _PATCHED_BATCH_NAME = None
-                logger.info("Respan CrewAI instrumentation disabled")
+        logger.info("Respan CrewAI instrumentation disabled")
 
     def _patch_span_processors(self) -> None:
         global _PATCHED, _PATCHED_BATCH_NAME
@@ -240,10 +238,15 @@ class RespanCrewAIInstrumentor(BaseInstrumentor):
                     _PATCHED_BATCH_NAME = "_export"
                     _patched_anything = True
                 else:
+                    batch_on_end_wrapper = _make_on_end_wrapper(
+                        exporter=self._exporter,
+                        dedupe=self._dedupe,
+                        passthrough=self._passthrough,
+                    )
                     wrapt.wrap_function_wrapper(
                         module="opentelemetry.sdk.trace.export",
                         name="BatchSpanProcessor.on_end",
-                        wrapper=on_end_wrapper,
+                        wrapper=batch_on_end_wrapper,
                     )
                     _PATCHED_BATCH_NAME = "on_end"
                     _patched_anything = True
