@@ -4,6 +4,8 @@ import pytest
 pytest.importorskip("respan_exporter_crewai")
 from unittest.mock import patch
 
+from respan_sdk.constants import RESPAN_DOGFOOD_HEADER
+
 from respan_exporter_crewai.exporter import RespanCrewAIExporter
 
 
@@ -82,7 +84,7 @@ def test_send_calls_requests_post():
         call_kw = mock_post.call_args[1]
         assert call_kw["json"] == payloads
         assert call_kw["headers"].get("Authorization") == "Bearer key123"
-        assert call_kw["headers"].get("X-Respan-Dogfood") == "1"
+        assert call_kw["headers"].get(RESPAN_DOGFOOD_HEADER) == "1"
 
 
 def test_send_handles_http_error():

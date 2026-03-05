@@ -256,6 +256,14 @@ class RespanCrewAIExporter:
                 "session",
             )
 
+        if not trace_group_identifier:
+            trace_group_identifier = pick_metadata_value(
+                root_metadata,
+                "trace_group_identifier",
+                "group_identifier",
+                "group_id",
+            )
+
         if not customer_identifier:
             customer_identifier = (
                 pick_metadata_value(
