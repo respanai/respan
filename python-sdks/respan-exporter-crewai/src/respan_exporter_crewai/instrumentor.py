@@ -146,8 +146,13 @@ def _make_on_end_wrapper(
 ):
     """Return a wrapper for SimpleSpanProcessor.on_end that closes over exporter config."""
 
+    def _on_end_wrapper(wrapped, instance, args, kwargs):
+        span = args[0] if args else kwargs.get("span")
+        if span is None or not is_crewai_span(span=span):
+            return wrapped(*args, **kwargs)
+
         try:
-            _export_crewai_spans(spans=[span], exporter=exporter, dedupe=dedupe, pre_filtered=True)
+            _export_crewai_spans(spans=[span], exporter=exporter, dedupe=dedupe)
         except Exception as exc:
             logger.warning("Failed to export CrewAI span: %s", exc, exc_info=True)
             return wrapped(*args, **kwargs)
@@ -202,7 +207,8 @@ class RespanCrewAIInstrumentor(BaseInstrumentor):
                     logger.debug("Failed to unwrap SimpleSpanProcessor.on_end: %s", exc)
                 _PATCHED = False
                 _PATCHED_BATCH_NAME = None
-                logger.info("Respan CrewAI instrumentation disabled")
+
+        logger.info("Respan CrewAI instrumentation disabled")
 
     def _patch_span_processors(self) -> None:
         global _PATCHED, _PATCHED_BATCH_NAME
@@ -216,6 +222,7 @@ class RespanCrewAIInstrumentor(BaseInstrumentor):
                 passthrough=self._passthrough,
             )
 
+            _patched_anything = False
             try:
                 if hasattr(export.BatchSpanProcessor, "_export"):
                     batch_wrapper = _make_batch_export_wrapper(
@@ -229,6 +236,7 @@ class RespanCrewAIInstrumentor(BaseInstrumentor):
                         wrapper=batch_wrapper,
                     )
                     _PATCHED_BATCH_NAME = "_export"
+                    _patched_anything = True
                 else:
                     wrapt.wrap_function_wrapper(
                         module="opentelemetry.sdk.trace.export",
@@ -236,6 +244,7 @@ class RespanCrewAIInstrumentor(BaseInstrumentor):
                         wrapper=on_end_wrapper,
                     )
                     _PATCHED_BATCH_NAME = "on_end"
+                    _patched_anything = True
             except Exception as exc:
                 logger.warning("Failed to patch BatchSpanProcessor: %s", exc)
                 _PATCHED_BATCH_NAME = None
@@ -246,8 +255,10 @@ class RespanCrewAIInstrumentor(BaseInstrumentor):
                     name="SimpleSpanProcessor.on_end",
                     wrapper=on_end_wrapper,
                 )
+                _patched_anything = True
             except Exception as exc:
                 logger.warning("Failed to patch SimpleSpanProcessor.on_end: %s", exc)
 
-            _PATCHED = True
-            logger.debug("Patched OpenTelemetry span processors for CrewAI export")
+            if _patched_anything:
+                _PATCHED = True
+                logger.debug("Patched OpenTelemetry span processors for CrewAI export")

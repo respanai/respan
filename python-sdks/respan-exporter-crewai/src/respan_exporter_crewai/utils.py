@@ -1,8 +1,11 @@
 """Utility functions for Respan CrewAI exporter."""
 import json
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence
+
+logger = logging.getLogger(__name__)
 
 def ns_to_datetime(value: Optional[int]) -> Optional[datetime]:
     """Convert nanoseconds timestamp to datetime."""
@@ -97,6 +100,10 @@ def group_spans_by_trace(
     for span in spans:
         trace_id = span.get("trace_id")
         if not isinstance(trace_id, str) or not trace_id:
+            logger.debug(
+                "group_spans_by_trace: skipping span with missing trace_id: %r",
+                span,
+            )
             continue
         grouped.setdefault(trace_id, []).append(span)
     return grouped
