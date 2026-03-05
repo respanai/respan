@@ -91,17 +91,19 @@ def test_send_handles_http_error():
     """Non-2xx response logs but does not raise."""
     exporter = RespanCrewAIExporter(api_key="key")
     with patch("respan_exporter_crewai.exporter.requests.post") as mock_post:
-        mock_post.return_value.status_code = 500
-        mock_post.return_value.text = "Server Error"
-        exporter.send(payloads=[{}])
+        with patch("respan_exporter_crewai.exporter.time.sleep"):
+            mock_post.return_value.status_code = 500
+            mock_post.return_value.text = "Server Error"
+            exporter.send(payloads=[{}])
 
 
 def test_send_handles_request_exception():
     """Request exception is caught and logged."""
     exporter = RespanCrewAIExporter(api_key="key")
     with patch("respan_exporter_crewai.exporter.requests.post") as mock_post:
-        mock_post.side_effect = Exception("network error")
-        exporter.send(payloads=[{}])
+        with patch("respan_exporter_crewai.exporter.time.sleep"):
+            mock_post.side_effect = Exception("network error")
+            exporter.send(payloads=[{}])
 
 
 # --- export() does not send when no api_key ---
