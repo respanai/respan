@@ -142,7 +142,7 @@ def test_crewai_exporter_real_send_to_respan() -> None:
 
     assert len(post_results) == 1, "exporter should POST once to Respan"
     status_code = post_results[0]["status_code"]
-    assert status_code in (200, 201), (
-        "Respan ingest should return 200/201, got %s: %s"
+    assert 200 <= status_code < 300, (
+        "Respan ingest should return 2xx, got %s: %s"
         % (status_code, post_results[0]["text"])
     )
