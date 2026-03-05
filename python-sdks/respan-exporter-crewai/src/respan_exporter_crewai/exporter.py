@@ -207,12 +207,12 @@ class RespanCrewAIExporter:
             "user_identifier",
             "user",
         )
-        if not customer_identifier and isinstance(trace_metadata, dict):
+        if customer_identifier is None and isinstance(trace_metadata, dict):
             for key in ("customer_identifier", "customer_id", "user_id", "user"):
                 if key in trace_metadata:
                     customer_identifier = trace_metadata.get(key)
                     break
-        if not customer_identifier:
+        if customer_identifier is None:
             customer_identifier = self.customer_identifier
 
         trace_start_time = coerce_datetime(
