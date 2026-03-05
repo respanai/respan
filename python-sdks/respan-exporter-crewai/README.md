@@ -45,6 +45,8 @@ trace.set_tracer_provider(provider)
 provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
 
 RespanCrewAIInstrumentor().instrument(api_key=os.getenv("RESPAN_API_KEY"))
+# With default passthrough=False, CrewAI spans are sent only to Respan (not to ConsoleSpanExporter).
+# Use passthrough=True to also forward CrewAI spans to the processor above (e.g. for console debug).
 CrewAIInstrumentor().instrument()
 
 agent = Agent(

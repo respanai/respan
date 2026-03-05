@@ -47,8 +47,18 @@ def otel_span_to_dict(span: object) -> Dict[str, object]:
     """Convert OpenTelemetry span to dict format."""
     attributes = dict(getattr(span, "attributes", None) or {})
     span_context = getattr(span, "context", None)
-    trace_id = format_trace_id(trace_id=span_context.trace_id) if span_context else None
-    span_id = format_span_id(span_id=span_context.span_id) if span_context else None
+    trace_id = None
+    span_id = None
+    if span_context is not None:
+        tid = getattr(span_context, "trace_id", None)
+        sid = getattr(span_context, "span_id", None)
+        if tid == 0 or sid == 0:
+            logger.debug(
+                "Span with invalid OTel context (zero trace_id or span_id); treating as missing"
+            )
+        else:
+            trace_id = format_trace_id(trace_id=tid) if tid is not None else None
+            span_id = format_span_id(span_id=sid) if sid is not None else None
 
     parent = getattr(span, "parent", None)
     parent_id = None
