@@ -34,7 +34,15 @@ This pulls in `openinference-instrumentation-crewai` so the instrumentor can cap
 import os
 from crewai import Agent, Task, Crew
 from openinference.instrumentation.crewai import CrewAIInstrumentor
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
 from respan_exporter_crewai.instrumentor import RespanCrewAIInstrumentor
+
+# Set up tracing so OpenTelemetry captures spans
+provider = TracerProvider()
+trace.set_tracer_provider(provider)
+provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
 
 RespanCrewAIInstrumentor().instrument(api_key=os.getenv("RESPAN_API_KEY"))
 CrewAIInstrumentor().instrument()
