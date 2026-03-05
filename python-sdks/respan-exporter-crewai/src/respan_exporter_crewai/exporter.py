@@ -269,15 +269,16 @@ if customer_identifier is None:
     customer_identifier = pick_metadata_value(
         root_metadata,
         "user.id",
-        "user_id",
-        "customer_identifier",
-        "customer_id",
-        "user",
-    )
-
-        if not trace_start_time:
-            trace_start_time = infer_trace_start_time(spans=spans)
-
+        if customer_identifier is None:
+            customer_identifier = pick_metadata_value(
+                root_metadata,
+                "respan.customer_params.customer_identifier",
+                "user.id",
+                "user_id",
+                "customer_identifier",
+                "customer_id",
+                "user",
+            )
         return TraceContext(
             trace_id=str(trace_id),
             trace_name=str(trace_name) if trace_name else None,
