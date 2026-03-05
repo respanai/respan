@@ -26,6 +26,7 @@ _INSTRUMENTS = ("crewai >= 1.5.2", "openinference-instrumentation-crewai >= 0.1.
 _PATCHED = False
 # Which BatchSpanProcessor method was patched: "_export" or "on_end" (for unwrapping).
 _PATCHED_BATCH_NAME: Optional[str] = None
+_PATCH_LOCK = Lock()
 
 
 class _SpanDedupeCache:
@@ -185,64 +186,63 @@ class RespanCrewAIInstrumentor(BaseInstrumentor):
     def _uninstrument(self, **kwargs) -> None:
         global _PATCHED, _PATCHED_BATCH_NAME
 
-        if _PATCHED:
-            if _PATCHED_BATCH_NAME is not None:
+        with _PATCH_LOCK:
+            if _PATCHED:
+                if _PATCHED_BATCH_NAME is not None:
+                    try:
+                        unwrap(export.BatchSpanProcessor, _PATCHED_BATCH_NAME)
+                    except Exception as exc:
+                        logger.debug("Failed to unwrap BatchSpanProcessor: %s", exc)
                 try:
-                    unwrap(export.BatchSpanProcessor, _PATCHED_BATCH_NAME)
+                    unwrap(export.SimpleSpanProcessor, "on_end")
                 except Exception as exc:
-                    logger.debug("Failed to unwrap BatchSpanProcessor: %s", exc)
-            try:
-                unwrap(export.SimpleSpanProcessor, "on_end")
-            except Exception as exc:
-                logger.debug("Failed to unwrap SimpleSpanProcessor.on_end: %s", exc)
-            _PATCHED = False
-            _PATCHED_BATCH_NAME = None
+                    logger.debug("Failed to unwrap SimpleSpanProcessor.on_end: %s", exc)
+                _PATCHED = False
+                _PATCHED_BATCH_NAME = None
 
         logger.info("Respan CrewAI instrumentation disabled")
 
     def _patch_span_processors(self) -> None:
         global _PATCHED, _PATCHED_BATCH_NAME
-        if _PATCHED:
-            return
+        with _PATCH_LOCK:
+            if _PATCHED:
+                return
 
-        batch_wrapper = _make_batch_export_wrapper(
-            exporter=self._exporter,
-            dedupe=self._dedupe,
-            passthrough=self._passthrough,
-        )
-        on_end_wrapper = _make_on_end_wrapper(
-            exporter=self._exporter,
-            dedupe=self._dedupe,
-            passthrough=self._passthrough,
-        )
+            batch_wrapper = _make_batch_export_wrapper(
+                exporter=self._exporter,
+                dedupe=self._dedupe,
+                passthrough=self._passthrough,
+            )
+            on_end_wrapper = _make_on_end_wrapper(
+                exporter=self._exporter,
+                dedupe=self._dedupe,
+                passthrough=self._passthrough,
+            )
 
-        try:
-            if hasattr(export.BatchSpanProcessor, "_export"):
-                wrapt.wrap_function_wrapper(
-                    module="opentelemetry.sdk.trace.export",
-                    name="BatchSpanProcessor._export",
-                    wrapper=batch_wrapper,
-                )
-                _PATCHED_BATCH_NAME = "_export"
-            else:
-                wrapt.wrap_function_wrapper(
-                    module="opentelemetry.sdk.trace.export",
-                    name="BatchSpanProcessor.on_end",
-                    wrapper=on_end_wrapper,
-                )
-                _PATCHED_BATCH_NAME = "on_end"
-        except Exception as exc:
-            logger.warning("Failed to patch BatchSpanProcessor: %s", exc)
-            _PATCHED_BATCH_NAME = None
+            try:
+                if hasattr(export.BatchSpanProcessor, "_export"):
+                    wrapt.wrap_function_wrapper(
+                        module="opentelemetry.sdk.trace.export",
+                        name="BatchSpanProcessor._export",
+                        wrapper=batch_wrapper,
+                    )
+                    _PATCHED_BATCH_NAME = "_export"
+                else:
+                    wrapt.wrap_function_wrapper(
+                        module="opentelemetry.sdk.trace.export",
+                        name="BatchSpanProcessor.on_end",
+                        wrapper=on_end_wrapper,
+                    )
+                    _PATCHED_BATCH_NAME = "on_end"
+            except Exception as exc:
+                logger.warning("Failed to patch BatchSpanProcessor: %s", exc)
+                _PATCHED_BATCH_NAME = None
 
-        try:
             wrapt.wrap_function_wrapper(
                 module="opentelemetry.sdk.trace.export",
                 name="SimpleSpanProcessor.on_end",
                 wrapper=on_end_wrapper,
             )
-        except Exception as exc:
-            logger.warning("Failed to patch SimpleSpanProcessor: %s", exc)
 
-        _PATCHED = True
-        logger.debug("Patched OpenTelemetry span processors for CrewAI export")
+            _PATCHED = True
+            logger.debug("Patched OpenTelemetry span processors for CrewAI export")

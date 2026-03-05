@@ -91,18 +91,8 @@ def test_crewai_exporter_real_send_to_respan() -> None:
     post_results: List[Dict[str, Any]] = []
     real_post = requests.post
 
-    def recording_post(
-        url: str,
-        json: Any,
-        headers: Dict[str, str],
-        timeout: int,
-    ) -> Any:
-        response = real_post(
-            url=url,
-            json=json,
-            headers=headers,
-            timeout=timeout,
-        )
+    def recording_post(url: str, **kwargs: Any) -> Any:
+        response = real_post(url=url, **kwargs)
         post_results.append({
             "url": url,
             "status_code": response.status_code,
