@@ -146,13 +146,8 @@ def _make_on_end_wrapper(
 ):
     """Return a wrapper for SimpleSpanProcessor.on_end that closes over exporter config."""
 
-    def _on_end_wrapper(wrapped, instance, args, kwargs):
-        span = args[0] if args else kwargs.get("span")
-        if span is None or not is_crewai_span(span=span):
-            return wrapped(*args, **kwargs)
-
         try:
-            _export_crewai_spans(spans=[span], exporter=exporter, dedupe=dedupe)
+            _export_crewai_spans(spans=[span], exporter=exporter, dedupe=dedupe, pre_filtered=True)
         except Exception as exc:
             logger.warning("Failed to export CrewAI span: %s", exc, exc_info=True)
             return wrapped(*args, **kwargs)
