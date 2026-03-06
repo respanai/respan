@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import requests
 
 from respan_sdk.constants import RESPAN_DOGFOOD_HEADER
-from respan_sdk.constants.llm_logging import LogMethodChoices
+from respan_sdk.constants.llm_logging import LOG_TYPE_MAP, LogMethodChoices
 
 from respan_exporter_crewai.types import TraceContext
 from respan_exporter_crewai.utils import (
@@ -36,7 +36,6 @@ from respan_exporter_crewai.utils import (
     to_completion_message,
     to_prompt_messages,
 )
-from respan_sdk.constants.llm_logging import LOG_TYPE_MAP
 from respan_sdk.respan_types.log_types import RespanFullLogParams
 
 logger = logging.getLogger(__name__)
@@ -613,6 +612,7 @@ class RespanCrewAIExporter:
         if not payloads:
             return
         if not self.api_key:
+            return
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",

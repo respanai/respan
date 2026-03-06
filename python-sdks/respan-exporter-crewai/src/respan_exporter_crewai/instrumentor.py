@@ -17,7 +17,13 @@ from opentelemetry.sdk.trace.export import SpanExportResult
 from opentelemetry.sdk.trace import export
 
 from respan_exporter_crewai.exporter import RespanCrewAIExporter
-from respan_exporter_crewai.utils import group_spans_by_trace, is_crewai_span, otel_span_to_dict
+from respan_exporter_crewai.utils import (
+    format_span_id,
+    format_trace_id,
+    group_spans_by_trace,
+    is_crewai_span,
+    otel_span_to_dict,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,9 +71,19 @@ def _export_crewai_spans(
         logger.warning("Respan API key is not set; skipping CrewAI export")
         return SpanExportResult.SUCCESS
 
+    crewai_span_dicts: List[Dict[str, object]] = []
+    for span in spans:
         span_context = getattr(span, "context", None)
-        raw_trace_id = format_trace_id(span_context.trace_id) if (span_context and span_context.trace_id) else None
-        raw_span_id = format_span_id(span_context.span_id) if (span_context and span_context.span_id) else None
+        raw_trace_id = (
+            format_trace_id(trace_id=span_context.trace_id)
+            if (span_context and span_context.trace_id is not None)
+            else None
+        )
+        raw_span_id = (
+            format_span_id(span_id=span_context.span_id)
+            if (span_context and span_context.span_id is not None)
+            else None
+        )
         if dedupe and not dedupe.add(trace_id=raw_trace_id, span_id=raw_span_id):
             continue
         span_dict = otel_span_to_dict(span=span)

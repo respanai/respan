@@ -1,11 +1,11 @@
 """Unit tests for payload building, normalization, send, and validation (no live API)."""
-import pytest
-
-pytest.importorskip("respan_exporter_crewai")
 from unittest.mock import patch
+
+import pytest
 
 from respan_sdk.constants import RESPAN_DOGFOOD_HEADER
 
+pytest.importorskip("respan_exporter_crewai")
 from respan_exporter_crewai.exporter import RespanCrewAIExporter
 
 
