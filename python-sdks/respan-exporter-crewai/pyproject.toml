@@ -1,0 +1,28 @@
+[tool.poetry]
+name = "respan-exporter-crewai"
+version = "1.0.1"
+description = "Respan exporter for CrewAI traces"
+authors = ["Respan <team@respan.ai>"]
+readme = "README.md"
+packages = [{include = "respan_exporter_crewai", from = "src"}]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.14"
+requests = "^2.32.5"
+wrapt = "^1.16.0"
+opentelemetry-sdk = "^1.20.0"
+opentelemetry-api = "^1.20.0"
+opentelemetry-instrumentation = "^0.41b0"
+respan-sdk = "^1.0.0"
+openinference-instrumentation-crewai = "^0.1.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^9.0.2"
+setuptools = "*"
+crewai = ">=1.5.2"
+openai = "^1.0.0"
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: marks tests as integration tests (require live API key)",
+]
