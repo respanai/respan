@@ -60,6 +60,16 @@ class TestIsProcessableSpan:
         span = _make_span({SpanAttributes.LLM_REQUEST_TYPE: "embedding"})
         assert is_processable_span(span) is True
 
+    def test_pydantic_ai_native_span_operation_name(self):
+        """Pydantic AI native span with gen_ai.operation.name should be processed."""
+        span = _make_span({"gen_ai.operation.name": "chat"})
+        assert is_processable_span(span) is True
+
+    def test_pydantic_ai_native_span_system(self):
+        """Pydantic AI native span with gen_ai.system should be processed."""
+        span = _make_span({"gen_ai.system": "openai"})
+        assert is_processable_span(span) is True
+
     def test_auto_instrumentation_noise_filtered(self):
         """Span without any recognized attributes should be filtered out."""
         span = _make_span({"http.method": "GET", "http.url": "https://api.openai.com"})
@@ -118,6 +128,19 @@ class TestIsRootSpanCandidate:
         """Standalone LLM span without entity_path should become root."""
         span = _make_span({SpanAttributes.LLM_REQUEST_TYPE: "chat"})
         assert is_root_span_candidate(span) is True
+
+    def test_pydantic_ai_native_span_without_entity_path_is_root(self):
+        """Pydantic AI native span without entity_path should become root."""
+        span = _make_span({"gen_ai.operation.name": "chat"})
+        assert is_root_span_candidate(span) is True
+
+    def test_pydantic_ai_native_span_with_entity_path_not_root(self):
+        """Pydantic AI native span inside decorator context should NOT become root."""
+        span = _make_span({
+            "gen_ai.operation.name": "chat",
+            SpanAttributes.TRACELOOP_ENTITY_PATH: "my_workflow.chat_step",
+        })
+        assert is_root_span_candidate(span) is False
 
     def test_standalone_llm_span_with_entity_path_not_root(self):
         """LLM span inside decorator context should NOT become root."""

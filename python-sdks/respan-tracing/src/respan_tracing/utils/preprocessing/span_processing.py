@@ -54,9 +54,17 @@ def is_processable_span(span: ReadableSpan) -> bool:
         )
         return True
 
+    # Pydantic AI native span (has gen_ai.operation.name or gen_ai.system)
+    if span.attributes.get("gen_ai.operation.name") is not None or span.attributes.get("gen_ai.system") is not None:
+        logger.debug(
+            f"[Respan Debug] Processing Pydantic AI native span: {span.name} "
+            f"(gen_ai.operation.name: {span.attributes.get('gen_ai.operation.name')})"
+        )
+        return True
+
     # Auto-instrumentation noise (HTTP, DB, etc.) - filter out
     logger.debug(
-        f"[Respan Debug] Filtering out auto-instrumentation span: {span.name} (no TRACELOOP_SPAN_KIND, entityPath, or llm.request.type)"
+        f"[Respan Debug] Filtering out auto-instrumentation span: {span.name} (no TRACELOOP_SPAN_KIND, entityPath, llm.request.type, or gen_ai.*)"
     )
     return False
 
@@ -89,6 +97,12 @@ def is_root_span_candidate(span: ReadableSpan) -> bool:
     # Standalone LLM span without entity path should become root
     if llm_request_type and span_kind is None and has_no_entity_path:
         logger.debug(f"[Respan Debug] Span is root candidate (standalone LLM): {span.name}")
+        return True
+
+    # Pydantic AI native span without entity path should become root
+    is_pydantic_ai_span = span.attributes.get("gen_ai.operation.name") is not None or span.attributes.get("gen_ai.system") is not None
+    if is_pydantic_ai_span and span_kind is None and has_no_entity_path:
+        logger.debug(f"[Respan Debug] Span is root candidate (Pydantic AI native): {span.name}")
         return True
 
     return False
