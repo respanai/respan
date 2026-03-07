@@ -12,6 +12,8 @@ from respan_tracing.utils.logging import get_respan_logger
 
 from ..constants.generic_constants import LOGGER_NAME_SPAN
 
+__all__ = ["SpanLink", "respan_span_attributes"]
+
 logger = get_respan_logger(LOGGER_NAME_SPAN)
 
 
@@ -58,8 +60,6 @@ class SpanLink:
         )
         return trace.Link(context=span_context, attributes=self.attributes)
 
-
-__all__ = ["SpanLink", "respan_span_attributes"]
 
 @contextmanager
 def respan_span_attributes(respan_params: Union[Dict[str, Any], RespanParams]):
