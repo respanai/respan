@@ -1372,6 +1372,37 @@ with client.get_span_buffer("experiment-123") as buffer:
 client.process_spans(collected_spans)
 ```
 
+#### Span Links for Pause/Resume Workflows
+
+Use `SpanLink` when a new trace should remain separate but still point back to
+the earlier causal span. This is the right pattern for pause/resume workflows.
+
+```python
+from respan_tracing import SpanLink, get_client
+
+client = get_client()
+
+resume_link = SpanLink(
+    trace_id="0123456789abcdef0123456789abcdef",
+    span_id="0123456789abcdef",
+    attributes={
+        "link.type": "resume",
+        "link.workflow_run_id": "wr-123",
+    },
+)
+
+with client.get_span_buffer("resume-trace") as buffer:
+    buffer.create_span(
+        "workflow_execution",
+        attributes={"status": "resumed"},
+        links=[resume_link],
+    )
+
+    collected_spans = buffer.get_all_spans()
+
+client.process_spans(collected_spans)
+```
+
 #### Inspect Before Export
 
 ```python
@@ -1400,7 +1431,7 @@ if len(collected_spans) > 0:
 #### SpanBuffer API
 
 **SpanBuffer Methods:**
-- `create_span(name, attributes=None, kind=None)` - Create a span in the local queue
+- `create_span(name, attributes=None, kind=None, links=None)` - Create a span in the local queue
 - `get_all_spans()` - Get list of all buffered spans for inspection
 - `get_span_count()` - Get the number of buffered spans
 - `clear_spans()` - Discard all buffered spans without exporting

@@ -49,6 +49,12 @@ from ..constants.generic_constants import LOGGER_NAME_EXPORTER
 
 logger = get_respan_logger(LOGGER_NAME_EXPORTER)
 
+_OTLP_REMOTE_LINK_FLAG = 0x100
+_OTLP_LINKS_KEY = "links"
+_OTLP_TRACE_STATE_KEY = "traceState"
+_OTLP_FLAGS_KEY = "flags"
+_OTLP_DROPPED_ATTRIBUTES_COUNT_KEY = "droppedAttributesCount"
+
 
 class ModifiedSpan:
     """A proxy wrapper that forwards all attributes to the original span except parent_span_id"""
@@ -163,6 +169,33 @@ def _span_to_otlp_json(span: ReadableSpan) -> Dict[str, Any]:
             event_dict[OTLP_ATTRIBUTES_KEY] = event_attrs
         events.append(event_dict)
 
+    links = []
+    for link in getattr(span, "links", ()) or ():
+        link_ctx = getattr(link, "context", None)
+        if link_ctx is None:
+            continue
+
+        link_dict = {
+            OTLP_TRACE_ID_KEY: format(link_ctx.trace_id, "032x"),
+            OTLP_SPAN_ID_KEY: format(link_ctx.span_id, "016x"),
+            OTLP_ATTRIBUTES_KEY: _convert_attributes(getattr(link, "attributes", None)),
+            _OTLP_FLAGS_KEY: int(link_ctx.trace_flags) | (
+                _OTLP_REMOTE_LINK_FLAG if getattr(link_ctx, "is_remote", False) else 0
+            ),
+        }
+
+        trace_state = getattr(link_ctx, "trace_state", None)
+        if trace_state:
+            trace_state_header = trace_state.to_header()
+            if trace_state_header:
+                link_dict[_OTLP_TRACE_STATE_KEY] = trace_state_header
+
+        dropped_attributes = getattr(link, "dropped_attributes", 0) or 0
+        if dropped_attributes:
+            link_dict[_OTLP_DROPPED_ATTRIBUTES_COUNT_KEY] = dropped_attributes
+
+        links.append(link_dict)
+
     result = {
         OTLP_TRACE_ID_KEY: trace_id,
         OTLP_SPAN_ID_KEY: span_id,
@@ -179,6 +212,8 @@ def _span_to_otlp_json(span: ReadableSpan) -> Dict[str, Any]:
         result[OTLP_STATUS_KEY] = status_dict
     if events:
         result[OTLP_EVENTS_KEY] = events
+    if links:
+        result[_OTLP_LINKS_KEY] = links
 
     return result
 

@@ -321,7 +321,7 @@ class RespanClient:
         
         Example:
             ```python
-            from respan_tracing import get_client
+            from respan_tracing import SpanLink, get_client
             
             client = get_client()
             
@@ -332,7 +332,17 @@ class RespanClient:
                 # Create multiple spans - they go to local queue
                 buffer.create_span("step1", {"status": "completed", "latency": 100})
                 buffer.create_span("step2", {"status": "completed", "latency": 200})
-                buffer.create_span("step3", {"status": "completed", "latency": 150})
+                buffer.create_span(
+                    "step3",
+                    {"status": "completed", "latency": 150},
+                    links=[
+                        SpanLink(
+                            trace_id="0123456789abcdef0123456789abcdef",
+                            span_id="0123456789abcdef",
+                            attributes={"link.type": "resume"},
+                        )
+                    ],
+                )
                 
                 # Optional: inspect before extracting
                 print(f"Buffered {buffer.get_span_count()} spans")
@@ -463,4 +473,4 @@ class RespanClient:
                 
             except Exception as e:
                 logger.exception(f"[Client] Exception during processing: {e}")
-                return False 
+                return False
