@@ -17,6 +17,7 @@ from respan_sdk.constants.otlp_constants import (
     OTLP_STRING_VALUE,
     OTLP_BYTES_VALUE,
     OTLP_ARRAY_VALUE,
+    OTLP_KVLIST_VALUE,
     OTLP_ARRAY_VALUES_KEY,
     OTLP_ATTR_KEY,
     OTLP_ATTR_VALUE,
@@ -43,9 +44,9 @@ from respan_sdk.constants.otlp_constants import (
     OTEL_STATUS_MESSAGE_KEY,
 )
 
-from ..utils.logging import get_respan_logger, build_spans_export_preview
-from ..utils.preprocessing.span_processing import is_root_span_candidate
-from ..constants.generic_constants import LOGGER_NAME_EXPORTER
+from respan_tracing.utils.logging import get_respan_logger, build_spans_export_preview
+from respan_tracing.utils.preprocessing.span_processing import is_root_span_candidate
+from respan_tracing.constants.generic_constants import LOGGER_NAME_EXPORTER
 
 logger = get_respan_logger(LOGGER_NAME_EXPORTER)
 
@@ -77,6 +78,16 @@ def _convert_attribute_value(value: Any) -> Optional[Dict[str, Any]]:
         return {OTLP_STRING_VALUE: value}
     if isinstance(value, bytes):
         return {OTLP_BYTES_VALUE: base64.b64encode(value).decode("ascii")}
+    if isinstance(value, dict):
+        converted = []
+        for key, item in value.items():
+            converted_item = _convert_attribute_value(item)
+            if converted_item is not None:
+                converted.append({
+                    OTLP_ATTR_KEY: str(key),
+                    OTLP_ATTR_VALUE: converted_item,
+                })
+        return {OTLP_KVLIST_VALUE: {OTLP_ARRAY_VALUES_KEY: converted}}
     if isinstance(value, (list, tuple)):
         converted = []
         for item in value:

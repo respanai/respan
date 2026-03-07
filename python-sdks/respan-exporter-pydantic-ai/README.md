@@ -14,7 +14,7 @@ Instrument [Pydantic AI](https://ai.pydantic.dev/) agents with Respan: traces, s
 pip install respan-exporter-pydantic-ai
 ```
 
-### 2. Set Environment Variables
+### 2. Set environment variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
@@ -47,12 +47,13 @@ Initialize once before calling `instrument_pydantic_ai()`:
 
 ## Quickstart
 
-### 3. Run Script
+### 3. Run script
 
 Use your Respan API key and base URL to configure the LLM client (no separate OpenAI key needed):
 
 ```python
 import os
+
 from pydantic_ai import Agent
 from respan_tracing import RespanTelemetry
 from respan_exporter_pydantic_ai import instrument_pydantic_ai
@@ -82,13 +83,13 @@ agent = Agent("openai:gpt-4o")
 instrument_pydantic_ai(agent=agent)
 ```
 
-### 4. View Dashboard
+### 4. View dashboard
 
 Traces appear in the [Respan dashboard](https://app.respan.ai) (or your configured `RESPAN_BASE_URL`). Open a trace to see the workflow → task → LLM span tree.
 
 ---
 
-## Further Reading
+## Further reading
 
 - **Examples:** [Pydantic AI Python example](https://github.com/respanai/respan-example-projects/python/tracing/pydantic-ai) — runnable integration in the Respan example projects repo
 - **Respan:** [respan.ai](https://respan.ai), [Documentation](https://docs.respan.ai)
@@ -99,6 +100,13 @@ Traces appear in the [Respan dashboard](https://app.respan.ai) (or your configur
 ---
 
 ## Dev guide
+
+### Code conventions
+
+When contributing, follow these conventions:
+
+- Use **keyword arguments** for calls with two or more parameters (e.g. `RespanTelemetry(app_name="my-app", api_key=key)`).
+- Put **imports at the top** of the file; use **absolute imports** only (no relative `from . import`).
 
 ### Setup
 
