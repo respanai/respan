@@ -9,8 +9,8 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcess
 from opentelemetry.context import Context
 from opentelemetry.semconv_ai import SpanAttributes
 
-from respan_sdk.respan_types.span_types import RespanSpanAttributes
-from respan_tracing.contexts.span import SpanLink
+from respan_sdk.respan_types.span_types import RespanSpanAttributes, SpanLink
+from respan_tracing.contexts.span import span_link_to_otel
 from respan_tracing.constants.generic_constants import SDK_PREFIX
 from respan_tracing.constants.tracing import EXPORT_FILTER_ATTR
 from respan_tracing.constants.context_constants import (
@@ -367,7 +367,7 @@ class SpanBuffer:
         otel_links: List[trace.Link] = []
         for link in links or []:
             if isinstance(link, SpanLink):
-                otel_links.append(link.to_otel_link())
+                otel_links.append(span_link_to_otel(link))
                 continue
             if isinstance(link, trace.Link):
                 otel_links.append(link)

@@ -3,16 +3,19 @@ import logging
 from typing import Any, Dict, Union
 from opentelemetry import trace
 from opentelemetry.trace.span import Span
-from pydantic import ConfigDict, Field, ValidationError
-from respan_sdk.respan_types.base_types import RespanBaseModel
-from respan_sdk.respan_types.span_types import RESPAN_SPAN_ATTRIBUTES_MAP, RespanSpanAttributes
+from pydantic import ValidationError
+from respan_sdk.respan_types.span_types import (
+    RESPAN_SPAN_ATTRIBUTES_MAP,
+    RespanSpanAttributes,
+    SpanLink,
+)
 from respan_sdk.respan_types.param_types import RespanParams
 from respan_tracing.utils.logging import get_respan_logger
 
 
 from ..constants.generic_constants import LOGGER_NAME_SPAN
 
-__all__ = ["SpanLink", "respan_span_attributes"]
+__all__ = ["SpanLink", "span_link_to_otel", "respan_span_attributes"]
 
 logger = get_respan_logger(LOGGER_NAME_SPAN)
 
@@ -36,30 +39,22 @@ def _normalize_hex_identifier(identifier: str, expected_length: int, field_name:
     return normalized
 
 
-class SpanLink(RespanBaseModel):
-    """Serializable link definition for attaching causal links to new spans."""
+def span_link_to_otel(link: SpanLink) -> trace.Link:
+    """Convert a SpanLink data model into an OpenTelemetry Link.
 
-    model_config = ConfigDict(frozen=True)
-
-    trace_id: str
-    span_id: str
-    attributes: Dict[str, Any] = Field(default_factory=dict)
-    is_remote: bool = True
-    is_sampled: bool = True
-
-    def to_otel_link(self) -> trace.Link:
-        """Convert the SDK link shape into an OpenTelemetry Link."""
-        normalized_trace_id = _normalize_hex_identifier(self.trace_id, 32, "trace_id")
-        normalized_span_id = _normalize_hex_identifier(self.span_id, 16, "span_id")
-        trace_flags = trace.TraceFlags(trace.TraceFlags.SAMPLED if self.is_sampled else 0)
-        span_context = trace.SpanContext(
-            trace_id=int(normalized_trace_id, 16),
-            span_id=int(normalized_span_id, 16),
-            is_remote=self.is_remote,
-            trace_flags=trace_flags,
-            trace_state=trace.TraceState(),
-        )
-        return trace.Link(context=span_context, attributes=self.attributes)
+    Validates hex identifiers and builds the OTel SpanContext + Link.
+    """
+    normalized_trace_id = _normalize_hex_identifier(link.trace_id, 32, "trace_id")
+    normalized_span_id = _normalize_hex_identifier(link.span_id, 16, "span_id")
+    trace_flags = trace.TraceFlags(trace.TraceFlags.SAMPLED if link.is_sampled else 0)
+    span_context = trace.SpanContext(
+        trace_id=int(normalized_trace_id, 16),
+        span_id=int(normalized_span_id, 16),
+        is_remote=link.is_remote,
+        trace_flags=trace_flags,
+        trace_state=trace.TraceState(),
+    )
+    return trace.Link(context=span_context, attributes=link.attributes)
 
 
 @contextmanager

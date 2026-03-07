@@ -11,7 +11,7 @@ from respan_sdk.constants.otlp_constants import (
     OTLP_STRING_VALUE,
     OTLP_TRACE_ID_KEY,
 )
-from respan_tracing import RespanTelemetry, SpanLink, get_client
+from respan_tracing import RespanTelemetry, SpanLink, span_link_to_otel, get_client
 from respan_tracing.core.tracer import RespanTracer
 from respan_tracing.exporters.respan import _span_to_otlp_json
 from respan_tracing.testing import InMemorySpanExporter
@@ -59,7 +59,7 @@ def _processable_attributes() -> dict[str, str]:
 
 
 def test_span_link_normalizes_prefixed_hex_ids():
-    otel_link = _resume_link().to_otel_link()
+    otel_link = span_link_to_otel(_resume_link())
 
     assert format(otel_link.context.trace_id, "032x") == "a" * 32
     assert format(otel_link.context.span_id, "016x") == "b" * 16
@@ -70,10 +70,10 @@ def test_span_link_normalizes_prefixed_hex_ids():
 
 def test_span_link_rejects_invalid_hex_ids():
     with pytest.raises(ValueError, match="trace_id must be 32 hex characters"):
-        SpanLink(trace_id="1234", span_id="b" * 16).to_otel_link()
+        span_link_to_otel(SpanLink(trace_id="1234", span_id="b" * 16))
 
     with pytest.raises(ValueError, match="span_id must be a hexadecimal string"):
-        SpanLink(trace_id="a" * 32, span_id="not-a-span-id!!!").to_otel_link()
+        span_link_to_otel(SpanLink(trace_id="a" * 32, span_id="not-a-span-id!!!"))
 
     with pytest.raises(Exception):
         SpanLink(trace_id=None, span_id="b" * 16)  # type: ignore[arg-type]
@@ -108,7 +108,7 @@ def test_span_buffer_create_span_preserves_links(clean_exporter):
 
 
 def test_span_buffer_accepts_raw_otel_links(clean_exporter):
-    raw_link = trace.Link(_resume_link().to_otel_link().context, {"link.type": "resume"})
+    raw_link = trace.Link(span_link_to_otel(_resume_link()).context, {"link.type": "resume"})
     telemetry, _ = clean_exporter
     client = get_client()
 
