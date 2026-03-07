@@ -10,6 +10,11 @@ from respan_sdk.respan_types.span_types import (
     SpanLink,
 )
 from respan_sdk.respan_types.param_types import RespanParams
+from respan_sdk.utils.data_processing.id_processing import (
+    SPAN_ID_HEX_LENGTH,
+    TRACE_ID_HEX_LENGTH,
+    normalize_hex_id,
+)
 from respan_tracing.utils.logging import get_respan_logger
 
 
@@ -20,32 +25,13 @@ __all__ = ["SpanLink", "span_link_to_otel", "respan_span_attributes"]
 logger = get_respan_logger(LOGGER_NAME_SPAN)
 
 
-def _normalize_hex_identifier(identifier: str, expected_length: int, field_name: str) -> str:
-    """Normalize a hex trace/span identifier and validate its shape."""
-    if not isinstance(identifier, str):
-        raise TypeError(f"{field_name} must be a string")
-
-    normalized = identifier.lower().removeprefix("0x")
-    if len(normalized) != expected_length:
-        raise ValueError(
-            f"{field_name} must be {expected_length} hex characters, got {len(normalized)}"
-        )
-
-    try:
-        int(normalized, 16)
-    except ValueError as exc:
-        raise ValueError(f"{field_name} must be a hexadecimal string") from exc
-
-    return normalized
-
-
 def span_link_to_otel(link: SpanLink) -> trace.Link:
     """Convert a SpanLink data model into an OpenTelemetry Link.
 
     Validates hex identifiers and builds the OTel SpanContext + Link.
     """
-    normalized_trace_id = _normalize_hex_identifier(link.trace_id, 32, "trace_id")
-    normalized_span_id = _normalize_hex_identifier(link.span_id, 16, "span_id")
+    normalized_trace_id = normalize_hex_id(link.trace_id, TRACE_ID_HEX_LENGTH, "trace_id")
+    normalized_span_id = normalize_hex_id(link.span_id, SPAN_ID_HEX_LENGTH, "span_id")
     trace_flags = trace.TraceFlags(trace.TraceFlags.SAMPLED if link.is_sampled else 0)
     span_context = trace.SpanContext(
         trace_id=int(normalized_trace_id, 16),
