@@ -17,6 +17,9 @@ logger = get_respan_logger(LOGGER_NAME_SPAN)
 
 def _normalize_hex_identifier(identifier: str, expected_length: int, field_name: str) -> str:
     """Normalize a hex trace/span identifier and validate its shape."""
+    if not isinstance(identifier, str):
+        raise TypeError(f"{field_name} must be a string")
+
     normalized = identifier.lower().removeprefix("0x")
     if len(normalized) != expected_length:
         raise ValueError(

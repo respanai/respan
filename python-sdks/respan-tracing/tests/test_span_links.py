@@ -1,4 +1,5 @@
 import pytest
+from opentelemetry import trace
 from opentelemetry.semconv_ai import SpanAttributes
 
 from respan_tracing import RespanTelemetry, SpanLink, get_client
@@ -65,6 +66,9 @@ def test_span_link_rejects_invalid_hex_ids():
     with pytest.raises(ValueError, match="span_id must be a hexadecimal string"):
         SpanLink(trace_id="a" * 32, span_id="not-a-span-id!!!").to_otel_link()
 
+    with pytest.raises(TypeError, match="trace_id must be a string"):
+        SpanLink(trace_id=None, span_id="b" * 16).to_otel_link()  # type: ignore[arg-type]
+
 
 def test_span_buffer_create_span_preserves_links(clean_exporter):
     telemetry, exporter = clean_exporter
@@ -92,6 +96,41 @@ def test_span_buffer_create_span_preserves_links(clean_exporter):
     assert len(exported_spans) == 1
     assert len(exported_spans[0].links) == 1
     assert format(exported_spans[0].links[0].context.span_id, "016x") == "b" * 16
+
+
+def test_span_buffer_accepts_raw_otel_links(clean_exporter):
+    raw_link = trace.Link(_resume_link().to_otel_link().context, {"link.type": "resume"})
+    telemetry, _ = clean_exporter
+    client = get_client()
+
+    with client.get_span_buffer("resume-trace") as buffer:
+        buffer.create_span(
+            "workflow_execution",
+            attributes=_processable_attributes(),
+            links=[raw_link],
+        )
+        buffered_span = buffer.get_all_spans()[0]
+
+    assert len(buffered_span.links) == 1
+    assert format(buffered_span.links[0].context.trace_id, "032x") == "a" * 32
+    telemetry.flush()
+
+
+def test_span_buffer_rejects_invalid_link_objects(clean_exporter):
+    telemetry, _ = clean_exporter
+    client = get_client()
+
+    with client.get_span_buffer("resume-trace") as buffer:
+        with pytest.raises(
+            TypeError,
+            match="links must contain SpanLink or opentelemetry.trace.Link instances",
+        ):
+            buffer.create_span(
+                "workflow_execution",
+                attributes=_processable_attributes(),
+                links=["invalid-link"],  # type: ignore[list-item]
+            )
+    telemetry.flush()
 
 
 def test_otlp_json_serializes_span_links(clean_exporter):
