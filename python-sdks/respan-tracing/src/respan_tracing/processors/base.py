@@ -10,9 +10,10 @@ from opentelemetry.context import Context
 from opentelemetry.semconv_ai import SpanAttributes
 
 from respan_sdk.respan_types.span_types import RespanSpanAttributes, SpanLink
+from respan_sdk.utils.data_processing.id_processing import format_span_id
 from respan_tracing.contexts.span import span_link_to_otel
 from respan_tracing.constants.generic_constants import SDK_PREFIX
-from respan_tracing.constants.tracing import EXPORT_FILTER_ATTR
+from respan_tracing.constants.tracing import EXPORT_FILTER_ATTR, SPAN_BUFFER_TRACER_NAME
 from respan_tracing.constants.context_constants import (
     TRACE_GROUP_ID_KEY,
     PARAMS_KEY
@@ -360,7 +361,7 @@ class SpanBuffer:
         Returns:
             The span ID as a hex string
         """
-        tracer = trace.get_tracer("respan.span_buffer")
+        tracer = trace.get_tracer(SPAN_BUFFER_TRACER_NAME)
         
         # Set span kind
         span_kind = kind or trace.SpanKind.INTERNAL
@@ -396,7 +397,7 @@ class SpanBuffer:
                         )
             
             # Span goes to local queue when this context exits
-            span_id = format(span.get_span_context().span_id, '016x')
+            span_id = format_span_id(span.get_span_context().span_id)
             logger.debug(f"[SpanBuffer] Created span '{span_name}' with ID {span_id}")
             
         return span_id

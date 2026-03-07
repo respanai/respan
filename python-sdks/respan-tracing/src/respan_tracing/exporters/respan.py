@@ -10,6 +10,7 @@ from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.trace import StatusCode
 
 from respan_sdk.constants import RESPAN_DOGFOOD_HEADER
+from respan_sdk.utils.data_processing.id_processing import format_trace_id, format_span_id
 from respan_sdk.constants.otlp_constants import (
     OTLP_BOOL_VALUE,
     OTLP_INT_VALUE,
@@ -122,8 +123,8 @@ def _span_to_otlp_json(span: ReadableSpan) -> Dict[str, Any]:
     """Convert a ReadableSpan (or ModifiedSpan) to OTLP JSON span dict."""
     ctx = span.get_span_context()
 
-    trace_id = format(ctx.trace_id, "032x") if ctx else ""
-    span_id = format(ctx.span_id, "016x") if ctx else ""
+    trace_id = format_trace_id(ctx.trace_id) if ctx else ""
+    span_id = format_span_id(ctx.span_id) if ctx else ""
 
     # Parent span ID
     parent_span_id = ""
@@ -131,7 +132,7 @@ def _span_to_otlp_json(span: ReadableSpan) -> Dict[str, Any]:
     if parent is not None:
         parent_sid = getattr(parent, "span_id", None)
         if parent_sid:
-            parent_span_id = format(parent_sid, "016x")
+            parent_span_id = format_span_id(parent_sid)
 
     # Timestamps as nanosecond strings
     start_time_ns = str(span.start_time) if span.start_time else "0"
@@ -175,8 +176,8 @@ def _span_to_otlp_json(span: ReadableSpan) -> Dict[str, Any]:
             continue
 
         link_dict = {
-            OTLP_TRACE_ID_KEY: format(link_ctx.trace_id, "032x"),
-            OTLP_SPAN_ID_KEY: format(link_ctx.span_id, "016x"),
+            OTLP_TRACE_ID_KEY: format_trace_id(link_ctx.trace_id),
+            OTLP_SPAN_ID_KEY: format_span_id(link_ctx.span_id),
             OTLP_ATTRIBUTES_KEY: _convert_attributes(getattr(link, "attributes", None)),
             OTLP_FLAGS_KEY: int(link_ctx.trace_flags) | (
                 OTLP_REMOTE_LINK_FLAG if getattr(link_ctx, "is_remote", False) else 0
