@@ -43,6 +43,14 @@ OTLP_START_TIME_KEY = "startTimeUnixNano"
 OTLP_END_TIME_KEY = "endTimeUnixNano"
 OTLP_STATUS_KEY = "status"
 OTLP_EVENTS_KEY = "events"
+OTLP_LINKS_KEY = "links"
+OTLP_FLAGS_KEY = "flags"
+OTLP_TRACE_STATE_KEY = "traceState"
+OTLP_DROPPED_ATTRIBUTES_COUNT_KEY = "droppedAttributesCount"
+
+# W3C trace context flag indicating the linked span is from a remote process.
+# See: https://www.w3.org/TR/trace-context/#trace-flags (bit 8 = HasRemoteParent)
+OTLP_REMOTE_LINK_FLAG = 0x100
 
 # OTLP attribute key/value pair keys
 OTLP_ATTR_KEY = "key"

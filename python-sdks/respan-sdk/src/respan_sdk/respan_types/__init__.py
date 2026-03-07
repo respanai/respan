@@ -28,6 +28,7 @@ from ._internal_types import (
     BasicEmbeddingParams,
 )
 from .exporter_session_types import ExporterSessionState, PendingToolState
+from .span_types import SpanLink
 
 # Filter types
 from .filter_types import (
@@ -84,6 +85,7 @@ __all__ = [
     "BasicEmbeddingParams",
     "ExporterSessionState",
     "PendingToolState",
+    "SpanLink",
 
     # Filter types (TypedDict versions)
     "MetricFilterParam",

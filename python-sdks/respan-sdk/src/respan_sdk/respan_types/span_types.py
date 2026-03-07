@@ -1,4 +1,26 @@
 from enum import Enum
+from typing import Any, Dict
+
+from pydantic import ConfigDict, Field
+
+from respan_sdk.respan_types.base_types import RespanBaseModel
+
+
+class SpanLink(RespanBaseModel):
+    """Serializable link definition for attaching causal links to new spans.
+
+    A lightweight data holder with no OTel dependency.  The conversion to an
+    OpenTelemetry ``trace.Link`` is performed by ``respan_tracing`` at runtime.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    trace_id: str
+    span_id: str
+    attributes: Dict[str, Any] = Field(default_factory=dict)
+    is_remote: bool = True
+    is_sampled: bool = True
+
 
 class RespanSpanAttributes(Enum):
     # Span attributes
