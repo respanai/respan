@@ -2,6 +2,15 @@ import pytest
 from opentelemetry import trace
 from opentelemetry.semconv_ai import SpanAttributes
 
+from respan_sdk.constants.otlp_constants import (
+    OTLP_ATTR_KEY,
+    OTLP_ATTR_VALUE,
+    OTLP_FLAGS_KEY,
+    OTLP_LINKS_KEY,
+    OTLP_SPAN_ID_KEY,
+    OTLP_STRING_VALUE,
+    OTLP_TRACE_ID_KEY,
+)
 from respan_tracing import RespanTelemetry, SpanLink, get_client
 from respan_tracing.core.tracer import RespanTracer
 from respan_tracing.exporters.respan import _span_to_otlp_json
@@ -66,8 +75,8 @@ def test_span_link_rejects_invalid_hex_ids():
     with pytest.raises(ValueError, match="span_id must be a hexadecimal string"):
         SpanLink(trace_id="a" * 32, span_id="not-a-span-id!!!").to_otel_link()
 
-    with pytest.raises(TypeError, match="trace_id must be a string"):
-        SpanLink(trace_id=None, span_id="b" * 16).to_otel_link()  # type: ignore[arg-type]
+    with pytest.raises(Exception):
+        SpanLink(trace_id=None, span_id="b" * 16)  # type: ignore[arg-type]
 
 
 def test_span_buffer_create_span_preserves_links(clean_exporter):
@@ -146,16 +155,16 @@ def test_otlp_json_serializes_span_links(clean_exporter):
 
     otlp_span = _span_to_otlp_json(buffered_span)
 
-    assert "links" in otlp_span
-    assert len(otlp_span["links"]) == 1
+    assert OTLP_LINKS_KEY in otlp_span
+    assert len(otlp_span[OTLP_LINKS_KEY]) == 1
 
-    link_payload = otlp_span["links"][0]
-    assert link_payload["traceId"] == "a" * 32
-    assert link_payload["spanId"] == "b" * 16
-    assert link_payload["flags"] == 257
+    link_payload = otlp_span[OTLP_LINKS_KEY][0]
+    assert link_payload[OTLP_TRACE_ID_KEY] == "a" * 32
+    assert link_payload[OTLP_SPAN_ID_KEY] == "b" * 16
+    assert link_payload[OTLP_FLAGS_KEY] == 257
 
     serialized_attributes = {
-        item["key"]: item["value"]["stringValue"]
+        item[OTLP_ATTR_KEY]: item[OTLP_ATTR_VALUE][OTLP_STRING_VALUE]
         for item in link_payload["attributes"]
     }
     assert serialized_attributes == {"link.type": "resume"}

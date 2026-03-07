@@ -30,6 +30,11 @@ from respan_sdk.constants.otlp_constants import (
     OTLP_ATTRIBUTES_KEY,
     OTLP_STATUS_KEY,
     OTLP_EVENTS_KEY,
+    OTLP_LINKS_KEY,
+    OTLP_FLAGS_KEY,
+    OTLP_TRACE_STATE_KEY,
+    OTLP_DROPPED_ATTRIBUTES_COUNT_KEY,
+    OTLP_REMOTE_LINK_FLAG,
     OTLP_RESOURCE_SPANS_KEY,
     OTLP_SCOPE_SPANS_KEY,
     OTLP_RESOURCE_KEY,
@@ -48,12 +53,6 @@ from ..utils.preprocessing.span_processing import is_root_span_candidate
 from ..constants.generic_constants import LOGGER_NAME_EXPORTER
 
 logger = get_respan_logger(LOGGER_NAME_EXPORTER)
-
-_OTLP_REMOTE_LINK_FLAG = 0x100
-_OTLP_LINKS_KEY = "links"
-_OTLP_TRACE_STATE_KEY = "traceState"
-_OTLP_FLAGS_KEY = "flags"
-_OTLP_DROPPED_ATTRIBUTES_COUNT_KEY = "droppedAttributesCount"
 
 
 class ModifiedSpan:
@@ -179,8 +178,8 @@ def _span_to_otlp_json(span: ReadableSpan) -> Dict[str, Any]:
             OTLP_TRACE_ID_KEY: format(link_ctx.trace_id, "032x"),
             OTLP_SPAN_ID_KEY: format(link_ctx.span_id, "016x"),
             OTLP_ATTRIBUTES_KEY: _convert_attributes(getattr(link, "attributes", None)),
-            _OTLP_FLAGS_KEY: int(link_ctx.trace_flags) | (
-                _OTLP_REMOTE_LINK_FLAG if getattr(link_ctx, "is_remote", False) else 0
+            OTLP_FLAGS_KEY: int(link_ctx.trace_flags) | (
+                OTLP_REMOTE_LINK_FLAG if getattr(link_ctx, "is_remote", False) else 0
             ),
         }
 
@@ -188,11 +187,11 @@ def _span_to_otlp_json(span: ReadableSpan) -> Dict[str, Any]:
         if trace_state:
             trace_state_header = trace_state.to_header()
             if trace_state_header:
-                link_dict[_OTLP_TRACE_STATE_KEY] = trace_state_header
+                link_dict[OTLP_TRACE_STATE_KEY] = trace_state_header
 
         dropped_attributes = getattr(link, "dropped_attributes", 0) or 0
         if dropped_attributes:
-            link_dict[_OTLP_DROPPED_ATTRIBUTES_COUNT_KEY] = dropped_attributes
+            link_dict[OTLP_DROPPED_ATTRIBUTES_COUNT_KEY] = dropped_attributes
 
         links.append(link_dict)
 
@@ -213,7 +212,7 @@ def _span_to_otlp_json(span: ReadableSpan) -> Dict[str, Any]:
     if events:
         result[OTLP_EVENTS_KEY] = events
     if links:
-        result[_OTLP_LINKS_KEY] = links
+        result[OTLP_LINKS_KEY] = links
 
     return result
 

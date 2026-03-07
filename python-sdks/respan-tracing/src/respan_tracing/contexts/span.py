@@ -1,12 +1,12 @@
 from contextlib import contextmanager
-from dataclasses import dataclass, field
 import logging
 from typing import Any, Dict, Union
 from opentelemetry import trace
 from opentelemetry.trace.span import Span
+from pydantic import ConfigDict, Field, ValidationError
+from respan_sdk.respan_types.base_types import RespanBaseModel
 from respan_sdk.respan_types.span_types import RESPAN_SPAN_ATTRIBUTES_MAP, RespanSpanAttributes
 from respan_sdk.respan_types.param_types import RespanParams
-from pydantic import ValidationError
 from respan_tracing.utils.logging import get_respan_logger
 
 
@@ -36,13 +36,14 @@ def _normalize_hex_identifier(identifier: str, expected_length: int, field_name:
     return normalized
 
 
-@dataclass(frozen=True)
-class SpanLink:
+class SpanLink(RespanBaseModel):
     """Serializable link definition for attaching causal links to new spans."""
+
+    model_config = ConfigDict(frozen=True)
 
     trace_id: str
     span_id: str
-    attributes: Dict[str, Any] = field(default_factory=dict)
+    attributes: Dict[str, Any] = Field(default_factory=dict)
     is_remote: bool = True
     is_sampled: bool = True
 
