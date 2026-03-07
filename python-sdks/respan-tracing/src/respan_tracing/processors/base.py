@@ -1,14 +1,19 @@
 import json
-from typing import Optional, Callable, Dict, Any, List
-from contextvars import ContextVar
 import logging
+from contextvars import ContextVar
+from typing import Any, Callable, Dict, List, Optional
 
-from opentelemetry import context as context_api, trace
+from opentelemetry import context, trace
 from opentelemetry.sdk.trace import SpanProcessor, ReadableSpan
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor, SpanExporter, SpanExportResult
 from opentelemetry.context import Context
 from opentelemetry.semconv_ai import SpanAttributes
 
+from respan_sdk.constants.llm_logging import (
+    LOG_TYPE_AGENT,
+    LOG_TYPE_TASK,
+    LOG_TYPE_TOOL,
+)
 from respan_sdk.respan_types.span_types import RespanSpanAttributes
 from respan_tracing.constants.generic_constants import SDK_PREFIX
 from respan_tracing.constants.tracing import EXPORT_FILTER_ATTR
@@ -21,6 +26,28 @@ from respan_tracing.utils.preprocessing.span_processing import is_processable_sp
 from respan_tracing.utils.context import get_entity_path
 
 logger = logging.getLogger(__name__)
+
+
+def _infer_respan_log_type_for_span(span: ReadableSpan) -> Optional[str]:
+    """Infer a valid Respan log type for spans emitted by external instrumentors."""
+    existing_log_type = span.attributes.get(RespanSpanAttributes.LOG_TYPE.value)
+    if existing_log_type:
+        return str(existing_log_type)
+
+    if span.attributes.get("gen_ai.agent.name"):
+        return LOG_TYPE_AGENT
+
+    if span.attributes.get("gen_ai.tool.name"):
+        return LOG_TYPE_TOOL
+
+    if (
+        span.attributes.get("tools")
+        and not span.attributes.get(SpanAttributes.LLM_REQUEST_TYPE)
+        and span.attributes.get("gen_ai.operation.name") is None
+    ):
+        return LOG_TYPE_TASK
+
+    return None
 
 
 class RespanSpanProcessor:
@@ -56,27 +83,34 @@ class RespanSpanProcessor:
             span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_PATH, entity_path)
 
         # Add workflow name if present in context
-        workflow_name = context_api.get_value(SpanAttributes.TRACELOOP_ENTITY_NAME)
+        workflow_name = context.get_value(SpanAttributes.TRACELOOP_ENTITY_NAME)
         if workflow_name:
             span.set_attribute(SpanAttributes.TRACELOOP_WORKFLOW_NAME, workflow_name)
 
         # Add entity path if present in context (for redundancy)
-        entity_path_from_context = context_api.get_value(SpanAttributes.TRACELOOP_ENTITY_PATH)
+        entity_path_from_context = context.get_value(SpanAttributes.TRACELOOP_ENTITY_PATH)
         if entity_path_from_context:
             span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_PATH, entity_path_from_context)
 
         # Add trace group identifier if present
-        trace_group_id = context_api.get_value(TRACE_GROUP_ID_KEY)
+        trace_group_id = context.get_value(TRACE_GROUP_ID_KEY)
         if trace_group_id:
             span.set_attribute(
                 RespanSpanAttributes.RESPAN_TRACE_GROUP_ID.value, trace_group_id
             )
 
         # Add custom parameters if present
-        respan_params = context_api.get_value(PARAMS_KEY)
+        respan_params = context.get_value(PARAMS_KEY)
         if respan_params and isinstance(respan_params, dict):
             for key, value in respan_params.items():
                 span.set_attribute(f"{SDK_PREFIX}.{key}", value)
+
+        inferred_log_type = _infer_respan_log_type_for_span(span=span)
+        if inferred_log_type:
+            span.set_attribute(
+                RespanSpanAttributes.LOG_TYPE.value,
+                inferred_log_type,
+            )
 
         # Call original processor's on_start
         self.processor.on_start(span, parent_context)
