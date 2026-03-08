@@ -1,9 +1,8 @@
 import copy
-import importlib
+import importlib.metadata
 import json
 import logging
 import traceback
-from dataclasses import dataclass
 from typing import Optional, Set, Callable
 
 from ..instruments import Instruments
@@ -11,254 +10,144 @@ from ..instruments import Instruments
 
 logger = logging.getLogger(__name__)
 
+ENTRY_POINT_GROUP = "opentelemetry_instrumentor"
 
-@dataclass(frozen=True)
-class InstrumentConfig:
-    """Configuration for a single OTEL instrumentation.
-
-    Adding a new instrumentation = one entry in INSTRUMENT_REGISTRY.
-    """
-
-    package: Optional[str]
-    module: str
-    class_name: str
-    post_init_hooks: tuple = ()
-
-
-# ---------------------------------------------------------------------------
-# Registry — one line per instrumentation, no boilerplate functions
-# ---------------------------------------------------------------------------
-
-INSTRUMENT_REGISTRY: dict[Instruments, InstrumentConfig] = {
-    # AI/ML Libraries
-    Instruments.OPENAI: InstrumentConfig(
-        package="openai",
-        module="opentelemetry.instrumentation.openai",
-        class_name="OpenAIInstrumentor",
-        post_init_hooks=("_patch_chat_prompt_capture",),
-    ),
-    Instruments.ANTHROPIC: InstrumentConfig(
-        package="anthropic",
-        module="opentelemetry.instrumentation.anthropic",
-        class_name="AnthropicInstrumentor",
-    ),
-    Instruments.COHERE: InstrumentConfig(
-        package="cohere",
-        module="opentelemetry.instrumentation.cohere",
-        class_name="CohereInstrumentor",
-    ),
-    Instruments.MISTRAL: InstrumentConfig(
-        package="mistralai",
-        module="opentelemetry.instrumentation.mistralai",
-        class_name="MistralAiInstrumentor",
-    ),
-    Instruments.OLLAMA: InstrumentConfig(
-        package="ollama",
-        module="opentelemetry.instrumentation.ollama",
-        class_name="OllamaInstrumentor",
-    ),
-    Instruments.GROQ: InstrumentConfig(
-        package="groq",
-        module="opentelemetry.instrumentation.groq",
-        class_name="GroqInstrumentor",
-    ),
-    Instruments.TOGETHER: InstrumentConfig(
-        package="together",
-        module="opentelemetry.instrumentation.together",
-        class_name="TogetherInstrumentor",
-    ),
-    Instruments.REPLICATE: InstrumentConfig(
-        package="replicate",
-        module="opentelemetry.instrumentation.replicate",
-        class_name="ReplicateInstrumentor",
-    ),
-    Instruments.TRANSFORMERS: InstrumentConfig(
-        package="transformers",
-        module="opentelemetry.instrumentation.transformers",
-        class_name="TransformersInstrumentor",
-    ),
-
-    # Cloud AI Services
-    Instruments.BEDROCK: InstrumentConfig(
-        package="boto3",
-        module="opentelemetry.instrumentation.bedrock",
-        class_name="BedrockInstrumentor",
-    ),
-    Instruments.SAGEMAKER: InstrumentConfig(
-        package="boto3",
-        module="opentelemetry.instrumentation.sagemaker",
-        class_name="SageMakerInstrumentor",
-    ),
-    Instruments.VERTEXAI: InstrumentConfig(
-        package="google.cloud.aiplatform",
-        module="opentelemetry.instrumentation.vertexai",
-        class_name="VertexAIInstrumentor",
-    ),
-    Instruments.GOOGLE_GENERATIVEAI: InstrumentConfig(
-        package="google.generativeai",
-        module="opentelemetry.instrumentation.google_generativeai",
-        class_name="GoogleGenerativeAiInstrumentor",
-    ),
-    Instruments.WATSONX: InstrumentConfig(
-        package="ibm_watsonx_ai",
-        module="opentelemetry.instrumentation.watsonx",
-        class_name="WatsonxInstrumentor",
-    ),
-    Instruments.ALEPHALPHA: InstrumentConfig(
-        package="aleph_alpha_client",
-        module="opentelemetry.instrumentation.alephalpha",
-        class_name="AlephAlphaInstrumentor",
-    ),
-
-    # Vector Databases
-    Instruments.PINECONE: InstrumentConfig(
-        package="pinecone",
-        module="opentelemetry.instrumentation.pinecone",
-        class_name="PineconeInstrumentor",
-    ),
-    Instruments.QDRANT: InstrumentConfig(
-        package="qdrant_client",
-        module="opentelemetry.instrumentation.qdrant",
-        class_name="QdrantInstrumentor",
-    ),
-    Instruments.CHROMA: InstrumentConfig(
-        package="chromadb",
-        module="opentelemetry.instrumentation.chromadb",
-        class_name="ChromaInstrumentor",
-    ),
-    Instruments.MILVUS: InstrumentConfig(
-        package="pymilvus",
-        module="opentelemetry.instrumentation.milvus",
-        class_name="MilvusInstrumentor",
-    ),
-    Instruments.WEAVIATE: InstrumentConfig(
-        package="weaviate",
-        module="opentelemetry.instrumentation.weaviate",
-        class_name="WeaviateInstrumentor",
-    ),
-    Instruments.LANCEDB: InstrumentConfig(
-        package="lancedb",
-        module="opentelemetry.instrumentation.lancedb",
-        class_name="LanceDBInstrumentor",
-    ),
-    Instruments.MARQO: InstrumentConfig(
-        package="marqo",
-        module="opentelemetry.instrumentation.marqo",
-        class_name="MarqoInstrumentor",
-    ),
-
-    # Frameworks
-    Instruments.LANGCHAIN: InstrumentConfig(
-        package="langchain",
-        module="opentelemetry.instrumentation.langchain",
-        class_name="LangchainInstrumentor",
-    ),
-    Instruments.LLAMA_INDEX: InstrumentConfig(
-        package="llama_index",
-        module="opentelemetry.instrumentation.llama_index",
-        class_name="LlamaIndexInstrumentor",
-    ),
-    Instruments.HAYSTACK: InstrumentConfig(
-        package="haystack",
-        module="opentelemetry.instrumentation.haystack",
-        class_name="HaystackInstrumentor",
-    ),
-    Instruments.CREW: InstrumentConfig(
-        package="crewai",
-        module="opentelemetry.instrumentation.crewai",
-        class_name="CrewAIInstrumentor",
-    ),
-    Instruments.MCP: InstrumentConfig(
-        package="mcp",
-        module="opentelemetry.instrumentation.mcp",
-        class_name="MCPInstrumentor",
-    ),
-
-    # Infrastructure
-    Instruments.CELERY: InstrumentConfig(
-        package="celery",
-        module="opentelemetry.instrumentation.celery",
-        class_name="CeleryInstrumentor",
-    ),
-    Instruments.DJANGO: InstrumentConfig(
-        package="django",
-        module="opentelemetry.instrumentation.django",
-        class_name="DjangoInstrumentor",
-    ),
-    Instruments.FASTAPI: InstrumentConfig(
-        package="fastapi",
-        module="opentelemetry.instrumentation.fastapi",
-        class_name="FastAPIInstrumentor",
-    ),
-    Instruments.FLASK: InstrumentConfig(
-        package="flask",
-        module="opentelemetry.instrumentation.flask",
-        class_name="FlaskInstrumentor",
-    ),
-    Instruments.SQLALCHEMY: InstrumentConfig(
-        package="sqlalchemy",
-        module="opentelemetry.instrumentation.sqlalchemy",
-        class_name="SQLAlchemyInstrumentor",
-    ),
-    Instruments.PSYCOPG2: InstrumentConfig(
-        package="psycopg2",
-        module="opentelemetry.instrumentation.psycopg2",
-        class_name="Psycopg2Instrumentor",
-    ),
-    Instruments.AIOHTTP_CLIENT: InstrumentConfig(
-        package="aiohttp",
-        module="opentelemetry.instrumentation.aiohttp_client",
-        class_name="AioHttpClientInstrumentor",
-    ),
-    Instruments.GRPC: InstrumentConfig(
-        package="grpc",
-        module="opentelemetry.instrumentation.grpc",
-        class_name="GrpcInstrumentorClient",
-    ),
-    Instruments.REDIS: InstrumentConfig(
-        package="redis",
-        module="opentelemetry.instrumentation.redis",
-        class_name="RedisInstrumentor",
-    ),
-    Instruments.REQUESTS: InstrumentConfig(
-        package="requests",
-        module="opentelemetry.instrumentation.requests",
-        class_name="RequestsInstrumentor",
-    ),
-    Instruments.URLLIB3: InstrumentConfig(
-        package="urllib3",
-        module="opentelemetry.instrumentation.urllib3",
-        class_name="URLLib3Instrumentor",
-    ),
-    Instruments.PYMYSQL: InstrumentConfig(
-        package="pymysql",
-        module="opentelemetry.instrumentation.pymysql",
-        class_name="PyMySQLInstrumentor",
-    ),
-    Instruments.THREADING: InstrumentConfig(
-        package=None,  # stdlib, always available
-        module="opentelemetry.instrumentation.threading",
-        class_name="ThreadingInstrumentor",
-    ),
+# Map Instruments enum values to entry point names.
+# Only needed when they differ (most match by convention).
+_ENUM_TO_ENTRY_POINT: dict[str, str] = {
+    "grpc": "grpc_client",
+    "aiohttp_client": "aiohttp_client",
 }
 
-
-# ---------------------------------------------------------------------------
-# Post-init hooks — special-case patches that run after instrument()
-# ---------------------------------------------------------------------------
-
+# Post-init hooks keyed by entry point name.
+# These run after instrument() for specific instrumentors.
 _POST_INIT_HOOKS: dict[str, Callable] = {}
 
 
 def _register_hook(name: str):
-    """Decorator to register a post-init hook by name."""
+    """Decorator to register a post-init hook by entry point name."""
     def decorator(fn):
         _POST_INIT_HOOKS[name] = fn
         return fn
     return decorator
 
 
-@_register_hook("_patch_chat_prompt_capture")
+# ---------------------------------------------------------------------------
+# Auto-discovery
+# ---------------------------------------------------------------------------
+
+def _discover_instrumentors() -> dict[str, object]:
+    """Discover all installed OTEL instrumentors via entry points.
+
+    Returns:
+        Dict mapping entry point name to the entry point object.
+    """
+    try:
+        eps = importlib.metadata.entry_points(group=ENTRY_POINT_GROUP)
+        return {ep.name: ep for ep in eps}
+    except Exception as e:
+        logger.warning(f"Failed to discover instrumentors: {e}")
+        return {}
+
+
+def _enum_to_entry_point_name(instrument: Instruments) -> str:
+    """Convert an Instruments enum to the entry point name."""
+    return _ENUM_TO_ENTRY_POINT.get(instrument.value, instrument.value)
+
+
+def _instrument_entry_point(ep, ep_name: str) -> bool:
+    """Load and instrument a single entry point.
+
+    Returns True if instrumentation succeeded.
+    """
+    try:
+        instrumentor_cls = ep.load()
+        instrumentor = instrumentor_cls()
+        if not instrumentor.is_instrumented_by_opentelemetry:
+            instrumentor.instrument()
+
+        hook = _POST_INIT_HOOKS.get(ep_name)
+        if hook is not None:
+            hook()
+
+        return True
+    except Exception as e:
+        logger.error(f"Failed to initialize {ep_name} instrumentation: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def init_instrumentations(
+    instruments: Optional[Set[Instruments]] = None,
+    block_instruments: Optional[Set[Instruments]] = None,
+) -> bool:
+    """
+    Initialize OpenTelemetry instrumentations via entry point auto-discovery.
+
+    Every installed ``opentelemetry-instrumentation-*`` package registers an
+    entry point under the ``opentelemetry_instrumentor`` group.  This function
+    discovers all of them at runtime and instruments each one — no manual
+    registry needed.
+
+    Args:
+        instruments: If provided, only these instruments are enabled.
+                     If None (default), **all** discovered instrumentors run.
+        block_instruments: Instruments to explicitly skip.
+
+    Returns:
+        True if at least one instrumentor was successfully initialized.
+
+    Note:
+        THREADING is always auto-included (unless explicitly blocked) because
+        it is critical for OTel context propagation across threads.
+    """
+    block_instruments = block_instruments or set()
+    block_names = {_enum_to_entry_point_name(i) for i in block_instruments}
+
+    discovered = _discover_instrumentors()
+
+    if instruments is not None:
+        # Explicit set — resolve enum values to entry point names
+        allowed_names = {_enum_to_entry_point_name(i) for i in instruments}
+        # Always include threading unless blocked
+        if Instruments.THREADING not in block_instruments:
+            allowed_names.add(_enum_to_entry_point_name(Instruments.THREADING))
+    else:
+        # Auto-discover: instrument everything found
+        allowed_names = set(discovered.keys())
+
+    # Remove blocked
+    allowed_names -= block_names
+
+    instrument_count = 0
+
+    for name in allowed_names:
+        ep = discovered.get(name)
+        if ep is None:
+            # Entry point not installed — skip silently
+            continue
+        try:
+            if _instrument_entry_point(ep, name):
+                instrument_count += 1
+        except Exception as e:
+            logger.warning(f"Failed to initialize {name} instrumentation: {e}")
+
+    if instrument_count == 0:
+        logger.warning("No instrumentations were successfully initialized")
+        return False
+
+    logger.info(f"Successfully initialized {instrument_count} instrumentations")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Post-init hooks — special-case patches that run after instrument()
+# ---------------------------------------------------------------------------
+
+@_register_hook("openai")
 def _patch_chat_prompt_capture():
     """
     Replace the async chat _handle_request with a sync version.
@@ -409,99 +298,3 @@ def _patch_chat_prompt_capture():
 
     except Exception as e:
         logger.warning(f"respan-tracing: failed to patch chat prompt capture: {e}")
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def is_package_installed(package_name: str) -> bool:
-    """Check if a package is installed."""
-    if package_name is None:
-        return True  # stdlib (e.g., threading)
-    try:
-        __import__(package_name)
-        return True
-    except ImportError:
-        return False
-
-
-def init_instrumentations(
-    instruments: Optional[Set[Instruments]] = None,
-    block_instruments: Optional[Set[Instruments]] = None,
-) -> bool:
-    """
-    Initialize OpenTelemetry instrumentations for specified libraries.
-
-    Args:
-        instruments: Set of instruments to enable. If None, enables all available.
-        block_instruments: Set of instruments to explicitly block.
-
-    Returns:
-        bool: True if at least one instrument was successfully initialized.
-
-    Note:
-        THREADING instrumentation is automatically enabled (unless explicitly blocked)
-        because it's critical for context propagation across threads. To disable it,
-        use: block_instruments={Instruments.THREADING}
-    """
-    block_instruments = block_instruments or set()
-
-    # Default to all instruments if none specified
-    if instruments is None:
-        instruments = set(Instruments)
-    else:
-        # If user specified instruments, automatically include THREADING
-        # unless they explicitly blocked it
-        if Instruments.THREADING not in block_instruments:
-            instruments = instruments | {Instruments.THREADING}
-
-    # Remove blocked instruments
-    instruments = instruments - block_instruments
-
-    instrument_count = 0
-
-    for instrument in instruments:
-        try:
-            if _init_single_instrument(instrument):
-                instrument_count += 1
-        except Exception as e:
-            logger.warning(f"Failed to initialize {instrument.value} instrumentation: {e}")
-
-    if instrument_count == 0:
-        logger.warning("No instrumentations were successfully initialized")
-        return False
-
-    logger.info(f"Successfully initialized {instrument_count} instrumentations")
-    return True
-
-
-def _init_single_instrument(instrument: Instruments) -> bool:
-    """Initialize a single instrument using the registry."""
-    config = INSTRUMENT_REGISTRY.get(instrument)
-    if config is None:
-        logger.warning(f"No registry entry for instrument: {instrument}")
-        return False
-
-    if not is_package_installed(config.package):
-        return False
-
-    try:
-        module = importlib.import_module(config.module)
-        instrumentor_cls = getattr(module, config.class_name)
-        instrumentor = instrumentor_cls()
-        if not instrumentor.is_instrumented_by_opentelemetry:
-            instrumentor.instrument()
-
-        # Run post-init hooks
-        for hook_name in config.post_init_hooks:
-            hook = _POST_INIT_HOOKS.get(hook_name)
-            if hook is not None:
-                hook()
-            else:
-                logger.warning(f"Post-init hook '{hook_name}' not found for {instrument.value}")
-
-        return True
-    except Exception as e:
-        logger.error(f"Failed to initialize {instrument.value} instrumentation: {e}")
-        return False
