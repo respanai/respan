@@ -6,7 +6,7 @@ This tutorial demonstrates how to build and trace complex LLM workflows using Re
 
 ## Prerequisites
 
-- Python 3.7+
+- Python 3.11+
 - OpenAI API key
 - Anthropic API key
 - Respan API key, you can get your API key from the [API keys page](https://platform.respan.co/platform/api/api-keys)
@@ -512,25 +512,31 @@ Instrumentation is the process of automatically adding telemetry (traces/spans) 
 - Latency and timing
 - Errors and exceptions
 
-### Default Behavior: All Instrumentations Enabled
+### Default Behavior: Auto-Discovery
 
-**By default, Respan tracing attempts to enable ALL available instrumentations.**
+**By default, Respan tracing auto-discovers and enables ALL installed instrumentations.**
+
+The SDK scans for installed `opentelemetry-instrumentation-*` packages at runtime using [OpenTelemetry entry points](https://opentelemetry.io/docs/zero-code/python/). Adding a new instrumentation is just `pip install`:
+
+```bash
+pip install opentelemetry-instrumentation-celery  # That's it — auto-enabled on next init
+```
 
 ```python
 from respan_tracing import RespanTelemetry
 
-# This enables ALL available instrumentations (if packages are installed)
+# This discovers and enables ALL installed instrumentations
 telemetry = RespanTelemetry(
     app_name="my-app",
     api_key="respan-xxx"
 )
 ```
 
-If a library is installed in your environment, its instrumentation will be automatically enabled. If not installed, it's silently skipped (no errors).
+If a package is installed, its instrumentation is automatically enabled. If not installed, it's silently skipped (no errors). No SDK changes or enum updates needed.
 
 ### Available Instrumentations
 
-The SDK supports instrumentation for:
+The SDK uses **OpenTelemetry entry point auto-discovery** — any installed `opentelemetry-instrumentation-*` package is automatically detected and enabled at runtime. The list below shows commonly used instrumentations, but any OTEL-compatible instrumentation package will work.
 
 **AI/ML Libraries:**
 - `openai` - OpenAI API
@@ -568,6 +574,14 @@ The SDK supports instrumentation for:
 - `mcp` - Model Context Protocol
 
 **Infrastructure:**
+- `celery` - Celery task queue
+- `django` - Django web framework
+- `fastapi` - FastAPI web framework
+- `flask` - Flask web framework
+- `sqlalchemy` - SQLAlchemy ORM
+- `psycopg2` - PostgreSQL database client
+- `aiohttp_client` - aiohttp HTTP client
+- `grpc` - gRPC client
 - `redis` - Redis
 - `requests` - HTTP requests library
 - `urllib3` - urllib3 HTTP client
