@@ -68,8 +68,8 @@ class TestEnumToEntryPoint:
         """GRPC maps to grpc_client entry point."""
         assert _enum_to_entry_point_name(Instruments.GRPC) == "grpc_client"
 
-    def test_aiohttp_override(self):
-        """AIOHTTP_CLIENT maps to aiohttp_client entry point."""
+    def test_aiohttp_direct_match(self):
+        """AIOHTTP_CLIENT maps directly — enum value equals entry point name."""
         assert _enum_to_entry_point_name(Instruments.AIOHTTP_CLIENT) == "aiohttp_client"
 
 

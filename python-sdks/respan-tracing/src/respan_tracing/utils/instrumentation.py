@@ -16,7 +16,6 @@ ENTRY_POINT_GROUP = "opentelemetry_instrumentor"
 # Only needed when they differ (most match by convention).
 _ENUM_TO_ENTRY_POINT: dict[str, str] = {
     "grpc": "grpc_client",
-    "aiohttp_client": "aiohttp_client",
 }
 
 # Post-init hooks keyed by entry point name.
