@@ -15,6 +15,11 @@ from respan_tracing.utils.instrumentation import (
     is_package_installed,
 )
 
+_MOD = "respan_tracing.utils.instrumentation"
+_MOCK_IS_INSTALLED = f"{_MOD}.is_package_installed"
+_MOCK_IMPORT_MODULE = f"{_MOD}.importlib.import_module"
+_MOCK_INIT_SINGLE = f"{_MOD}._init_single_instrument"
+
 
 class TestInstrumentRegistry:
     """Registry completeness and correctness."""
@@ -114,7 +119,7 @@ class TestInitSingleInstrument:
     def test_missing_package_returns_false(self):
         """If the package isn't installed, returns False."""
         with patch(
-            "respan_tracing.utils.instrumentation.is_package_installed",
+            _MOCK_IS_INSTALLED,
             return_value=False,
         ):
             result = _init_single_instrument(Instruments.CELERY)
@@ -128,10 +133,10 @@ class TestInitSingleInstrument:
         mock_module.CeleryInstrumentor.return_value = mock_instrumentor
 
         with patch(
-            "respan_tracing.utils.instrumentation.is_package_installed",
+            _MOCK_IS_INSTALLED,
             return_value=True,
         ), patch(
-            "respan_tracing.utils.instrumentation.importlib.import_module",
+            _MOCK_IMPORT_MODULE,
             return_value=mock_module,
         ):
             result = _init_single_instrument(Instruments.CELERY)
@@ -147,10 +152,10 @@ class TestInitSingleInstrument:
         mock_module.CeleryInstrumentor.return_value = mock_instrumentor
 
         with patch(
-            "respan_tracing.utils.instrumentation.is_package_installed",
+            _MOCK_IS_INSTALLED,
             return_value=True,
         ), patch(
-            "respan_tracing.utils.instrumentation.importlib.import_module",
+            _MOCK_IMPORT_MODULE,
             return_value=mock_module,
         ):
             result = _init_single_instrument(Instruments.CELERY)
@@ -161,10 +166,10 @@ class TestInitSingleInstrument:
     def test_import_error_returns_false(self):
         """If the OTEL instrumentation package isn't installed, returns False."""
         with patch(
-            "respan_tracing.utils.instrumentation.is_package_installed",
+            _MOCK_IS_INSTALLED,
             return_value=True,
         ), patch(
-            "respan_tracing.utils.instrumentation.importlib.import_module",
+            _MOCK_IMPORT_MODULE,
             side_effect=ImportError("No module"),
         ):
             result = _init_single_instrument(Instruments.CELERY)
@@ -180,10 +185,10 @@ class TestInitSingleInstrument:
         mock_hook = MagicMock()
 
         with patch(
-            "respan_tracing.utils.instrumentation.is_package_installed",
+            _MOCK_IS_INSTALLED,
             return_value=True,
         ), patch(
-            "respan_tracing.utils.instrumentation.importlib.import_module",
+            _MOCK_IMPORT_MODULE,
             return_value=mock_module,
         ), patch.dict(_POST_INIT_HOOKS, {"_patch_chat_prompt_capture": mock_hook}):
             result = _init_single_instrument(Instruments.OPENAI)
@@ -199,7 +204,7 @@ class TestInitSingleInstrument:
         mock_module.ThreadingInstrumentor.return_value = mock_instrumentor
 
         with patch(
-            "respan_tracing.utils.instrumentation.importlib.import_module",
+            _MOCK_IMPORT_MODULE,
             return_value=mock_module,
         ):
             result = _init_single_instrument(Instruments.THREADING)
@@ -220,7 +225,7 @@ class TestInitInstrumentations:
             return False  # pretend nothing installed
 
         with patch(
-            "respan_tracing.utils.instrumentation._init_single_instrument",
+            _MOCK_INIT_SINGLE,
             side_effect=track_init,
         ):
             init_instrumentations(instruments={Instruments.OPENAI})
@@ -237,7 +242,7 @@ class TestInitInstrumentations:
             return False
 
         with patch(
-            "respan_tracing.utils.instrumentation._init_single_instrument",
+            _MOCK_INIT_SINGLE,
             side_effect=track_init,
         ):
             init_instrumentations(
@@ -256,7 +261,7 @@ class TestInitInstrumentations:
             return False
 
         with patch(
-            "respan_tracing.utils.instrumentation._init_single_instrument",
+            _MOCK_INIT_SINGLE,
             side_effect=track_init,
         ):
             init_instrumentations(
@@ -275,7 +280,7 @@ class TestInitInstrumentations:
             return True
 
         with patch(
-            "respan_tracing.utils.instrumentation._init_single_instrument",
+            _MOCK_INIT_SINGLE,
             side_effect=track_init,
         ):
             result = init_instrumentations(instruments=None)
@@ -286,7 +291,7 @@ class TestInitInstrumentations:
     def test_returns_false_when_none_initialized(self):
         """Returns False if no instruments succeeded."""
         with patch(
-            "respan_tracing.utils.instrumentation._init_single_instrument",
+            _MOCK_INIT_SINGLE,
             return_value=False,
         ):
             result = init_instrumentations(instruments={Instruments.OPENAI})
@@ -305,7 +310,7 @@ class TestInitInstrumentations:
             return True
 
         with patch(
-            "respan_tracing.utils.instrumentation._init_single_instrument",
+            _MOCK_INIT_SINGLE,
             side_effect=failing_then_success,
         ):
             result = init_instrumentations(
