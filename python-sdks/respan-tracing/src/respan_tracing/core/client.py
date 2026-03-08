@@ -1,13 +1,20 @@
-from typing import Any, Dict, Optional, Union
+import json
+from contextlib import contextmanager
+from typing import Any, Callable, Dict, Generator, List, Optional, Union
 from opentelemetry import trace, context as context_api
 from opentelemetry.trace.span import Span
 from opentelemetry.trace import Status, StatusCode
+from opentelemetry.semconv_ai import TraceloopSpanKindValues, SpanAttributes
 
-from respan_sdk.respan_types.span_types import RESPAN_SPAN_ATTRIBUTES_MAP, RespanSpanAttributes
+from respan_sdk import FilterParamDict
+from respan_sdk.constants.llm_logging import LogMethodChoices
+from respan_sdk.respan_types.span_types import RESPAN_SPAN_ATTRIBUTES_MAP, RespanSpanAttributes, SpanLink
 from respan_sdk.respan_types.param_types import RespanParams
 from pydantic import ValidationError
 
 from .tracer import RespanTracer
+from ..contexts.span import span_link_to_otel, consume_span_links
+from ..constants.tracing import EXPORT_FILTER_ATTR
 from ..processors import SpanBuffer
 from ..utils.logging import get_respan_logger
 
@@ -299,7 +306,138 @@ class RespanClient:
             ```
         """
         return self._tracer.get_tracer()
-    
+
+    # Type alias for span links parameter
+    LinksParam = Optional[Union[List[SpanLink], Callable[[], List[SpanLink]]]]
+
+    @contextmanager
+    def start_span(
+        self,
+        name: str,
+        kind: str = "task",
+        processors: Optional[Union[str, List[str]]] = None,
+        export_filter: Optional[FilterParamDict] = None,
+        links: "RespanClient.LinksParam" = None,
+        version: Optional[int] = None,
+    ) -> Generator[Span, None, None]:
+        """
+        Context manager for creating spans with full Respan metadata.
+
+        This is the imperative equivalent of the @workflow/@task/@agent/@tool
+        decorators. Use it when the span name or kind must be determined at
+        runtime (e.g., dynamic task loops).
+
+        Handles all the same concerns as the decorators:
+        - ``processors`` attribute for FilteringSpanProcessor routing
+        - ``TRACELOOP_ENTITY_NAME`` attribute and OTel context propagation
+        - ``TRACELOOP_WORKFLOW_NAME`` inheritance for child spans
+        - Span links (static list or callable)
+        - Error recording and status propagation
+
+        Args:
+            name: Span name (equivalent to the decorator ``name`` parameter).
+            kind: Span kind — ``"workflow"``, ``"task"``, ``"agent"``, or
+                ``"tool"``. Controls context propagation behavior (workflow/agent
+                kinds propagate entity name to children). Defaults to ``"task"``.
+            processors: Processor name(s) to route this span to (e.g.,
+                ``"dogfood"`` or ``["dogfood", "debug"]``).
+            export_filter: Optional filter dict for conditional export.
+            links: Span links — a list of ``SpanLink`` objects or a callable
+                returning one.
+            version: Optional version number.
+
+        Yields:
+            The active ``Span`` object.
+
+        Example:
+            ```python
+            from respan_tracing import get_client
+
+            client = get_client()
+
+            # Imperative workflow span with processor routing
+            with client.start_span("workflow_execution", kind="workflow", processors="dogfood") as span:
+                span.set_attribute("workflow_count", 3)
+
+                # Child spans inherit workflow_name automatically
+                with client.start_span("step_1", kind="task", processors="dogfood") as task_span:
+                    task_span.set_attribute("task_type", "condition")
+                    # ... execute task ...
+            ```
+        """
+        # Normalize kind to string
+        kind_str = kind.value if hasattr(kind, "value") else str(kind)
+        entity_path = context_api.get_value(SpanAttributes.TRACELOOP_ENTITY_PATH) or ""
+
+        # Propagate entity name for workflow/agent spans (children inherit it
+        # as TRACELOOP_WORKFLOW_NAME via RespanSpanProcessor.on_start)
+        if kind_str in [
+            TraceloopSpanKindValues.WORKFLOW.value,
+            TraceloopSpanKindValues.AGENT.value,
+        ]:
+            context_api.attach(
+                context_api.set_value(SpanAttributes.TRACELOOP_ENTITY_NAME, name)
+            )
+
+        # Set entity path for task/tool spans
+        if kind_str in [
+            TraceloopSpanKindValues.TASK.value,
+            TraceloopSpanKindValues.TOOL.value,
+        ]:
+            entity_path = f"{entity_path}.{name}" if entity_path else name
+            context_api.attach(
+                context_api.set_value(SpanAttributes.TRACELOOP_ENTITY_PATH, entity_path)
+            )
+
+        # Resolve span links: explicit param + context-attached
+        otel_links: List[trace.Link] = []
+        explicit_links = links() if callable(links) else (links or [])
+        for link in explicit_links:
+            otel_links.append(span_link_to_otel(link))
+        otel_links.extend(consume_span_links())
+
+        # Create span
+        tracer = self._tracer.get_tracer()
+        span_name = f"{name}.{kind_str}"
+        span = tracer.start_span(span_name, links=otel_links or None)
+
+        # Set standard Respan attributes
+        span.set_attribute(SpanAttributes.TRACELOOP_SPAN_KIND, kind_str)
+        span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_NAME, name)
+        span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_PATH, entity_path)
+        span.set_attribute(
+            RespanSpanAttributes.LOG_METHOD.value,
+            LogMethodChoices.PYTHON_TRACING.value,
+        )
+        if version:
+            span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_VERSION, version)
+
+        # Set processors for FilteringSpanProcessor routing
+        if processors:
+            processors_list = [processors] if isinstance(processors, str) else processors
+            span.set_attribute("processors", ",".join(processors_list))
+
+        # Set export filter
+        if export_filter is not None:
+            try:
+                span.set_attribute(EXPORT_FILTER_ATTR, json.dumps(export_filter))
+            except (TypeError, ValueError):
+                pass
+
+        # Activate span in context
+        ctx = trace.set_span_in_context(span)
+        ctx_token = context_api.attach(ctx)
+
+        try:
+            yield span
+        except Exception as e:
+            span.set_status(Status(StatusCode.ERROR, str(e)))
+            span.record_exception(e)
+            raise
+        finally:
+            span.end()
+            context_api.detach(ctx_token)
+
     def get_span_buffer(self, trace_id: str) -> SpanBuffer:
         """
         Get an OpenTelemetry-compliant context manager for buffering spans with manual export control.
