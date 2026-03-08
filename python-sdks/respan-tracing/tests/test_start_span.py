@@ -264,6 +264,127 @@ class TestStartSpan:
         assert path_after is None or path_after == ""
 
 
+class TestWorkflowNameInheritance:
+    """Tests for TRACELOOP_WORKFLOW_NAME propagation — the DEV-7151 fix.
+
+    The root cause of 28 fragmented traces was that imperative spans didn't
+    propagate TRACELOOP_ENTITY_NAME via context, so the RespanSpanProcessor
+    couldn't set TRACELOOP_WORKFLOW_NAME on child spans.
+    """
+
+    def setup_method(self):
+        self.telemetry = RespanTelemetry(
+            app_name="test-wf-inheritance",
+            api_key="test-key",
+            is_enabled=True,
+        )
+        self.client = get_client()
+
+    def test_child_task_inherits_workflow_name(self):
+        """Child task span gets TRACELOOP_WORKFLOW_NAME from parent workflow.
+
+        This is THE test for DEV-7151. RespanSpanProcessor.on_start reads
+        TRACELOOP_ENTITY_NAME from context and sets TRACELOOP_WORKFLOW_NAME.
+        """
+        with self.client.start_span("my_workflow", kind="workflow") as _:
+            with self.client.start_span("my_task", kind="task") as child:
+                attrs = dict(child.attributes)
+                assert attrs.get(SpanAttributes.TRACELOOP_WORKFLOW_NAME) == "my_workflow"
+
+    def test_nested_tasks_all_inherit_workflow_name(self):
+        """Multiple nested tasks all inherit the same workflow name."""
+        with self.client.start_span("executor", kind="workflow") as _:
+            with self.client.start_span("task_1", kind="task") as t1:
+                assert dict(t1.attributes).get(SpanAttributes.TRACELOOP_WORKFLOW_NAME) == "executor"
+            with self.client.start_span("task_2", kind="task") as t2:
+                assert dict(t2.attributes).get(SpanAttributes.TRACELOOP_WORKFLOW_NAME) == "executor"
+            with self.client.start_span("task_3", kind="task") as t3:
+                assert dict(t3.attributes).get(SpanAttributes.TRACELOOP_WORKFLOW_NAME) == "executor"
+
+    def test_workflow_name_not_set_without_parent_workflow(self):
+        """Without a parent workflow, TRACELOOP_WORKFLOW_NAME is absent."""
+        with self.client.start_span("orphan_task", kind="task") as span:
+            attrs = dict(span.attributes)
+            assert SpanAttributes.TRACELOOP_WORKFLOW_NAME not in attrs
+
+    def test_processors_attribute_propagated(self):
+        """Processors attribute on workflow span routes to FilteringSpanProcessor."""
+        with self.client.start_span("wf", kind="workflow", processors="dogfood") as outer:
+            assert dict(outer.attributes)["processors"] == "dogfood"
+            with self.client.start_span("t", kind="task", processors="dogfood") as inner:
+                assert dict(inner.attributes)["processors"] == "dogfood"
+
+    def test_inner_workflow_overrides_parent_workflow_name(self):
+        """Nested workflow overrides TRACELOOP_ENTITY_NAME for its children."""
+        with self.client.start_span("outer_wf", kind="workflow") as _:
+            with self.client.start_span("inner_wf", kind="workflow") as _:
+                with self.client.start_span("deep_task", kind="task") as deep:
+                    attrs = dict(deep.attributes)
+                    assert attrs.get(SpanAttributes.TRACELOOP_WORKFLOW_NAME) == "inner_wf"
+
+
+class TestEdgeCases:
+    """Edge cases and coverage gaps."""
+
+    def setup_method(self):
+        self.telemetry = RespanTelemetry(
+            app_name="test-edge-cases",
+            api_key="test-key",
+            is_enabled=True,
+        )
+        self.client = get_client()
+
+    def test_tool_kind_appends_entity_path(self):
+        """Tool kind appends to entity path, same as task."""
+        with self.client.start_span("my_tool", kind="tool") as span:
+            attrs = dict(span.attributes)
+            assert attrs[SpanAttributes.TRACELOOP_SPAN_KIND] == "tool"
+            assert attrs[SpanAttributes.TRACELOOP_ENTITY_PATH] == "my_tool"
+
+    def test_chained_tasks_build_entity_path(self):
+        """Nested task spans build a dotted entity path chain."""
+        with self.client.start_span("wf", kind="workflow") as _:
+            with self.client.start_span("a", kind="task") as _:
+                with self.client.start_span("b", kind="task") as inner:
+                    attrs = dict(inner.attributes)
+                    assert attrs[SpanAttributes.TRACELOOP_ENTITY_PATH] == "a.b"
+
+    def test_enum_kind_value(self):
+        """kind parameter accepts TraceloopSpanKindValues enum."""
+        from opentelemetry.semconv_ai import TraceloopSpanKindValues
+        with self.client.start_span("my_wf", kind=TraceloopSpanKindValues.WORKFLOW) as span:
+            attrs = dict(span.attributes)
+            assert attrs[SpanAttributes.TRACELOOP_SPAN_KIND] == "workflow"
+
+    def test_non_serializable_export_filter_silently_skipped(self):
+        """Non-JSON-serializable export filter is silently skipped."""
+        class NotSerializable:
+            pass
+        with self.client.start_span("my_task", export_filter={"x": NotSerializable()}) as span:
+            attrs = dict(span.attributes)
+            assert EXPORT_FILTER_ATTR not in attrs
+
+    def test_entity_name_context_restored_after_nested_workflows(self):
+        """After nested workflow exits, parent's entity name is restored."""
+        with self.client.start_span("outer", kind="workflow") as _:
+            with self.client.start_span("inner", kind="workflow") as _:
+                assert context_api.get_value(SpanAttributes.TRACELOOP_ENTITY_NAME) == "inner"
+            # After inner exits, outer's entity name should be restored
+            assert context_api.get_value(SpanAttributes.TRACELOOP_ENTITY_NAME) == "outer"
+
+    def test_entity_path_restored_after_nested_tasks(self):
+        """After nested task exits, parent's entity path is restored."""
+        with self.client.start_span("wf", kind="workflow") as _:
+            with self.client.start_span("a", kind="task") as _:
+                with self.client.start_span("b", kind="task") as _:
+                    assert context_api.get_value(SpanAttributes.TRACELOOP_ENTITY_PATH) == "a.b"
+                # After b exits, a's path should be restored
+                assert context_api.get_value(SpanAttributes.TRACELOOP_ENTITY_PATH) == "a"
+            # After a exits, path should be empty
+            path = context_api.get_value(SpanAttributes.TRACELOOP_ENTITY_PATH)
+            assert path is None or path == ""
+
+
 class TestSetupSpanShared:
     """Tests for the shared setup_span/cleanup_span used by both decorators and client."""
 
