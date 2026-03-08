@@ -4,21 +4,18 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
+from respan_sdk.utils.data_processing.id_processing import (
+    format_span_id,
+    format_trace_id,
+    is_hex_string,
+)
+
+
 def ns_to_datetime(value: Optional[int]) -> Optional[datetime]:
     """Convert nanoseconds timestamp to datetime."""
     if not value:
         return None
     return datetime.fromtimestamp(value / 1e9, tz=timezone.utc)
-
-
-def format_trace_id(trace_id: int) -> str:
-    """Format trace ID as 32-char hex string."""
-    return format(trace_id, "032x")
-
-
-def format_span_id(span_id: int) -> str:
-    """Format span ID as 16-char hex string."""
-    return format(span_id, "016x")
 
 
 def is_agno_span(span: object) -> bool:
@@ -245,17 +242,6 @@ def format_rfc3339(value: Optional[datetime]) -> Optional[str]:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def is_hex_string(value: str, length: int) -> bool:
-    """Check if string is a valid hex string of given length."""
-    if len(value) != length:
-        return False
-    try:
-        int(value, 16)
-        return True
-    except ValueError:
-        return False
 
 
 def normalize_trace_id(trace_id: str) -> str:
