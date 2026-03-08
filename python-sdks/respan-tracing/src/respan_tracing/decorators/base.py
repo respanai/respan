@@ -1,25 +1,15 @@
 import json
 import inspect
 from functools import wraps
-from typing import Optional, TypeVar, Callable, Any, List, ParamSpec, Awaitable, Union
-from opentelemetry import trace, context as context_api
+from typing import Optional, TypeVar, Callable, Any, ParamSpec, Awaitable
+from opentelemetry import context as context_api
 from opentelemetry.trace.status import Status, StatusCode
-from opentelemetry.semconv_ai import TraceloopSpanKindValues, SpanAttributes
-from respan_sdk.constants.llm_logging import (
-    LogMethodChoices
-)
+from opentelemetry.semconv_ai import SpanAttributes
 from respan_sdk import FilterParamDict
-from respan_sdk.respan_types.span_types import RespanSpanAttributes, SpanLink
-from respan_tracing.core import RespanTracer
-from respan_tracing.contexts.span import span_link_to_otel, consume_span_links
 from respan_tracing.constants.context_constants import (
-    WORKFLOW_NAME_KEY,
-    ENTITY_PATH_KEY,
     ENABLE_CONTENT_TRACING_KEY
 )
-from respan_tracing.constants.tracing import EXPORT_FILTER_ATTR
-
-LinksParam = Optional[Union[List[SpanLink], Callable[[], List[SpanLink]]]]
+from respan_tracing.utils.span_setup import setup_span, cleanup_span, LinksParam
 
 
 P = ParamSpec("P")
@@ -50,75 +40,24 @@ def _setup_span(
     export_filter: Optional[FilterParamDict] = None,
     links: LinksParam = None,
 ):
-    """Setup OpenTelemetry span and context"""
-    # Ensure span_kind is a string
-    span_kind_str = span_kind.value if hasattr(span_kind, "value") else str(span_kind)
-    entity_path = context_api.get_value(SpanAttributes.TRACELOOP_ENTITY_PATH) or ""
+    """Setup OpenTelemetry span and context.
 
-    # Set workflow name for workflow spans
-    if span_kind_str in [
-        TraceloopSpanKindValues.WORKFLOW.value,
-        TraceloopSpanKindValues.AGENT.value,
-    ]:
-        context_api.attach(
-            context_api.set_value(SpanAttributes.TRACELOOP_ENTITY_NAME, entity_name)
-        )
-
-    # Set entity path for task spans
-    if span_kind_str in [
-        TraceloopSpanKindValues.TASK.value,
-        TraceloopSpanKindValues.TOOL.value,
-    ]:
-        entity_path = f"{entity_path}.{entity_name}" if entity_path else entity_name
-        context_api.attach(context_api.set_value(SpanAttributes.TRACELOOP_ENTITY_PATH, entity_path))
-
-    # Resolve span links: explicit param + context-attached
-    otel_links: List[trace.Link] = []
-    # 1. Resolve explicit links param (static list or callable)
-    explicit_links = links() if callable(links) else (links or [])
-    for link in explicit_links:
-        otel_links.append(span_link_to_otel(link))
-    # 2. Consume context-attached links (from attach_span_links())
-    otel_links.extend(consume_span_links())
-
-    # Get tracer and start span
-    tracer = RespanTracer().get_tracer()
-    span_name = f"{entity_name}.{span_kind_str}"
-    span = tracer.start_span(span_name, links=otel_links or None)
-
-    # Set span attributes
-    span.set_attribute(SpanAttributes.TRACELOOP_SPAN_KIND, span_kind_str)
-    span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_NAME, entity_name)
-    span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_PATH, entity_path)
-    span.set_attribute(
-        RespanSpanAttributes.LOG_METHOD.value, LogMethodChoices.PYTHON_TRACING.value
+    Delegates to the shared setup_span() utility.
+    Returns (span, ctx_token) for backward compatibility with existing callers.
+    Context tokens for entity_name/entity_path are tracked internally and
+    cleaned up in _cleanup_span().
+    """
+    span, ctx_token, entity_name_token, entity_path_token = setup_span(
+        entity_name=entity_name,
+        span_kind=span_kind,
+        version=version,
+        processors=processors,
+        export_filter=export_filter,
+        links=links,
     )
-    if version:
-        span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_VERSION, version)
-
-    # Set processors attribute for routing (OTEL standard way!)
-    if processors:
-        # Normalize to list
-        if isinstance(processors, str):
-            processors_list = [processors]
-        else:
-            processors_list = processors
-
-        # Store as comma-separated string (OTEL attribute friendly)
-        span.set_attribute("processors", ",".join(processors_list))
-
-    # Store export filter as JSON string on span attribute
-    if export_filter is not None:
-        try:
-            span.set_attribute(EXPORT_FILTER_ATTR, json.dumps(export_filter))
-        except (TypeError, ValueError):
-            # Skip if serialization fails — filter won't be applied
-            pass
-
-    # Set span in context
-    ctx = trace.set_span_in_context(span)
-    ctx_token = context_api.attach(ctx)
-
+    # Store extra tokens on the span object for _cleanup_span to detach
+    span._entity_name_token = entity_name_token
+    span._entity_path_token = entity_path_token
     return span, ctx_token
 
 
@@ -146,9 +85,13 @@ def _handle_span_output(span, result):
 
 
 def _cleanup_span(span, ctx_token):
-    """End span and detach context"""
-    span.end()
-    context_api.detach(ctx_token)
+    """End span and detach all context tokens."""
+    cleanup_span(
+        span,
+        ctx_token,
+        entity_name_token=getattr(span, '_entity_name_token', None),
+        entity_path_token=getattr(span, '_entity_path_token', None),
+    )
 
 
 def _handle_generator(span, ctx_token, generator):
