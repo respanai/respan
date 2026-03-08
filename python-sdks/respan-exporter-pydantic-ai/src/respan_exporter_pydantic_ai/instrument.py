@@ -12,21 +12,6 @@ logger = logging.getLogger(__name__)
 
 PYDANTIC_AI_REQUEST_PARAMETERS_ATTR = "model_request_parameters"
 PYDANTIC_AI_TOOL_DEFINITIONS_ATTR = "gen_ai.tool.definitions"
-PYDANTIC_AI_INPUT_MESSAGES_ATTR = "gen_ai.input.messages"
-PYDANTIC_AI_OUTPUT_MESSAGES_ATTR = "gen_ai.output.messages"
-
-# Attributes consumed during enrichment or already extracted into structured
-# CHLog fields by the backend.  Stripped after enrichment to prevent
-# redundant copies in `metadata`.
-_ENRICHMENT_STRIP_ATTRS = frozenset({
-    PYDANTIC_AI_REQUEST_PARAMETERS_ATTR,
-    PYDANTIC_AI_TOOL_DEFINITIONS_ATTR,
-    PYDANTIC_AI_INPUT_MESSAGES_ATTR,
-    PYDANTIC_AI_OUTPUT_MESSAGES_ATTR,
-    "tools",
-    "response_format",
-})
-
 _PYDANTIC_AI_ENRICHMENT_MARKER = "_respan_pydantic_ai_enrichment_installed"
 _PYDANTIC_AI_ADD_PROCESSOR_PATCH_MARKER = (
     "_respan_pydantic_ai_add_span_processor_patched"
@@ -194,10 +179,7 @@ def _enrich_pydantic_ai_span(span: ReadableSpan) -> None:
         if tools is None and response_format is None:
             return
 
-        enriched_attributes = {
-            k: v for k, v in attributes.items()
-            if k not in _ENRICHMENT_STRIP_ATTRS
-        }
+        enriched_attributes = dict(attributes)
         if tools is not None:
             enriched_attributes["tools"] = tools
         if response_format is not None:
