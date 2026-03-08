@@ -365,9 +365,18 @@ class RespanClient:
                     # ... execute task ...
             ```
         """
+        if not self._tracer.is_enabled or not RespanTracer.is_initialized():
+            logger.warning("Respan Telemetry not initialized or disabled.")
+            yield None
+            return
+
         # Normalize kind to string
         kind_str = kind.value if hasattr(kind, "value") else str(kind)
         entity_path = context_api.get_value(SpanAttributes.TRACELOOP_ENTITY_PATH) or ""
+
+        # Track context tokens for cleanup
+        entity_name_token = None
+        entity_path_token = None
 
         # Propagate entity name for workflow/agent spans (children inherit it
         # as TRACELOOP_WORKFLOW_NAME via RespanSpanProcessor.on_start)
@@ -375,7 +384,7 @@ class RespanClient:
             TraceloopSpanKindValues.WORKFLOW.value,
             TraceloopSpanKindValues.AGENT.value,
         ]:
-            context_api.attach(
+            entity_name_token = context_api.attach(
                 context_api.set_value(SpanAttributes.TRACELOOP_ENTITY_NAME, name)
             )
 
@@ -385,7 +394,7 @@ class RespanClient:
             TraceloopSpanKindValues.TOOL.value,
         ]:
             entity_path = f"{entity_path}.{name}" if entity_path else name
-            context_api.attach(
+            entity_path_token = context_api.attach(
                 context_api.set_value(SpanAttributes.TRACELOOP_ENTITY_PATH, entity_path)
             )
 
@@ -409,7 +418,7 @@ class RespanClient:
             RespanSpanAttributes.LOG_METHOD.value,
             LogMethodChoices.PYTHON_TRACING.value,
         )
-        if version:
+        if version is not None:
             span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_VERSION, version)
 
         # Set processors for FilteringSpanProcessor routing
@@ -437,6 +446,10 @@ class RespanClient:
         finally:
             span.end()
             context_api.detach(ctx_token)
+            if entity_path_token is not None:
+                context_api.detach(entity_path_token)
+            if entity_name_token is not None:
+                context_api.detach(entity_name_token)
 
     def get_span_buffer(self, trace_id: str) -> SpanBuffer:
         """
