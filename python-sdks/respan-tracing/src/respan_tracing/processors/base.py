@@ -284,17 +284,20 @@ class SpanBuffer:
     5. Thread-safe isolation (each context has its own buffer)
     """
     
-    def __init__(self, trace_id: str):
+    def __init__(self, trace_id: str, tracer_provider=None):
         """
         Initialize the span buffer.
-        
+
         Args:
             trace_id: Trace ID for the spans being buffered
+            tracer_provider: Optional TracerProvider. When provided, buffered
+                spans are auto-flushed through the processor pipeline on exit.
         """
         self.trace_id = trace_id
         self._local_queue: List[ReadableSpan] = []
         self._is_buffering = False
         self._context_token = None
+        self._tracer_provider = tracer_provider
     
     def __enter__(self):
         """
@@ -320,27 +323,28 @@ class SpanBuffer:
     
     def __exit__(self, exc_type, exc_val, exc_tb):
         """
-        Exit context: Deactivate this buffer in the current context.
-        
-        Args:
-            exc_type: Exception type if an exception was raised
-            exc_val: Exception value if an exception was raised
-            exc_tb: Exception traceback if an exception was raised
+        Exit context: Deactivate this buffer and auto-flush spans.
+
+        Buffered spans are replayed through the tracer provider's processor
+        pipeline so they reach the OTLP exporter. This does NOT clear the
+        local queue — ``get_all_spans()`` still works after exit for read-only
+        use cases (e.g., converting spans to unified logs).
         """
         logger.debug(f"[SpanBuffer] Exiting buffering context for trace {self.trace_id}")
-        
-        # Mark as not buffering
+
+        # Mark as not buffering FIRST so replayed spans don't re-enter the buffer
         self._is_buffering = False
-        
+
         # Reset the context variable
         if self._context_token is not None:
             _active_span_buffer.reset(self._context_token)
             self._context_token = None
-        
+
+        # Auto-flush: replay buffered spans through the processor pipeline
+        if self._tracer_provider is not None and self._local_queue:
+            self.process_spans(self._tracer_provider)
+
         logger.debug(f"[SpanBuffer] Deactivated buffer for trace {self.trace_id}")
-        
-        # Note: Local queue persists for manual export or inspection
-        # It will be cleaned up by garbage collection when this object is destroyed
     
     def create_span(
         self, 

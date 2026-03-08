@@ -468,7 +468,7 @@ class RespanClient:
             logger.warning("Respan Telemetry not initialized or disabled.")
             raise RuntimeError("Respan Telemetry not initialized or disabled.")
         
-        return SpanBuffer(trace_id=trace_id)
+        return SpanBuffer(trace_id=trace_id, tracer_provider=self._tracer.tracer_provider)
     
     def process_spans(self, spans) -> bool:
         """
