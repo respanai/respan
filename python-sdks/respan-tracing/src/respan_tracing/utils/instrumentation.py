@@ -3,8 +3,8 @@ import importlib
 import json
 import logging
 import traceback
-from dataclasses import dataclass, field
-from typing import Optional, Set, Callable, List
+from dataclasses import dataclass
+from typing import Optional, Set, Callable
 
 from ..instruments import Instruments
 
@@ -19,7 +19,7 @@ class InstrumentConfig:
     Adding a new instrumentation = one entry in INSTRUMENT_REGISTRY.
     """
 
-    package: str
+    package: Optional[str]
     module: str
     class_name: str
     post_init_hooks: tuple = ()
