@@ -14,6 +14,7 @@ from respan_sdk.constants.otlp_constants import (
     OTLP_TRACE_ID_KEY,
 )
 from respan_sdk.respan_types.span_types import RespanSpanAttributes
+from respan_sdk.utils.data_processing.id_processing import format_span_id, format_trace_id
 
 LINK_TIMESTAMP_ATTR = RespanSpanAttributes.LINK_TIMESTAMP.value
 from respan_tracing import RespanTelemetry, SpanLink, span_link_to_otel, span_to_link, get_client
@@ -226,8 +227,8 @@ def test_span_to_link_captures_ids_from_live_span(clean_exporter):
         link = span_to_link(span)
 
     ctx = span.get_span_context()
-    assert link.trace_id == format(ctx.trace_id, "032x")
-    assert link.span_id == format(ctx.span_id, "016x")
+    assert link.trace_id == format_trace_id(ctx.trace_id)
+    assert link.span_id == format_span_id(ctx.span_id)
     telemetry.flush()
 
 
@@ -276,8 +277,8 @@ def test_span_to_link_roundtrips_through_otel(clean_exporter):
 
     otel_link = span_link_to_otel(link)
     ctx = span.get_span_context()
-    assert format(otel_link.context.trace_id, "032x") == format(ctx.trace_id, "032x")
-    assert format(otel_link.context.span_id, "016x") == format(ctx.span_id, "016x")
+    assert format_trace_id(otel_link.context.trace_id) == format_trace_id(ctx.trace_id)
+    assert format_span_id(otel_link.context.span_id) == format_span_id(ctx.span_id)
     # Timestamp should be merged into attributes
     assert LINK_TIMESTAMP_ATTR in otel_link.attributes
     assert otel_link.attributes["link.type"] == "resume"

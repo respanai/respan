@@ -15,6 +15,8 @@ from respan_sdk.respan_types.param_types import RespanParams
 from respan_sdk.utils.data_processing.id_processing import (
     SPAN_ID_HEX_LENGTH,
     TRACE_ID_HEX_LENGTH,
+    format_span_id,
+    format_trace_id,
     normalize_hex_id,
 )
 from respan_tracing.utils.logging import get_respan_logger
@@ -74,8 +76,8 @@ def span_to_link(
     if not ctx or not ctx.is_valid:
         raise ValueError("Cannot create link from span with invalid SpanContext")
 
-    trace_id = format(ctx.trace_id, "032x")
-    span_id = format(ctx.span_id, "016x")
+    trace_id = format_trace_id(ctx.trace_id)
+    span_id = format_span_id(ctx.span_id)
 
     # Auto-capture timestamp from span start_time (SDK spans expose this)
     timestamp = None
