@@ -41,7 +41,11 @@ def span_link_to_otel(link: SpanLink) -> trace.Link:
         trace_flags=trace_flags,
         trace_state=trace.TraceState(),
     )
-    return trace.Link(context=span_context, attributes=link.attributes)
+    # Merge timestamp into attributes if provided (enables efficient CH lookups)
+    attrs = dict(link.attributes)
+    if link.timestamp:
+        attrs["respan.link.timestamp"] = link.timestamp
+    return trace.Link(context=span_context, attributes=attrs)
 
 
 def attach_span_links(links: List[SpanLink]) -> None:
