@@ -8,7 +8,8 @@ exporter can forget retry logic or the anti-recursion header.
 
 import logging
 import threading
-from typing import Any, Dict, List
+import time
+from typing import Any, Dict, List, Optional, Set
 
 import requests
 
@@ -18,6 +19,9 @@ from respan_sdk.utils.retry_handler import RetryHandler
 
 
 logger = logging.getLogger(__name__)
+
+_export_threads: Set[threading.Thread] = set()
+_export_threads_lock = threading.Lock()
 
 
 def validate_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -80,5 +84,41 @@ def send_payloads(
         except Exception as exc:
             logger.exception("Respan ingest failed after retries: %s", exc)
 
-    thread = threading.Thread(target=_run, daemon=True)
+    def _run_and_unregister() -> None:
+        try:
+            _run()
+        finally:
+            with _export_threads_lock:
+                _export_threads.discard(threading.current_thread())
+
+    thread = threading.Thread(target=_run_and_unregister, daemon=True)
+    with _export_threads_lock:
+        _export_threads.add(thread)
     thread.start()
+
+
+def flush_export_threads(timeout: Optional[float] = None) -> None:
+    """
+    Wait for in-flight background export threads to finish.
+
+    This is primarily useful in short-lived scripts that would otherwise exit
+    before fire-and-forget exports have been sent.
+    """
+    deadline = None if timeout is None else time.monotonic() + timeout
+
+    while True:
+        with _export_threads_lock:
+            active_threads = [thread for thread in _export_threads if thread.is_alive()]
+            _export_threads.clear()
+            _export_threads.update(active_threads)
+
+        if not active_threads:
+            return
+
+        for thread in active_threads:
+            remaining = None
+            if deadline is not None:
+                remaining = max(0.0, deadline - time.monotonic())
+                if remaining == 0.0:
+                    return
+            thread.join(timeout=remaining)

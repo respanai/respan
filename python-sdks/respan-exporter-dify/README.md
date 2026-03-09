@@ -16,16 +16,44 @@ pip install respan-exporter-dify
 
 ## Configuration
 
-Respan ingest is configured via environment variables or by passing credentials in code.
+Gateway + tracing can be configured via environment variables or by passing
+credentials in code.
 
 | Variable           | Description                                  |
 |--------------------|----------------------------------------------|
 | `RESPAN_API_KEY`   | Your Respan API key                          |
+| `RESPAN_BASE_URL`  | Respan gateway base URL (optional)           |
 | `RESPAN_ENDPOINT`  | Respan ingest endpoint (optional; default)   |
 
 ---
 
 ## Usage
+
+### Gateway mode (sync, no Dify API key)
+
+The local unpublished package can translate Dify request objects into
+OpenAI-compatible gateway calls. This lets you run examples with only
+`RESPAN_API_KEY`.
+
+```python
+from dify_client import models
+from respan_exporter_dify import create_client
+
+respan_client = create_client(
+    api_key="your-respan-api-key",
+    gateway_base_url="https://api.respan.ai/api",
+    gateway_model="gpt-4o-mini",
+)
+
+req = models.ChatRequest(
+    query="Hello!",
+    user="user-123",
+    response_mode=models.ResponseMode.BLOCKING,
+    inputs={},
+)
+response = respan_client.chat_messages(req=req)
+print(response.answer)
+```
 
 ### Wrap an existing client (sync)
 
@@ -33,7 +61,7 @@ Create the official Dify client, then wrap it with `create_client`. All calls ar
 
 ```python
 from dify_client import Client
-from dify_client.models import ChatMessageRequest, ResponseMode
+from dify_client.models import ChatRequest, ResponseMode
 from respan_exporter_dify import create_client
 
 dify_client = Client(api_key="your-dify-api-key")
@@ -42,7 +70,7 @@ respan_client = create_client(
     api_key="your-respan-api-key",
 )
 
-req = ChatMessageRequest(
+req = ChatRequest(
     query="Hello!",
     user="user-123",
     response_mode=ResponseMode.BLOCKING,
@@ -58,7 +86,7 @@ response = respan_client.chat_messages(req=req)
 ```python
 import asyncio
 from dify_client import AsyncClient
-from dify_client.models import ChatMessageRequest, ResponseMode
+from dify_client.models import ChatRequest, ResponseMode
 from respan_exporter_dify import create_async_client
 
 async def main():
@@ -67,7 +95,7 @@ async def main():
         client=dify_client,
         api_key="your-respan-api-key",
     )
-    req = ChatMessageRequest(
+    req = ChatRequest(
         query="Hello!",
         user="user-123",
         response_mode=ResponseMode.BLOCKING,
@@ -86,9 +114,9 @@ asyncio.run(main())
 Use `ResponseMode.STREAMING` and iterate over the returned stream. Data is sent to Respan when the stream is fully consumed.
 
 ```python
-from dify_client.models import ChatMessageRequest, ResponseMode
+from dify_client.models import ChatRequest, ResponseMode
 
-req = ChatMessageRequest(
+req = ChatRequest(
     query="Hello!",
     user="user-123",
     response_mode=ResponseMode.STREAMING,

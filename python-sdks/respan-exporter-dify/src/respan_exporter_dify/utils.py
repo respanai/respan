@@ -1,4 +1,5 @@
 import logging
+import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Set, Union
 
@@ -26,6 +27,44 @@ logger = logging.getLogger(__name__)
 # Max recursion depth for _to_serializable to avoid hitting Python's recursion limit
 # on deeply nested Dify responses (e.g. long conversation histories).
 _TO_SERIALIZABLE_MAX_DEPTH = 50
+
+
+def _is_hex_string(value: str, *, length: int) -> bool:
+    if len(value) != length:
+        return False
+    try:
+        int(value, 16)
+        return True
+    except ValueError:
+        return False
+
+
+def _normalize_trace_id(trace_id: str) -> str:
+    if _is_hex_string(trace_id, length=32):
+        return trace_id.lower()
+    return uuid.uuid5(uuid.NAMESPACE_DNS, trace_id).hex
+
+
+def _normalize_span_id(span_id: str, trace_id: str) -> str:
+    if _is_hex_string(span_id, length=16):
+        return span_id.lower()
+    stable_seed = f"{trace_id}:{span_id}"
+    return uuid.uuid5(uuid.NAMESPACE_DNS, stable_seed).hex[:16]
+
+
+def _default_child_span_seed(
+    *,
+    span_name: str,
+    start_time: datetime,
+    end_time: datetime,
+    metadata_extra: Optional[Dict[str, Any]],
+) -> str:
+    if metadata_extra:
+        for key in ("message_id", "workflow_run_id", "task_id"):
+            value = metadata_extra.get(key)
+            if value not in EMPTY_VALUES:
+                return str(value)
+    return f"{span_name}:{start_time.isoformat()}:{end_time.isoformat()}"
 
 
 def _to_serializable(value: Any, max_depth: int = _TO_SERIALIZABLE_MAX_DEPTH) -> Any:
@@ -300,6 +339,27 @@ def build_payload(
     metadata_extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     params = export_params or RespanParams()
+    trace_id = _normalize_trace_id(params.trace_unique_id) if params.trace_unique_id else None
+    parent_span_id = (
+        _normalize_span_id(params.span_parent_id, trace_id)
+        if params.span_parent_id and trace_id
+        else params.span_parent_id
+    )
+    span_unique_id = None
+    if params.span_unique_id and trace_id:
+        span_unique_id = _normalize_span_id(params.span_unique_id, trace_id)
+    elif trace_id and not parent_span_id:
+        span_unique_id = trace_id
+    elif trace_id:
+        span_unique_id = _normalize_span_id(
+            _default_child_span_seed(
+                span_name=span_name or params.span_name or f"dify.{method_name}",
+                start_time=start_time,
+                end_time=end_time,
+                metadata_extra=metadata_extra,
+            ),
+            trace_id,
+        )
 
     payload: Dict[str, Any] = {
         "span_workflow_name": params.span_workflow_name or "dify",
@@ -318,14 +378,15 @@ def build_payload(
     if error_message:
         payload["error_message"] = error_message
 
-    if params.trace_unique_id:
-        payload["trace_unique_id"] = params.trace_unique_id
-        payload["trace_name"] = params.trace_name or payload["span_workflow_name"]
+    if trace_id:
+        payload["trace_unique_id"] = trace_id
+        if params.trace_name or not parent_span_id:
+            payload["trace_name"] = params.trace_name or payload["span_workflow_name"]
 
-    if params.span_unique_id:
-        payload["span_unique_id"] = params.span_unique_id
-    if params.span_parent_id:
-        payload["span_parent_id"] = params.span_parent_id
+    if span_unique_id:
+        payload["span_unique_id"] = span_unique_id
+    if parent_span_id:
+        payload["span_parent_id"] = parent_span_id
 
     chosen_session_id = (
         session_identifier

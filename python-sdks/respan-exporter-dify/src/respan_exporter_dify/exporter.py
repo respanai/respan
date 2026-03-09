@@ -8,10 +8,41 @@ from dify_client.models import ResponseMode
 from respan_sdk.constants import RESPAN_TRACING_INGEST_ENDPOINT
 from respan_sdk.respan_types import RespanParams
 from respan_sdk.utils.time import now_utc
+from respan_exporter_dify.gateway import RespanAsyncGatewayClient, RespanGatewayClient
 from respan_exporter_dify.utils import export_dify_call
 
 
 logger = logging.getLogger(__name__)
+
+
+def _get_active_trace_context() -> tuple[Optional[str], Optional[str]]:
+    try:
+        from respan_tracing import get_client
+    except Exception:
+        return None, None
+
+    try:
+        client = get_client()
+        return client.get_current_trace_id(), client.get_current_span_id()
+    except Exception:
+        logger.debug("Failed to read active Respan trace context", exc_info=True)
+        return None, None
+
+
+def _inherit_active_trace_context(params: RespanParams) -> RespanParams:
+    if params.trace_unique_id and params.span_parent_id:
+        return params
+
+    trace_id, span_id = _get_active_trace_context()
+    if not trace_id and not span_id:
+        return params
+
+    enriched = params.model_copy(deep=True)
+    if not enriched.trace_unique_id and trace_id:
+        enriched.trace_unique_id = trace_id
+    if not enriched.span_parent_id and span_id:
+        enriched.span_parent_id = span_id
+    return enriched
 
 
 class _BaseDifyClient:
@@ -21,10 +52,12 @@ class _BaseDifyClient:
         *,
         api_key: Optional[str] = None,
         endpoint: Optional[str] = None,
-        timeout: int = 10,
+        timeout: int = 60,
         client: Optional[Any] = None,
         dify_api_key: Optional[str] = None,
         dify_api_base: Optional[str] = None,
+        gateway_base_url: Optional[str] = None,
+        gateway_model: Optional[str] = None,
     ) -> None:
         self.api_key = api_key or os.getenv("RESPAN_API_KEY")
         self.endpoint = endpoint or os.getenv("RESPAN_ENDPOINT") or RESPAN_TRACING_INGEST_ENDPOINT
@@ -34,8 +67,22 @@ class _BaseDifyClient:
             self._client = client
         elif dify_api_key is not None:
             self._client = client_cls(api_key=dify_api_key, api_base=dify_api_base or "https://api.dify.ai/v1")
+        elif self.api_key is not None:
+            gateway_kwargs = {
+                "api_key": self.api_key,
+                "base_url": gateway_base_url or dify_api_base,
+                "model": gateway_model,
+                "timeout": timeout,
+            }
+            self._client = (
+                RespanGatewayClient(**gateway_kwargs)
+                if client_cls is Client
+                else RespanAsyncGatewayClient(**gateway_kwargs)
+            )
         else:
-            raise RuntimeError(f"Must provide a {client_cls.__name__} or dify_api_key")
+            raise RuntimeError(
+                f"Must provide a {client_cls.__name__}, dify_api_key, or RESPAN_API_KEY for gateway mode"
+            )
 
     def _get_export_func(self, method_name: str, start_time: datetime, kwargs: Any, params: RespanParams):
         # Capture only the minimal kwargs needed for export (payload building uses "req").
@@ -85,10 +132,12 @@ class RespanDifyClient(_BaseDifyClient):
         *,
         api_key: Optional[str] = None,
         endpoint: Optional[str] = None,
-        timeout: int = 10,
+        timeout: int = 60,
         client: Optional["Client"] = None,
         dify_api_key: Optional[str] = None,
         dify_api_base: Optional[str] = None,
+        gateway_base_url: Optional[str] = None,
+        gateway_model: Optional[str] = None,
     ) -> None:
         super().__init__(
             client_cls=Client,
@@ -98,6 +147,8 @@ class RespanDifyClient(_BaseDifyClient):
             client=client,
             dify_api_key=dify_api_key,
             dify_api_base=dify_api_base,
+            gateway_base_url=gateway_base_url,
+            gateway_model=gateway_model,
         )
 
     def _call_and_export(
@@ -108,6 +159,7 @@ class RespanDifyClient(_BaseDifyClient):
         **kwargs: Any,
     ) -> Any:
         params = RespanParams.model_validate(respan_params) if respan_params else RespanParams()
+        params = _inherit_active_trace_context(params)
         method = getattr(self._client, method_name)
 
         if params.disable_log is True:
@@ -194,10 +246,12 @@ class RespanAsyncDifyClient(_BaseDifyClient):
         *,
         api_key: Optional[str] = None,
         endpoint: Optional[str] = None,
-        timeout: int = 10,
+        timeout: int = 60,
         client: Optional["AsyncClient"] = None,
         dify_api_key: Optional[str] = None,
         dify_api_base: Optional[str] = None,
+        gateway_base_url: Optional[str] = None,
+        gateway_model: Optional[str] = None,
     ) -> None:
         super().__init__(
             client_cls=AsyncClient,
@@ -207,6 +261,8 @@ class RespanAsyncDifyClient(_BaseDifyClient):
             client=client,
             dify_api_key=dify_api_key,
             dify_api_base=dify_api_base,
+            gateway_base_url=gateway_base_url,
+            gateway_model=gateway_model,
         )
 
     async def _call_and_export(
@@ -217,6 +273,7 @@ class RespanAsyncDifyClient(_BaseDifyClient):
         **kwargs: Any,
     ) -> Any:
         params = RespanParams.model_validate(respan_params) if respan_params else RespanParams()
+        params = _inherit_active_trace_context(params)
         method = getattr(self._client, method_name)
 
         if params.disable_log is True:
@@ -286,10 +343,12 @@ def create_client(
     *,
     api_key: Optional[str] = None,
     endpoint: Optional[str] = None,
-    timeout: int = 10,
+    timeout: int = 60,
     client: Optional["Client"] = None,
     dify_api_key: Optional[str] = None,
     dify_api_base: Optional[str] = None,
+    gateway_base_url: Optional[str] = None,
+    gateway_model: Optional[str] = None,
 ) -> RespanDifyClient:
     """
     Create a Respan-exporting Dify Client.
@@ -301,6 +360,8 @@ def create_client(
         client=client,
         dify_api_key=dify_api_key,
         dify_api_base=dify_api_base,
+        gateway_base_url=gateway_base_url,
+        gateway_model=gateway_model,
     )
 
 
@@ -308,10 +369,12 @@ def create_async_client(
     *,
     api_key: Optional[str] = None,
     endpoint: Optional[str] = None,
-    timeout: int = 10,
+    timeout: int = 60,
     client: Optional["AsyncClient"] = None,
     dify_api_key: Optional[str] = None,
     dify_api_base: Optional[str] = None,
+    gateway_base_url: Optional[str] = None,
+    gateway_model: Optional[str] = None,
 ) -> RespanAsyncDifyClient:
     """
     Create a Respan-exporting Dify AsyncClient.
@@ -323,4 +386,6 @@ def create_async_client(
         client=client,
         dify_api_key=dify_api_key,
         dify_api_base=dify_api_base,
+        gateway_base_url=gateway_base_url,
+        gateway_model=gateway_model,
     )

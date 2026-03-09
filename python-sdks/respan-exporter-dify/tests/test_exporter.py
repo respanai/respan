@@ -1,11 +1,12 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from dify_client import AsyncClient, Client
+from dify_client import AsyncClient, Client, models
 from dify_client.models import ResponseMode
 from respan_sdk.respan_types import RespanParams
 from respan_sdk.utils.time import now_utc
 from respan_exporter_dify.exporter import create_async_client, create_client
+from respan_exporter_dify.gateway import RespanGatewayClient
 from respan_exporter_dify.utils import export_dify_call
 
 
@@ -21,6 +22,30 @@ class ResultMessage:
     def __init__(self, *, messages: list, usage: dict):
         self.messages = messages
         self.usage = usage
+
+
+class FakeRequestsResponse:
+    def __init__(self, *, json_data=None, lines=None, status_code=200, text=""):
+        self._json_data = json_data or {}
+        self._lines = lines or []
+        self.status_code = status_code
+        self.text = text
+
+    def json(self):
+        return self._json_data
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(self.text or f"HTTP {self.status_code}")
+
+    def iter_lines(self, decode_unicode=True):
+        yield from self._lines
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
 
 
 def test_create_client():
@@ -41,6 +66,115 @@ def test_create_client_with_dify_key():
     respan_client = create_client(dify_api_key="test-dify-key", api_key="test-respan-key")
     assert respan_client.api_key == "test-respan-key"
     assert respan_client._client.api_key == "test-dify-key"
+
+
+def test_create_client_without_dify_key_uses_gateway_mode():
+    respan_client = create_client(api_key="test-respan-key")
+    assert respan_client.api_key == "test-respan-key"
+    assert isinstance(respan_client._client, RespanGatewayClient)
+    assert respan_client._client.api_key == "test-respan-key"
+
+
+def test_sync_client_inherits_active_trace_context():
+    fake_result = {"messages": [{"type": "assistant", "content": "hi"}]}
+    mock_client = MagicMock(spec=Client)
+    mock_client.chat_messages = MagicMock(return_value=fake_result)
+
+    with patch(
+        "respan_exporter_dify.exporter._get_active_trace_context",
+        return_value=("a" * 32, "b" * 16),
+    ):
+        with patch("respan_exporter_dify.exporter.export_dify_call") as export_mock:
+            wrapper = create_client(client=mock_client, api_key="respan-key")
+            req = MagicMock()
+            req.response_mode = None
+            wrapper.chat_messages(req, respan_params=None)
+
+    params = export_mock.call_args.kwargs["params"]
+    assert params.trace_unique_id == "a" * 32
+    assert params.span_parent_id == "b" * 16
+
+
+def test_sync_client_preserves_explicit_trace_context():
+    fake_result = {"messages": [{"type": "assistant", "content": "hi"}]}
+    mock_client = MagicMock(spec=Client)
+    mock_client.chat_messages = MagicMock(return_value=fake_result)
+    explicit_params = RespanParams(trace_unique_id="c" * 32, span_parent_id="d" * 16)
+
+    with patch(
+        "respan_exporter_dify.exporter._get_active_trace_context",
+        return_value=("a" * 32, "b" * 16),
+    ):
+        with patch("respan_exporter_dify.exporter.export_dify_call") as export_mock:
+            wrapper = create_client(client=mock_client, api_key="respan-key")
+            req = MagicMock()
+            req.response_mode = None
+            wrapper.chat_messages(req, respan_params=explicit_params)
+
+    params = export_mock.call_args.kwargs["params"]
+    assert params.trace_unique_id == "c" * 32
+    assert params.span_parent_id == "d" * 16
+
+
+def test_gateway_blocking_chat_uses_respan_key_only():
+    req = models.ChatRequest(
+        query="What is the capital of France?",
+        inputs={},
+        user="user-123",
+        response_mode=ResponseMode.BLOCKING,
+    )
+    lines = [
+        'data: {"id":"chatcmpl-gateway-1","created":1730000000,"model":"gpt-4o-mini","choices":[{"delta":{"content":"Par"}}]}',
+        'data: {"id":"chatcmpl-gateway-1","created":1730000001,"model":"gpt-4o-mini","choices":[{"delta":{"content":"is"}}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}',
+        "data: [DONE]",
+    ]
+
+    with patch("respan_exporter_dify.gateway.requests.post", return_value=FakeRequestsResponse(lines=lines)) as post_mock:
+        with patch("respan_exporter_dify.exporter.export_dify_call") as export_mock:
+            wrapper = create_client(
+                api_key="respan-key",
+                gateway_base_url="https://api.respan.ai/api",
+                gateway_model="gpt-4o-mini",
+            )
+            result = wrapper.chat_messages(req, respan_params=None)
+
+    assert result.answer == "Paris"
+    assert result.message_id == "chatcmpl-gateway-1"
+    assert post_mock.call_args.kwargs["headers"]["Authorization"] == "Bearer respan-key"
+    assert post_mock.call_args.kwargs["json"]["model"] == "gpt-4o-mini"
+    assert post_mock.call_args.kwargs["json"]["disable_log"] is True
+    assert post_mock.call_args.kwargs["json"]["stream"] is True
+    assert post_mock.call_args.kwargs["json"]["messages"][-1]["content"] == "What is the capital of France?"
+    export_mock.assert_called_once()
+
+
+def test_gateway_streaming_chat_maps_openai_stream_to_dify_events():
+    req = models.ChatRequest(
+        query="Say hello",
+        inputs={},
+        user="user-123",
+        response_mode=ResponseMode.STREAMING,
+    )
+    lines = [
+        'data: {"id":"chatcmpl-stream-1","created":1730000000,"choices":[{"delta":{"content":"Hel"}}]}',
+        'data: {"id":"chatcmpl-stream-1","created":1730000001,"choices":[{"delta":{"content":"lo"}}]}',
+        'data: {"id":"chatcmpl-stream-1","created":1730000002,"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}',
+        "data: [DONE]",
+    ]
+
+    with patch("respan_exporter_dify.gateway.requests.post", return_value=FakeRequestsResponse(lines=lines)) as post_mock:
+        with patch("respan_exporter_dify.exporter.export_dify_call") as export_mock:
+            wrapper = create_client(api_key="respan-key")
+            events = list(wrapper.chat_messages(req, respan_params=None))
+
+    assert len(events) == 3
+    assert events[0].event == models.StreamEvent.MESSAGE
+    assert events[0].answer == "Hel"
+    assert events[1].answer == "lo"
+    assert events[2].event == models.StreamEvent.MESSAGE_END
+    assert events[2].metadata.usage.total_tokens == 3
+    assert post_mock.call_args.kwargs["json"]["stream"] is True
+    export_mock.assert_called_once()
 
 
 def test_build_export_payloads_prefers_message_usage_and_session():
@@ -183,6 +317,46 @@ def test_build_export_payloads_uses_assistant_message_usage_and_dedupes_by_id():
     assert second_payload["completion_tokens"] == 1
     assert "total_request_tokens" not in second_payload
     assert second_payload["metadata"]["message_id"] == "turn-2"
+
+
+def test_build_export_payloads_generates_child_span_for_linked_trace():
+    start_time = now_utc()
+    end_time = now_utc()
+    params = RespanParams(trace_unique_id="a" * 32, span_parent_id="b" * 16)
+    result = ResultMessage(
+        messages=[
+            AssistantMessage(
+                message_id="turn-1",
+                usage={"input_tokens": 2, "output_tokens": 1},
+                content="linked response",
+            )
+        ],
+        usage={"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+    )
+
+    with patch("respan_exporter_dify.utils.send_payloads") as send_mock:
+        export_dify_call(
+            api_key="test-key",
+            endpoint="https://test",
+            timeout=10,
+            method_name="chat_messages",
+            start_time=start_time,
+            end_time=end_time,
+            status="success",
+            kwargs={"req": {"conversation_id": "session-from-hook"}},
+            result=result,
+            error_message=None,
+            params=params,
+        )
+        payloads = send_mock.call_args.kwargs["payloads"]
+
+    assert len(payloads) == 1
+    payload = payloads[0]
+    assert payload["trace_unique_id"] == "a" * 32
+    assert payload["span_parent_id"] == "b" * 16
+    assert payload["span_unique_id"] != "b" * 16
+    assert len(payload["span_unique_id"]) == 16
+    assert "trace_name" not in payload
 
 
 # --- RespanAsyncDifyClient behavior ---
