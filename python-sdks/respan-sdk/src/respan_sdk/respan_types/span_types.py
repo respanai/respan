@@ -56,6 +56,9 @@ class RespanSpanAttributes(Enum):
     # Metadata
     RESPAN_METADATA = "respan.metadata" # This is a pattern, it can be  any "respan.metadata.key" where key is customizable
 
+    # Span links
+    LINK_TIMESTAMP = "respan.link.timestamp"
+
     # Logging
     LOG_METHOD = "respan.entity.log_method"
     LOG_TYPE = "respan.entity.log_type"
