@@ -70,6 +70,16 @@ class TestIsProcessableSpan:
         span = _make_span({"gen_ai.system": "openai"})
         assert is_processable_span(span) is True
 
+    def test_pydantic_ai_tool_span_name_is_processed(self):
+        """Pydantic AI tool spans should be processed even without entity path."""
+        span = _make_span({"gen_ai.tool.name": "add"}, name="running tool")
+        assert is_processable_span(span) is True
+
+    def test_pydantic_ai_agent_span_name_is_processed(self):
+        """Pydantic AI agent spans should be processed even without entity path."""
+        span = _make_span({"gen_ai.agent.name": "calculator"})
+        assert is_processable_span(span) is True
+
     def test_auto_instrumentation_noise_filtered(self):
         """Span without any recognized attributes should be filtered out."""
         span = _make_span({"http.method": "GET", "http.url": "https://api.openai.com"})
@@ -132,6 +142,11 @@ class TestIsRootSpanCandidate:
     def test_pydantic_ai_native_span_without_entity_path_is_root(self):
         """Pydantic AI native span without entity_path should become root."""
         span = _make_span({"gen_ai.operation.name": "chat"})
+        assert is_root_span_candidate(span) is True
+
+    def test_pydantic_ai_tool_span_without_entity_path_is_root(self):
+        """Pydantic AI tool span without entity_path should become root if orphaned."""
+        span = _make_span({"gen_ai.tool.name": "add"}, name="running tool")
         assert is_root_span_candidate(span) is True
 
     def test_pydantic_ai_native_span_with_entity_path_not_root(self):

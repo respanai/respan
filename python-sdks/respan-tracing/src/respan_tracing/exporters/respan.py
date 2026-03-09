@@ -1,5 +1,6 @@
 import base64
 import json
+from collections import defaultdict
 from collections.abc import Mapping
 from typing import Dict, Optional, Sequence, List, Any
 
@@ -59,16 +60,253 @@ logger = get_respan_logger(LOGGER_NAME_EXPORTER)
 
 
 class ModifiedSpan:
-    """A proxy wrapper that forwards all attributes to the original span except parent_span_id"""
+    """A proxy wrapper that forwards the original span with optional overrides."""
 
-    def __init__(self, original_span: ReadableSpan):
+    def __init__(
+        self,
+        original_span: ReadableSpan,
+        overrides: Optional[Dict[str, Any]] = None,
+    ):
         self._original_span = original_span
+        self._overrides = overrides or {}
 
     def __getattr__(self, name):
-        """Forward all attribute access to the original span"""
-        if name in ("parent_span_id", "parent", "_parent"):
-            return None  # Override parent to None for root-promoted spans
+        """Forward all attribute access to the original span unless overridden."""
+        if name in self._overrides:
+            return self._overrides[name]
         return getattr(self._original_span, name)
+
+
+_PYDANTIC_AI_SCOPE_NAME = "pydantic-ai"
+_OPENAI_CHAT_SPAN_NAMES = frozenset({"openai.chat"})
+_PYDANTIC_AI_CHAT_REQUIRED_FIELDS = frozenset({
+    "full_request",
+    "full_response",
+})
+_MERGED_CHAT_FIELDS = frozenset({
+    "respan.entity.log_type",
+    "respan.entity.log_method",
+    "model",
+    "prompt_tokens",
+    "completion_tokens",
+    "total_request_tokens",
+})
+_ALWAYS_OVERRIDE_CHAT_FIELDS = frozenset({
+    "full_request",
+    "full_response",
+})
+
+
+def _get_span_identity(span: ReadableSpan) -> Optional[tuple[int, int]]:
+    context = span.get_span_context()
+    trace_id = getattr(context, "trace_id", None)
+    span_id = getattr(context, "span_id", None)
+    if trace_id is None or span_id is None:
+        return None
+    return trace_id, span_id
+
+
+def _get_parent_identity(span: ReadableSpan) -> Optional[tuple[int, int]]:
+    parent = getattr(span, "parent", None)
+    parent_span_id = getattr(parent, "span_id", None)
+    if parent_span_id is None:
+        return None
+
+    parent_trace_id = getattr(parent, "trace_id", None)
+    if parent_trace_id is None:
+        context = span.get_span_context()
+        parent_trace_id = getattr(context, "trace_id", None)
+    if parent_trace_id is None:
+        return None
+
+    return parent_trace_id, parent_span_id
+
+
+def _get_scope_name(span: ReadableSpan) -> Optional[str]:
+    scope = getattr(span, "instrumentation_scope", None)
+    scope_name = getattr(scope, "name", None)
+    if isinstance(scope_name, str) and scope_name:
+        return scope_name
+    return None
+
+
+def _iter_message_parts(messages: Any):
+    if not isinstance(messages, list):
+        return
+
+    for message in messages:
+        if not isinstance(message, Mapping):
+            continue
+        parts = message.get("parts")
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if isinstance(part, Mapping):
+                yield part
+
+
+def _extract_tool_calls_from_messages(*message_groups: Any) -> list[dict[str, Any]]:
+    tool_calls: list[dict[str, Any]] = []
+    for messages in message_groups:
+        for part in _iter_message_parts(messages) or ():
+            if part.get("type") != "tool_call":
+                continue
+            tool_calls.append({
+                str(key): value
+                for key, value in part.items()
+                if value is not None
+            })
+    return tool_calls
+
+
+def _extract_tool_names(tool_calls: list[dict[str, Any]]) -> list[str]:
+    tool_names: list[str] = []
+    seen_names: set[str] = set()
+
+    for tool_call in tool_calls:
+        tool_name = tool_call.get("name")
+        if not isinstance(tool_name, str) or not tool_name or tool_name in seen_names:
+            continue
+        seen_names.add(tool_name)
+        tool_names.append(tool_name)
+
+    return tool_names
+
+
+def _is_pydantic_ai_chat_wrapper_span(span: ReadableSpan) -> bool:
+    if _get_scope_name(span) != _PYDANTIC_AI_SCOPE_NAME:
+        return False
+
+    attributes = getattr(span, "attributes", {}) or {}
+    if attributes.get("respan.entity.log_type") != "chat":
+        return False
+
+    return all(
+        attributes.get(field_name) is not None
+        for field_name in _PYDANTIC_AI_CHAT_REQUIRED_FIELDS
+    )
+
+
+def _is_openai_chat_span(span: ReadableSpan) -> bool:
+    return getattr(span, "name", None) in _OPENAI_CHAT_SPAN_NAMES
+
+
+def _merge_chat_wrapper_into_openai_child(
+    wrapper_span: ReadableSpan,
+    openai_chat_span: ReadableSpan,
+) -> ModifiedSpan:
+    wrapper_attributes = dict(getattr(wrapper_span, "attributes", {}) or {})
+    merged_attributes = dict(getattr(openai_chat_span, "attributes", {}) or {})
+
+    for field_name in _MERGED_CHAT_FIELDS:
+        if merged_attributes.get(field_name) is not None:
+            continue
+        wrapper_value = wrapper_attributes.get(field_name)
+        if wrapper_value is not None:
+            merged_attributes[field_name] = wrapper_value
+
+    for field_name in _ALWAYS_OVERRIDE_CHAT_FIELDS:
+        wrapper_value = wrapper_attributes.get(field_name)
+        if wrapper_value is not None:
+            merged_attributes[field_name] = wrapper_value
+
+    tool_calls = _extract_tool_calls_from_messages(
+        merged_attributes.get("full_request"),
+        merged_attributes.get("full_response"),
+    )
+    if tool_calls:
+        merged_attributes["tool_calls"] = tool_calls
+        merged_attributes["has_tool_calls"] = True
+        tool_names = _extract_tool_names(tool_calls=tool_calls)
+        if tool_names:
+            merged_attributes["span_tools"] = tool_names
+
+    wrapper_parent = getattr(wrapper_span, "parent", None)
+    return ModifiedSpan(
+        original_span=openai_chat_span,
+        overrides={
+            "attributes": merged_attributes,
+            "parent": wrapper_parent,
+            "_parent": wrapper_parent,
+        },
+    )
+
+
+def _merge_pydantic_ai_chat_spans(
+    spans: Sequence[ReadableSpan],
+) -> List[ReadableSpan]:
+    spans_list = list(spans)
+    children_by_parent_identity: dict[tuple[int, int], list[ReadableSpan]] = defaultdict(list)
+    merged_span_by_identity: dict[tuple[int, int], ReadableSpan] = {}
+    wrapper_identities_to_drop: set[tuple[int, int]] = set()
+
+    for span in spans_list:
+        parent_identity = _get_parent_identity(span)
+        if parent_identity is not None:
+            children_by_parent_identity[parent_identity].append(span)
+
+    for wrapper_span in spans_list:
+        if not _is_pydantic_ai_chat_wrapper_span(wrapper_span):
+            continue
+
+        wrapper_identity = _get_span_identity(wrapper_span)
+        if wrapper_identity is None:
+            continue
+
+        matching_children = [
+            child_span
+            for child_span in children_by_parent_identity.get(wrapper_identity, [])
+            if _is_openai_chat_span(child_span)
+        ]
+        if len(matching_children) != 1:
+            continue
+
+        openai_chat_span = matching_children[0]
+        openai_chat_identity = _get_span_identity(openai_chat_span)
+        if openai_chat_identity is None:
+            continue
+
+        merged_span_by_identity[openai_chat_identity] = (
+            _merge_chat_wrapper_into_openai_child(
+                wrapper_span=wrapper_span,
+                openai_chat_span=openai_chat_span,
+            )
+        )
+        wrapper_identities_to_drop.add(wrapper_identity)
+
+    if not wrapper_identities_to_drop:
+        return spans_list
+
+    merged_spans: List[ReadableSpan] = []
+    for span in spans_list:
+        span_identity = _get_span_identity(span)
+        if span_identity in wrapper_identities_to_drop:
+            continue
+        merged_spans.append(merged_span_by_identity.get(span_identity, span))
+
+    return merged_spans
+
+
+def _prepare_spans_for_export(spans: Sequence[ReadableSpan]) -> List[ReadableSpan]:
+    merged_spans = _merge_pydantic_ai_chat_spans(spans=spans)
+    prepared_spans: List[ReadableSpan] = []
+
+    for span in merged_spans:
+        if is_root_span_candidate(span):
+            logger.debug("Making span a root span: %s", span.name)
+            prepared_spans.append(
+                ModifiedSpan(
+                    original_span=span,
+                    overrides={
+                        "parent": None,
+                        "_parent": None,
+                    },
+                )
+            )
+        else:
+            prepared_spans.append(span)
+
+    return prepared_spans
 
 
 def _convert_attribute_value(value: Any) -> Optional[Dict[str, Any]]:
@@ -344,14 +582,7 @@ class RespanSpanExporter:
         if self._is_shutdown:
             return SpanExportResult.FAILURE
 
-        # Apply root-span promotion logic
-        modified_spans: List[ReadableSpan] = []
-        for span in spans:
-            if is_root_span_candidate(span):
-                logger.debug("Making span a root span: %s", span.name)
-                modified_spans.append(ModifiedSpan(span))
-            else:
-                modified_spans.append(span)
+        modified_spans = _prepare_spans_for_export(spans=spans)
 
         # Debug preview
         try:

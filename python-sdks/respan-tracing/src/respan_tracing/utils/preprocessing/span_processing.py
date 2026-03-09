@@ -5,6 +5,24 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _is_pydantic_ai_span(span: ReadableSpan) -> bool:
+    attributes = span.attributes or {}
+    return any(
+        attributes.get(attr_name) is not None
+        for attr_name in (
+            "gen_ai.operation.name",
+            "gen_ai.system",
+            "gen_ai.agent.name",
+            "agent_name",
+            "gen_ai.tool.name",
+            "gen_ai.tool.call.arguments",
+            "gen_ai.tool.call.result",
+            "tool_arguments",
+            "tool_response",
+        )
+    )
+
+
 def is_processable_span(span: ReadableSpan) -> bool:
     """
     Determine if a span should be processed based on Respan/Traceloop attributes.
@@ -54,8 +72,8 @@ def is_processable_span(span: ReadableSpan) -> bool:
         )
         return True
 
-    # Pydantic AI native span (has gen_ai.operation.name or gen_ai.system)
-    if span.attributes.get("gen_ai.operation.name") is not None or span.attributes.get("gen_ai.system") is not None:
+    # Pydantic AI native spans can be model, agent, or tool spans.
+    if _is_pydantic_ai_span(span):
         logger.debug(
             f"[Respan Debug] Processing Pydantic AI native span: {span.name} "
             f"(gen_ai.operation.name: {span.attributes.get('gen_ai.operation.name')})"
@@ -100,7 +118,7 @@ def is_root_span_candidate(span: ReadableSpan) -> bool:
         return True
 
     # Pydantic AI native span without entity path should become root
-    is_pydantic_ai_span = span.attributes.get("gen_ai.operation.name") is not None or span.attributes.get("gen_ai.system") is not None
+    is_pydantic_ai_span = _is_pydantic_ai_span(span)
     if is_pydantic_ai_span and span_kind is None and has_no_entity_path:
         logger.debug(f"[Respan Debug] Span is root candidate (Pydantic AI native): {span.name}")
         return True

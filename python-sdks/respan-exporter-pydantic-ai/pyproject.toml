@@ -12,7 +12,8 @@ packages = [
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
 pydantic-ai = ">=0.0.36"
-respan-tracing = "^2.1.2"
+respan-sdk = { path = "../respan-sdk", develop = true }
+respan-tracing = "^2.7.4"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.4"

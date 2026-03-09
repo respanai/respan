@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from pydantic import ConfigDict, Field
 
@@ -18,6 +18,7 @@ class SpanLink(RespanBaseModel):
     trace_id: str
     span_id: str
     attributes: Dict[str, Any] = Field(default_factory=dict)
+    timestamp: Optional[str] = None  # ISO 8601 for link start time (e.g. CH lookups)
     is_remote: bool = True
     is_sampled: bool = True
 
@@ -50,6 +51,9 @@ class RespanSpanAttributes(Enum):
     LOG_PARENT_ID = "respan.entity.log_parent_id"
     LOG_ROOT_ID = "respan.entity.log_root_id"
     LOG_SOURCE = "respan.entity.log_source"
+
+    # Span links (for link timestamp attribute on OTel Link)
+    LINK_TIMESTAMP = "respan.link.timestamp"
 
 RESPAN_SPAN_ATTRIBUTES_MAP = {
     "customer_identifier": RespanSpanAttributes.RESPAN_CUSTOMER_PARAMS_ID.value,
