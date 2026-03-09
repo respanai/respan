@@ -220,7 +220,6 @@ def test_span_link_timestamp_does_not_mutate_original_attributes():
 def test_span_to_link_captures_ids_from_live_span(clean_exporter):
     """span_to_link() should extract trace_id and span_id from a live span."""
     telemetry, exporter = clean_exporter
-    client = get_client()
     tracer = trace.get_tracer("test-span-to-link")
 
     with tracer.start_as_current_span("source-span") as span:
@@ -235,7 +234,6 @@ def test_span_to_link_captures_ids_from_live_span(clean_exporter):
 def test_span_to_link_auto_captures_timestamp(clean_exporter):
     """span_to_link() should auto-capture start_time as ISO 8601 timestamp."""
     telemetry, exporter = clean_exporter
-    client = get_client()
     tracer = trace.get_tracer("test-span-to-link")
 
     with tracer.start_as_current_span("source-span") as span:

@@ -82,7 +82,7 @@ def span_to_link(
     # Auto-capture timestamp from span start_time (SDK spans expose this)
     timestamp = None
     start_time_ns = getattr(span, "start_time", None)
-    if start_time_ns is not None:
+    if start_time_ns:
         dt = datetime.fromtimestamp(start_time_ns / 1e9, tz=timezone.utc)
         timestamp = dt.isoformat()
 
@@ -92,6 +92,7 @@ def span_to_link(
         attributes=attributes or {},
         timestamp=timestamp,
         is_remote=ctx.is_remote,
+        is_sampled=bool(ctx.trace_flags & trace.TraceFlags.SAMPLED),
     )
 
 
