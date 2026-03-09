@@ -219,7 +219,7 @@ def test_span_link_timestamp_does_not_mutate_original_attributes():
 
 def test_span_to_link_captures_ids_from_live_span(clean_exporter):
     """span_to_link() should extract trace_id and span_id from a live span."""
-    telemetry, exporter = clean_exporter
+    telemetry, _ = clean_exporter
     tracer = trace.get_tracer("test-span-to-link")
 
     with tracer.start_as_current_span("source-span") as span:
@@ -233,7 +233,7 @@ def test_span_to_link_captures_ids_from_live_span(clean_exporter):
 
 def test_span_to_link_auto_captures_timestamp(clean_exporter):
     """span_to_link() should auto-capture start_time as ISO 8601 timestamp."""
-    telemetry, exporter = clean_exporter
+    telemetry, _ = clean_exporter
     tracer = trace.get_tracer("test-span-to-link")
 
     with tracer.start_as_current_span("source-span") as span:
@@ -248,7 +248,7 @@ def test_span_to_link_auto_captures_timestamp(clean_exporter):
 
 def test_span_to_link_includes_custom_attributes(clean_exporter):
     """span_to_link() should pass through custom attributes."""
-    telemetry, exporter = clean_exporter
+    telemetry, _ = clean_exporter
     tracer = trace.get_tracer("test-span-to-link")
 
     with tracer.start_as_current_span("source-span") as span:
@@ -267,7 +267,7 @@ def test_span_to_link_rejects_invalid_span_context():
 
 def test_span_to_link_roundtrips_through_otel(clean_exporter):
     """SpanLink from span_to_link() should convert cleanly to OTel Link."""
-    telemetry, exporter = clean_exporter
+    telemetry, _ = clean_exporter
     tracer = trace.get_tracer("test-span-to-link")
 
     with tracer.start_as_current_span("source-span") as span:

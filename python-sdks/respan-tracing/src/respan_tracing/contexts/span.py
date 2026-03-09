@@ -83,7 +83,9 @@ def span_to_link(
     timestamp = None
     start_time_ns = getattr(span, "start_time", None)
     if start_time_ns:
-        dt = datetime.fromtimestamp(start_time_ns / 1e9, tz=timezone.utc)
+        dt = datetime.fromtimestamp(
+            start_time_ns // 10**9, tz=timezone.utc
+        ).replace(microsecond=(start_time_ns % 10**9) // 1000)
         timestamp = dt.isoformat()
 
     return SpanLink(
