@@ -1,3 +1,5 @@
+from datetime import datetime
+
 import pytest
 from opentelemetry import trace
 from opentelemetry.semconv_ai import SpanAttributes
@@ -240,7 +242,6 @@ def test_span_to_link_auto_captures_timestamp(clean_exporter):
 
     assert link.timestamp is not None
     # Should be valid ISO 8601
-    from datetime import datetime
     dt = datetime.fromisoformat(link.timestamp)
     assert dt.year >= 2020
     telemetry.flush()
