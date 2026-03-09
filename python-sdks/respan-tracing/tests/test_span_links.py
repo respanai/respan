@@ -14,7 +14,7 @@ from respan_sdk.constants.otlp_constants import (
 from respan_sdk.respan_types.span_types import RespanSpanAttributes
 
 LINK_TIMESTAMP_ATTR = RespanSpanAttributes.LINK_TIMESTAMP.value
-from respan_tracing import RespanTelemetry, SpanLink, span_link_to_otel, get_client
+from respan_tracing import RespanTelemetry, SpanLink, span_link_to_otel, span_to_link, get_client
 from respan_tracing.core.tracer import RespanTracer
 from respan_tracing.exporters.respan import _span_to_otlp_json
 from respan_tracing.testing import InMemorySpanExporter
@@ -209,3 +209,75 @@ def test_span_link_timestamp_does_not_mutate_original_attributes():
     )
     span_link_to_otel(link)
     assert LINK_TIMESTAMP_ATTR not in original_attrs
+
+
+# ---------- span_to_link() tests ----------
+
+
+def test_span_to_link_captures_ids_from_live_span(clean_exporter):
+    """span_to_link() should extract trace_id and span_id from a live span."""
+    telemetry, exporter = clean_exporter
+    client = get_client()
+    tracer = trace.get_tracer("test-span-to-link")
+
+    with tracer.start_as_current_span("source-span") as span:
+        link = span_to_link(span)
+
+    ctx = span.get_span_context()
+    assert link.trace_id == format(ctx.trace_id, "032x")
+    assert link.span_id == format(ctx.span_id, "016x")
+    telemetry.flush()
+
+
+def test_span_to_link_auto_captures_timestamp(clean_exporter):
+    """span_to_link() should auto-capture start_time as ISO 8601 timestamp."""
+    telemetry, exporter = clean_exporter
+    client = get_client()
+    tracer = trace.get_tracer("test-span-to-link")
+
+    with tracer.start_as_current_span("source-span") as span:
+        link = span_to_link(span)
+
+    assert link.timestamp is not None
+    # Should be valid ISO 8601
+    from datetime import datetime
+    dt = datetime.fromisoformat(link.timestamp)
+    assert dt.year >= 2020
+    telemetry.flush()
+
+
+def test_span_to_link_includes_custom_attributes(clean_exporter):
+    """span_to_link() should pass through custom attributes."""
+    telemetry, exporter = clean_exporter
+    tracer = trace.get_tracer("test-span-to-link")
+
+    with tracer.start_as_current_span("source-span") as span:
+        link = span_to_link(span, attributes={"link.type": "resume", "link.source": "pause"})
+
+    assert link.attributes == {"link.type": "resume", "link.source": "pause"}
+    telemetry.flush()
+
+
+def test_span_to_link_rejects_invalid_span_context():
+    """span_to_link() should raise ValueError for invalid spans."""
+    invalid_span = trace.INVALID_SPAN
+    with pytest.raises(ValueError, match="invalid SpanContext"):
+        span_to_link(invalid_span)
+
+
+def test_span_to_link_roundtrips_through_otel(clean_exporter):
+    """SpanLink from span_to_link() should convert cleanly to OTel Link."""
+    telemetry, exporter = clean_exporter
+    tracer = trace.get_tracer("test-span-to-link")
+
+    with tracer.start_as_current_span("source-span") as span:
+        link = span_to_link(span, attributes={"link.type": "resume"})
+
+    otel_link = span_link_to_otel(link)
+    ctx = span.get_span_context()
+    assert format(otel_link.context.trace_id, "032x") == format(ctx.trace_id, "032x")
+    assert format(otel_link.context.span_id, "016x") == format(ctx.span_id, "016x")
+    # Timestamp should be merged into attributes
+    assert LINK_TIMESTAMP_ATTR in otel_link.attributes
+    assert otel_link.attributes["link.type"] == "resume"
+    telemetry.flush()
