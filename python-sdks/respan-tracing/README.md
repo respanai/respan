@@ -1287,6 +1287,7 @@ This is particularly useful for:
 - **Batch ingestion**: Collect multiple spans and export them with a single API call
 - **Manual export control**: Decide when and whether to export collected spans
 - **Trace-level batching**: Group all spans for a trace and export together
+- **Trace continuation**: Continue a pre-existing trace across workflow pause/resume boundaries
 
 #### Basic Usage
 
@@ -1417,6 +1418,38 @@ with client.get_span_buffer("resume-trace") as buffer:
 client.process_spans(collected_spans)
 ```
 
+#### Trace Continuation (Workflow Pause/Resume)
+
+When a workflow pauses and resumes, you may want all spans — pre-pause and post-resume — to share the **same trace_id** so they appear as one continuous trace in the UI.
+
+Use `parent_trace_id` and `parent_span_id` to continue an existing trace. The SDK injects a `NonRecordingSpan` parent context so all spans created in the buffer inherit the parent's trace_id and become children of the specified span.
+
+```python
+from respan_tracing import get_client
+
+client = get_client()
+
+# Pre-pause: save the trace_id and root span_id from the first execution
+pre_pause_trace_id = "0123456789abcdef0123456789abcdef"
+pre_pause_span_id = "fedcba9876543210"
+
+# On resume: continue the same trace
+with client.get_span_buffer(
+    trace_id="workflow-run-456",
+    parent_trace_id=pre_pause_trace_id,
+    parent_span_id=pre_pause_span_id,
+) as buffer:
+    # These spans inherit pre_pause_trace_id — same trace as before pause
+    buffer.create_span("resumed_step_1", {"status": "running"})
+    buffer.create_span("resumed_step_2", {"status": "completed"})
+```
+
+**When to use which:**
+- **Span links** (`links=[SpanLink(...)]`): Traces stay separate but linked. Use when you want independent traces with causal references (e.g., cross-service calls).
+- **Trace continuation** (`parent_trace_id`/`parent_span_id`): Spans join the same trace. Use when pre-pause and post-resume should appear as one execution in the waterfall view.
+
+Both can be combined — use trace continuation for a unified trace AND span links for explicit "resumed from" semantics.
+
 #### Inspect Before Export
 
 ```python
@@ -1444,6 +1477,14 @@ if len(collected_spans) > 0:
 
 #### SpanBuffer API
 
+**`client.get_span_buffer()` Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `trace_id` | `str` | required | Trace ID for the spans being buffered |
+| `parent_trace_id` | `str \| None` | `None` | OTel trace ID (hex) to continue. Spans inherit this trace_id. |
+| `parent_span_id` | `str \| None` | `None` | OTel span ID (hex) of the parent. Must be provided with `parent_trace_id`. |
+
 **SpanBuffer Methods:**
 - `create_span(name, attributes=None, kind=None, links=None)` - Create a span in the local queue
 - `get_all_spans()` - Get list of all buffered spans for inspection
@@ -1460,6 +1501,7 @@ if len(collected_spans) > 0:
 - Spans created outside the buffer context are processed normally through processors
 - **Spans are extractable as list** - spans are transportable!
 - Processing happens through standard OTEL processor pipeline (filters, transformations, export)
+- When `parent_trace_id` + `parent_span_id` are set, all spans inherit the parent's trace_id
 
 **Key Insight: Transportable Spans**
 The real power is that spans are **transportable** - collect in one place, process anywhere:
