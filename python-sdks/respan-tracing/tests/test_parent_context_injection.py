@@ -9,8 +9,9 @@ This is the SDK side of Phase 6 (Continue-Trace-on-Resume) from
 span_mv_and_trace_evolution.md.
 """
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
+from opentelemetry import trace
 from respan_tracing import RespanTelemetry, get_client
 from respan_tracing.processors.base import SpanBuffer
 
@@ -88,8 +89,6 @@ class TestParentContextInjection:
 
     def test_parent_context_detached_after_exit(self):
         """Parent context is properly detached after buffer exits."""
-        from opentelemetry import trace
-
         # Get trace_id before entering buffer
         pre_span = trace.get_current_span()
 
