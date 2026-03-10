@@ -381,34 +381,46 @@ class RespanClient:
         finally:
             cleanup_span(span, ctx_token, entity_name_token, entity_path_token)
 
-    def get_span_buffer(self, trace_id: str) -> SpanBuffer:
+    def get_span_buffer(
+        self,
+        trace_id: str,
+        parent_trace_id: Optional[str] = None,
+        parent_span_id: Optional[str] = None,
+    ) -> SpanBuffer:
         """
         Get an OpenTelemetry-compliant context manager for buffering spans with manual export control.
-        
+
         This enables batch buffering of multiple spans for a single trace, allowing you to:
         - Create spans asynchronously (after execution completes)
         - Buffer multiple spans and export with single API call
         - Manually control when spans are exported
         - Inspect spans before exporting
-        
+        - Continue a pre-existing trace (workflow pause/resume)
+
         Spans created within the SpanBuffer context are isolated and only buffered
         in that buffer's local queue, without affecting other spans in the application.
-        
+
         Args:
             trace_id: Trace ID for the spans being buffered
-        
+            parent_trace_id: Optional OTel trace ID (hex string) to continue.
+                When provided with parent_span_id, spans created in this buffer
+                inherit the parent trace, making them children of the specified
+                span. Used for workflow pause/resume to keep all spans in one trace.
+            parent_span_id: Optional OTel span ID (hex string) of the parent span.
+                Must be provided together with parent_trace_id.
+
         Returns:
             SpanBuffer: Context manager for span buffering
-        
+
         Example:
             ```python
             from respan_tracing import SpanLink, get_client
-            
+
             client = get_client()
-            
+
             # Buffer spans for batch export
             collected_spans = []
-            
+
             with client.get_span_buffer("trace-123") as buffer:
                 # Create multiple spans - they go to local queue
                 buffer.create_span("step1", {"status": "completed", "latency": 100})
@@ -424,51 +436,39 @@ class RespanClient:
                         )
                     ],
                 )
-                
+
                 # Optional: inspect before extracting
                 print(f"Buffered {buffer.get_span_count()} spans")
-                
+
                 # Extract spans before context exits
                 collected_spans = buffer.get_all_spans()
-            
+
             # Export all spans as a single batch
             client.export_spans(collected_spans)
             ```
-        
-        Example (async span creation):
+
+        Example (trace continuation for workflow resume):
             ```python
-            # Phase 1: Execute workflows (no spans yet)
-            results = []
-            for workflow in workflows:
-                result = execute_workflow(workflow)
-                results.append(result)
-            
-            # Phase 2: Create spans from results 
-            collected_spans = []
-            
-            with client.get_span_buffer("exp-123") as buffer:
-                for i, result in enumerate(results):
-                    buffer.create_span(
-                        f"workflow_{i}",
-                        attributes={
-                            "input": result["input"],
-                            "output": result["output"],
-                            "latency": result["latency"],
-                        }
-                    )
-                
-                # Extract spans before context exits
-                collected_spans = buffer.get_all_spans()
-            
-            # Phase 3: Export as batch
-            client.export_spans(collected_spans)
+            # On resume, continue the pre-pause trace:
+            with client.get_span_buffer(
+                trace_id="new-run-id",
+                parent_trace_id="abcdef1234567890abcdef1234567890",
+                parent_span_id="abcdef1234567890",
+            ) as buffer:
+                # Spans inherit parent_trace_id — same trace as pre-pause
+                buffer.create_span("resumed_step", {"status": "running"})
             ```
         """
         if not self._tracer.is_enabled or not RespanTracer.is_initialized():
             logger.warning("Respan Telemetry not initialized or disabled.")
             raise RuntimeError("Respan Telemetry not initialized or disabled.")
-        
-        return SpanBuffer(trace_id=trace_id, tracer_provider=self._tracer.tracer_provider)
+
+        return SpanBuffer(
+            trace_id=trace_id,
+            tracer_provider=self._tracer.tracer_provider,
+            parent_trace_id=parent_trace_id,
+            parent_span_id=parent_span_id,
+        )
     
     def process_spans(self, spans) -> bool:
         """
