@@ -30,6 +30,7 @@ LOG_TYPE_GENERATION = "generation"
 LOG_TYPE_UNKNOWN = "unknown"
 LOG_TYPE_SCORE = "score"
 LOG_TYPE_BATCH = "batch"
+LOG_TYPE_SPAN = "span"
 
 
 class LogTypeChoices(Enum):
@@ -52,6 +53,7 @@ class LogTypeChoices(Enum):
     UNKNOWN = LOG_TYPE_UNKNOWN
     SCORE = LOG_TYPE_SCORE
     BATCH = LOG_TYPE_BATCH
+    SPAN = LOG_TYPE_SPAN  # Generic OTel span (no specific kind)
 
 LogType = Literal[
     "text",
@@ -73,6 +75,7 @@ LogType = Literal[
     "unknown",
     "score",
     "batch",
+    "span",
 ]
 
 LOG_TYPE_MAP: Dict[str, str] = {

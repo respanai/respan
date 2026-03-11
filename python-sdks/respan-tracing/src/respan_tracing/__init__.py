@@ -1,7 +1,7 @@
 from .main import RespanTelemetry, get_client
 from .core.client import RespanClient
 from .decorators import workflow, task, agent, tool
-from .contexts.span import SpanLink, span_link_to_otel, respan_span_attributes, attach_span_links
+from .contexts.span import SpanLink, span_link_to_otel, span_to_link, respan_span_attributes, attach_span_links
 from .instruments import Instruments
 from .utils.logging import get_respan_logger, get_main_logger
 from respan_sdk.respan_types.param_types import RespanParams
@@ -17,6 +17,7 @@ __all__ = [
     "tool",
     "SpanLink",
     "span_link_to_otel",
+    "span_to_link",
     "respan_span_attributes",
     "attach_span_links",
     "Instruments",

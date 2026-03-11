@@ -1,6 +1,7 @@
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import logging
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 from opentelemetry import trace, context as context_api
 from opentelemetry.trace.span import Span
 from pydantic import ValidationError
@@ -9,10 +10,13 @@ from respan_sdk.respan_types.span_types import (
     RespanSpanAttributes,
     SpanLink,
 )
+LINK_TIMESTAMP_ATTR = RespanSpanAttributes.LINK_TIMESTAMP.value
 from respan_sdk.respan_types.param_types import RespanParams
 from respan_sdk.utils.data_processing.id_processing import (
     SPAN_ID_HEX_LENGTH,
     TRACE_ID_HEX_LENGTH,
+    format_span_id,
+    format_trace_id,
     normalize_hex_id,
 )
 from respan_tracing.utils.logging import get_respan_logger
@@ -21,7 +25,7 @@ from respan_tracing.utils.logging import get_respan_logger
 from ..constants.generic_constants import LOGGER_NAME_SPAN
 from ..constants.context_constants import PENDING_SPAN_LINKS_KEY
 
-__all__ = ["SpanLink", "span_link_to_otel", "respan_span_attributes", "attach_span_links"]
+__all__ = ["SpanLink", "span_link_to_otel", "span_to_link", "respan_span_attributes", "attach_span_links"]
 
 logger = get_respan_logger(LOGGER_NAME_SPAN)
 
@@ -41,7 +45,57 @@ def span_link_to_otel(link: SpanLink) -> trace.Link:
         trace_flags=trace_flags,
         trace_state=trace.TraceState(),
     )
-    return trace.Link(context=span_context, attributes=link.attributes)
+    # Merge timestamp into attributes if provided (enables efficient CH lookups)
+    attrs = dict(link.attributes)
+    if link.timestamp:
+        attrs[LINK_TIMESTAMP_ATTR] = link.timestamp
+    return trace.Link(context=span_context, attributes=attrs)
+
+
+def span_to_link(
+    span: Span,
+    attributes: Optional[Dict[str, Any]] = None,
+) -> SpanLink:
+    """Create a SpanLink from a live OTel span, auto-capturing its timestamp.
+
+    Extracts trace_id, span_id, and start_time from the span. The start_time
+    is converted to ISO 8601 and stored as ``timestamp`` so downstream consumers
+    (e.g., CH point-lookups) can use it without a full scan.
+
+    Args:
+        span: A live OpenTelemetry span (must have a valid SpanContext).
+        attributes: Optional extra attributes to include in the link.
+
+    Returns:
+        A SpanLink with auto-captured identifiers and timestamp.
+
+    Raises:
+        ValueError: If the span has an invalid (zero) SpanContext.
+    """
+    ctx = span.get_span_context()
+    if not ctx or not ctx.is_valid:
+        raise ValueError("Cannot create link from span with invalid SpanContext")
+
+    trace_id = format_trace_id(ctx.trace_id)
+    span_id = format_span_id(ctx.span_id)
+
+    # Auto-capture timestamp from span start_time (SDK spans expose this)
+    timestamp = None
+    start_time_ns = getattr(span, "start_time", None)
+    if start_time_ns:
+        dt = datetime.fromtimestamp(
+            start_time_ns // 10**9, tz=timezone.utc
+        ).replace(microsecond=(start_time_ns % 10**9) // 1000)
+        timestamp = dt.isoformat()
+
+    return SpanLink(
+        trace_id=trace_id,
+        span_id=span_id,
+        attributes=attributes or {},
+        timestamp=timestamp,
+        is_remote=ctx.is_remote,
+        is_sampled=bool(ctx.trace_flags & trace.TraceFlags.SAMPLED),
+    )
 
 
 def attach_span_links(links: List[SpanLink]) -> None:

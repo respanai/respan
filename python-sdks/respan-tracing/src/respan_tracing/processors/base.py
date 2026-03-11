@@ -7,6 +7,7 @@ from opentelemetry import context as context_api, trace
 from opentelemetry.sdk.trace import SpanProcessor, ReadableSpan
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor, SpanExporter, SpanExportResult
 from opentelemetry.context import Context
+from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
 from opentelemetry.semconv_ai import SpanAttributes
 
 from respan_sdk.respan_types.span_types import RespanSpanAttributes, SpanLink
@@ -179,12 +180,8 @@ class BufferingSpanProcessor(SpanProcessor):
         buffer = _active_span_buffer.get()
         
         if buffer is not None and buffer._is_buffering:
-            # Route to the buffer's local queue
-            logger.debug(
-                f"[SpanBuffer] Buffering span '{span.name}' "
-                f"for trace {buffer.trace_id}"
-            )
-            buffer._local_queue.append(span)
+            # Route to the buffer's local queue (deduplicated)
+            buffer.buffer_span(span)
         else:
             # No active buffer - use original processor (normal export)
             self.original_processor.on_end(span)
@@ -284,63 +281,110 @@ class SpanBuffer:
     5. Thread-safe isolation (each context has its own buffer)
     """
     
-    def __init__(self, trace_id: str):
+    def __init__(
+        self,
+        trace_id: str,
+        tracer_provider=None,
+        parent_trace_id: Optional[str] = None,
+        parent_span_id: Optional[str] = None,
+    ):
         """
         Initialize the span buffer.
-        
+
         Args:
             trace_id: Trace ID for the spans being buffered
+            tracer_provider: Optional TracerProvider. When provided, buffered
+                spans are auto-flushed through the processor pipeline on exit.
+            parent_trace_id: Optional OTel trace ID (hex string) to continue.
+                When provided with parent_span_id, spans created in this buffer
+                inherit the parent trace, making them children of the specified
+                span. Used for workflow pause/resume to keep all spans in one trace.
+            parent_span_id: Optional OTel span ID (hex string) of the parent span.
+                Must be provided together with parent_trace_id.
         """
         self.trace_id = trace_id
         self._local_queue: List[ReadableSpan] = []
+        self._seen_span_ids: set = set()
         self._is_buffering = False
         self._context_token = None
+        self._parent_context_token = None
+        self._tracer_provider = tracer_provider
+        self._parent_trace_id = parent_trace_id
+        self._parent_span_id = parent_span_id
     
     def __enter__(self):
         """
         Enter context: Set this buffer as active in the current context.
-        
+
         Spans created within this context will be routed to this buffer's
         local queue instead of being exported immediately.
-        
+
+        When parent_trace_id and parent_span_id are set, injects a
+        NonRecordingSpan as the current context so that all spans created
+        in this buffer inherit the parent's trace_id and become children
+        of the specified span. This enables workflow resume to continue
+        the pre-pause trace instead of starting a new one.
+
         Returns:
             self for context manager usage
         """
         logger.debug(f"[SpanBuffer] Entering buffering context for trace {self.trace_id}")
-        
+
+        # Inject parent context for trace continuation (workflow resume)
+        if self._parent_trace_id and self._parent_span_id:
+            parent_ctx = SpanContext(
+                trace_id=int(self._parent_trace_id, 16),
+                span_id=int(self._parent_span_id, 16),
+                is_remote=True,
+                trace_flags=TraceFlags(TraceFlags.SAMPLED),
+            )
+            parent_span = NonRecordingSpan(parent_ctx)
+            ctx = trace.set_span_in_context(parent_span)
+            self._parent_context_token = context_api.attach(ctx)
+            logger.debug(
+                f"[SpanBuffer] Injected parent context: "
+                f"trace_id={self._parent_trace_id}, span_id={self._parent_span_id}"
+            )
+
         # Mark as buffering
         self._is_buffering = True
-        
+
         # Set this buffer as active in the context variable
         self._context_token = _active_span_buffer.set(self)
-        
+
         logger.debug(f"[SpanBuffer] Activated buffer for trace {self.trace_id}")
-        
+
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
         """
-        Exit context: Deactivate this buffer in the current context.
-        
-        Args:
-            exc_type: Exception type if an exception was raised
-            exc_val: Exception value if an exception was raised
-            exc_tb: Exception traceback if an exception was raised
+        Exit context: Deactivate this buffer and auto-flush spans.
+
+        Buffered spans are replayed through the tracer provider's processor
+        pipeline so they reach the OTLP exporter. This does NOT clear the
+        local queue — ``get_all_spans()`` still works after exit for read-only
+        use cases (e.g., converting spans to unified logs).
         """
         logger.debug(f"[SpanBuffer] Exiting buffering context for trace {self.trace_id}")
-        
-        # Mark as not buffering
+
+        # Mark as not buffering FIRST so replayed spans don't re-enter the buffer
         self._is_buffering = False
-        
+
         # Reset the context variable
         if self._context_token is not None:
             _active_span_buffer.reset(self._context_token)
             self._context_token = None
-        
+
+        # Auto-flush: replay buffered spans through the processor pipeline
+        if self._tracer_provider is not None and self._local_queue:
+            self.process_spans(self._tracer_provider)
+
+        # Detach parent context (must happen after flush so spans keep the parent)
+        if self._parent_context_token is not None:
+            context_api.detach(self._parent_context_token)
+            self._parent_context_token = None
+
         logger.debug(f"[SpanBuffer] Deactivated buffer for trace {self.trace_id}")
-        
-        # Note: Local queue persists for manual export or inspection
-        # It will be cleaned up by garbage collection when this object is destroyed
     
     def create_span(
         self, 
@@ -402,10 +446,39 @@ class SpanBuffer:
             
         return span_id
     
+    def buffer_span(self, span: ReadableSpan) -> bool:
+        """
+        Add a span to the buffer, deduplicating by span_id.
+
+        Multiple BufferingSpanProcessor instances (one per processor chain)
+        all intercept on_end() and share this buffer via the ContextVar.
+        Without dedup, each processor adds the same span → N copies.
+
+        Args:
+            span: The span to buffer
+
+        Returns:
+            True if the span was added, False if it was a duplicate.
+        """
+        span_id = span.get_span_context().span_id
+        if span_id in self._seen_span_ids:
+            logger.debug(
+                f"[SpanBuffer] Skipping duplicate span '{span.name}' "
+                f"(span_id={format_span_id(span_id)}) for trace {self.trace_id}"
+            )
+            return False
+        self._seen_span_ids.add(span_id)
+        self._local_queue.append(span)
+        logger.debug(
+            f"[SpanBuffer] Buffering span '{span.name}' "
+            f"for trace {self.trace_id}"
+        )
+        return True
+
     def get_all_spans(self) -> List[ReadableSpan]:
         """
         Get all spans from the local queue.
-        
+
         Returns:
             List of all buffered spans
         """
@@ -456,11 +529,12 @@ class SpanBuffer:
     def clear_spans(self):
         """
         Clear all spans from the local queue without exporting.
-        
+
         Useful for discarding buffered spans if you decide not to export them.
         """
         span_count = len(self._local_queue)
         self._local_queue.clear()
+        self._seen_span_ids.clear()
         logger.debug(f"[SpanBuffer] Cleared {span_count} spans from queue")
     
     def get_span_count(self) -> int:
