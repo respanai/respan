@@ -28,7 +28,11 @@ def _make_span(
     return span
 
 
-def test_prepare_spans_for_export_merges_pydantic_chat_wrapper_into_openai_chat():
+def test_prepare_spans_drops_openai_chat_child_keeps_wrapper():
+    """The pydantic-ai chat wrapper has clean extracted attributes.
+    The openai.chat child has many raw gen_ai.* properties.
+    We drop the child and keep the wrapper."""
+
     agent_span = _make_span(
         name="invoke_agent agent",
         span_id=1001,
@@ -37,30 +41,6 @@ def test_prepare_spans_for_export_merges_pydantic_chat_wrapper_into_openai_chat(
     )
     agent_context = agent_span.get_span_context.return_value
 
-    wrapper_full_request = [
-        {
-            "role": "user",
-            "parts": [
-                {
-                    "type": "text",
-                    "content": "use add to compute 1 + 2",
-                }
-            ],
-        }
-    ]
-    wrapper_full_response = [
-        {
-            "role": "assistant",
-            "parts": [
-                {
-                    "type": "tool_call",
-                    "id": "tool-call-1",
-                    "name": "add",
-                    "arguments": {"a": 1, "b": 2},
-                }
-            ],
-        }
-    ]
     wrapper_span = _make_span(
         name="chat gpt-4o",
         span_id=1002,
@@ -72,8 +52,25 @@ def test_prepare_spans_for_export_merges_pydantic_chat_wrapper_into_openai_chat(
             "prompt_tokens": 11,
             "completion_tokens": 7,
             "total_request_tokens": 18,
-            "full_request": wrapper_full_request,
-            "full_response": wrapper_full_response,
+            "full_request": [
+                {
+                    "role": "user",
+                    "parts": [{"type": "text", "content": "compute 1 + 2"}],
+                }
+            ],
+            "full_response": [
+                {
+                    "role": "assistant",
+                    "parts": [
+                        {
+                            "type": "tool_call",
+                            "id": "tc-1",
+                            "name": "add",
+                            "arguments": {"a": 1, "b": 2},
+                        }
+                    ],
+                }
+            ],
         },
         scope_name="pydantic-ai",
     )
@@ -85,52 +82,39 @@ def test_prepare_spans_for_export_merges_pydantic_chat_wrapper_into_openai_chat(
         parent=wrapper_context,
         attributes={
             "gen_ai.system": "openai",
+            "gen_ai.request.model": "gpt-4o",
+            "gen_ai.usage.input_tokens": 11,
+            "gen_ai.usage.output_tokens": 7,
+            "gen_ai.input.messages": "[...]",
+            "gen_ai.output.messages": "[...]",
             SpanAttributes.TRACELOOP_ENTITY_PATH: "calc.agent.openai_chat",
         },
         scope_name="opentelemetry.instrumentation.openai",
     )
 
-    prepared_spans = _prepare_spans_for_export(
+    prepared = _prepare_spans_for_export(
         spans=[agent_span, wrapper_span, openai_chat_span]
     )
 
-    assert [span.name for span in prepared_spans] == [
+    assert [s.name for s in prepared] == [
         "invoke_agent agent",
-        "openai.chat",
+        "chat gpt-4o",
     ]
 
-    merged_chat_span = prepared_spans[1]
-    assert merged_chat_span.parent.span_id == agent_context.span_id
-    assert merged_chat_span.attributes["full_request"] == wrapper_full_request
-    assert merged_chat_span.attributes["full_response"] == wrapper_full_response
-    assert merged_chat_span.attributes["tool_calls"] == [
-        {
-            "type": "tool_call",
-            "id": "tool-call-1",
-            "name": "add",
-            "arguments": {"a": 1, "b": 2},
-        }
-    ]
-    assert merged_chat_span.attributes["has_tool_calls"] is True
-    assert merged_chat_span.attributes["span_tools"] == ["add"]
-    assert merged_chat_span.attributes["respan.entity.log_type"] == "chat"
-    assert merged_chat_span.attributes["respan.entity.log_method"] == "tracing_integration"
-    assert merged_chat_span.attributes["gen_ai.system"] == "openai"
+    kept_chat = prepared[1]
+    assert kept_chat.attributes["respan.entity.log_type"] == "chat"
+    assert kept_chat.attributes["model"] == "gpt-4o"
+    assert kept_chat.attributes["prompt_tokens"] == 11
+    assert kept_chat.attributes["full_request"] is not None
+    assert kept_chat.attributes["full_response"] is not None
 
 
-def test_prepare_spans_for_export_keeps_wrapper_without_openai_chat_child():
-    agent_span = _make_span(
-        name="invoke_agent agent",
-        span_id=2001,
-        attributes={"respan.entity.log_type": "agent"},
-        scope_name="pydantic-ai",
-    )
-    agent_context = agent_span.get_span_context.return_value
+def test_prepare_spans_reparents_openai_chat_grandchildren():
+    """Children of a dropped openai.chat span are reparented to the wrapper."""
 
     wrapper_span = _make_span(
         name="chat gpt-4o",
-        span_id=2002,
-        parent=agent_context,
+        span_id=2001,
         attributes={
             "respan.entity.log_type": "chat",
             "full_request": [{"role": "user", "parts": [{"type": "text", "content": "hi"}]}],
@@ -140,20 +124,49 @@ def test_prepare_spans_for_export_keeps_wrapper_without_openai_chat_child():
     )
     wrapper_context = wrapper_span.get_span_context.return_value
 
-    unrelated_child_span = _make_span(
+    openai_chat_span = _make_span(
+        name="openai.chat",
+        span_id=2002,
+        parent=wrapper_context,
+        attributes={
+            "gen_ai.system": "openai",
+            SpanAttributes.TRACELOOP_ENTITY_PATH: "agent.openai_chat",
+        },
+        scope_name="opentelemetry.instrumentation.openai",
+    )
+    openai_context = openai_chat_span.get_span_context.return_value
+
+    http_child = _make_span(
         name="http.request",
         span_id=2003,
-        parent=wrapper_context,
+        parent=openai_context,
         attributes={"http.method": "POST"},
         scope_name="opentelemetry.instrumentation.requests",
     )
 
-    prepared_spans = _prepare_spans_for_export(
-        spans=[agent_span, wrapper_span, unrelated_child_span]
+    prepared = _prepare_spans_for_export(
+        spans=[wrapper_span, openai_chat_span, http_child]
     )
 
-    assert [span.name for span in prepared_spans] == [
-        "invoke_agent agent",
-        "chat gpt-4o",
-        "http.request",
-    ]
+    assert [s.name for s in prepared] == ["chat gpt-4o", "http.request"]
+    reparented = prepared[1]
+    assert reparented.parent.span_id == wrapper_context.span_id
+
+
+def test_prepare_spans_keeps_wrapper_without_openai_child():
+    """Wrapper without an openai.chat child is kept as-is."""
+
+    wrapper_span = _make_span(
+        name="chat anthropic",
+        span_id=3001,
+        attributes={
+            "respan.entity.log_type": "chat",
+            "full_request": [{"role": "user", "parts": [{"type": "text", "content": "hi"}]}],
+            "full_response": [{"role": "assistant", "parts": [{"type": "text", "content": "hello"}]}],
+        },
+        scope_name="pydantic-ai",
+    )
+
+    prepared = _prepare_spans_for_export(spans=[wrapper_span])
+
+    assert [s.name for s in prepared] == ["chat anthropic"]
