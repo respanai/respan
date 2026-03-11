@@ -24,28 +24,35 @@ from respan_sdk.respan_types.span_types import RespanSpanAttributes
 from respan_sdk.utils.data_processing.id_processing import format_trace_id, format_span_id
 from respan_tracing.core.tracer import RespanTracer
 
+from respan_exporter_pydantic_ai.constants import (
+    DEFAULT_RESPAN_GATEWAY_BASE_URL,
+    ENRICHMENT_STRIP_ATTRS,
+    MODEL_NAME_ATTR,
+    RESPAN_RESPONSE_FORMAT_ATTR,
+    RESPAN_TOOLS_ATTR,
+    PYDANTIC_AI_ADD_PROCESSOR_PATCH_MARKER,
+    PYDANTIC_AI_AGENT_NAME_ATTR,
+    PYDANTIC_AI_ENRICHMENT_MARKER,
+    PYDANTIC_AI_INPUT_MESSAGES_ATTR,
+    PYDANTIC_AI_LEGACY_AGENT_NAME_ATTR,
+    PYDANTIC_AI_LEGACY_TOOL_ARGUMENTS_ATTR,
+    PYDANTIC_AI_LEGACY_TOOL_RESULT_ATTR,
+    PYDANTIC_AI_OPENAI_HANDLE_REQUEST_PATCH_MARKER,
+    PYDANTIC_AI_OPERATION_NAME_ATTR,
+    PYDANTIC_AI_OUTPUT_MESSAGES_ATTR,
+    PYDANTIC_AI_REQUEST_PARAMETERS_ATTR,
+    PYDANTIC_AI_RUNNING_TOOLS_SPAN_NAME,
+    PYDANTIC_AI_SYSTEM_ATTR,
+    PYDANTIC_AI_TOOL_ARGUMENTS_ATTR,
+    PYDANTIC_AI_TOOL_DEFINITIONS_ATTR,
+    PYDANTIC_AI_TOOL_NAME_ATTR,
+    PYDANTIC_AI_TOOL_RESULT_ATTR,
+    PYDANTIC_AI_USAGE_INPUT_TOKENS_ATTR,
+    PYDANTIC_AI_USAGE_OUTPUT_TOKENS_ATTR,
+)
+
 logger = logging.getLogger(__name__)
 
-PYDANTIC_AI_REQUEST_PARAMETERS_ATTR = "model_request_parameters"
-PYDANTIC_AI_TOOL_DEFINITIONS_ATTR = "gen_ai.tool.definitions"
-PYDANTIC_AI_INPUT_MESSAGES_ATTR = "gen_ai.input.messages"
-PYDANTIC_AI_OUTPUT_MESSAGES_ATTR = "gen_ai.output.messages"
-PYDANTIC_AI_OPERATION_NAME_ATTR = "gen_ai.operation.name"
-PYDANTIC_AI_SYSTEM_ATTR = "gen_ai.system"
-PYDANTIC_AI_TOOL_NAME_ATTR = "gen_ai.tool.name"
-PYDANTIC_AI_TOOL_ARGUMENTS_ATTR = "gen_ai.tool.call.arguments"
-PYDANTIC_AI_TOOL_RESULT_ATTR = "gen_ai.tool.call.result"
-PYDANTIC_AI_AGENT_NAME_ATTR = "gen_ai.agent.name"
-PYDANTIC_AI_LEGACY_TOOL_ARGUMENTS_ATTR = "tool_arguments"
-PYDANTIC_AI_LEGACY_TOOL_RESULT_ATTR = "tool_response"
-PYDANTIC_AI_LEGACY_AGENT_NAME_ATTR = "agent_name"
-_PYDANTIC_AI_ENRICHMENT_MARKER = "_respan_pydantic_ai_enrichment_installed"
-_PYDANTIC_AI_ADD_PROCESSOR_PATCH_MARKER = (
-    "_respan_pydantic_ai_add_span_processor_patched"
-)
-_PYDANTIC_AI_OPENAI_HANDLE_REQUEST_PATCH_MARKER = (
-    "_respan_pydantic_ai_openai_handle_request_patched"
-)
 _RESPAN_TEXT_LOG_FIELDS = frozenset(RespanTextLogParams.model_fields.keys())
 _PYDANTIC_AI_OPERATION_TO_LOG_TYPE = {
     "chat": LOG_TYPE_CHAT,
@@ -54,20 +61,6 @@ _PYDANTIC_AI_OPERATION_TO_LOG_TYPE = {
     "speech": LOG_TYPE_SPEECH,
     "transcription": LOG_TYPE_TRANSCRIPTION,
 }
-_ENRICHMENT_STRIP_ATTRS = frozenset({
-    PYDANTIC_AI_REQUEST_PARAMETERS_ATTR,
-    PYDANTIC_AI_TOOL_DEFINITIONS_ATTR,
-    PYDANTIC_AI_INPUT_MESSAGES_ATTR,
-    PYDANTIC_AI_OUTPUT_MESSAGES_ATTR,
-    PYDANTIC_AI_TOOL_ARGUMENTS_ATTR,
-    PYDANTIC_AI_TOOL_RESULT_ATTR,
-    PYDANTIC_AI_LEGACY_TOOL_ARGUMENTS_ATTR,
-    PYDANTIC_AI_LEGACY_TOOL_RESULT_ATTR,
-    "tools",
-    "response_format",
-    "tool_calls",
-})
-_DEFAULT_RESPAN_GATEWAY_BASE_URL = "https://api.respan.ai/api"
 
 
 def _safe_json_loads(value: Any) -> Any:
@@ -92,7 +85,7 @@ def _is_respan_gateway_base_url(base_url: Any) -> bool:
         return False
 
     respan_base_url = _normalize_base_url(
-        base_url=os.getenv("RESPAN_BASE_URL") or _DEFAULT_RESPAN_GATEWAY_BASE_URL
+        base_url=os.getenv("RESPAN_BASE_URL") or DEFAULT_RESPAN_GATEWAY_BASE_URL
     )
     return (
         normalized_base_url == respan_base_url
@@ -207,7 +200,7 @@ def _extract_tool_span_value(attributes: dict[str, Any], *attr_names: str) -> An
 
 
 def _extract_tool_name_sequence(attributes: dict[str, Any]) -> Optional[list[str]]:
-    raw_tools = attributes.get("tools")
+    raw_tools = attributes.get(RESPAN_TOOLS_ATTR)
     if not isinstance(raw_tools, (list, tuple)):
         return None
     if not all(isinstance(tool_name, str) for tool_name in raw_tools):
@@ -216,7 +209,11 @@ def _extract_tool_name_sequence(attributes: dict[str, Any]) -> Optional[list[str
 
 
 def _extract_respan_model(attributes: dict[str, Any]) -> Optional[str]:
-    for attr_name in ("gen_ai.response.model", "gen_ai.request.model", "model_name"):
+    for attr_name in (
+        SpanAttributes.LLM_RESPONSE_MODEL,
+        SpanAttributes.LLM_REQUEST_MODEL,
+        MODEL_NAME_ATTR,
+    ):
         value = attributes.get(attr_name)
         if isinstance(value, str) and value:
             return value
@@ -226,11 +223,11 @@ def _extract_respan_model(attributes: dict[str, Any]) -> Optional[str]:
 def _extract_respan_usage(attributes: dict[str, Any]) -> dict[str, int]:
     usage = {}
 
-    prompt_tokens = attributes.get("gen_ai.usage.input_tokens")
+    prompt_tokens = attributes.get(PYDANTIC_AI_USAGE_INPUT_TOKENS_ATTR)
     if isinstance(prompt_tokens, int):
         usage["prompt_tokens"] = prompt_tokens
 
-    completion_tokens = attributes.get("gen_ai.usage.output_tokens")
+    completion_tokens = attributes.get(PYDANTIC_AI_USAGE_OUTPUT_TOKENS_ATTR)
     if isinstance(completion_tokens, int):
         usage["completion_tokens"] = completion_tokens
 
@@ -266,7 +263,7 @@ def _normalize_tool_definition(
 
 
 def _extract_tools(attributes: dict[str, Any]) -> Optional[list[dict[str, Any]]]:
-    tool_definitions = attributes.get("tools")
+    tool_definitions = attributes.get(RESPAN_TOOLS_ATTR)
     if not isinstance(tool_definitions, list):
         tool_definitions = _safe_json_loads(value=tool_definitions)
 
@@ -329,7 +326,7 @@ def _build_json_schema_response_format(
 def _extract_response_format(
     attributes: dict[str, Any],
 ) -> Optional[dict[str, Any]]:
-    existing_response_format = attributes.get("response_format")
+    existing_response_format = attributes.get(RESPAN_RESPONSE_FORMAT_ATTR)
     if isinstance(existing_response_format, dict):
         return TextModelResponseFormat.model_validate(
             existing_response_format
@@ -361,7 +358,8 @@ def _extract_response_format(
             return _build_json_schema_response_format(output_object=output_object)
         return TextModelResponseFormat(type="json_schema").model_dump()
 
-    return TextModelResponseFormat(type=str(output_mode)).model_dump()
+    logger.debug("Unknown Pydantic AI output_mode %r, skipping response_format extraction", output_mode)
+    return None
 
 
 def _extract_log_type(span: ReadableSpan, attributes: dict[str, Any]) -> Optional[str]:
@@ -378,42 +376,29 @@ def _extract_log_type(span: ReadableSpan, attributes: dict[str, Any]) -> Optiona
         return _PYDANTIC_AI_OPERATION_TO_LOG_TYPE.get(operation_name)
 
     running_tool_names = _extract_tool_name_sequence(attributes=attributes)
-    if span.name == "running tools" and running_tool_names:
+    if span.name == PYDANTIC_AI_RUNNING_TOOLS_SPAN_NAME and running_tool_names:
         return LOG_TYPE_TASK
 
     return None
 
 
 def _is_pydantic_ai_span(span: ReadableSpan, attributes: dict[str, Any]) -> bool:
-    has_running_tools_attr = _extract_tool_name_sequence(attributes=attributes) is not None
-
-    return any(
-        (
-            attributes.get(PYDANTIC_AI_SYSTEM_ATTR),
-            PYDANTIC_AI_REQUEST_PARAMETERS_ATTR in attributes,
-            PYDANTIC_AI_TOOL_DEFINITIONS_ATTR in attributes,
-            attributes.get(PYDANTIC_AI_TOOL_NAME_ATTR),
-            attributes.get(PYDANTIC_AI_AGENT_NAME_ATTR),
-            attributes.get(PYDANTIC_AI_LEGACY_AGENT_NAME_ATTR),
-            attributes.get(PYDANTIC_AI_TOOL_ARGUMENTS_ATTR),
-            attributes.get(PYDANTIC_AI_TOOL_RESULT_ATTR),
-            attributes.get(PYDANTIC_AI_LEGACY_TOOL_ARGUMENTS_ATTR),
-            attributes.get(PYDANTIC_AI_LEGACY_TOOL_RESULT_ATTR),
-            has_running_tools_attr and span.name == "running tools",
+    return (
+        bool(attributes.get(PYDANTIC_AI_SYSTEM_ATTR))
+        or PYDANTIC_AI_REQUEST_PARAMETERS_ATTR in attributes
+        or PYDANTIC_AI_TOOL_DEFINITIONS_ATTR in attributes
+        or bool(attributes.get(PYDANTIC_AI_TOOL_NAME_ATTR))
+        or bool(attributes.get(PYDANTIC_AI_AGENT_NAME_ATTR))
+        or bool(attributes.get(PYDANTIC_AI_LEGACY_AGENT_NAME_ATTR))
+        or bool(attributes.get(PYDANTIC_AI_TOOL_ARGUMENTS_ATTR))
+        or bool(attributes.get(PYDANTIC_AI_TOOL_RESULT_ATTR))
+        or bool(attributes.get(PYDANTIC_AI_LEGACY_TOOL_ARGUMENTS_ATTR))
+        or bool(attributes.get(PYDANTIC_AI_LEGACY_TOOL_RESULT_ATTR))
+        or (
+            span.name == PYDANTIC_AI_RUNNING_TOOLS_SPAN_NAME
+            and _extract_tool_name_sequence(attributes=attributes) is not None
         )
     )
-
-
-def _to_json_string(value: Any) -> Optional[str]:
-    """Serialize complex values (list/dict) to JSON strings for OTel attribute safety."""
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return value
-    try:
-        return json.dumps(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def _set_respan_log_field(
@@ -421,27 +406,10 @@ def _set_respan_log_field(
 ) -> None:
     if value is None or field_name not in _RESPAN_TEXT_LOG_FIELDS:
         return
-    # OTel attributes only support primitives and sequences of primitives.
-    # Serialize dicts and list-of-dicts to JSON strings so they survive
-    # OTLP serialization without being silently dropped.
-    if isinstance(value, dict):
-        value = _to_json_string(value=value)
-    elif isinstance(value, (list, tuple)) and value and isinstance(value[0], dict):
-        value = _to_json_string(value=value)
-    if value is None:
-        return
     attributes.setdefault(field_name, value)
 
 
-def _set_respan_internal_field(
-    attributes: dict[str, Any], field_name: str, value: Any
-) -> None:
-    if value is None:
-        return
-    attributes.setdefault(field_name, value)
-
-
-def _set_traceloop_field(
+def _set_span_field(
     attributes: dict[str, Any], field_name: str, value: Any
 ) -> None:
     if value is None:
@@ -474,27 +442,27 @@ def _apply_traceloop_field_mapping(
     running_tool_names = _extract_tool_name_sequence(attributes=attributes)
 
     if log_type == LOG_TYPE_TOOL and isinstance(tool_name, str):
-        _set_traceloop_field(
+        _set_span_field(
             attributes=enriched_attributes,
             field_name=SpanAttributes.TRACELOOP_SPAN_KIND,
             value=TraceloopSpanKindValues.TOOL.value,
         )
-        _set_traceloop_field(
+        _set_span_field(
             attributes=enriched_attributes,
             field_name=SpanAttributes.TRACELOOP_ENTITY_NAME,
             value=tool_name,
         )
-        _set_traceloop_field(
+        _set_span_field(
             attributes=enriched_attributes,
             field_name=SpanAttributes.TRACELOOP_ENTITY_PATH,
             value=enriched_attributes.get(SpanAttributes.TRACELOOP_ENTITY_PATH) or tool_name,
         )
-        _set_traceloop_field(
+        _set_span_field(
             attributes=enriched_attributes,
             field_name=SpanAttributes.TRACELOOP_ENTITY_INPUT,
             value=tool_input,
         )
-        _set_traceloop_field(
+        _set_span_field(
             attributes=enriched_attributes,
             field_name=SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
             value=tool_output,
@@ -502,36 +470,36 @@ def _apply_traceloop_field_mapping(
         return
 
     if log_type == LOG_TYPE_AGENT and isinstance(agent_name, str):
-        _set_traceloop_field(
+        _set_span_field(
             attributes=enriched_attributes,
             field_name=SpanAttributes.TRACELOOP_SPAN_KIND,
             value=TraceloopSpanKindValues.AGENT.value,
         )
-        _set_traceloop_field(
+        _set_span_field(
             attributes=enriched_attributes,
             field_name=SpanAttributes.TRACELOOP_ENTITY_NAME,
             value=agent_name,
         )
-        _set_traceloop_field(
+        _set_span_field(
             attributes=enriched_attributes,
             field_name=SpanAttributes.TRACELOOP_ENTITY_PATH,
             value=enriched_attributes.get(SpanAttributes.TRACELOOP_ENTITY_PATH) or agent_name,
         )
         return
 
-    if log_type == LOG_TYPE_TASK and span.name == "running tools" and running_tool_names:
+    if log_type == LOG_TYPE_TASK and span.name == PYDANTIC_AI_RUNNING_TOOLS_SPAN_NAME and running_tool_names:
         task_name = "running_tools"
-        _set_traceloop_field(
+        _set_span_field(
             attributes=enriched_attributes,
             field_name=SpanAttributes.TRACELOOP_SPAN_KIND,
             value=TraceloopSpanKindValues.TASK.value,
         )
-        _set_traceloop_field(
+        _set_span_field(
             attributes=enriched_attributes,
             field_name=SpanAttributes.TRACELOOP_ENTITY_NAME,
             value=task_name,
         )
-        _set_traceloop_field(
+        _set_span_field(
             attributes=enriched_attributes,
             field_name=SpanAttributes.TRACELOOP_ENTITY_PATH,
             value=enriched_attributes.get(SpanAttributes.TRACELOOP_ENTITY_PATH) or task_name,
@@ -544,12 +512,12 @@ def _apply_respan_field_mapping(
     enriched_attributes: dict[str, Any],
 ) -> None:
     log_type = _extract_log_type(span=span, attributes=attributes)
-    _set_respan_internal_field(
+    _set_span_field(
         attributes=enriched_attributes,
         field_name=RespanSpanAttributes.LOG_METHOD.value,
         value=LogMethodChoices.TRACING_INTEGRATION.value,
     )
-    _set_respan_internal_field(
+    _set_span_field(
         attributes=enriched_attributes,
         field_name=RespanSpanAttributes.LOG_TYPE.value,
         value=log_type,
@@ -595,7 +563,7 @@ def _apply_respan_field_mapping(
         )
 
     running_tool_names = _extract_tool_name_sequence(attributes=attributes)
-    if span.name == "running tools" and running_tool_names:
+    if span.name == PYDANTIC_AI_RUNNING_TOOLS_SPAN_NAME and running_tool_names:
         _set_respan_log_field(
             attributes=enriched_attributes,
             field_name="span_tools",
@@ -648,7 +616,7 @@ def _enrich_pydantic_ai_span(span: ReadableSpan) -> None:
 
         enriched_attributes = {
             k: v for k, v in attributes.items()
-            if k not in _ENRICHMENT_STRIP_ATTRS
+            if k not in ENRICHMENT_STRIP_ATTRS
         }
         _apply_respan_field_mapping(
             span=span,
@@ -661,26 +629,13 @@ def _enrich_pydantic_ai_span(span: ReadableSpan) -> None:
             enriched_attributes=enriched_attributes,
         )
 
-        # Write extracted tools and response_format back (JSON-stringified
-        # so they survive OTel BoundedAttributes and OTLP serialization).
-        _set_respan_log_field(
-            attributes=enriched_attributes,
-            field_name="tools",
-            value=tools,
-        )
-        _set_respan_log_field(
-            attributes=enriched_attributes,
-            field_name="response_format",
-            value=response_format,
-        )
-
         span._attributes = enriched_attributes
     except Exception:
         logger.exception("Failed to enrich Pydantic AI span attributes.")
 
 
 def _wrap_span_processor(span_processor: Any) -> None:
-    if getattr(span_processor, _PYDANTIC_AI_ENRICHMENT_MARKER, False):
+    if getattr(span_processor, PYDANTIC_AI_ENRICHMENT_MARKER, False):
         return
 
     original_on_end = span_processor.on_end
@@ -690,20 +645,29 @@ def _wrap_span_processor(span_processor: Any) -> None:
         original_on_end(span)
 
     span_processor.on_end = _wrapped_on_end
-    setattr(span_processor, _PYDANTIC_AI_ENRICHMENT_MARKER, True)
+    setattr(span_processor, PYDANTIC_AI_ENRICHMENT_MARKER, True)
 
 
 def _install_respan_gateway_trace_correlation() -> None:
-    from opentelemetry.instrumentation.openai.shared import chat_wrappers as openai_chat_wrappers
+    # Deferred import: opentelemetry-instrumentation-openai is an optional
+    # dependency that is only present when the user instruments OpenAI calls.
+    try:
+        from opentelemetry.instrumentation.openai.shared import chat_wrappers
+    except ImportError:
+        logger.debug(
+            "opentelemetry-instrumentation-openai not installed, "
+            "skipping gateway trace correlation"
+        )
+        return
 
     if getattr(
-        openai_chat_wrappers,
-        _PYDANTIC_AI_OPENAI_HANDLE_REQUEST_PATCH_MARKER,
+        chat_wrappers,
+        PYDANTIC_AI_OPENAI_HANDLE_REQUEST_PATCH_MARKER,
         False,
     ):
         return
 
-    original_handle_request = openai_chat_wrappers._handle_request
+    original_handle_request = chat_wrappers._handle_request
 
     async def _wrapped_handle_request(span: Any, kwargs: dict[str, Any], instance: Any) -> Any:
         try:
@@ -717,10 +681,10 @@ def _install_respan_gateway_trace_correlation() -> None:
 
         return await original_handle_request(span, kwargs, instance)
 
-    openai_chat_wrappers._handle_request = _wrapped_handle_request
+    chat_wrappers._handle_request = _wrapped_handle_request
     setattr(
-        openai_chat_wrappers,
-        _PYDANTIC_AI_OPENAI_HANDLE_REQUEST_PATCH_MARKER,
+        chat_wrappers,
+        PYDANTIC_AI_OPENAI_HANDLE_REQUEST_PATCH_MARKER,
         True,
     )
 
@@ -730,7 +694,7 @@ def _install_pydantic_ai_span_enrichment(tracer: RespanTracer) -> None:
     if tracer_provider is None:
         return
 
-    if not getattr(tracer_provider, _PYDANTIC_AI_ADD_PROCESSOR_PATCH_MARKER, False):
+    if not getattr(tracer_provider, PYDANTIC_AI_ADD_PROCESSOR_PATCH_MARKER, False):
         original_add_span_processor = tracer_provider.add_span_processor
 
         def _wrapped_add_span_processor(span_processor: Any) -> None:
@@ -738,7 +702,7 @@ def _install_pydantic_ai_span_enrichment(tracer: RespanTracer) -> None:
             original_add_span_processor(span_processor)
 
         tracer_provider.add_span_processor = _wrapped_add_span_processor
-        setattr(tracer_provider, _PYDANTIC_AI_ADD_PROCESSOR_PATCH_MARKER, True)
+        setattr(tracer_provider, PYDANTIC_AI_ADD_PROCESSOR_PATCH_MARKER, True)
 
     active_span_processor = getattr(tracer_provider, "_active_span_processor", None)
     span_processors = getattr(active_span_processor, "_span_processors", ())

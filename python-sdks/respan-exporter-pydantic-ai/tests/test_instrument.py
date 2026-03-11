@@ -2,14 +2,18 @@ import json
 from types import SimpleNamespace
 
 import pytest
-from opentelemetry.instrumentation.openai.shared import chat_wrappers as openai_chat_wrappers
+from opentelemetry.instrumentation.openai.shared import chat_wrappers
 from opentelemetry.semconv_ai import SpanAttributes
 from pydantic_ai.agent import Agent
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.models.instrumented import InstrumentationSettings
 from respan_exporter_pydantic_ai import instrument_pydantic_ai
+from respan_exporter_pydantic_ai.constants import (
+    RESPAN_RESPONSE_FORMAT_ATTR,
+    RESPAN_TOOLS_ATTR,
+    PYDANTIC_AI_OPENAI_HANDLE_REQUEST_PATCH_MARKER,
+)
 from respan_exporter_pydantic_ai.instrument import (
-    _PYDANTIC_AI_OPENAI_HANDLE_REQUEST_PATCH_MARKER,
     _build_gateway_trace_extra_body,
     _inject_gateway_trace_extra_body,
 )
@@ -55,7 +59,7 @@ def test_instrument_global():
     spans = span_exporter.get_finished_spans()
     
     assert len(spans) > 0
-    assert any("gen_ai.system" in (s.attributes or {}) for s in spans)
+    assert any("respan.entity.log_type" in (s.attributes or {}) for s in spans)
 
 def test_instrument_disabled():
     """When telemetry is disabled, instrumentation is skipped."""
@@ -114,8 +118,8 @@ def test_instrument_patches_openai_gateway_request_hook():
 
     assert telemetry.tracer is not None
     assert getattr(
-        openai_chat_wrappers,
-        _PYDANTIC_AI_OPENAI_HANDLE_REQUEST_PATCH_MARKER,
+        chat_wrappers,
+        PYDANTIC_AI_OPENAI_HANDLE_REQUEST_PATCH_MARKER,
         False,
     ) is True
 
@@ -241,13 +245,15 @@ def test_pydantic_ai_span_extracts_tools_and_response_format():
     chat_span = next(
         span
         for span in spans
-        if (span.attributes or {}).get("gen_ai.operation.name") == "chat"
+        if (span.attributes or {}).get(RespanSpanAttributes.LOG_TYPE.value) == LOG_TYPE_CHAT
     )
 
-    assert "tools" not in chat_span.attributes
-    assert "response_format" not in chat_span.attributes
+    assert RESPAN_TOOLS_ATTR not in chat_span.attributes
+    assert RESPAN_RESPONSE_FORMAT_ATTR not in chat_span.attributes
     assert "gen_ai.input.messages" not in chat_span.attributes
     assert "gen_ai.output.messages" not in chat_span.attributes
+    assert "gen_ai.operation.name" not in chat_span.attributes
+    assert "gen_ai.system" not in chat_span.attributes
     assert chat_span.attributes["full_request"]
     assert chat_span.attributes["full_response"]
     assert (
@@ -291,7 +297,8 @@ def test_pydantic_ai_tool_span_maps_to_respan_fields():
     tool_span = next(
         span
         for span in spans
-        if (span.attributes or {}).get("gen_ai.tool.name") == "add"
+        if span.name == "execute_tool add"
+        and (span.attributes or {}).get(RespanSpanAttributes.LOG_TYPE.value) == LOG_TYPE_TOOL
     )
     running_tools_span = next(
         span
@@ -299,6 +306,9 @@ def test_pydantic_ai_tool_span_maps_to_respan_fields():
         if span.name == "running tools"
     )
 
+    assert "gen_ai.tool.name" not in tool_span.attributes
+    assert "gen_ai.tool.call.id" not in tool_span.attributes
+    assert "logfire.msg" not in tool_span.attributes
     assert tool_span.attributes["span_tools"] == ["add"]
     assert tool_span.name == "execute_tool add"
     tool_input = json.loads(tool_span.attributes["input"])
@@ -317,5 +327,5 @@ def test_pydantic_ai_tool_span_maps_to_respan_fields():
         running_tools_span.attributes[RespanSpanAttributes.LOG_TYPE.value]
         == LOG_TYPE_TASK
     )
-    assert "tools" not in running_tools_span.attributes
+    assert RESPAN_TOOLS_ATTR not in running_tools_span.attributes
 

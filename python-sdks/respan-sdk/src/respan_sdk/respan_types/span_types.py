@@ -67,8 +67,6 @@ class RespanSpanAttributes(Enum):
     LOG_ROOT_ID = "respan.entity.log_root_id"
     LOG_SOURCE = "respan.entity.log_source"
 
-    # Span links (for link timestamp attribute on OTel Link)
-    LINK_TIMESTAMP = "respan.link.timestamp"
 
 RESPAN_SPAN_ATTRIBUTES_MAP = {
     "customer_identifier": RespanSpanAttributes.RESPAN_CUSTOMER_PARAMS_ID.value,

@@ -80,6 +80,14 @@ def is_processable_span(span: ReadableSpan) -> bool:
         )
         return True
 
+    # Enriched Respan span (has respan.entity.log_type set by an exporter plugin).
+    if span.attributes.get("respan.entity.log_type"):
+        logger.debug(
+            f"[Respan Debug] Processing enriched Respan span: {span.name} "
+            f"(log_type: {span.attributes.get('respan.entity.log_type')})"
+        )
+        return True
+
     # Auto-instrumentation noise (HTTP, DB, etc.) - filter out
     logger.debug(
         f"[Respan Debug] Filtering out auto-instrumentation span: {span.name} (no TRACELOOP_SPAN_KIND, entityPath, llm.request.type, or gen_ai.*)"
@@ -118,9 +126,14 @@ def is_root_span_candidate(span: ReadableSpan) -> bool:
         return True
 
     # Pydantic AI native span without entity path should become root
-    is_pydantic_ai_span = _is_pydantic_ai_span(span)
-    if is_pydantic_ai_span and span_kind is None and has_no_entity_path:
+    pydantic_ai = _is_pydantic_ai_span(span)
+    if pydantic_ai and span_kind is None and has_no_entity_path:
         logger.debug(f"[Respan Debug] Span is root candidate (Pydantic AI native): {span.name}")
+        return True
+
+    # Enriched Respan span without entity path should become root
+    if span.attributes.get("respan.entity.log_type") and span_kind is None and has_no_entity_path:
+        logger.debug(f"[Respan Debug] Span is root candidate (enriched Respan): {span.name}")
         return True
 
     return False
