@@ -404,10 +404,31 @@ def _is_pydantic_ai_span(span: ReadableSpan, attributes: dict[str, Any]) -> bool
     )
 
 
+def _to_json_string(value: Any) -> Optional[str]:
+    """Serialize complex values (list/dict) to JSON strings for OTel attribute safety."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _set_respan_log_field(
     attributes: dict[str, Any], field_name: str, value: Any
 ) -> None:
     if value is None or field_name not in _RESPAN_TEXT_LOG_FIELDS:
+        return
+    # OTel attributes only support primitives and sequences of primitives.
+    # Serialize dicts and list-of-dicts to JSON strings so they survive
+    # OTLP serialization without being silently dropped.
+    if isinstance(value, dict):
+        value = _to_json_string(value=value)
+    elif isinstance(value, (list, tuple)) and value and isinstance(value[0], dict):
+        value = _to_json_string(value=value)
+    if value is None:
         return
     attributes.setdefault(field_name, value)
 
@@ -638,6 +659,19 @@ def _enrich_pydantic_ai_span(span: ReadableSpan) -> None:
             span=span,
             attributes=attributes,
             enriched_attributes=enriched_attributes,
+        )
+
+        # Write extracted tools and response_format back (JSON-stringified
+        # so they survive OTel BoundedAttributes and OTLP serialization).
+        _set_respan_log_field(
+            attributes=enriched_attributes,
+            field_name="tools",
+            value=tools,
+        )
+        _set_respan_log_field(
+            attributes=enriched_attributes,
+            field_name="response_format",
+            value=response_format,
         )
 
         span._attributes = enriched_attributes
