@@ -83,3 +83,79 @@ OTEL_SCOPE_VERSION_KEY = "otel.scope.version"
 # Error message attribute (non-standard but widely used)
 # ---------------------------------------------------------------------------
 ERROR_MESSAGE_ATTR = "error.message"
+
+# ---------------------------------------------------------------------------
+# Promoted attribute keys (Tier 1)
+#
+# Attributes that the backend extracts into typed CHLogV2 columns during
+# span-to-log conversion.  After promotion they are excluded from the
+# passthrough metadata to avoid duplication.
+#
+# This is the single source of truth — both the backend and SDK enrichment
+# layers import from here.
+# ---------------------------------------------------------------------------
+
+# Respan SDK-specific extensions (values from RespanSpanAttributes enum)
+RESPAN_PROMOTED_KEYS = frozenset({
+    "respan.span_params.custom_identifier",
+    "respan.customer_params.customer_identifier",
+    "respan.customer_params.email",
+    "respan.customer_params.name",
+    "respan.evaluation_params.evaluation_identifier",
+    "respan.threads.thread_identifier",
+    "respan.trace.trace_group_identifier",
+    "respan.metadata",
+    "respan.entity.log_method",
+    "respan.entity.log_type",
+})
+
+# Gen AI semantic conventions + OTel standard attributes
+GEN_AI_PROMOTED_KEYS = frozenset({
+    # Core LLM request/response attributes
+    "llm.request.type",
+    "gen_ai.request.model",
+    "gen_ai.response.model",
+    "gen_ai.request.temperature",
+    "gen_ai.request.max_tokens",
+    "llm.frequency_penalty",
+    "llm.presence_penalty",
+    "llm.is_streaming",
+    # Token usage
+    "gen_ai.usage.prompt_tokens",
+    "gen_ai.usage.completion_tokens",
+    "llm.usage.total_tokens",
+    # Traceloop conventions
+    "traceloop.span.kind",
+    "traceloop.entity.path",
+    "traceloop.entity.input",
+    "traceloop.entity.output",
+    "traceloop.workflow.name",
+    # Non-standard variants (Instructor telemetry, OpenAI-specific)
+    "gen_ai.usage.input_tokens",
+    "gen_ai.usage.output_tokens",
+    "gen_ai.usage.total_tokens",
+    "llm.openai.chat_completions.streaming_time_to_first_token",
+    "llm.embeddings.0",
+    ERROR_MESSAGE_ATTR,
+    # OTel v2 semantic convention keys (Pydantic AI, OpenAI instrumentor).
+    # SDK enrichment remaps these to backend column names; promoted here
+    # so originals don't leak into metadata passthrough.
+    "gen_ai.usage.cache_read_input_tokens",
+    "llm.usage.reasoning_tokens",
+    "llm.request.reasoning_effort",
+    # Pydantic AI agent run span attributes — consumed by SDK enrichment,
+    # remapped to traceloop.entity.output / gen_ai.request.model.
+    "final_result",
+    "model_name",
+    "agent_name",
+    "logfire.msg",
+    # Override keys — set by SDK enrichment for the backend override mechanism.
+    # Promoted so they don't leak into passthrough metadata.
+    "model",
+    "prompt_tokens",
+    "completion_tokens",
+    "total_request_tokens",
+})
+
+# Union of all promoted keys for quick lookup
+ALL_PROMOTED_KEYS = RESPAN_PROMOTED_KEYS | GEN_AI_PROMOTED_KEYS

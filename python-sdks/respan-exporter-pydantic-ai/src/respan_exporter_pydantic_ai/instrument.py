@@ -6,7 +6,7 @@ from typing import Any, Optional
 from pydantic_ai.agent import Agent
 from pydantic_ai.models.instrumented import InstrumentationSettings
 from opentelemetry.sdk.trace import ReadableSpan
-from opentelemetry.semconv_ai import SpanAttributes, TraceloopSpanKindValues
+from opentelemetry.semconv_ai import SpanAttributes, TraceloopSpanKindValues, LLMRequestTypeValues
 from respan_sdk.constants.llm_logging import (
     LOG_TYPE_AGENT,
     LOG_TYPE_CHAT,
@@ -530,6 +530,11 @@ def _apply_traceloop_field_mapping(
         return
 
     if log_type == LOG_TYPE_CHAT:
+        _set_span_field(
+            attributes=enriched_attributes,
+            field_name=SpanAttributes.TRACELOOP_SPAN_KIND,
+            value=LLMRequestTypeValues.CHAT.value,
+        )
         input_messages = _extract_messages(
             attributes=attributes,
             attr_name=PYDANTIC_AI_INPUT_MESSAGES_ATTR,
@@ -604,18 +609,51 @@ def _apply_respan_field_mapping(
         value=log_type,
     )
 
-    _set_respan_log_field(
-        attributes=enriched_attributes,
-        field_name="model",
-        value=_extract_respan_model(attributes=attributes),
-    )
-
-    usage_values = _extract_respan_usage(attributes=attributes)
-    for field_name, value in usage_values.items():
+    model = _extract_respan_model(attributes=attributes)
+    if model is not None:
+        # Standard semconv attr (used by backend CHAT branch for cost calc)
+        _set_span_field(
+            attributes=enriched_attributes,
+            field_name=SpanAttributes.LLM_REQUEST_MODEL,
+            value=model,
+        )
+        # Override attr (used by backend override mechanism for non-CHAT spans)
         _set_respan_log_field(
             attributes=enriched_attributes,
-            field_name=field_name,
-            value=value,
+            field_name="model",
+            value=model,
+        )
+
+    usage_values = _extract_respan_usage(attributes=attributes)
+    prompt_tokens = usage_values.get("prompt_tokens")
+    if prompt_tokens is not None:
+        _set_span_field(
+            attributes=enriched_attributes,
+            field_name=SpanAttributes.LLM_USAGE_PROMPT_TOKENS,
+            value=prompt_tokens,
+        )
+        _set_respan_log_field(
+            attributes=enriched_attributes,
+            field_name="prompt_tokens",
+            value=prompt_tokens,
+        )
+    completion_tokens = usage_values.get("completion_tokens")
+    if completion_tokens is not None:
+        _set_span_field(
+            attributes=enriched_attributes,
+            field_name=SpanAttributes.LLM_USAGE_COMPLETION_TOKENS,
+            value=completion_tokens,
+        )
+        _set_respan_log_field(
+            attributes=enriched_attributes,
+            field_name="completion_tokens",
+            value=completion_tokens,
+        )
+    if prompt_tokens is not None or completion_tokens is not None:
+        _set_respan_log_field(
+            attributes=enriched_attributes,
+            field_name="total_request_tokens",
+            value=(prompt_tokens or 0) + (completion_tokens or 0),
         )
 
     tool_name = attributes.get(PYDANTIC_AI_TOOL_NAME_ATTR)

@@ -41,6 +41,11 @@ OTEL_SCOPE_NAME_ATTR = "otel.scope.name"
 OTEL_SCOPE_VERSION_ATTR = "otel.scope.version"
 MODEL_NAME_ATTR = "model_name"
 
+# Attributes emitted by pydantic-ai instrumentation (consumed or redundant)
+PYDANTIC_AI_OPERATION_COST_ATTR = "operation.cost"
+PYDANTIC_AI_USAGE_DETAILS_INPUT_TOKENS_ATTR = "gen_ai.usage.details.input_tokens"
+PYDANTIC_AI_USAGE_DETAILS_OUTPUT_TOKENS_ATTR = "gen_ai.usage.details.output_tokens"
+
 # Attributes emitted by opentelemetry-instrumentation-openai (stripped if present)
 OPENAI_LLM_HEADERS_ATTR = "llm.headers"
 OPENAI_LLM_REQUEST_REASONING_EFFORT_ATTR = "llm.request.reasoning_effort"
@@ -105,6 +110,9 @@ ENRICHMENT_STRIP_ATTRS = frozenset({
     OPENAI_RESPONSE_SERVICE_TIER_ATTR,
     OPENAI_CACHE_READ_INPUT_TOKENS_ATTR,
     OPENAI_REASONING_TOKENS_ATTR,
+    PYDANTIC_AI_OPERATION_COST_ATTR,
+    PYDANTIC_AI_USAGE_DETAILS_INPUT_TOKENS_ATTR,
+    PYDANTIC_AI_USAGE_DETAILS_OUTPUT_TOKENS_ATTR,
 })
 
 # ── Default gateway URL ────────────────────────────────────────────────────
