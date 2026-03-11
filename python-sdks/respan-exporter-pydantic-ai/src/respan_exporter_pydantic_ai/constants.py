@@ -36,7 +36,21 @@ RESPAN_TOOL_CALLS_ATTR = "tool_calls"
 LOGFIRE_MSG_ATTR = "logfire.msg"
 OTEL_SERVER_ADDRESS_ATTR = "server.address"
 OTEL_SERVER_PORT_ATTR = "server.port"
+OTEL_SERVICE_NAME_ATTR = "service.name"
+OTEL_SCOPE_NAME_ATTR = "otel.scope.name"
+OTEL_SCOPE_VERSION_ATTR = "otel.scope.version"
 MODEL_NAME_ATTR = "model_name"
+
+# Attributes emitted by opentelemetry-instrumentation-openai
+OPENAI_LLM_HEADERS_ATTR = "llm.headers"
+OPENAI_LLM_REQUEST_REASONING_EFFORT_ATTR = "llm.request.reasoning_effort"
+OPENAI_SYSTEM_FINGERPRINT_ATTR = "gen_ai.openai.system_fingerprint"
+OPENAI_RESPONSE_SERVICE_TIER_ATTR = "openai.response.service_tier"
+OPENAI_CACHE_READ_INPUT_TOKENS_ATTR = "gen_ai.usage.cache_read_input_tokens"
+OPENAI_REASONING_TOKENS_ATTR = "llm.usage.reasoning_tokens"
+
+# Span name prefix emitted by opentelemetry-instrumentation-openai
+OPENAI_CHAT_SPAN_NAME_PREFIX = "openai.chat"
 
 # ── Well-known span names emitted by Pydantic AI ───────────────────────────
 
@@ -85,6 +99,15 @@ ENRICHMENT_STRIP_ATTRS = frozenset({
     LOGFIRE_MSG_ATTR,
     OTEL_SERVER_ADDRESS_ATTR,
     OTEL_SERVER_PORT_ATTR,
+    OTEL_SERVICE_NAME_ATTR,
+    OTEL_SCOPE_NAME_ATTR,
+    OTEL_SCOPE_VERSION_ATTR,
+    OPENAI_LLM_HEADERS_ATTR,
+    OPENAI_LLM_REQUEST_REASONING_EFFORT_ATTR,
+    OPENAI_SYSTEM_FINGERPRINT_ATTR,
+    OPENAI_RESPONSE_SERVICE_TIER_ATTR,
+    OPENAI_CACHE_READ_INPUT_TOKENS_ATTR,
+    OPENAI_REASONING_TOKENS_ATTR,
 })
 
 # ── Default gateway URL ────────────────────────────────────────────────────

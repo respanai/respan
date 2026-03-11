@@ -28,6 +28,7 @@ from respan_exporter_pydantic_ai.constants import (
     DEFAULT_RESPAN_GATEWAY_BASE_URL,
     ENRICHMENT_STRIP_ATTRS,
     MODEL_NAME_ATTR,
+    OPENAI_CHAT_SPAN_NAME_PREFIX,
     RESPAN_RESPONSE_FORMAT_ATTR,
     RESPAN_TOOLS_ATTR,
     PYDANTIC_AI_ADD_PROCESSOR_PATCH_MARKER,
@@ -182,12 +183,72 @@ def _extract_request_parameters(attributes: dict[str, Any]) -> Optional[dict[str
     return None
 
 
+def _convert_parts_message_to_standard(
+    message: dict[str, Any],
+) -> dict[str, Any]:
+    """Convert a pydantic-ai parts-based message to standard {role, content} format.
+
+    Pydantic AI emits: {role, parts: [{type: "text", content: "..."}, ...]}
+    Respan platform expects: {role, content: "...", tool_calls: [...]}
+    """
+    parts = message.get("parts")
+    if not isinstance(parts, list):
+        return message
+
+    converted: dict[str, Any] = {"role": message.get("role", "user")}
+
+    text_segments: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        part_type = part.get("type")
+        if part_type == "text":
+            text = part.get("content") or part.get("text") or ""
+            if text:
+                text_segments.append(str(text))
+        elif part_type == "tool_call":
+            tool_call: dict[str, Any] = {"type": "function"}
+            call_id = part.get("id") or part.get("tool_call_id")
+            if call_id:
+                tool_call["id"] = call_id
+            tool_call["function"] = {
+                "name": part.get("name", ""),
+                "arguments": json.dumps(part["arguments"])
+                if isinstance(part.get("arguments"), dict)
+                else str(part.get("arguments", "")),
+            }
+            tool_calls.append(tool_call)
+        elif part_type == "tool_return" or part_type == "tool_result":
+            converted["role"] = "tool"
+            converted["tool_call_id"] = part.get("tool_call_id") or part.get("id", "")
+            content = part.get("content") or part.get("return_value")
+            if content is not None:
+                text_segments.append(
+                    json.dumps(content) if not isinstance(content, str) else content
+                )
+
+    if text_segments:
+        converted["content"] = "\n".join(text_segments) if len(text_segments) > 1 else text_segments[0]
+    if tool_calls:
+        converted["tool_calls"] = tool_calls
+
+    return converted
+
+
+def _normalize_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [_convert_parts_message_to_standard(m) for m in messages if isinstance(m, dict)]
+
+
 def _extract_messages(
     attributes: dict[str, Any], attr_name: str
 ) -> Optional[list[dict[str, Any]]]:
     messages = _safe_json_loads(value=attributes.get(attr_name))
     if isinstance(messages, list):
-        return messages
+        return _normalize_messages(messages)
     return None
 
 
@@ -379,6 +440,11 @@ def _extract_log_type(span: ReadableSpan, attributes: dict[str, Any]) -> Optiona
     if span.name == PYDANTIC_AI_RUNNING_TOOLS_SPAN_NAME and running_tool_names:
         return LOG_TYPE_TASK
 
+    # Auto-instrumented OpenAI spans (opentelemetry-instrumentation-openai)
+    # don't set gen_ai.operation.name but are identifiable by span name.
+    if span.name.startswith(OPENAI_CHAT_SPAN_NAME_PREFIX):
+        return LOG_TYPE_CHAT
+
     return None
 
 
@@ -469,6 +535,27 @@ def _apply_traceloop_field_mapping(
         )
         return
 
+    if log_type == LOG_TYPE_CHAT:
+        input_messages = _extract_messages(
+            attributes=attributes,
+            attr_name=PYDANTIC_AI_INPUT_MESSAGES_ATTR,
+        )
+        output_messages = _extract_messages(
+            attributes=attributes,
+            attr_name=PYDANTIC_AI_OUTPUT_MESSAGES_ATTR,
+        )
+        _set_span_field(
+            attributes=enriched_attributes,
+            field_name=SpanAttributes.TRACELOOP_ENTITY_INPUT,
+            value=json.dumps(input_messages, default=str) if input_messages is not None else None,
+        )
+        _set_span_field(
+            attributes=enriched_attributes,
+            field_name=SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+            value=json.dumps(output_messages, default=str) if output_messages is not None else None,
+        )
+        return
+
     if log_type == LOG_TYPE_AGENT and isinstance(agent_name, str):
         _set_span_field(
             attributes=enriched_attributes,
@@ -536,23 +623,6 @@ def _apply_respan_field_mapping(
             field_name=field_name,
             value=value,
         )
-
-    _set_respan_log_field(
-        attributes=enriched_attributes,
-        field_name="full_request",
-        value=_extract_messages(
-            attributes=attributes,
-            attr_name=PYDANTIC_AI_INPUT_MESSAGES_ATTR,
-        ),
-    )
-    _set_respan_log_field(
-        attributes=enriched_attributes,
-        field_name="full_response",
-        value=_extract_messages(
-            attributes=attributes,
-            attr_name=PYDANTIC_AI_OUTPUT_MESSAGES_ATTR,
-        ),
-    )
 
     tool_name = attributes.get(PYDANTIC_AI_TOOL_NAME_ATTR)
     if isinstance(tool_name, str):

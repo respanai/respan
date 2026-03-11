@@ -51,5 +51,6 @@ class Instruments(Enum):
     REDIS = "redis"
     REQUESTS = "requests"
     URLLIB3 = "urllib3"
+    HTTPX = "httpx"
     PYMYSQL = "pymysql"
     THREADING = "threading"  # Context propagation across threads

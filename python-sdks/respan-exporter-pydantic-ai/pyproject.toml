@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "respan-exporter-pydantic-ai"
-version = "0.1.0"
+version = "0.1.2"
 description = "Respan exporter for Pydantic AI SDK"
 authors = ["Respan <team@respan.ai>"]
 license = "Apache-2.0"
@@ -12,8 +12,9 @@ packages = [
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
 pydantic-ai = ">=0.0.36"
-respan-sdk = { path = "../respan-sdk", develop = true }
+respan-sdk = "^2.6.3"
 respan-tracing = "^2.7.4"
+opentelemetry-instrumentation-openai = ">=0.34.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.4"
