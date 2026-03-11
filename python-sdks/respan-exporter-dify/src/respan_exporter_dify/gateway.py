@@ -283,7 +283,7 @@ class _BaseRespanGatewayClient:
         timeout: Any = None,
     ) -> Iterator[Dict[str, Any]]:
         with requests.post(
-            self._chat_completions_url(),
+            url=self._chat_completions_url(),
             headers=self._headers(headers),
             json=payload,
             timeout=timeout or self.timeout,
@@ -466,7 +466,7 @@ class _BaseRespanGatewayClient:
         timeout: Any = None,
     ) -> Dict[str, Any]:
         response = requests.post(
-            self._chat_completions_url(),
+            url=self._chat_completions_url(),
             headers=self._headers(headers),
             json=payload,
             timeout=timeout or self.timeout,

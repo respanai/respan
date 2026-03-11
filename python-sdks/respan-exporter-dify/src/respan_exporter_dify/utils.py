@@ -1,13 +1,18 @@
+import json
 import logging
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Set, Union
 
-from respan_sdk.constants.llm_logging import LOG_TYPE_GENERATION
-from respan_sdk.respan_types import RespanParams
-from respan_sdk.utils.export import send_payloads, validate_payload
-from respan_sdk.utils.serialization import safe_json_dumps
-from respan_sdk.utils.time import now_utc
+from respan_sdk.constants.llm_logging import (
+    LOG_TYPE_CHAT,
+    LOG_TYPE_COMPLETION,
+    LOG_TYPE_GENERATION,
+    LOG_TYPE_WORKFLOW,
+    LogMethodChoices,
+)
+from respan_sdk.respan_types.log_types import RespanLogParams
+from respan_sdk.utils.serialization import json_serial
 
 from respan_exporter_dify.constants import (
     EMPTY_VALUES,
@@ -20,6 +25,7 @@ from respan_exporter_dify.constants import (
     TOTAL_TOKENS_PATH,
     USAGE_PATHS,
 )
+from respan_exporter_dify.sdk_compat import send_payloads, validate_payload
 
 
 logger = logging.getLogger(__name__)
@@ -27,6 +33,24 @@ logger = logging.getLogger(__name__)
 # Max recursion depth for _to_serializable to avoid hitting Python's recursion limit
 # on deeply nested Dify responses (e.g. long conversation histories).
 _TO_SERIALIZABLE_MAX_DEPTH = 50
+_DERIVED_USAGE_FIELDS = {
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "prompt_unit_price",
+    "prompt_price_unit",
+    "prompt_price",
+    "completion_unit_price",
+    "completion_price_unit",
+    "completion_price",
+    "total_price",
+    "currency",
+    "latency",
+}
+
+
+def _safe_json_dumps(value: Any) -> str:
+    return json.dumps(value, default=json_serial)
 
 
 def _is_hex_string(value: str, *, length: int) -> bool:
@@ -160,16 +184,18 @@ def _coerce_usage(usage_value: Any) -> Optional[Dict[str, Any]]:
     if completion_tokens is None:
         completion_tokens = usage.get("output_tokens")
 
-    total_tokens = usage.get("total_tokens")
+    normalized_usage = {
+        key: value
+        for key, value in usage.items()
+        if key not in _DERIVED_USAGE_FIELDS
+    }
 
     if prompt_tokens is not None:
-        usage["prompt_tokens"] = prompt_tokens
+        normalized_usage["prompt_tokens"] = prompt_tokens
     if completion_tokens is not None:
-        usage["completion_tokens"] = completion_tokens
-    if total_tokens is not None:
-        usage["total_tokens"] = total_tokens
+        normalized_usage["completion_tokens"] = completion_tokens
 
-    return usage
+    return normalized_usage or None
 
 
 def _extract_usage(value: Any) -> Optional[Dict[str, Any]]:
@@ -311,15 +337,125 @@ def _method_name_from_kwargs(*, kwargs: Dict[str, Any]) -> str:
     return str(kwargs.get("method_name") or "unknown")
 
 
+def _normalize_method_name(method_name: str) -> str:
+    normalized = method_name[1:] if method_name.startswith("a") else method_name
+    if normalized in {"chat_messages", "completion_messages", "run_workflows"}:
+        return normalized
+    return method_name
+
+
+def _has_meaningful_value(value: Any) -> bool:
+    if value in EMPTY_VALUES:
+        return False
+    if isinstance(value, (dict, list, tuple, set)) and not value:
+        return False
+    return True
+
+
+def _extract_request_input(*, method_name: str, hook_input: Any) -> Any:
+    request_data = _to_serializable(hook_input)
+    if not isinstance(request_data, dict):
+        return request_data
+
+    normalized_method = _normalize_method_name(method_name)
+    compact_input: Dict[str, Any] = {}
+
+    if normalized_method == "chat_messages":
+        query = request_data.get("query")
+        inputs = request_data.get("inputs")
+        files = request_data.get("files")
+
+        if _has_meaningful_value(query) and not _has_meaningful_value(inputs) and not _has_meaningful_value(files):
+            return query
+
+        if _has_meaningful_value(query):
+            compact_input["query"] = query
+        if _has_meaningful_value(inputs):
+            compact_input["inputs"] = inputs
+        if _has_meaningful_value(files):
+            compact_input["files"] = files
+
+        return compact_input or request_data
+
+    if normalized_method == "completion_messages":
+        query = request_data.get("query")
+        inputs = request_data.get("inputs")
+        files = request_data.get("files")
+
+        normalized_inputs = dict(inputs) if isinstance(inputs, dict) else inputs
+        if isinstance(normalized_inputs, dict) and not _has_meaningful_value(query):
+            query = normalized_inputs.pop("query", None)
+
+        if _has_meaningful_value(query):
+            compact_input["query"] = query
+        if _has_meaningful_value(normalized_inputs):
+            compact_input["inputs"] = normalized_inputs
+        if _has_meaningful_value(files):
+            compact_input["files"] = files
+
+        return compact_input or request_data
+
+    if normalized_method == "run_workflows":
+        inputs = request_data.get("inputs")
+        files = request_data.get("files")
+
+        if _has_meaningful_value(inputs):
+            compact_input["inputs"] = inputs
+        if _has_meaningful_value(files):
+            compact_input["files"] = files
+
+        return compact_input or request_data
+
+    return request_data
+
+
+def _serialize_full_payload(value: Any) -> Optional[Union[Dict[str, Any], List[Any]]]:
+    serialized = _to_serializable(value)
+    if isinstance(serialized, (dict, list)):
+        return serialized
+    return None
+
+
+def _extract_model_name(*, message: Any, result: Any, fallback_model: Optional[str]) -> Optional[str]:
+    model_paths = (
+        ("model",),
+        ("metadata", "model"),
+        ("data", "model"),
+    )
+
+    for value in (message, result):
+        model = _first_non_empty_nested(value, model_paths)
+        if model not in EMPTY_VALUES:
+            return str(model)
+
+    if fallback_model not in EMPTY_VALUES:
+        return str(fallback_model)
+
+    return None
+
+
+def _default_log_type(method_name: str) -> str:
+    normalized_method = _normalize_method_name(method_name)
+    if normalized_method == "chat_messages":
+        return LOG_TYPE_CHAT
+    if normalized_method == "completion_messages":
+        return LOG_TYPE_COMPLETION
+    if normalized_method == "run_workflows":
+        return LOG_TYPE_WORKFLOW
+    return LOG_TYPE_GENERATION
+
+
+def _status_code_from_status(status: str) -> int:
+    return 200 if status == "success" else 500
+
+
 def _usage_to_payload_fields(usage: Dict[str, Any]) -> Dict[str, Any]:
-    """Build payload fields from already-normalized usage (e.g. from _coerce_usage)."""
+    """Build payload fields from raw token usage only."""
     out: Dict[str, Any] = {}
     if usage.get("prompt_tokens") is not None:
         out["prompt_tokens"] = usage["prompt_tokens"]
     if usage.get("completion_tokens") is not None:
         out["completion_tokens"] = usage["completion_tokens"]
-    if usage.get("total_tokens") is not None:
-        out["total_request_tokens"] = usage["total_tokens"]
     return out
 
 
@@ -332,13 +468,16 @@ def build_payload(
     input_value: Any,
     output_value: Any,
     error_message: Optional[str],
-    export_params: Optional[RespanParams],
+    export_params: Optional[RespanLogParams],
+    full_request: Optional[Union[Dict[str, Any], List[Any]]] = None,
+    full_response: Optional[Union[Dict[str, Any], List[Any]]] = None,
     span_name: Optional[str] = None,
     session_identifier: Optional[Union[str, int]] = None,
+    model: Optional[str] = None,
     usage: Optional[Dict[str, Any]] = None,
     metadata_extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    params = export_params or RespanParams()
+    params = export_params or RespanLogParams()
     trace_id = _normalize_trace_id(params.trace_unique_id) if params.trace_unique_id else None
     parent_span_id = (
         _normalize_span_id(params.span_parent_id, trace_id)
@@ -364,17 +503,23 @@ def build_payload(
     payload: Dict[str, Any] = {
         "span_workflow_name": params.span_workflow_name or "dify",
         "span_name": span_name or params.span_name or f"dify.{method_name}",
-        "log_type": params.log_type or LOG_TYPE_GENERATION,
+        "log_method": LogMethodChoices.TRACING_INTEGRATION.value,
+        "log_type": _default_log_type(method_name),
         "start_time": start_time.isoformat(),
         "timestamp": end_time.isoformat(),
         "latency": (end_time - start_time).total_seconds(),
         "status": status,
+        "status_code": _status_code_from_status(status),
     }
 
     if input_value is not None:
-        payload["input"] = safe_json_dumps(input_value) if not isinstance(input_value, str) else input_value
+        payload["input"] = _safe_json_dumps(input_value) if not isinstance(input_value, str) else input_value
     if output_value is not None:
-        payload["output"] = safe_json_dumps(output_value) if not isinstance(output_value, str) else output_value
+        payload["output"] = _safe_json_dumps(output_value) if not isinstance(output_value, str) else output_value
+    if full_request is not None:
+        payload["full_request"] = full_request
+    if full_response is not None:
+        payload["full_response"] = full_response
     if error_message:
         payload["error_message"] = error_message
 
@@ -399,10 +544,12 @@ def build_payload(
     if params.customer_identifier:
         payload["customer_identifier"] = params.customer_identifier
 
+    if model not in EMPTY_VALUES:
+        payload["model"] = str(model)
+
     if usage:
         normalized_usage = _coerce_usage(usage)
         if normalized_usage:
-            payload["usage"] = normalized_usage
             payload.update(_usage_to_payload_fields(normalized_usage))
 
     metadata: Dict[str, Any] = {}
@@ -428,10 +575,13 @@ def _build_export_payloads(
     kwargs: Dict[str, Any],
     result: Any,
     error_message: Optional[str],
-    params: RespanParams,
+    params: RespanLogParams,
+    model: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     result_usage = _extract_usage(result)
     hook_input = kwargs.get("req") or kwargs
+    full_request = _serialize_full_payload(hook_input)
+    full_response = _serialize_full_payload(result)
     messages = _extract_messages(result=result, kwargs={**kwargs, "method_name": method_name})
 
     payloads: List[Dict[str, Any]] = []
@@ -450,6 +600,7 @@ def _build_export_payloads(
         if message_usage is None and not is_assistant_message_with_usage:
             message_usage = result_usage
         session_id = _extract_session_id(message=message, hook_input=hook_input)
+        model_name = _extract_model_name(message=message, result=result, fallback_model=model)
         metadata_extra: Dict[str, Any] = {"message_type": message_type}
         if message_id:
             metadata_extra["message_id"] = message_id
@@ -459,14 +610,17 @@ def _build_export_payloads(
             start_time=start_time,
             end_time=end_time,
             status=status,
-            input_value=_to_serializable(message),
+            input_value=_extract_request_input(method_name=method_name, hook_input=hook_input),
             output_value=_to_serializable(
                 _extract_response_content(message=message, result=result)
             ),
             error_message=error_message,
             export_params=params,
+            full_request=full_request,
+            full_response=full_response,
             span_name=span_name,
             session_identifier=session_id,
+            model=model_name,
             usage=message_usage,
             metadata_extra=metadata_extra,
         )
@@ -487,7 +641,8 @@ def export_dify_call(
     kwargs: Dict[str, Any],
     result: Any,
     error_message: Optional[str],
-    params: RespanParams,
+    params: RespanLogParams,
+    model: Optional[str] = None,
 ) -> None:
     """
     Build Respan payloads and send them to ingest (fire-and-forget).
@@ -509,6 +664,7 @@ def export_dify_call(
             result=result,
             error_message=error_message,
             params=params,
+            model=model,
         )
     except Exception as exc:
         logger.exception("Failed to build Respan payloads: %s", exc)

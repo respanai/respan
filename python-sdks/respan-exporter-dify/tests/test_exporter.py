@@ -3,11 +3,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from dify_client import AsyncClient, Client, models
 from dify_client.models import ResponseMode
-from respan_sdk.respan_types import RespanParams
-from respan_sdk.utils.time import now_utc
+from respan_sdk.respan_types.log_types import RespanLogParams
+from respan_sdk.utils.time import parse_datetime
 from respan_exporter_dify.exporter import create_async_client, create_client
 from respan_exporter_dify.gateway import RespanGatewayClient
-from respan_exporter_dify.utils import export_dify_call
+from respan_exporter_dify.utils import _default_log_type, export_dify_call
 
 
 class AssistantMessage:
@@ -46,6 +46,13 @@ class FakeRequestsResponse:
 
     def __exit__(self, exc_type, exc, tb):
         return False
+
+
+TEST_TIMESTAMP = parse_datetime("2026-03-09T00:00:00+00:00")
+
+
+def _now_utc():
+    return TEST_TIMESTAMP
 
 
 def test_create_client():
@@ -99,7 +106,7 @@ def test_sync_client_preserves_explicit_trace_context():
     fake_result = {"messages": [{"type": "assistant", "content": "hi"}]}
     mock_client = MagicMock(spec=Client)
     mock_client.chat_messages = MagicMock(return_value=fake_result)
-    explicit_params = RespanParams(trace_unique_id="c" * 32, span_parent_id="d" * 16)
+    explicit_params = RespanLogParams(trace_unique_id="c" * 32, span_parent_id="d" * 16)
 
     with patch(
         "respan_exporter_dify.exporter._get_active_trace_context",
@@ -145,6 +152,7 @@ def test_gateway_blocking_chat_uses_respan_key_only():
     assert post_mock.call_args.kwargs["json"]["disable_log"] is True
     assert post_mock.call_args.kwargs["json"]["stream"] is True
     assert post_mock.call_args.kwargs["json"]["messages"][-1]["content"] == "What is the capital of France?"
+    assert export_mock.call_args.kwargs["model"] == "gpt-4o-mini"
     export_mock.assert_called_once()
 
 
@@ -178,9 +186,9 @@ def test_gateway_streaming_chat_maps_openai_stream_to_dify_events():
 
 
 def test_build_export_payloads_prefers_message_usage_and_session():
-    start_time = now_utc()
-    end_time = now_utc()
-    params = RespanParams()
+    start_time = _now_utc()
+    end_time = _now_utc()
+    params = RespanLogParams()
     result = [
         {
             "event": "message",
@@ -213,19 +221,167 @@ def test_build_export_payloads_prefers_message_usage_and_session():
     assert payload["session_identifier"] == "session-from-message"
     assert payload["prompt_tokens"] == 11
     assert payload["completion_tokens"] == 5
-    assert payload["usage"]["prompt_tokens"] == 11
-    assert payload["usage"]["completion_tokens"] == 5
+    assert "usage" not in payload
     assert "total_request_tokens" not in payload
-    assert "total_tokens" not in payload["usage"]
     assert "hello world" in payload["output"]
     assert "completion_message" not in payload
     assert "completion_messages" not in payload
 
 
+def test_build_export_payloads_uses_compact_chat_request_input():
+    start_time = _now_utc()
+    end_time = _now_utc()
+    params = RespanLogParams()
+    result = {
+        "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+        "messages": [{"type": "assistant", "content": "2 + 2 equals 4."}],
+    }
+    request = {
+        "query": "What is 2+2?",
+        "inputs": {},
+        "response_mode": "blocking",
+        "user": "user-06e9871d",
+        "conversation_id": "",
+        "files": [],
+        "auto_generate_name": True,
+    }
+
+    with patch("respan_exporter_dify.utils.send_payloads") as send_mock:
+        export_dify_call(
+            api_key="test-key",
+            endpoint="https://test",
+            timeout=10,
+            method_name="chat_messages",
+            start_time=start_time,
+            end_time=end_time,
+            status="success",
+            kwargs={"req": request},
+            result=result,
+            error_message=None,
+            params=params,
+        )
+        send_mock.assert_called_once()
+        payloads = send_mock.call_args.kwargs["payloads"]
+
+    assert len(payloads) == 1
+    payload = payloads[0]
+    assert payload["input"] == "What is 2+2?"
+
+
+def test_build_export_payloads_uses_provided_model():
+    start_time = _now_utc()
+    end_time = _now_utc()
+    params = RespanLogParams()
+    result = {
+        "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+        "messages": [{"type": "assistant", "content": "2 + 2 equals 4."}],
+    }
+
+    with patch("respan_exporter_dify.utils.send_payloads") as send_mock:
+        export_dify_call(
+            api_key="test-key",
+            endpoint="https://test",
+            timeout=10,
+            method_name="chat_messages",
+            start_time=start_time,
+            end_time=end_time,
+            status="success",
+            kwargs={"req": {"query": "What is 2+2?"}},
+            result=result,
+            error_message=None,
+            params=params,
+            model="gpt-4o",
+        )
+        send_mock.assert_called_once()
+        payloads = send_mock.call_args.kwargs["payloads"]
+
+    assert len(payloads) == 1
+    payload = payloads[0]
+    assert payload["model"] == "gpt-4o"
+
+
+@pytest.mark.parametrize(
+    ("method_name", "expected_log_type"),
+    [
+        ("chat_messages", "chat"),
+        ("achat_messages", "chat"),
+        ("completion_messages", "completion"),
+        ("acompletion_messages", "completion"),
+        ("run_workflows", "workflow"),
+        ("arun_workflows", "workflow"),
+    ],
+)
+def test_default_log_type_matches_dify_method(method_name, expected_log_type):
+    assert _default_log_type(method_name) == expected_log_type
+
+
+def test_build_export_payloads_maps_sdk_log_fields_for_chat():
+    start_time = _now_utc()
+    end_time = _now_utc()
+    params = RespanLogParams()
+    request = {
+        "query": "What is 2+2?",
+        "inputs": {},
+        "files": [],
+        "response_mode": "blocking",
+    }
+    result = {
+        "message_id": "msg-123",
+        "conversation_id": "conv-123",
+        "mode": "chat",
+        "answer": "2 + 2 equals 4.",
+        "metadata": {
+            "usage": {
+                "prompt_tokens": 2,
+                "completion_tokens": 3,
+                "total_tokens": 5,
+                "prompt_unit_price": "0.001",
+                "completion_unit_price": "0.002",
+                "total_price": "0.007",
+            }
+        },
+    }
+
+    with patch("respan_exporter_dify.utils.send_payloads") as send_mock:
+        export_dify_call(
+            api_key="test-key",
+            endpoint="https://test",
+            timeout=10,
+            method_name="chat_messages",
+            start_time=start_time,
+            end_time=end_time,
+            status="success",
+            kwargs={"req": request},
+            result=result,
+            error_message=None,
+            params=params,
+            model="gpt-4o",
+        )
+        send_mock.assert_called_once()
+        payloads = send_mock.call_args.kwargs["payloads"]
+
+    assert len(payloads) == 1
+    payload = payloads[0]
+    assert payload["log_method"] == "tracing_integration"
+    assert payload["log_type"] == "chat"
+    assert payload["status"] == "success"
+    assert payload["status_code"] == 200
+    assert payload["model"] == "gpt-4o"
+    assert "usage" not in payload
+    assert "prompt_unit_price" not in payload
+    assert "completion_unit_price" not in payload
+    assert "cost" not in payload
+    assert "total_request_tokens" not in payload
+    assert payload["full_request"] == request
+    assert payload["full_response"] == result
+    assert payload["input"] == "What is 2+2?"
+    assert payload["output"] == "2 + 2 equals 4."
+
+
 def test_build_export_payloads_falls_back_to_result_usage_and_hook_session():
-    start_time = now_utc()
-    end_time = now_utc()
-    params = RespanParams()
+    start_time = _now_utc()
+    end_time = _now_utc()
+    params = RespanLogParams()
     result = {
         "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
         "messages": [{"type": "assistant", "content": "final answer"}],
@@ -254,16 +410,14 @@ def test_build_export_payloads_falls_back_to_result_usage_and_hook_session():
     assert payload["session_identifier"] == "session-from-hook"
     assert payload["prompt_tokens"] == 2
     assert payload["completion_tokens"] == 3
-    assert payload["total_request_tokens"] == 5
-    assert payload["usage"]["prompt_tokens"] == 2
-    assert payload["usage"]["completion_tokens"] == 3
-    assert payload["usage"]["total_tokens"] == 5
+    assert "usage" not in payload
+    assert "total_request_tokens" not in payload
 
 
 def test_build_export_payloads_uses_assistant_message_usage_and_dedupes_by_id():
-    start_time = now_utc()
-    end_time = now_utc()
-    params = RespanParams()
+    start_time = _now_utc()
+    end_time = _now_utc()
+    params = RespanLogParams()
     result = ResultMessage(
         messages=[
             AssistantMessage(
@@ -308,21 +462,22 @@ def test_build_export_payloads_uses_assistant_message_usage_and_dedupes_by_id():
     assert first_payload["span_name"] == "dify.assistant"
     assert first_payload["prompt_tokens"] == 7
     assert first_payload["completion_tokens"] == 4
-    assert first_payload["usage"]["cache_read_input_tokens"] == 2
+    assert "usage" not in first_payload
     assert "total_request_tokens" not in first_payload
     assert first_payload["metadata"]["message_id"] == "turn-1"
 
     second_payload = payloads[1]
     assert second_payload["prompt_tokens"] == 3
     assert second_payload["completion_tokens"] == 1
+    assert "usage" not in second_payload
     assert "total_request_tokens" not in second_payload
     assert second_payload["metadata"]["message_id"] == "turn-2"
 
 
 def test_build_export_payloads_generates_child_span_for_linked_trace():
-    start_time = now_utc()
-    end_time = now_utc()
-    params = RespanParams(trace_unique_id="a" * 32, span_parent_id="b" * 16)
+    start_time = _now_utc()
+    end_time = _now_utc()
+    params = RespanLogParams(trace_unique_id="a" * 32, span_parent_id="b" * 16)
     result = ResultMessage(
         messages=[
             AssistantMessage(

@@ -1,13 +1,14 @@
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from dify_client import AsyncClient, Client
 from dify_client.models import ResponseMode
 from respan_sdk.constants import RESPAN_TRACING_INGEST_ENDPOINT
-from respan_sdk.respan_types import RespanParams
-from respan_sdk.utils.time import now_utc
+from respan_sdk.respan_types.log_types import RespanLogParams
+from respan_sdk.utils.time import parse_datetime
+from respan_tracing import get_client
 from respan_exporter_dify.gateway import RespanAsyncGatewayClient, RespanGatewayClient
 from respan_exporter_dify.utils import export_dify_call
 
@@ -15,12 +16,11 @@ from respan_exporter_dify.utils import export_dify_call
 logger = logging.getLogger(__name__)
 
 
-def _get_active_trace_context() -> tuple[Optional[str], Optional[str]]:
-    try:
-        from respan_tracing import get_client
-    except Exception:
-        return None, None
+def _now_utc() -> datetime:
+    return parse_datetime(datetime.now(timezone.utc).isoformat())
 
+
+def _get_active_trace_context() -> tuple[Optional[str], Optional[str]]:
     try:
         client = get_client()
         return client.get_current_trace_id(), client.get_current_span_id()
@@ -29,7 +29,7 @@ def _get_active_trace_context() -> tuple[Optional[str], Optional[str]]:
         return None, None
 
 
-def _inherit_active_trace_context(params: RespanParams) -> RespanParams:
+def _inherit_active_trace_context(params: RespanLogParams) -> RespanLogParams:
     if params.trace_unique_id and params.span_parent_id:
         return params
 
@@ -84,10 +84,18 @@ class _BaseDifyClient:
                 f"Must provide a {client_cls.__name__}, dify_api_key, or RESPAN_API_KEY for gateway mode"
             )
 
-    def _get_export_func(self, method_name: str, start_time: datetime, kwargs: Any, params: RespanParams):
+    def _get_export_func(
+        self,
+        *,
+        method_name: str,
+        start_time: datetime,
+        kwargs: Any,
+        params: RespanLogParams,
+    ):
         # Capture only the minimal kwargs needed for export (payload building uses "req").
         # Avoids holding other keys from the caller's kwargs in the closure until export runs.
         export_kwargs = {k: kwargs[k] for k in ("req",) if k in kwargs}
+        export_model = getattr(self._client, "model", None)
 
         def _export(
             *,
@@ -105,6 +113,7 @@ class _BaseDifyClient:
                 end_time=end_time,
                 status=status,
                 kwargs=export_kwargs,
+                model=export_model,
                 result=result,
                 error_message=error_message,
                 params=params,
@@ -155,10 +164,14 @@ class RespanDifyClient(_BaseDifyClient):
         self,
         *,
         method_name: str,
-        respan_params: Optional[RespanParams] = None,
+        respan_params: Optional[RespanLogParams] = None,
         **kwargs: Any,
     ) -> Any:
-        params = RespanParams.model_validate(respan_params) if respan_params else RespanParams()
+        params = (
+            RespanLogParams.model_validate(respan_params)
+            if respan_params
+            else RespanLogParams()
+        )
         params = _inherit_active_trace_context(params)
         method = getattr(self._client, method_name)
 
@@ -168,8 +181,13 @@ class RespanDifyClient(_BaseDifyClient):
         req = kwargs.get("req")
         is_stream = req and getattr(req, "response_mode", None) == ResponseMode.STREAMING
 
-        start_time = now_utc()
-        _export = self._get_export_func(method_name, start_time, kwargs, params)
+        start_time = _now_utc()
+        _export = self._get_export_func(
+            method_name=method_name,
+            start_time=start_time,
+            kwargs=kwargs,
+            params=params,
+        )
 
         try:
             result = method(**kwargs)
@@ -190,7 +208,7 @@ class RespanDifyClient(_BaseDifyClient):
                         raise
                     finally:
                         _export(
-                            end_time=now_utc(),
+                            end_time=_now_utc(),
                             status=status,
                             result=events,
                             error_message=error_msg,
@@ -199,7 +217,7 @@ class RespanDifyClient(_BaseDifyClient):
                 return stream_generator()
             else:
                 _export(
-                    end_time=now_utc(),
+                    end_time=_now_utc(),
                     status="success",
                     result=result,
                     error_message=None,
@@ -208,21 +226,54 @@ class RespanDifyClient(_BaseDifyClient):
 
         except Exception as exc:
             _export(
-                end_time=now_utc(),
+                end_time=_now_utc(),
                 status="error",
                 result=None,
                 error_message=str(exc),
             )
             raise
 
-    def chat_messages(self, req, *, respan_params: Optional[RespanParams] = None, **kwargs: Any) -> Any:
-        return self._call_and_export(method_name="chat_messages", respan_params=respan_params, req=req, **kwargs)
+    def chat_messages(
+        self,
+        req,
+        *,
+        respan_params: Optional[RespanLogParams] = None,
+        **kwargs: Any,
+    ) -> Any:
+        return self._call_and_export(
+            method_name="chat_messages",
+            respan_params=respan_params,
+            req=req,
+            **kwargs,
+        )
 
-    def completion_messages(self, req, *, respan_params: Optional[RespanParams] = None, **kwargs: Any) -> Any:
-        return self._call_and_export(method_name="completion_messages", respan_params=respan_params, req=req, **kwargs)
+    def completion_messages(
+        self,
+        req,
+        *,
+        respan_params: Optional[RespanLogParams] = None,
+        **kwargs: Any,
+    ) -> Any:
+        return self._call_and_export(
+            method_name="completion_messages",
+            respan_params=respan_params,
+            req=req,
+            **kwargs,
+        )
 
-    def run_workflows(self, req, *, respan_params: Optional[RespanParams] = None, **kwargs: Any) -> Any:
-        return self._call_and_export(method_name="run_workflows", respan_params=respan_params, req=req, **kwargs)
+    def run_workflows(
+        self,
+        req,
+        *,
+        respan_params: Optional[RespanLogParams] = None,
+        **kwargs: Any,
+    ) -> Any:
+        return self._call_and_export(
+            method_name="run_workflows",
+            respan_params=respan_params,
+            req=req,
+            **kwargs,
+        )
 
 
 class RespanAsyncDifyClient(_BaseDifyClient):
@@ -269,10 +320,14 @@ class RespanAsyncDifyClient(_BaseDifyClient):
         self,
         *,
         method_name: str,
-        respan_params: Optional[RespanParams] = None,
+        respan_params: Optional[RespanLogParams] = None,
         **kwargs: Any,
     ) -> Any:
-        params = RespanParams.model_validate(respan_params) if respan_params else RespanParams()
+        params = (
+            RespanLogParams.model_validate(respan_params)
+            if respan_params
+            else RespanLogParams()
+        )
         params = _inherit_active_trace_context(params)
         method = getattr(self._client, method_name)
 
@@ -282,8 +337,13 @@ class RespanAsyncDifyClient(_BaseDifyClient):
         req = kwargs.get("req")
         is_stream = req and getattr(req, "response_mode", None) == ResponseMode.STREAMING
 
-        start_time = now_utc()
-        _export = self._get_export_func(method_name, start_time, kwargs, params)
+        start_time = _now_utc()
+        _export = self._get_export_func(
+            method_name=method_name,
+            start_time=start_time,
+            kwargs=kwargs,
+            params=params,
+        )
 
         try:
             result = await method(**kwargs)
@@ -304,7 +364,7 @@ class RespanAsyncDifyClient(_BaseDifyClient):
                         raise
                     finally:
                         _export(
-                            end_time=now_utc(),
+                            end_time=_now_utc(),
                             status=status,
                             result=events,
                             error_message=error_msg,
@@ -313,7 +373,7 @@ class RespanAsyncDifyClient(_BaseDifyClient):
                 return stream_generator()
             else:
                 _export(
-                    end_time=now_utc(),
+                    end_time=_now_utc(),
                     status="success",
                     result=result,
                     error_message=None,
@@ -322,21 +382,54 @@ class RespanAsyncDifyClient(_BaseDifyClient):
 
         except Exception as exc:
             _export(
-                end_time=now_utc(),
+                end_time=_now_utc(),
                 status="error",
                 result=None,
                 error_message=str(exc),
             )
             raise
 
-    async def achat_messages(self, req, *, respan_params: Optional[RespanParams] = None, **kwargs: Any) -> Any:
-        return await self._call_and_export(method_name="achat_messages", respan_params=respan_params, req=req, **kwargs)
+    async def achat_messages(
+        self,
+        req,
+        *,
+        respan_params: Optional[RespanLogParams] = None,
+        **kwargs: Any,
+    ) -> Any:
+        return await self._call_and_export(
+            method_name="achat_messages",
+            respan_params=respan_params,
+            req=req,
+            **kwargs,
+        )
 
-    async def acompletion_messages(self, req, *, respan_params: Optional[RespanParams] = None, **kwargs: Any) -> Any:
-        return await self._call_and_export(method_name="acompletion_messages", respan_params=respan_params, req=req, **kwargs)
+    async def acompletion_messages(
+        self,
+        req,
+        *,
+        respan_params: Optional[RespanLogParams] = None,
+        **kwargs: Any,
+    ) -> Any:
+        return await self._call_and_export(
+            method_name="acompletion_messages",
+            respan_params=respan_params,
+            req=req,
+            **kwargs,
+        )
 
-    async def arun_workflows(self, req, *, respan_params: Optional[RespanParams] = None, **kwargs: Any) -> Any:
-        return await self._call_and_export(method_name="arun_workflows", respan_params=respan_params, req=req, **kwargs)
+    async def arun_workflows(
+        self,
+        req,
+        *,
+        respan_params: Optional[RespanLogParams] = None,
+        **kwargs: Any,
+    ) -> Any:
+        return await self._call_and_export(
+            method_name="arun_workflows",
+            respan_params=respan_params,
+            req=req,
+            **kwargs,
+        )
 
 
 def create_client(
