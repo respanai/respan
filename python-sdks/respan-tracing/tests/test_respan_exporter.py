@@ -52,25 +52,8 @@ def test_prepare_spans_drops_openai_chat_child_keeps_wrapper():
             "prompt_tokens": 11,
             "completion_tokens": 7,
             "total_request_tokens": 18,
-            "full_request": [
-                {
-                    "role": "user",
-                    "parts": [{"type": "text", "content": "compute 1 + 2"}],
-                }
-            ],
-            "full_response": [
-                {
-                    "role": "assistant",
-                    "parts": [
-                        {
-                            "type": "tool_call",
-                            "id": "tc-1",
-                            "name": "add",
-                            "arguments": {"a": 1, "b": 2},
-                        }
-                    ],
-                }
-            ],
+            "traceloop.entity.input": '[{"role": "user", "parts": [{"type": "text", "content": "compute 1 + 2"}]}]',
+            "traceloop.entity.output": '[{"role": "assistant", "parts": [{"type": "tool_call", "id": "tc-1", "name": "add", "arguments": {"a": 1, "b": 2}}]}]',
         },
         scope_name="pydantic-ai",
     )
@@ -105,8 +88,8 @@ def test_prepare_spans_drops_openai_chat_child_keeps_wrapper():
     assert kept_chat.attributes["respan.entity.log_type"] == "chat"
     assert kept_chat.attributes["model"] == "gpt-4o"
     assert kept_chat.attributes["prompt_tokens"] == 11
-    assert kept_chat.attributes["full_request"] is not None
-    assert kept_chat.attributes["full_response"] is not None
+    assert kept_chat.attributes["traceloop.entity.input"] is not None
+    assert kept_chat.attributes["traceloop.entity.output"] is not None
 
 
 def test_prepare_spans_reparents_openai_chat_grandchildren():
@@ -117,8 +100,8 @@ def test_prepare_spans_reparents_openai_chat_grandchildren():
         span_id=2001,
         attributes={
             "respan.entity.log_type": "chat",
-            "full_request": [{"role": "user", "parts": [{"type": "text", "content": "hi"}]}],
-            "full_response": [{"role": "assistant", "parts": [{"type": "text", "content": "hello"}]}],
+            "traceloop.entity.input": '[{"role": "user", "parts": [{"type": "text", "content": "hi"}]}]',
+            "traceloop.entity.output": '[{"role": "assistant", "parts": [{"type": "text", "content": "hello"}]}]',
         },
         scope_name="pydantic-ai",
     )
@@ -161,8 +144,8 @@ def test_prepare_spans_keeps_wrapper_without_openai_child():
         span_id=3001,
         attributes={
             "respan.entity.log_type": "chat",
-            "full_request": [{"role": "user", "parts": [{"type": "text", "content": "hi"}]}],
-            "full_response": [{"role": "assistant", "parts": [{"type": "text", "content": "hello"}]}],
+            "traceloop.entity.input": '[{"role": "user", "parts": [{"type": "text", "content": "hi"}]}]',
+            "traceloop.entity.output": '[{"role": "assistant", "parts": [{"type": "text", "content": "hello"}]}]',
         },
         scope_name="pydantic-ai",
     )

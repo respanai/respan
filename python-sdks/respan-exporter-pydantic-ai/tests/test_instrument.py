@@ -254,8 +254,10 @@ def test_pydantic_ai_span_extracts_tools_and_response_format():
     assert "gen_ai.output.messages" not in chat_span.attributes
     assert "gen_ai.operation.name" not in chat_span.attributes
     assert "gen_ai.system" not in chat_span.attributes
-    assert chat_span.attributes["full_request"]
-    assert chat_span.attributes["full_response"]
+    assert "full_request" not in chat_span.attributes
+    assert "full_response" not in chat_span.attributes
+    assert chat_span.attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT]
+    assert chat_span.attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]
     assert (
         chat_span.attributes[RespanSpanAttributes.LOG_TYPE.value] == LOG_TYPE_CHAT
     )

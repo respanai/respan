@@ -602,6 +602,73 @@ def _apply_respan_field_mapping(
         )
 
 
+def _convert_pydantic_message_to_openai(msg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Convert a single Pydantic AI message (parts-based) to OpenAI chat message(s).
+
+    A Pydantic AI message with tool_call_response parts may expand into
+    multiple OpenAI "tool" role messages, so this always returns a list.
+    """
+    parts = msg.get("parts")
+    if not isinstance(parts, list):
+        return [msg]
+
+    role = msg.get("role", "")
+    text_contents: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    tool_responses: list[dict[str, Any]] = []
+
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        part_type = part.get("type")
+        if part_type == "text":
+            text_contents.append(part.get("content", ""))
+        elif part_type == "tool_call":
+            tool_calls.append(part)
+        elif part_type == "tool_call_response":
+            tool_responses.append(part)
+
+    if tool_responses:
+        result: list[dict[str, Any]] = []
+        for resp in tool_responses:
+            result_value = resp.get("result")
+            content = json.dumps(result_value) if not isinstance(result_value, str) else result_value
+            tool_msg: dict[str, Any] = {"role": "tool", "content": content}
+            if resp.get("id"):
+                tool_msg["tool_call_id"] = resp["id"]
+            if resp.get("name"):
+                tool_msg["name"] = resp["name"]
+            result.append(tool_msg)
+        return result
+
+    openai_msg: dict[str, Any] = {"role": role}
+    if text_contents:
+        openai_msg["content"] = text_contents[0] if len(text_contents) == 1 else "\n".join(text_contents)
+    if tool_calls:
+        openai_msg["tool_calls"] = [
+            {
+                "id": tc.get("id", ""),
+                "type": "function",
+                "function": {
+                    "name": tc.get("name", ""),
+                    "arguments": tc.get("arguments", ""),
+                },
+            }
+            for tc in tool_calls
+        ]
+    return [openai_msg]
+
+
+def _convert_pydantic_messages_to_openai(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Convert a list of Pydantic AI messages to OpenAI chat format."""
+    converted: list[dict[str, Any]] = []
+    for msg in messages:
+        converted.extend(_convert_pydantic_message_to_openai(msg))
+    return converted
+
+
 def _enrich_pydantic_ai_span(span: ReadableSpan) -> None:
     try:
         attributes = dict(getattr(span, "attributes", {}) or {})
@@ -628,6 +695,21 @@ def _enrich_pydantic_ai_span(span: ReadableSpan) -> None:
             attributes=attributes,
             enriched_attributes=enriched_attributes,
         )
+
+        full_request = enriched_attributes.pop("full_request", None)
+        if full_request is not None:
+            openai_messages = _convert_pydantic_messages_to_openai(full_request) if isinstance(full_request, list) else full_request
+            serialized = json.dumps(openai_messages) if not isinstance(openai_messages, str) else openai_messages
+            enriched_attributes.setdefault(SpanAttributes.TRACELOOP_ENTITY_INPUT, serialized)
+
+        full_response = enriched_attributes.pop("full_response", None)
+        if full_response is not None:
+            openai_messages = _convert_pydantic_messages_to_openai(full_response) if isinstance(full_response, list) else full_response
+            serialized = json.dumps(openai_messages) if not isinstance(openai_messages, str) else openai_messages
+            enriched_attributes.setdefault(SpanAttributes.TRACELOOP_ENTITY_OUTPUT, serialized)
+
+        for usage_key in ("prompt_tokens", "completion_tokens", "total_request_tokens"):
+            enriched_attributes.pop(usage_key, None)
 
         span._attributes = enriched_attributes
     except Exception:

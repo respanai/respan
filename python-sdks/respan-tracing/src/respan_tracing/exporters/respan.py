@@ -80,8 +80,8 @@ class ModifiedSpan:
 _PYDANTIC_AI_SCOPE_NAME = "pydantic-ai"
 _OPENAI_CHAT_SPAN_NAMES = frozenset({"openai.chat"})
 _PYDANTIC_AI_CHAT_REQUIRED_FIELDS = frozenset({
-    "full_request",
-    "full_response",
+    "traceloop.entity.input",
+    "traceloop.entity.output",
 })
 
 def _get_span_identity(span: ReadableSpan) -> Optional[tuple[int, int]]:
