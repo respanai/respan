@@ -17,7 +17,7 @@ from respan_exporter_pydantic_ai.instrument import (
     _build_gateway_trace_extra_body,
     _inject_gateway_trace_extra_body,
 )
-from respan_sdk.constants.llm_logging import LOG_TYPE_CHAT, LOG_TYPE_TASK, LOG_TYPE_TOOL, LogMethodChoices
+from respan_sdk.constants.llm_logging import LOG_TYPE_AGENT, LOG_TYPE_CHAT, LOG_TYPE_TASK, LOG_TYPE_TOOL, LogMethodChoices
 from respan_sdk.respan_types.base_types import RespanBaseModel
 from respan_sdk.respan_types.span_types import RespanSpanAttributes
 from respan_sdk.utils.data_processing.id_processing import format_trace_id, format_span_id
@@ -216,7 +216,12 @@ def test_build_gateway_trace_extra_body_formats_span_ids():
     }
 
 
-def test_pydantic_ai_span_extracts_tools_and_response_format():
+def test_pydantic_ai_agent_span_enriched_and_stripped():
+    """TestModel with version=4 produces agent/tool/task spans (no chat span).
+
+    Verify the invoke_agent span is enriched with Respan fields, raw
+    Pydantic AI attributes are stripped, and model/usage fields are mapped.
+    """
     telemetry = RespanTelemetry(
         app_name="test-app",
         is_enabled=True,
@@ -242,27 +247,22 @@ def test_pydantic_ai_span_extracts_tools_and_response_format():
 
     telemetry.flush()
     spans = span_exporter.get_finished_spans()
-    chat_span = next(
+    agent_span = next(
         span
         for span in spans
-        if (span.attributes or {}).get(RespanSpanAttributes.LOG_TYPE.value) == LOG_TYPE_CHAT
+        if (span.attributes or {}).get(RespanSpanAttributes.LOG_TYPE.value) == LOG_TYPE_AGENT
     )
 
-    assert RESPAN_TOOLS_ATTR not in chat_span.attributes
-    assert RESPAN_RESPONSE_FORMAT_ATTR not in chat_span.attributes
-    assert "gen_ai.input.messages" not in chat_span.attributes
-    assert "gen_ai.output.messages" not in chat_span.attributes
-    assert "gen_ai.operation.name" not in chat_span.attributes
-    assert "gen_ai.system" not in chat_span.attributes
-    assert chat_span.attributes["full_request"]
-    assert chat_span.attributes["full_response"]
+    assert RESPAN_TOOLS_ATTR not in agent_span.attributes
+    assert RESPAN_RESPONSE_FORMAT_ATTR not in agent_span.attributes
+    assert agent_span.attributes[RespanSpanAttributes.LOG_TYPE.value] == LOG_TYPE_AGENT
     assert (
-        chat_span.attributes[RespanSpanAttributes.LOG_TYPE.value] == LOG_TYPE_CHAT
-    )
-    assert (
-        chat_span.attributes[RespanSpanAttributes.LOG_METHOD.value]
+        agent_span.attributes[RespanSpanAttributes.LOG_METHOD.value]
         == LogMethodChoices.TRACING_INTEGRATION.value
     )
+    assert agent_span.attributes[SpanAttributes.TRACELOOP_SPAN_KIND] == "agent"
+    assert agent_span.attributes[SpanAttributes.TRACELOOP_ENTITY_NAME] == "agent"
+    assert agent_span.attributes["model"] == "test"
 
 
 def test_pydantic_ai_tool_span_maps_to_respan_fields():
@@ -328,4 +328,3 @@ def test_pydantic_ai_tool_span_maps_to_respan_fields():
         == LOG_TYPE_TASK
     )
     assert RESPAN_TOOLS_ATTR not in running_tools_span.attributes
-
