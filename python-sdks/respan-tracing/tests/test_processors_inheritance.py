@@ -91,7 +91,13 @@ class TestProcessorsInheritance:
 
     def test_decorator_processors_inheritance(self):
         """@task inside @workflow inherits processors via decorator."""
-        collected_spans = []
+        from opentelemetry import trace as trace_api
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+
+        exporter = InMemorySpanExporter()
+        provider = trace_api.get_tracer_provider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
 
         @workflow(name="test_wf", processors="dogfood")
         def my_workflow():
@@ -100,12 +106,13 @@ class TestProcessorsInheritance:
                 return "done"
             return my_task()
 
-        # Patch to collect spans
         my_workflow()
-        # We can't easily inspect spans from decorators in a unit test,
-        # but the mechanism is the same as start_span (both go through
-        # setup_span → on_start). The start_span tests above cover the
-        # core inheritance logic.
+        provider.force_flush()
+
+        spans = exporter.get_finished_spans()
+        task_spans = [s for s in spans if "test_task" in s.name]
+        assert len(task_spans) >= 1, f"Expected task span, got: {[s.name for s in spans]}"
+        assert task_spans[0].attributes.get(PROCESSORS_ATTR) == "dogfood"
 
 
 if __name__ == "__main__":

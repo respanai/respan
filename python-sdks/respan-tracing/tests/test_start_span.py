@@ -19,7 +19,7 @@ from opentelemetry.trace import StatusCode
 from opentelemetry.semconv_ai import SpanAttributes
 
 from respan_tracing import RespanTelemetry, get_client
-from respan_tracing.constants.tracing import EXPORT_FILTER_ATTR
+from respan_tracing.constants.tracing import EXPORT_FILTER_ATTR, PROCESSORS_ATTR
 from respan_sdk.respan_types.span_types import RespanSpanAttributes, SpanLink
 from respan_sdk.constants.llm_logging import LogMethodChoices
 
@@ -125,19 +125,19 @@ class TestStartSpan:
         """Single processor string sets the processors attribute."""
         with self.client.start_span("my_task", processors="dogfood") as span:
             attrs = dict(span.attributes)
-            assert attrs["processors"] == "dogfood"
+            assert attrs[PROCESSORS_ATTR] == "dogfood"
 
     def test_processors_list(self):
         """List of processors is joined with commas."""
         with self.client.start_span("my_task", processors=["dogfood", "debug"]) as span:
             attrs = dict(span.attributes)
-            assert attrs["processors"] == "dogfood,debug"
+            assert attrs[PROCESSORS_ATTR] == "dogfood,debug"
 
     def test_no_processors_no_attribute(self):
         """When processors is None, no processors attribute is set."""
         with self.client.start_span("my_task") as span:
             attrs = dict(span.attributes)
-            assert "processors" not in attrs
+            assert PROCESSORS_ATTR not in attrs
 
     # --- Outcome 6: Version=0 regression test ---
 
@@ -310,9 +310,9 @@ class TestWorkflowNameInheritance:
     def test_processors_attribute_propagated(self):
         """Processors attribute on workflow span routes to FilteringSpanProcessor."""
         with self.client.start_span("wf", kind="workflow", processors="dogfood") as outer:
-            assert dict(outer.attributes)["processors"] == "dogfood"
+            assert dict(outer.attributes)[PROCESSORS_ATTR] == "dogfood"
             with self.client.start_span("t", kind="task", processors="dogfood") as inner:
-                assert dict(inner.attributes)["processors"] == "dogfood"
+                assert dict(inner.attributes)[PROCESSORS_ATTR] == "dogfood"
 
     def test_inner_workflow_overrides_parent_workflow_name(self):
         """Nested workflow overrides TRACELOOP_ENTITY_NAME for its children."""

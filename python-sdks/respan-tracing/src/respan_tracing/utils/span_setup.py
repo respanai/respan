@@ -73,11 +73,20 @@ def setup_span(
         otel_links.append(span_link_to_otel(link))
     otel_links.extend(consume_span_links())
 
-    # Create span
+    # Build initial attributes — processors must be set BEFORE start_span()
+    # so that on_start's inheritance guard can distinguish explicit processors
+    # from spans that should inherit from their parent.
     from ..core.tracer import RespanTracer
     tracer = RespanTracer().get_tracer()
     span_name = f"{entity_name}.{span_kind_str}"
-    span = tracer.start_span(span_name, links=otel_links or None)
+    initial_attributes = {}
+    if processors:
+        processors_list = [processors] if isinstance(processors, str) else processors
+        initial_attributes[PROCESSORS_ATTR] = ",".join(processors_list)
+
+    span = tracer.start_span(
+        span_name, attributes=initial_attributes, links=otel_links or None,
+    )
 
     # Set standard Respan attributes
     span.set_attribute(SpanAttributes.TRACELOOP_SPAN_KIND, span_kind_str)
@@ -89,11 +98,6 @@ def setup_span(
     )
     if version is not None:
         span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_VERSION, version)
-
-    # Set processors for FilteringSpanProcessor routing
-    if processors:
-        processors_list = [processors] if isinstance(processors, str) else processors
-        span.set_attribute(PROCESSORS_ATTR, ",".join(processors_list))
 
     # Set export filter
     if export_filter is not None:

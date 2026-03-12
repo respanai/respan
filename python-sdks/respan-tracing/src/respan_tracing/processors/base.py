@@ -79,8 +79,10 @@ class RespanSpanProcessor:
         # This enables a parent @workflow(processors="dogfood,production") to
         # automatically route all child @task spans to the same processors,
         # without each child needing to repeat the processors param.
+        # Uses parent_context (not ambient context) for correctness in async
+        # and explicit-context scenarios.
         if not span.attributes.get(PROCESSORS_ATTR):
-            parent_span = trace.get_current_span()
+            parent_span = trace.get_current_span(parent_context)
             if parent_span and hasattr(parent_span, "attributes"):
                 parent_processors = (parent_span.attributes or {}).get(PROCESSORS_ATTR)
                 if parent_processors:
