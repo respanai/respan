@@ -148,7 +148,7 @@ export class RespanExporter implements SpanExporter {
       prompt_messages: this.parsePromptMessages(span),
       completion_message: messages[0],
       customer_identifier: customerParams?.customer_identifier || metadata.userId || "default_user",
-      thread_identifier: customerParams?.customer_identifier || metadata.userId,
+      thread_identifier: metadata.threadId,
       prompt_tokens: this.parsePromptTokens(span),
       completion_tokens: this.parseCompletionTokens(span),
       cost: this.parseCost(span),
