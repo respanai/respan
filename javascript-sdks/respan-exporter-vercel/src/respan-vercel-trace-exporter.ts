@@ -138,13 +138,16 @@ export class RespanExporter implements SpanExporter {
     const toolCalls = this.parseToolCalls(span);
     const messages = this.parseCompletionMessages(span, toolCalls);
 
+    // Resolve customer identity: own span → parent span → default
+    const customerParams = this.resolveCustomerParams(span, relatedSpans);
+
     const payload: RespanPayload = {
       model,
       start_time: this.formatTimestamp(span.startTime),
       timestamp: this.formatTimestamp(span.endTime),
       prompt_messages: this.parsePromptMessages(span),
       completion_message: messages[0],
-      customer_identifier: metadata.userId || "default_user",
+      customer_identifier: customerParams?.customer_identifier || metadata.userId || "default_user",
       thread_identifier: metadata.userId,
       prompt_tokens: this.parsePromptTokens(span),
       completion_tokens: this.parseCompletionTokens(span),
@@ -192,7 +195,7 @@ export class RespanExporter implements SpanExporter {
       disable_log: false,
       request_breakdown: false,
       disable_fallback: false,
-      ...this.parseCustomerParams(span),
+      ...(customerParams || {}),
     };
 
     return payload;
@@ -531,6 +534,36 @@ export class RespanExporter implements SpanExporter {
   private compareHrTime(a: [number, number], b: [number, number]): number {
     if (a[0] !== b[0]) return a[0] - b[0];
     return a[1] - b[1];
+  }
+
+  private findParentSpan(
+    span: ReadableSpan,
+    spans: ReadableSpan[]
+  ): ReadableSpan | undefined {
+    const parentId = span.parentSpanId;
+    if (!parentId) return undefined;
+    return spans.find((s) => s.spanContext().spanId === parentId);
+  }
+
+  private resolveCustomerParams(
+    span: ReadableSpan,
+    relatedSpans: ReadableSpan[]
+  ): ReturnType<typeof this.parseCustomerParams> {
+    // Try own span first
+    const own = this.parseCustomerParams(span);
+    if (own) return own;
+
+    // Walk up the parent chain to inherit customer identity
+    let current: ReadableSpan | undefined = span;
+    while (current) {
+      const parent = this.findParentSpan(current, relatedSpans);
+      if (!parent) break;
+      const parentParams = this.parseCustomerParams(parent);
+      if (parentParams) return parentParams;
+      current = parent;
+    }
+
+    return undefined;
   }
 
   private findRootSpan(
