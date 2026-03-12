@@ -148,7 +148,7 @@ export class RespanExporter implements SpanExporter {
       prompt_messages: this.parsePromptMessages(span),
       completion_message: messages[0],
       customer_identifier: customerParams?.customer_identifier || metadata.userId || "default_user",
-      thread_identifier: metadata.userId,
+      thread_identifier: customerParams?.customer_identifier || metadata.userId,
       prompt_tokens: this.parsePromptTokens(span),
       completion_tokens: this.parseCompletionTokens(span),
       cost: this.parseCost(span),
@@ -555,9 +555,14 @@ export class RespanExporter implements SpanExporter {
 
     // Walk up the parent chain to inherit customer identity
     let current: ReadableSpan | undefined = span;
+    const visited = new Set<string>();
+    visited.add(span.spanContext().spanId);
     while (current) {
       const parent = this.findParentSpan(current, relatedSpans);
       if (!parent) break;
+      const parentId = parent.spanContext().spanId;
+      if (visited.has(parentId)) break;
+      visited.add(parentId);
       const parentParams = this.parseCustomerParams(parent);
       if (parentParams) return parentParams;
       current = parent;
