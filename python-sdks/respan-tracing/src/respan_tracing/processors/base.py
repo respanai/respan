@@ -14,7 +14,7 @@ from respan_sdk.respan_types.span_types import RespanSpanAttributes, SpanLink
 from respan_sdk.utils.data_processing.id_processing import format_span_id
 from respan_tracing.contexts.span import span_link_to_otel
 from respan_tracing.constants.generic_constants import SDK_PREFIX
-from respan_tracing.constants.tracing import EXPORT_FILTER_ATTR, SPAN_BUFFER_TRACER_NAME
+from respan_tracing.constants.tracing import EXPORT_FILTER_ATTR, PROCESSORS_ATTR, SPAN_BUFFER_TRACER_NAME
 from respan_tracing.constants.context_constants import (
     TRACE_GROUP_ID_KEY,
     PARAMS_KEY
@@ -74,6 +74,17 @@ class RespanSpanProcessor:
             span.set_attribute(
                 RespanSpanAttributes.RESPAN_TRACE_GROUP_ID.value, trace_group_id
             )
+
+        # Inherit processors from parent span when child doesn't have its own.
+        # This enables a parent @workflow(processors="dogfood,production") to
+        # automatically route all child @task spans to the same processors,
+        # without each child needing to repeat the processors param.
+        if not span.attributes.get(PROCESSORS_ATTR):
+            parent_span = trace.get_current_span()
+            if parent_span and hasattr(parent_span, "attributes"):
+                parent_processors = (parent_span.attributes or {}).get(PROCESSORS_ATTR)
+                if parent_processors:
+                    span.set_attribute(PROCESSORS_ATTR, parent_processors)
 
         # Add custom parameters if present
         respan_params = context_api.get_value(PARAMS_KEY)

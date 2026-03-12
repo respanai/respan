@@ -14,7 +14,7 @@ from respan_sdk.constants.llm_logging import LogMethodChoices
 from respan_sdk.respan_types.span_types import RespanSpanAttributes, SpanLink
 
 from ..contexts.span import span_link_to_otel, consume_span_links
-from ..constants.tracing import EXPORT_FILTER_ATTR
+from ..constants.tracing import EXPORT_FILTER_ATTR, PROCESSORS_ATTR
 
 LinksParam = Optional[Union[List[SpanLink], Callable[[], List[SpanLink]]]]
 
@@ -93,7 +93,7 @@ def setup_span(
     # Set processors for FilteringSpanProcessor routing
     if processors:
         processors_list = [processors] if isinstance(processors, str) else processors
-        span.set_attribute("processors", ",".join(processors_list))
+        span.set_attribute(PROCESSORS_ATTR, ",".join(processors_list))
 
     # Set export filter
     if export_filter is not None:

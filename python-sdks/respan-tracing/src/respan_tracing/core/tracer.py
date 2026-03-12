@@ -21,7 +21,7 @@ from ..utils.notebook import is_notebook
 from ..utils.instrumentation import init_instrumentations
 from ..utils.imports import import_from_string
 from ..utils.logging import get_respan_logger
-from ..constants.tracing import TRACER_NAME
+from ..constants.tracing import TRACER_NAME, PROCESSORS_ATTR
 from ..constants.generic_constants import LOGGER_NAME_TRACER
 
 # Use Respan logger for all logging in this module
@@ -190,7 +190,7 @@ class RespanTracer:
         # Create combined filter: name-based + custom filter
         if name is not None:
             # Name-based filter (always applied when name is provided)
-            name_filter = lambda span: name in (span.attributes.get("processors") or "").split(",")
+            name_filter = lambda span: name in (span.attributes.get(PROCESSORS_ATTR) or "").split(",")
             
             if filter_fn is not None:
                 # Combine: BOTH name filter AND custom filter must pass
