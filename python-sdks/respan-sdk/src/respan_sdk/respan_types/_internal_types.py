@@ -265,6 +265,7 @@ class BasicLLMParams(RespanBaseModel):
 
 class LiteLLMCompletionParams(BasicLLMParams):
     thinking: Optional[dict] = None
+    speed: Optional[str] = None  # Anthropic fast mode: "fast" or "standard"
 
 
 class Usage(RespanBaseModel):
