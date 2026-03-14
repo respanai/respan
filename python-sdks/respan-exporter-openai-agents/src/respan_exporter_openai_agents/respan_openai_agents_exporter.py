@@ -460,7 +460,11 @@ def convert_to_respan_log(
                 error_message=str(item.error) if item.error else None,
                 model=default_model,
             )
-            data.latency = (data.timestamp - data.start_time).total_seconds()
+            data.latency = (
+                (data.timestamp - data.start_time).total_seconds()
+                if data.timestamp is not None and data.start_time is not None
+                else None
+            )
             try:
                 if isinstance(item.span_data, ResponseSpanData):
                     _response_data_to_respan_log(data, item.span_data)
