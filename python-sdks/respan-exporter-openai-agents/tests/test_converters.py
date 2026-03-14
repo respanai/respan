@@ -42,40 +42,7 @@ from respan_exporter_openai_agents.respan_openai_agents_exporter import (
     LOG_TYPE_HANDOFF,
     LOG_TYPE_RESPONSE,
     LOG_TYPE_TOOL,
-    METADATA_KEY_AGENT_NAME,
-    METADATA_KEY_FROM_AGENT,
-    METADATA_KEY_OUTPUT_TYPE,
-    METADATA_KEY_TO_AGENT,
-    ROLE_ASSISTANT,
-    ROLE_SYSTEM,
-    ROLE_TOOL,
-    ROLE_USER,
-    TOOL_CALL_TYPE_FUNCTION,
-    USAGE_KEY_CACHED_TOKENS,
-    USAGE_KEY_COMPLETION_TOKENS,
-    USAGE_KEY_INPUT_DETAILS,
-    USAGE_KEY_INPUT_TOKENS,
-    USAGE_KEY_OUTPUT_TOKENS,
-    USAGE_KEY_PROMPT_TOKENS,
-from respan_sdk.utils.serialization import safe_attr, safe_serialize
-from respan_exporter_openai_agents.respan_openai_agents_exporter import (
-    CONTENT_TYPE_INPUT_TEXT,
-    CONTENT_TYPE_OUTPUT_TEXT,
-    CONTENT_TYPE_TEXT,
-    FIELD_ARGUMENTS,
-    FIELD_CALL_ID,
-    FIELD_NAME,
-    FIELD_OUTPUT,
-    GUARDRAIL_TRIGGERED_MSG,
-    ITEM_TYPE_FUNCTION_CALL,
-    ITEM_TYPE_FUNCTION_CALL_OUTPUT,
-    ITEM_TYPE_MESSAGE,
-    LOG_TYPE_AGENT,
-    LOG_TYPE_GENERATION,
-    LOG_TYPE_GUARDRAIL,
-    LOG_TYPE_HANDOFF,
-    LOG_TYPE_RESPONSE,
-    LOG_TYPE_TOOL,
+    LocalSpanCollector,
     METADATA_KEY_AGENT_NAME,
     METADATA_KEY_FROM_AGENT,
     METADATA_KEY_OUTPUT_TYPE,
@@ -96,6 +63,8 @@ from respan_exporter_openai_agents.respan_openai_agents_exporter import (
     _input_to_prompt_messages,
     _output_to_completion,
     convert_to_respan_log,
+    safe_attr,
+    safe_serialize,
 )
 
 
@@ -881,3 +850,140 @@ class TestConvertEdgeCases:
 
         result = convert_to_respan_log(item=span)
         assert result["span_parent_id"] == "trace_T1"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  LocalSpanCollector
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _make_mock_trace(trace_id="trace_1", name="Test Trace"):
+    """Build a mock Trace with the minimum interface LocalSpanCollector needs."""
+    mock = MagicMock()
+    mock.trace_id = trace_id
+    mock.name = name
+    mock.__class__ = type("MockTrace", (Trace,), {
+        "trace_id": property(lambda self: trace_id),
+        "name": property(lambda self: name),
+        "tracing_api_key": property(lambda self: None),
+        "start": lambda self: None,
+        "finish": lambda self, *a: None,
+        "export": lambda self: {},
+        "__enter__": lambda self: self,
+        "__exit__": lambda self, *a: None,
+    })
+    return mock
+
+
+class TestLocalSpanCollector:
+    def test_on_span_end_appends_to_traces(self):
+        collector = LocalSpanCollector(default_model="gpt-4o")
+        span = _make_span(
+            FunctionSpanData(name="get_weather", input="Tokyo", output="Sunny"),
+            trace_id="trace_A",
+        )
+
+        collector.on_span_end(span)
+
+        spans = collector.pop_trace("trace_A")
+        assert len(spans) == 1
+        assert spans[0]["span_name"] == "get_weather"
+        assert spans[0]["log_type"] == LOG_TYPE_TOOL
+
+    def test_on_trace_end_inserts_at_index_zero(self):
+        """Trace record must be first (root-first ordering)."""
+        collector = LocalSpanCollector(default_model="gpt-4o")
+
+        span = _make_span(
+            FunctionSpanData(name="fn1", input="x", output="y"),
+            trace_id="trace_B",
+        )
+        collector.on_span_end(span)
+
+        trace = _make_mock_trace(trace_id="trace_B", name="My Workflow")
+        collector.on_trace_end(trace)
+
+        spans = collector.pop_trace("trace_B")
+        assert len(spans) == 2
+        assert spans[0]["span_name"] == "My Workflow"
+        assert spans[0]["log_type"] == LOG_TYPE_AGENT
+        assert spans[1]["span_name"] == "fn1"
+
+    def test_pop_trace_removes_and_returns(self):
+        collector = LocalSpanCollector(default_model="gpt-4o")
+        span = _make_span(
+            FunctionSpanData(name="fn", input="a", output="b"),
+            trace_id="trace_C",
+        )
+        collector.on_span_end(span)
+
+        first_pop = collector.pop_trace("trace_C")
+        assert len(first_pop) == 1
+
+        second_pop = collector.pop_trace("trace_C")
+        assert second_pop == []
+
+    def test_pop_trace_unknown_id_returns_empty_list(self):
+        collector = LocalSpanCollector()
+        assert collector.pop_trace("nonexistent") == []
+
+    def test_shutdown_clears_all_traces(self):
+        collector = LocalSpanCollector(default_model="gpt-4o")
+
+        for tid in ("trace_1", "trace_2", "trace_3"):
+            span = _make_span(
+                FunctionSpanData(name="fn", input="x", output="y"),
+                trace_id=tid,
+            )
+            collector.on_span_end(span)
+
+        collector.shutdown()
+
+        for tid in ("trace_1", "trace_2", "trace_3"):
+            assert collector.pop_trace(tid) == []
+
+    def test_multiple_spans_same_trace(self):
+        collector = LocalSpanCollector(default_model="gpt-4o")
+
+        for i in range(3):
+            span = _make_span(
+                FunctionSpanData(name=f"tool_{i}", input="x", output="y"),
+                trace_id="trace_multi",
+                span_id=f"span_{i}",
+            )
+            collector.on_span_end(span)
+
+        spans = collector.pop_trace("trace_multi")
+        assert len(spans) == 3
+        assert [s["span_name"] for s in spans] == ["tool_0", "tool_1", "tool_2"]
+
+    def test_separate_traces_isolated(self):
+        collector = LocalSpanCollector(default_model="gpt-4o")
+
+        span_a = _make_span(
+            FunctionSpanData(name="fn_a", input="x", output="y"),
+            trace_id="trace_X",
+        )
+        span_b = _make_span(
+            FunctionSpanData(name="fn_b", input="x", output="y"),
+            trace_id="trace_Y",
+        )
+        collector.on_span_end(span_a)
+        collector.on_span_end(span_b)
+
+        spans_x = collector.pop_trace("trace_X")
+        spans_y = collector.pop_trace("trace_Y")
+        assert len(spans_x) == 1
+        assert spans_x[0]["span_name"] == "fn_a"
+        assert len(spans_y) == 1
+        assert spans_y[0]["span_name"] == "fn_b"
+
+    def test_default_model_propagated(self):
+        collector = LocalSpanCollector(default_model="gpt-4o-mini")
+        span = _make_span(
+            FunctionSpanData(name="fn", input="x", output="y"),
+            trace_id="trace_model",
+        )
+        collector.on_span_end(span)
+
+        spans = collector.pop_trace("trace_model")
+        assert spans[0]["model"] == "gpt-4o-mini"
