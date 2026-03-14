@@ -33,6 +33,12 @@ from respan_sdk.utils.serialization import safe_attr, safe_serialize
 
 logger = logging.getLogger(__name__)
 
+warnings.filterwarnings(
+    "ignore",
+    message="Pydantic serializer warnings",
+    category=UserWarning,
+)
+
 # ---------------------------------------------------------------------------
 # Constants — Responses API item types and Chat Completions roles
 # ---------------------------------------------------------------------------
@@ -431,64 +437,57 @@ def convert_to_respan_log(
         A JSON-serializable dict matching ``RespanTextLogParams``, or ``None``
         if the item type is unrecognised.
     """
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message="Pydantic serializer warnings",
-            category=UserWarning,
+    if isinstance(item, Trace):
+        return RespanTextLogParams(
+            trace_unique_id=item.trace_id,
+            span_unique_id=item.trace_id,
+            span_name=item.name,
+            log_type=LOG_TYPE_AGENT,
+            model=default_model,
+        ).model_dump(mode="json")
+
+    if isinstance(item, SpanImpl):
+        parent_id = item.parent_id or item.trace_id
+        data = RespanTextLogParams(
+            trace_unique_id=item.trace_id,
+            span_unique_id=item.span_id,
+            span_parent_id=parent_id,
+            start_time=item.started_at,
+            timestamp=item.ended_at,
+            error_bit=1 if item.error else 0,
+            status_code=400 if item.error else 200,
+            error_message=str(item.error) if item.error else None,
+            model=default_model,
         )
-
-        if isinstance(item, Trace):
-            return RespanTextLogParams(
-                trace_unique_id=item.trace_id,
-                span_unique_id=item.trace_id,
-                span_name=item.name,
-                log_type=LOG_TYPE_AGENT,
-                model=default_model,
-            ).model_dump(mode="json")
-
-        if isinstance(item, SpanImpl):
-            parent_id = item.parent_id or item.trace_id
-            data = RespanTextLogParams(
-                trace_unique_id=item.trace_id,
-                span_unique_id=item.span_id,
-                span_parent_id=parent_id,
-                start_time=item.started_at,
-                timestamp=item.ended_at,
-                error_bit=1 if item.error else 0,
-                status_code=400 if item.error else 200,
-                error_message=str(item.error) if item.error else None,
-                model=default_model,
-            )
-            data.latency = (
-                (data.timestamp - data.start_time).total_seconds()
-                if data.timestamp is not None and data.start_time is not None
-                else None
-            )
-            try:
-                if isinstance(item.span_data, ResponseSpanData):
-                    _response_data_to_respan_log(data, item.span_data)
-                elif isinstance(item.span_data, FunctionSpanData):
-                    _function_data_to_respan_log(data, item.span_data)
-                elif isinstance(item.span_data, GenerationSpanData):
-                    _generation_data_to_respan_log(data, item.span_data)
-                elif isinstance(item.span_data, HandoffSpanData):
-                    _handoff_data_to_respan_log(data, item.span_data)
-                elif isinstance(item.span_data, CustomSpanData):
-                    _custom_data_to_respan_log(data, item.span_data)
-                elif isinstance(item.span_data, AgentSpanData):
-                    _agent_data_to_respan_log(data, item.span_data)
-                elif isinstance(item.span_data, GuardrailSpanData):
-                    _guardrail_data_to_respan_log(data, item.span_data)
-                else:
-                    logger.warning(f"Unknown span data type: {item.span_data}")
-                    return None
-                return data.model_dump(mode="json")
-            except Exception as e:
-                logger.error(
-                    f"Error converting span data of {item.span_data} to Respan log: {e}"
-                )
+        data.latency = (
+            (data.timestamp - data.start_time).total_seconds()
+            if data.timestamp is not None and data.start_time is not None
+            else None
+        )
+        try:
+            if isinstance(item.span_data, ResponseSpanData):
+                _response_data_to_respan_log(data, item.span_data)
+            elif isinstance(item.span_data, FunctionSpanData):
+                _function_data_to_respan_log(data, item.span_data)
+            elif isinstance(item.span_data, GenerationSpanData):
+                _generation_data_to_respan_log(data, item.span_data)
+            elif isinstance(item.span_data, HandoffSpanData):
+                _handoff_data_to_respan_log(data, item.span_data)
+            elif isinstance(item.span_data, CustomSpanData):
+                _custom_data_to_respan_log(data, item.span_data)
+            elif isinstance(item.span_data, AgentSpanData):
+                _agent_data_to_respan_log(data, item.span_data)
+            elif isinstance(item.span_data, GuardrailSpanData):
+                _guardrail_data_to_respan_log(data, item.span_data)
+            else:
+                logger.warning(f"Unknown span data type: {item.span_data}")
                 return None
+            return data.model_dump(mode="json")
+        except Exception as e:
+            logger.error(
+                f"Error converting span data of {item.span_data} to Respan log: {e}"
+            )
+            return None
 
     return None
 
