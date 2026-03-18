@@ -39,6 +39,7 @@ def _setup_span(
     processors=None,
     export_filter: Optional[FilterParamDict] = None,
     links: LinksParam = None,
+    sample_rate: Optional[float] = None,
 ):
     """Setup OpenTelemetry span and context.
 
@@ -54,6 +55,7 @@ def _setup_span(
         processors=processors,
         export_filter=export_filter,
         links=links,
+        sample_rate=sample_rate,
     )
     # Store extra tokens on the span object for _cleanup_span to detach
     span._entity_name_token = entity_name_token
@@ -128,6 +130,7 @@ def create_entity_method(
     processors=None,
     export_filter: Optional[FilterParamDict] = None,
     links: LinksParam = None,
+    sample_rate: Optional[float] = None,
 ) -> Callable[[F], F]:
     """Create entity decorator for methods or classes"""
 
@@ -141,6 +144,7 @@ def create_entity_method(
             processors=processors,
             export_filter=export_filter,
             links=links,
+            sample_rate=sample_rate,
         )
     else:
         # Method decorator
@@ -151,6 +155,7 @@ def create_entity_method(
             processors=processors,
             export_filter=export_filter,
             links=links,
+            sample_rate=sample_rate,
         )
 
 
@@ -161,6 +166,7 @@ def _create_entity_method_decorator(
     processors=None,
     export_filter: Optional[FilterParamDict] = None,
     links: LinksParam = None,
+    sample_rate: Optional[float] = None,
 ) -> Callable[[F], F]:
     """Create method decorator"""
 
@@ -179,6 +185,7 @@ def _create_entity_method_decorator(
                         processors=processors,
                         export_filter=export_filter,
                         links=links,
+                        sample_rate=sample_rate,
                     )
                     _handle_span_input(span, args, kwargs)
 
@@ -204,6 +211,7 @@ def _create_entity_method_decorator(
                         processors=processors,
                         export_filter=export_filter,
                         links=links,
+                        sample_rate=sample_rate,
                     )
                     _handle_span_input(span, args, kwargs)
 
@@ -230,6 +238,7 @@ def _create_entity_method_decorator(
                     processors=processors,
                     export_filter=export_filter,
                     links=links,
+                    sample_rate=sample_rate,
                 )
                 _handle_span_input(span, args, kwargs)
 
@@ -263,6 +272,7 @@ def _create_entity_class(
     processors=None,
     export_filter: Optional[FilterParamDict] = None,
     links: LinksParam = None,
+    sample_rate: Optional[float] = None,
 ):
     """Create class decorator"""
 
@@ -280,6 +290,7 @@ def _create_entity_class(
             processors=processors,
             export_filter=export_filter,
             links=links,
+            sample_rate=sample_rate,
         )(original_method)
 
         # Replace the method

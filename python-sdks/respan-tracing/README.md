@@ -1069,6 +1069,46 @@ See [`examples/custom_exporter_example.py`](examples/custom_exporter_example.py)
 - Backend exporter with per-request context
 - Direct logging exporter for immediate export
 
+### Sampling (Rate Limiting Spans)
+
+Control what fraction of spans get exported using the `sample_rate` parameter. This is essential for high-throughput paths where exporting every span would overwhelm your backend.
+
+```python
+from respan_tracing import workflow, task
+
+# Export all spans (default behavior)
+@workflow(name="webhook_handler", processors="dogfood")
+def handle_webhook():
+    pass
+
+# Export only 1% of spans — ideal for very high volume paths
+@workflow(name="log_ingestion", processors="dogfood", sample_rate=0.01)
+def ingest_log():
+    pass
+
+# Export 10% of spans
+@task(name="credit_deduction", processors="dogfood", sample_rate=0.1)
+def deduct_credits():
+    pass
+```
+
+**Key behavior:**
+- `sample_rate=1.0` (or `None`) = export all spans (default)
+- `sample_rate=0.01` = export ~1% of spans
+- `sample_rate=0.0` = export no spans (effectively disabled)
+- Sampling is applied per-span at export time using a probabilistic check
+- Child spans do **not** inherit `sample_rate` from parents — set it on each decorator independently
+- Combines with `export_filter` — both must pass for a span to be exported (sample rate is checked first)
+
+**Recommended rates by volume:**
+
+| Volume | Example | Recommended `sample_rate` |
+|--------|---------|--------------------------|
+| Low (<100/min) | Webhooks, auth flows | `None` (100%) |
+| Medium (~1k/min) | Evaluator sync, exports | `0.1` (10%) |
+| High (~10k/s) | Log ingestion, billing | `0.01` (1%) |
+| Very High | Chat proxy hot path | `0.001` or use `export_filter` for errors-only |
+
 ### Update Span Functionality
 
 You can dynamically update spans while they're running using the `get_client()` API. This is useful for:

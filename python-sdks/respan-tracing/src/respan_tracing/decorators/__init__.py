@@ -12,6 +12,7 @@ def workflow(
     processors: Optional[Union[str, List[str]]] = None,
     export_filter: Optional[FilterParamDict] = None,
     links: LinksParam = None,
+    sample_rate: Optional[float] = None,
 ):
     """Respan workflow decorator
 
@@ -27,6 +28,9 @@ def workflow(
                       Example: {"status_code": {"operator": "", "value": "ERROR"}}
         links: Optional span links. Can be a list of SpanLink objects (static) or a
                callable returning a list of SpanLink objects (resolved at call time).
+        sample_rate: Optional float between 0.0 and 1.0 controlling what fraction of
+                    spans are exported. 1.0 = export all (default), 0.01 = export 1%.
+                    When None, all spans are exported.
     """
     return create_entity_method(
         name=name,
@@ -36,6 +40,7 @@ def workflow(
         processors=processors,
         export_filter=export_filter,
         links=links,
+        sample_rate=sample_rate,
     )
 
 
@@ -46,6 +51,7 @@ def task(
     processors: Optional[Union[str, List[str]]] = None,
     export_filter: Optional[FilterParamDict] = None,
     links: LinksParam = None,
+    sample_rate: Optional[float] = None,
 ):
     """Respan task decorator
 
@@ -61,6 +67,9 @@ def task(
                       Example: {"status_code": {"operator": "", "value": "ERROR"}}
         links: Optional span links. Can be a list of SpanLink objects (static) or a
                callable returning a list of SpanLink objects (resolved at call time).
+        sample_rate: Optional float between 0.0 and 1.0 controlling what fraction of
+                    spans are exported. 1.0 = export all (default), 0.01 = export 1%.
+                    When None, all spans are exported.
     """
     return create_entity_method(
         name=name,
@@ -70,6 +79,7 @@ def task(
         processors=processors,
         export_filter=export_filter,
         links=links,
+        sample_rate=sample_rate,
     )
 
 
@@ -80,6 +90,7 @@ def agent(
     processors: Optional[Union[str, List[str]]] = None,
     export_filter: Optional[FilterParamDict] = None,
     links: LinksParam = None,
+    sample_rate: Optional[float] = None,
 ):
     """Respan agent decorator
 
@@ -95,6 +106,9 @@ def agent(
                       Example: {"status_code": {"operator": "", "value": "ERROR"}}
         links: Optional span links. Can be a list of SpanLink objects (static) or a
                callable returning a list of SpanLink objects (resolved at call time).
+        sample_rate: Optional float between 0.0 and 1.0 controlling what fraction of
+                    spans are exported. 1.0 = export all (default), 0.01 = export 1%.
+                    When None, all spans are exported.
     """
     return create_entity_method(
         name=name,
@@ -104,6 +118,7 @@ def agent(
         processors=processors,
         export_filter=export_filter,
         links=links,
+        sample_rate=sample_rate,
     )
 
 
@@ -114,6 +129,7 @@ def tool(
     processors: Optional[Union[str, List[str]]] = None,
     export_filter: Optional[FilterParamDict] = None,
     links: LinksParam = None,
+    sample_rate: Optional[float] = None,
 ):
     """Respan tool decorator
 
@@ -129,6 +145,9 @@ def tool(
                       Example: {"status_code": {"operator": "", "value": "ERROR"}}
         links: Optional span links. Can be a list of SpanLink objects (static) or a
                callable returning a list of SpanLink objects (resolved at call time).
+        sample_rate: Optional float between 0.0 and 1.0 controlling what fraction of
+                    spans are exported. 1.0 = export all (default), 0.01 = export 1%.
+                    When None, all spans are exported.
     """
     return create_entity_method(
         name=name,
@@ -138,4 +157,5 @@ def tool(
         processors=processors,
         export_filter=export_filter,
         links=links,
+        sample_rate=sample_rate,
     )

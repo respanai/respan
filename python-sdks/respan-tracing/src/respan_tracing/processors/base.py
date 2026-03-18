@@ -1,4 +1,5 @@
 import json
+import random
 from typing import Optional, Callable, Dict, Any, List, Sequence
 from contextvars import ContextVar
 import logging
@@ -14,7 +15,7 @@ from respan_sdk.respan_types.span_types import RespanSpanAttributes, SpanLink
 from respan_sdk.utils.data_processing.id_processing import format_span_id
 from respan_tracing.contexts.span import span_link_to_otel
 from respan_tracing.constants.generic_constants import SDK_PREFIX
-from respan_tracing.constants.tracing import EXPORT_FILTER_ATTR, PROCESSORS_ATTR, SPAN_BUFFER_TRACER_NAME
+from respan_tracing.constants.tracing import EXPORT_FILTER_ATTR, PROCESSORS_ATTR, SAMPLE_RATE_ATTR, SPAN_BUFFER_TRACER_NAME
 from respan_tracing.constants.context_constants import (
     TRACE_GROUP_ID_KEY,
     PARAMS_KEY
@@ -103,6 +104,13 @@ class RespanSpanProcessor:
         if not is_processable_span(span):
             logger.debug(f"[Respan Debug] Skipping filtered span: {span.name}")
             return
+
+        # Apply sample_rate if present on this span
+        if span.attributes:
+            sample_rate = span.attributes.get(SAMPLE_RATE_ATTR)
+            if sample_rate is not None and random.random() >= sample_rate:
+                logger.debug(f"[Respan Debug] Sample rate ({sample_rate}) dropped span: {span.name}")
+                return
 
         # Apply export_filter if present on this span
         filter_json = span.attributes.get(EXPORT_FILTER_ATTR) if span.attributes else None

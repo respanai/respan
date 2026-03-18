@@ -14,7 +14,7 @@ from respan_sdk.constants.llm_logging import LogMethodChoices
 from respan_sdk.respan_types.span_types import RespanSpanAttributes, SpanLink
 
 from ..contexts.span import span_link_to_otel, consume_span_links
-from ..constants.tracing import EXPORT_FILTER_ATTR, PROCESSORS_ATTR
+from ..constants.tracing import EXPORT_FILTER_ATTR, PROCESSORS_ATTR, SAMPLE_RATE_ATTR
 
 LinksParam = Optional[Union[List[SpanLink], Callable[[], List[SpanLink]]]]
 
@@ -38,6 +38,7 @@ def setup_span(
     processors: Optional[Union[str, List[str]]] = None,
     export_filter: Optional[FilterParamDict] = None,
     links: LinksParam = None,
+    sample_rate: Optional[float] = None,
 ) -> Tuple[Span, object, Optional[object], Optional[object]]:
     """Create and configure an OpenTelemetry span with Respan metadata.
 
@@ -105,6 +106,10 @@ def setup_span(
             span.set_attribute(EXPORT_FILTER_ATTR, json.dumps(export_filter))
         except (TypeError, ValueError):
             pass
+
+    # Set sample rate
+    if sample_rate is not None:
+        span.set_attribute(SAMPLE_RATE_ATTR, sample_rate)
 
     # Activate span in context
     ctx = trace.set_span_in_context(span)
