@@ -87,6 +87,7 @@ class RespanTelemetry:
         resource_attributes: Optional[Dict[str, str]] = None,
         span_postprocess_callback: Optional[Callable[[ReadableSpan], None]] = None,
         is_enabled: bool = True,
+        auto_instrument: bool = True,
     ):
         # Get configuration from environment variables
         api_key = api_key or os.getenv("RESPAN_API_KEY")
@@ -121,6 +122,7 @@ class RespanTelemetry:
             resource_attributes=resource_attributes,
             span_postprocess_callback=span_postprocess_callback,
             is_enabled=is_enabled,
+            auto_instrument=auto_instrument,
         )
         
         if is_enabled:

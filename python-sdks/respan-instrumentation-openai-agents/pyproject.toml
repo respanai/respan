@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "respan-instrumentation-openai-agents"
+version = "1.0.0"
+description = "Respan instrumentation plugin for the OpenAI Agents SDK"
+authors = ["Respan <team@respan.ai>"]
+license = "Apache 2.0"
+readme = "README.md"
+packages = [
+    { include = "respan_instrumentation_openai_agents", from = "./src" },
+]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.14"
+respan-ai = ">=3.0.0"
+respan-sdk = ">=2.5.0"
+openai-agents = ">=0.3.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

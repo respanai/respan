@@ -6,7 +6,10 @@ to different destinations like the Respan API, files, or other systems.
 """
 
 from .respan import RespanSpanExporter
+from .span_exporter_v2 import RespanSpanExporterV2, propagate_attributes
 
 __all__ = [
     "RespanSpanExporter",
+    "RespanSpanExporterV2",
+    "propagate_attributes",
 ]

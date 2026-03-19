@@ -1,0 +1,51 @@
+"""Structured Output — JSON mode with Pydantic, auto-traced."""
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv(override=True)
+
+from pydantic import BaseModel
+from openai import OpenAI
+from respan import Respan, workflow
+
+respan = Respan()
+
+client = OpenAI(
+    api_key=os.getenv("RESPAN_API_KEY"),
+    base_url=os.getenv("RESPAN_BASE_URL", "https://api.respan.ai/api"),
+)
+
+
+class MovieReview(BaseModel):
+    title: str
+    rating: int
+    summary: str
+    pros: list[str]
+    cons: list[str]
+
+
+@workflow(name="movie_review")
+def review(movie: str) -> MovieReview:
+    response = client.beta.chat.completions.parse(
+        model="gpt-4.1-nano",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a film critic. Rate movies 1-10.",
+            },
+            {"role": "user", "content": f"Review: {movie}"},
+        ],
+        response_format=MovieReview,
+
+    )
+    return response.choices[0].message.parsed
+
+
+result = review("The Matrix")
+print(f"{result.title} — {result.rating}/10")
+print(f"Summary: {result.summary}")
+print(f"Pros: {', '.join(result.pros)}")
+print(f"Cons: {', '.join(result.cons)}")
+
+respan.flush()
