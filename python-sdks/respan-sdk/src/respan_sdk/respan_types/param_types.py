@@ -536,8 +536,8 @@ class RespanParams(RespanBaseModel, PreprocessLogDataMixin):
 
     @field_validator("customer_identifier")
     def validate_customer_identifier(cls, v):
-        if v and isinstance(v, str) and len(v) > 120:
-            raise ValueError("Customer identifier must be less than 120 characters")
+        if v and isinstance(v, str) and len(v) > 254:
+            v = v[:254]
         return v
 
     @field_validator("input")
