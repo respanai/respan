@@ -57,6 +57,7 @@ class RespanTracer:
         propagator: Optional[TextMapPropagator] = None,
         span_postprocess_callback: Optional[Callable[[ReadableSpan], None]] = None,
         is_enabled: bool = True,
+        auto_instrument: bool = True,
     ):
         # Prevent re-initialization
         if hasattr(self, '_initialized'):
@@ -81,7 +82,8 @@ class RespanTracer:
         # Initialize OpenTelemetry components
         self._setup_tracer_provider(resource_attributes)
         self._setup_propagation(propagator)
-        self._setup_instrumentations(instruments, block_instruments)
+        if auto_instrument:
+            self._setup_instrumentations(instruments, block_instruments)
         
         # Add default Respan processor for backward compatibility
         # Only if api_key is provided (user wants to send to Respan)

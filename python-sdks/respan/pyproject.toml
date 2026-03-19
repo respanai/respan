@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "respan-ai"
-version = "2.0.1"
-description = "A package that helps interacting with Respan monitoring, evaluation & user analytics APIs"
+version = "3.0.0"
+description = "Unified entry point for Respan tracing and instrumentation plugins"
 authors = ["Respan <team@respan.ai>"]
 license = "Apache 2.0"
 readme = "README.md"
@@ -10,17 +10,12 @@ packages = [
 ]
 
 [tool.poetry.dependencies]
-python = ">3.9,<4.0"
-httpx = "^0.28.1"
-respan-sdk = "^1.0.0"
-
+python = ">=3.9,<4.0"
+respan-tracing = ">=2.3.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.4.1"
-pytest-asyncio = "^0.23.0"
-pytest-cov = "^3.0.0"
 python-dotenv = "^1.0.0"
-ipykernel = "^6.30.1"
 
 [build-system]
 requires = ["poetry-core"]
