@@ -1,4 +1,6 @@
-# Respan CrewAI Exporter
+# Respan Exporter for CrewAI
+
+**[respan.ai](https://respan.ai)** | **[Documentation](https://docs.respan.ai)** | **[PyPI](https://pypi.org/project/respan-exporter-crewai/)**
 
 Export CrewAI traces to Respan via OpenTelemetry span interception.
 
