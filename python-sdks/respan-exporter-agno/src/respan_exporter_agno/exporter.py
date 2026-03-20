@@ -1,6 +1,8 @@
 """Respan Agno Exporter - Export Agno traces to Respan tracing endpoint."""
 import logging
 import os
+import random
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -589,22 +591,47 @@ class RespanAgnoExporter:
         return "task"
 
     def _send(self, payloads: List[Dict[str, Any]]) -> None:
-        """Send payloads to Respan endpoint."""
-        try:
-            response = requests.post(
-                url=self.endpoint,
-                json=payloads,
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                timeout=self.timeout,
-            )
-            if response.status_code not in (200, 201):
-                logger.warning(
-                    "Respan export failed with status %s: %s",
-                    response.status_code,
-                    response.text,
+        """Send payloads to Respan endpoint with retry on transient errors."""
+        max_retries = 3
+        base_delay = 1.0
+        max_delay = 10.0
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(
+                    url=self.endpoint,
+                    json=payloads,
+                    headers=headers,
+                    timeout=self.timeout,
                 )
-        except Exception as exc:
-            logger.warning("Respan export request failed: %s", exc)
+                if response.status_code in (200, 201):
+                    return
+                if response.status_code < 500:
+                    logger.warning(
+                        "Respan export failed with status %s: %s",
+                        response.status_code,
+                        response.text,
+                    )
+                    return
+                logger.warning(
+                    "Respan export failed with status %s (attempt %d/%d)",
+                    response.status_code,
+                    attempt + 1,
+                    max_retries,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Respan export request failed (attempt %d/%d): %s",
+                    attempt + 1,
+                    max_retries,
+                    exc,
+                )
+
+            if attempt < max_retries - 1:
+                delay = min(base_delay * (2 ** attempt), max_delay)
+                delay += random.uniform(0, delay * 0.1)
+                time.sleep(delay)
