@@ -85,8 +85,13 @@ def _batch_export_wrapper(wrapped, instance, args, kwargs):
     if not spans:
         return wrapped(*args, **kwargs)
 
-    smolagents_spans = [s for s in spans if is_smolagents_span(span=s)]
-    other_spans = [s for s in spans if not is_smolagents_span(span=s)]
+    smolagents_spans = []
+    other_spans = []
+    for s in spans:
+        if is_smolagents_span(span=s):
+            smolagents_spans.append(s)
+        else:
+            other_spans.append(s)
 
     if not smolagents_spans:
         return wrapped(*args, **kwargs)
@@ -153,7 +158,7 @@ class RespanSmolagentsInstrumentor(BaseInstrumentor):
     def _uninstrument(self, **kwargs) -> None:
         global _ACTIVE_EXPORTER, _ACTIVE_DEDUPE, _ACTIVE_PASSTHROUGH
         _ACTIVE_EXPORTER = None
-        _ACTIVE_DEDUPE = None
+        _ACTIVE_DEDUPE = _SpanDedupeCache()
         _ACTIVE_PASSTHROUGH = True
         logger.info("Respan smolagents instrumentation disabled")
 
