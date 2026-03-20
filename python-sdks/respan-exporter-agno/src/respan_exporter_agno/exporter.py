@@ -1,8 +1,6 @@
 """Respan Agno Exporter - Export Agno traces to Respan tracing endpoint."""
 import logging
 import os
-import random
-import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -35,6 +33,7 @@ from respan_exporter_agno.utils import (
 )
 from respan_sdk.constants.llm_logging import LOG_TYPE_MAP
 from respan_sdk.respan_types.log_types import RespanFullLogParams
+from respan_sdk.utils import RetryHandler
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +76,12 @@ class RespanAgnoExporter:
             or os.getenv("RESPAN_CUSTOMER_IDENTIFIER")
         )
         self.timeout = timeout
+        self._retry_handler = RetryHandler(
+            max_retries=3,
+            retry_delay=1.0,
+            backoff_multiplier=2.0,
+            max_delay=10.0,
+        )
 
     def _build_endpoint(self, base_url: Optional[str]) -> str:
         """Build the ingest endpoint URL from base URL."""
@@ -592,46 +597,33 @@ class RespanAgnoExporter:
 
     def _send(self, payloads: List[Dict[str, Any]]) -> None:
         """Send payloads to Respan endpoint with retry on transient errors."""
-        max_retries = 3
-        base_delay = 1.0
-        max_delay = 10.0
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
 
-        for attempt in range(max_retries):
-            try:
-                response = requests.post(
-                    url=self.endpoint,
-                    json=payloads,
-                    headers=headers,
-                    timeout=self.timeout,
-                )
-                if response.status_code in (200, 201):
-                    return
-                if response.status_code < 500:
-                    logger.warning(
-                        "Respan export failed with status %s: %s",
-                        response.status_code,
-                        response.text,
-                    )
-                    return
+        def _do_request() -> None:
+            response = requests.post(
+                url=self.endpoint,
+                json=payloads,
+                headers=headers,
+                timeout=self.timeout,
+            )
+            if response.status_code in (200, 201):
+                return
+            if response.status_code < 500:
                 logger.warning(
-                    "Respan export failed with status %s (attempt %d/%d)",
+                    "Respan export failed with status %s: %s",
                     response.status_code,
-                    attempt + 1,
-                    max_retries,
+                    response.text,
                 )
-            except Exception as exc:
-                logger.warning(
-                    "Respan export request failed (attempt %d/%d): %s",
-                    attempt + 1,
-                    max_retries,
-                    exc,
-                )
+                return
+            raise RuntimeError(
+                "Respan export server error %s: %s"
+                % (response.status_code, response.text[:200])
+            )
 
-            if attempt < max_retries - 1:
-                delay = min(base_delay * (2 ** attempt), max_delay)
-                delay += random.uniform(0, delay * 0.1)
-                time.sleep(delay)
+        try:
+            self._retry_handler.execute(_do_request, context="Respan Agno export")
+        except Exception as exc:
+            logger.error("Respan Agno export failed after retries: %s", exc)
