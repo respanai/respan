@@ -1,0 +1,334 @@
+"""Utility functions for Respan microsoft_agents exporter."""
+import json
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Sequence
+
+from respan_sdk.utils.data_processing.id_processing import (
+    format_span_id,
+    format_trace_id,
+    is_hex_string,
+)
+
+
+def ns_to_datetime(value: Optional[int]) -> Optional[datetime]:
+    """Convert nanoseconds timestamp to datetime."""
+    if not value:
+        return None
+    return datetime.fromtimestamp(value / 1e9, tz=timezone.utc)
+
+
+_FRAMEWORK_SCOPE_KEYWORDS = ("autogen", "semantic_kernel", "semantic-kernel", "microsoft")
+_FRAMEWORK_ATTR_PREFIXES = ("autogen.", "semantic_kernel.", "ag.", "sk.")
+
+
+def is_microsoft_agents_span(span: object) -> bool:
+    """Check if span is from AutoGen or Semantic Kernel instrumentation."""
+    scope = getattr(span, "instrumentation_scope", None) or getattr(
+        span, "instrumentation_library", None
+    )
+    scope_name = (getattr(scope, "name", "") or "").lower()
+    if any(kw in scope_name for kw in _FRAMEWORK_SCOPE_KEYWORDS):
+        return True
+    attributes = getattr(span, "attributes", None) or {}
+    if any(key.startswith(prefix) for key in attributes for prefix in _FRAMEWORK_ATTR_PREFIXES):
+        return True
+    return False
+
+
+def otel_span_to_dict(span: object) -> Dict[str, object]:
+    """Convert OpenTelemetry span to dict format."""
+    attributes = dict(getattr(span, "attributes", None) or {})
+    span_context = getattr(span, "context", None)
+    trace_id = format_trace_id(trace_id=span_context.trace_id) if span_context else None
+    span_id = format_span_id(span_id=span_context.span_id) if span_context else None
+
+    parent = getattr(span, "parent", None)
+    parent_id = None
+    if parent is not None and getattr(parent, "span_id", None) is not None:
+        parent_id = format_span_id(span_id=parent.span_id)
+
+    span_kind = attributes.get("openinference.span.kind")
+    if not span_kind:
+        raw_kind = getattr(span, "kind", None)
+        span_kind = getattr(raw_kind, "name", None) if raw_kind is not None else None
+        if span_kind is None and raw_kind is not None:
+            span_kind = str(raw_kind)
+
+    status = getattr(span, "status", None)
+    status_code = None
+    error_message = None
+    if status is not None:
+        status_enum = getattr(status, "status_code", None)
+        status_name = getattr(status_enum, "name", None)
+        if status_name == "ERROR":
+            status_code = 500
+            error_message = getattr(status, "description", None) or "error"
+        elif status_name == "OK":
+            status_code = 200
+
+    span_path = attributes.get("graph.node.id")
+
+    return {
+        "trace_id": trace_id,
+        "span_id": span_id,
+        "parent_id": parent_id,
+        "name": getattr(span, "name", None),
+        "span_type": span_kind,
+        "kind": span_kind,
+        "span_path": span_path,
+        "start_time": ns_to_datetime(value=getattr(span, "start_time", None)),
+        "end_time": ns_to_datetime(value=getattr(span, "end_time", None)),
+        "attributes": attributes,
+        "status_code": status_code,
+        "error": error_message,
+    }
+
+
+def group_spans_by_trace(
+    spans: Sequence[Dict[str, object]],
+) -> Dict[str, List[Dict[str, object]]]:
+    """Group spans by trace ID."""
+    grouped: Dict[str, List[Dict[str, object]]] = {}
+    for span in spans:
+        trace_id = span.get("trace_id")
+        if not isinstance(trace_id, str) or not trace_id:
+            continue
+        grouped.setdefault(trace_id, []).append(span)
+    return grouped
+
+
+def get_attr(obj: Any, *keys: str, default: Any = None) -> Any:
+    """Get attribute from object or dict by trying multiple keys."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        for key in keys:
+            if key in obj:
+                return obj[key]
+    for key in keys:
+        if hasattr(obj, key):
+            return getattr(obj, key)
+    return default
+
+
+def as_dict(value: Any) -> Optional[Dict[str, Any]]:
+    """Convert value to dict if possible."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return dict(value)
+    if hasattr(value, "model_dump"):
+        try:
+            return value.model_dump()
+        except Exception:
+            return None
+    if hasattr(value, "dict"):
+        try:
+            return value.dict()
+        except Exception:
+            return None
+    return None
+
+
+def pick_metadata_value(metadata: Optional[Dict[str, Any]], *keys: str) -> Any:
+    """Pick first available value from metadata."""
+    if not metadata:
+        return None
+    for key in keys:
+        if key in metadata:
+            return metadata[key]
+    return None
+
+
+def coerce_datetime(value: Any, reference: Optional[datetime] = None) -> Optional[datetime]:
+    """Coerce various value types to datetime."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+    if isinstance(value, (int, float)):
+        numeric_value = float(value)
+        if reference and numeric_value < 1_000_000_000:
+            return reference + timedelta(seconds=numeric_value)
+        if numeric_value > 100_000_000_000:
+            return datetime.fromtimestamp(numeric_value / 1000, tz=timezone.utc)
+        return datetime.fromtimestamp(numeric_value, tz=timezone.utc)
+    if isinstance(value, str):
+        trimmed = value.strip()
+        try:
+            return datetime.fromisoformat(trimmed.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                numeric_value = float(trimmed)
+                if reference and numeric_value < 1_000_000_000:
+                    return reference + timedelta(seconds=numeric_value)
+                if numeric_value > 100_000_000_000:
+                    return datetime.fromtimestamp(numeric_value / 1000, tz=timezone.utc)
+                return datetime.fromtimestamp(numeric_value, tz=timezone.utc)
+            except ValueError:
+                return None
+    return None
+
+
+def coerce_token_count(value: Any) -> Optional[int]:
+    """Coerce value to token count integer."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            return int(float(stripped))
+        except ValueError:
+            return None
+    return None
+
+
+def infer_trace_start_time(spans: Sequence[Any]) -> Optional[datetime]:
+    """Infer the earliest start time from spans."""
+    earliest: Optional[datetime] = None
+    for span in spans:
+        raw_value = get_attr(span, "start_time", "started_at", "start", "start_timestamp")
+        if isinstance(raw_value, (int, float)) and float(raw_value) < 1_000_000_000:
+            continue
+        candidate = coerce_datetime(value=raw_value)
+        if candidate and candidate.year < 2001:
+            continue
+        if candidate and (earliest is None or candidate < earliest):
+            earliest = candidate
+    return earliest
+
+
+def serialize_value(value: Any) -> Optional[str]:
+    """Serialize value to JSON string."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        trimmed = value.strip()
+        if trimmed:
+            try:
+                json.loads(trimmed)
+                return trimmed
+            except Exception:
+                return json.dumps(value)
+        return json.dumps(value)
+    try:
+        return json.dumps(value, default=str)
+    except Exception:
+        return json.dumps(str(value))
+
+
+def format_rfc3339(value: Optional[datetime]) -> Optional[str]:
+    """Format datetime as RFC3339 string."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def normalize_trace_id(trace_id: str) -> str:
+    """Normalize trace ID to 32-char hex string."""
+    if is_hex_string(value=trace_id, length=32):
+        return trace_id.lower()
+    return uuid.uuid5(uuid.NAMESPACE_DNS, trace_id).hex
+
+
+def normalize_span_id(span_id: str, trace_id: str) -> str:
+    """Normalize span ID to 16-char hex string."""
+    if is_hex_string(value=span_id, length=16):
+        return span_id.lower()
+    stable_seed = f"{trace_id}:{span_id}"
+    return uuid.uuid5(uuid.NAMESPACE_DNS, stable_seed).hex[:16]
+
+
+def clean_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove None, empty dict, and empty list values."""
+    return {key: value for key, value in payload.items() if value not in (None, {}, [])}
+
+
+def merge_openinference_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Merge OpenInference metadata format."""
+    if not metadata:
+        return {}
+    merged = dict(metadata)
+    raw_meta = merged.get("metadata")
+    if isinstance(raw_meta, dict):
+        merged.pop("metadata", None)
+        merged.update(raw_meta)
+    return merged
+
+
+def find_root_span(spans: Sequence[Any]) -> Optional[Any]:
+    """Find the root span."""
+    if not spans:
+        return None
+    span_ids = set()
+    for span in spans:
+        span_id = get_attr(span, "span_id", "id", "uid")
+        if span_id is not None:
+            span_ids.add(str(span_id))
+    for span in spans:
+        parent_id = get_attr(span, "parent_id", "parent_span_id", "parentId")
+        if not parent_id or str(parent_id) not in span_ids:
+            return span
+    return spans[0]
+
+
+def extract_span_metadata(span: Any) -> Dict[str, Any]:
+    """Extract and normalize metadata from span."""
+    raw = as_dict(value=get_attr(span, "metadata", "attributes", "tags", "data")) or {}
+    return merge_openinference_metadata(metadata=raw)
+
+
+def extract_openinference_messages(
+    metadata: Optional[Dict[str, Any]], prefix: str,
+) -> Optional[List[Dict[str, Any]]]:
+    """Extract messages from OpenInference format metadata."""
+    if not metadata:
+        return None
+    prefix_token = f"{prefix}."
+    messages: Dict[int, Dict[str, Any]] = {}
+    for key, value in metadata.items():
+        if not isinstance(key, str) or not key.startswith(prefix_token):
+            continue
+        parts = key[len(prefix_token):].split(".")
+        if len(parts) < 3:
+            continue
+        index_str, section, field = parts[0], parts[1], parts[2]
+        if not index_str.isdigit() or section != "message":
+            continue
+        index = int(index_str)
+        if field == "role":
+            messages.setdefault(index, {})["role"] = value
+        elif field == "content":
+            messages.setdefault(index, {})["content"] = value
+    if not messages:
+        return None
+    return [messages[i] for i in sorted(messages)]
+
+
+def is_blank_value(value: Any) -> bool:
+    """Check if value is blank."""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        trimmed = value.strip()
+        if not trimmed or trimmed in ("[]", "{}", "null"):
+            return True
+        try:
+            parsed = json.loads(trimmed)
+            return parsed in (None, [], {})
+        except Exception:
+            return False
+    if isinstance(value, (list, tuple, dict)) and not value:
+        return True
+    return False
