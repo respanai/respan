@@ -2,6 +2,7 @@
 import logging
 import threading
 import uuid
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Union
 
@@ -155,9 +156,9 @@ class RespanCallbackHandler(BaseCallbackHandler):
             if span.parent_run_id is not None:
                 children_map.setdefault(span.parent_run_id, []).append(span.run_id)
         result.append(root)
-        queue = [root_run_id]
+        queue = deque([root_run_id])
         while queue:
-            parent = queue.pop(0)
+            parent = queue.popleft()
             for child_id in children_map.get(parent, []):
                 child = self._spans.get(child_id)
                 if child is not None and child not in result:
@@ -423,11 +424,7 @@ class RespanCallbackHandler(BaseCallbackHandler):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> None:
-        name = serialized.get("name")
-        if not name:
-            id_list = serialized.get("id")
-            if isinstance(id_list, list) and id_list:
-                name = str(id_list[-1])
+        name = self._extract_chain_name(serialized)
         self._register_span(
             run_id=run_id,
             parent_run_id=parent_run_id,

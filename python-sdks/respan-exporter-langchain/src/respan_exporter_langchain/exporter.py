@@ -180,7 +180,7 @@ class RespanLangchainExporter:
         workflow_name = trace_name
 
         # Extract metadata from root span
-        trace_metadata = dict(root_span.get("metadata", {})) if root_span else {}
+        trace_metadata = dict(root_span.get("metadata") or {}) if root_span else {}
 
         # Try to extract customer_identifier from metadata
         customer_identifier = None
@@ -281,7 +281,7 @@ class RespanLangchainExporter:
             model=model,
         )
 
-        span_metadata = dict(span.get("metadata", {}))
+        span_metadata = dict(span.get("metadata") or {})
         tags = span.get("tags", [])
         if tags:
             span_metadata["langchain_tags"] = tags

@@ -1,7 +1,7 @@
 """Unit tests for the LangChain exporter - no external API calls needed."""
 
 import json
-import time
+import os
 import uuid
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -9,6 +9,30 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from respan_exporter_langchain import RespanCallbackHandler, RespanLangchainExporter
+
+
+class _InlineThread:
+    """Replacement for threading.Thread that runs target inline on start()."""
+
+    def __init__(self, target=None, args=None, kwargs=None, **_):
+        self._target = target
+        self._args = args or ()
+        self._kwargs = kwargs or {}
+
+    def start(self):
+        if self._target:
+            self._target(*self._args, **self._kwargs)
+
+    def join(self, timeout=None):
+        pass
+
+
+def _patch_inline_thread():
+    """Patch threading.Thread in the callback handler to run inline."""
+    return patch(
+        "respan_exporter_langchain.callback_handler.threading.Thread",
+        side_effect=_InlineThread,
+    )
 
 
 class TestRespanLangchainExporter:
@@ -143,22 +167,21 @@ class TestRespanCallbackHandler:
     @patch("respan_exporter_langchain.exporter.requests.post")
     def test_chain_lifecycle(self, mock_post):
         mock_post.return_value = MagicMock(status_code=200)
-        handler = RespanCallbackHandler(api_key="test-key")
+        with _patch_inline_thread():
+            handler = RespanCallbackHandler(api_key="test-key")
 
-        root_id = uuid.uuid4()
-        handler.on_chain_start(
-            serialized={"name": "TestChain", "id": ["langchain", "chains", "TestChain"]},
-            inputs={"input": "hello"},
-            run_id=root_id,
-        )
+            root_id = uuid.uuid4()
+            handler.on_chain_start(
+                serialized={"name": "TestChain", "id": ["langchain", "chains", "TestChain"]},
+                inputs={"input": "hello"},
+                run_id=root_id,
+            )
 
-        handler.on_chain_end(
-            outputs={"output": "world"},
-            run_id=root_id,
-        )
+            handler.on_chain_end(
+                outputs={"output": "world"},
+                run_id=root_id,
+            )
 
-        # Wait for background thread
-        time.sleep(0.5)
         mock_post.assert_called_once()
         call_args = mock_post.call_args
         payloads = call_args.kwargs.get("json") or call_args[1].get("json")
@@ -169,34 +192,34 @@ class TestRespanCallbackHandler:
     @patch("respan_exporter_langchain.exporter.requests.post")
     def test_llm_span(self, mock_post):
         mock_post.return_value = MagicMock(status_code=200)
-        handler = RespanCallbackHandler(api_key="test-key")
+        with _patch_inline_thread():
+            handler = RespanCallbackHandler(api_key="test-key")
 
-        root_id = uuid.uuid4()
-        llm_id = uuid.uuid4()
+            root_id = uuid.uuid4()
+            llm_id = uuid.uuid4()
 
-        handler.on_chain_start(
-            serialized={"name": "RunnableSequence", "id": ["langchain", "RunnableSequence"]},
-            inputs={"input": "hello"},
-            run_id=root_id,
-        )
+            handler.on_chain_start(
+                serialized={"name": "RunnableSequence", "id": ["langchain", "RunnableSequence"]},
+                inputs={"input": "hello"},
+                run_id=root_id,
+            )
 
-        handler.on_llm_start(
-            serialized={"name": "ChatOpenAI", "id": ["langchain", "ChatOpenAI"], "kwargs": {"model_name": "gpt-4o-mini"}},
-            prompts=["hello"],
-            run_id=llm_id,
-            parent_run_id=root_id,
-        )
+            handler.on_llm_start(
+                serialized={"name": "ChatOpenAI", "id": ["langchain", "ChatOpenAI"], "kwargs": {"model_name": "gpt-4o-mini"}},
+                prompts=["hello"],
+                run_id=llm_id,
+                parent_run_id=root_id,
+            )
 
-        # Simulate LLMResult
-        from langchain_core.outputs import LLMResult, Generation
-        result = LLMResult(
-            generations=[[Generation(text="Hi there!")]],
-            llm_output={"token_usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}},
-        )
-        handler.on_llm_end(response=result, run_id=llm_id, parent_run_id=root_id)
-        handler.on_chain_end(outputs={"output": "Hi there!"}, run_id=root_id)
+            # Simulate LLMResult
+            from langchain_core.outputs import LLMResult, Generation
+            result = LLMResult(
+                generations=[[Generation(text="Hi there!")]],
+                llm_output={"token_usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}},
+            )
+            handler.on_llm_end(response=result, run_id=llm_id, parent_run_id=root_id)
+            handler.on_chain_end(outputs={"output": "Hi there!"}, run_id=root_id)
 
-        time.sleep(0.5)
         mock_post.assert_called_once()
         payloads = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1].get("json")
         assert len(payloads) == 2
@@ -210,28 +233,28 @@ class TestRespanCallbackHandler:
     @patch("respan_exporter_langchain.exporter.requests.post")
     def test_tool_span(self, mock_post):
         mock_post.return_value = MagicMock(status_code=200)
-        handler = RespanCallbackHandler(api_key="test-key")
+        with _patch_inline_thread():
+            handler = RespanCallbackHandler(api_key="test-key")
 
-        root_id = uuid.uuid4()
-        tool_id = uuid.uuid4()
+            root_id = uuid.uuid4()
+            tool_id = uuid.uuid4()
 
-        handler.on_chain_start(
-            serialized={"name": "AgentExecutor", "id": ["langchain", "agents", "AgentExecutor"]},
-            inputs={"input": "what's the weather?"},
-            run_id=root_id,
-        )
+            handler.on_chain_start(
+                serialized={"name": "AgentExecutor", "id": ["langchain", "agents", "AgentExecutor"]},
+                inputs={"input": "what's the weather?"},
+                run_id=root_id,
+            )
 
-        handler.on_tool_start(
-            serialized={"name": "weather_tool"},
-            input_str='{"city": "SF"}',
-            run_id=tool_id,
-            parent_run_id=root_id,
-        )
+            handler.on_tool_start(
+                serialized={"name": "weather_tool"},
+                input_str='{"city": "SF"}',
+                run_id=tool_id,
+                parent_run_id=root_id,
+            )
 
-        handler.on_tool_end(output="Sunny, 72F", run_id=tool_id, parent_run_id=root_id)
-        handler.on_chain_end(outputs={"output": "It's sunny"}, run_id=root_id)
+            handler.on_tool_end(output="Sunny, 72F", run_id=tool_id, parent_run_id=root_id)
+            handler.on_chain_end(outputs={"output": "It's sunny"}, run_id=root_id)
 
-        time.sleep(0.5)
         mock_post.assert_called_once()
         payloads = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1].get("json")
 
@@ -241,20 +264,20 @@ class TestRespanCallbackHandler:
     @patch("respan_exporter_langchain.exporter.requests.post")
     def test_error_handling(self, mock_post):
         mock_post.return_value = MagicMock(status_code=200)
-        handler = RespanCallbackHandler(api_key="test-key")
+        with _patch_inline_thread():
+            handler = RespanCallbackHandler(api_key="test-key")
 
-        root_id = uuid.uuid4()
-        handler.on_chain_start(
-            serialized={"name": "TestChain"},
-            inputs={"input": "hello"},
-            run_id=root_id,
-        )
-        handler.on_chain_error(
-            error=ValueError("test error"),
-            run_id=root_id,
-        )
+            root_id = uuid.uuid4()
+            handler.on_chain_start(
+                serialized={"name": "TestChain"},
+                inputs={"input": "hello"},
+                run_id=root_id,
+            )
+            handler.on_chain_error(
+                error=ValueError("test error"),
+                run_id=root_id,
+            )
 
-        time.sleep(0.5)
         mock_post.assert_called_once()
         payloads = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1].get("json")
         assert payloads[0]["status_code"] == 500
@@ -263,37 +286,37 @@ class TestRespanCallbackHandler:
     @patch("respan_exporter_langchain.exporter.requests.post")
     def test_retriever_span(self, mock_post):
         mock_post.return_value = MagicMock(status_code=200)
-        handler = RespanCallbackHandler(api_key="test-key")
+        with _patch_inline_thread():
+            handler = RespanCallbackHandler(api_key="test-key")
 
-        root_id = uuid.uuid4()
-        retriever_id = uuid.uuid4()
+            root_id = uuid.uuid4()
+            retriever_id = uuid.uuid4()
 
-        handler.on_chain_start(
-            serialized={"name": "RAGChain", "id": ["langchain", "RAGChain"]},
-            inputs={"input": "what is respan?"},
-            run_id=root_id,
-        )
-        handler.on_retriever_start(
-            serialized={"name": "VectorStoreRetriever"},
-            query="what is respan?",
-            run_id=retriever_id,
-            parent_run_id=root_id,
-        )
+            handler.on_chain_start(
+                serialized={"name": "RAGChain", "id": ["langchain", "RAGChain"]},
+                inputs={"input": "what is respan?"},
+                run_id=root_id,
+            )
+            handler.on_retriever_start(
+                serialized={"name": "VectorStoreRetriever"},
+                query="what is respan?",
+                run_id=retriever_id,
+                parent_run_id=root_id,
+            )
 
-        # Simulate Document objects
-        class FakeDoc:
-            def __init__(self, content, metadata):
-                self.page_content = content
-                self.metadata = metadata
+            # Simulate Document objects
+            class FakeDoc:
+                def __init__(self, content, metadata):
+                    self.page_content = content
+                    self.metadata = metadata
 
-        handler.on_retriever_end(
-            documents=[FakeDoc("Respan is an observability platform", {"source": "docs"})],
-            run_id=retriever_id,
-            parent_run_id=root_id,
-        )
-        handler.on_chain_end(outputs={"output": "Respan is..."}, run_id=root_id)
+            handler.on_retriever_end(
+                documents=[FakeDoc("Respan is an observability platform", {"source": "docs"})],
+                run_id=retriever_id,
+                parent_run_id=root_id,
+            )
+            handler.on_chain_end(outputs={"output": "Respan is..."}, run_id=root_id)
 
-        time.sleep(0.5)
         mock_post.assert_called_once()
         payloads = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1].get("json")
 
@@ -303,38 +326,45 @@ class TestRespanCallbackHandler:
     @patch("respan_exporter_langchain.exporter.requests.post")
     def test_tool_span_has_span_tools(self, mock_post):
         mock_post.return_value = MagicMock(status_code=200)
-        handler = RespanCallbackHandler(api_key="test-key")
+        with _patch_inline_thread():
+            handler = RespanCallbackHandler(api_key="test-key")
 
-        root_id = uuid.uuid4()
-        tool_id = uuid.uuid4()
+            root_id = uuid.uuid4()
+            tool_id = uuid.uuid4()
 
-        handler.on_chain_start(
-            serialized={"name": "Chain"},
-            inputs={"input": "test"},
-            run_id=root_id,
-        )
-        handler.on_tool_start(
-            serialized={"name": "calculator"},
-            input_str="2+2",
-            run_id=tool_id,
-            parent_run_id=root_id,
-        )
-        handler.on_tool_end(output="4", run_id=tool_id, parent_run_id=root_id)
-        handler.on_chain_end(outputs={"output": "4"}, run_id=root_id)
+            handler.on_chain_start(
+                serialized={"name": "Chain"},
+                inputs={"input": "test"},
+                run_id=root_id,
+            )
+            handler.on_tool_start(
+                serialized={"name": "calculator"},
+                input_str="2+2",
+                run_id=tool_id,
+                parent_run_id=root_id,
+            )
+            handler.on_tool_end(output="4", run_id=tool_id, parent_run_id=root_id)
+            handler.on_chain_end(outputs={"output": "4"}, run_id=root_id)
 
-        time.sleep(0.5)
         payloads = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1].get("json")
         tool_payload = next(p for p in payloads if p["log_type"] == "tool")
         assert tool_payload["span_tools"] == ["calculator"]
 
-    def test_no_api_key_skips_export(self):
-        handler = RespanCallbackHandler()  # no api key
-        root_id = uuid.uuid4()
-        handler.on_chain_start(
-            serialized={"name": "Test"},
-            inputs={"input": "hello"},
-            run_id=root_id,
-        )
-        handler.on_chain_end(outputs={"output": "world"}, run_id=root_id)
-        time.sleep(0.5)
-        # Should not raise, just skip
+    @patch.dict(os.environ, {}, clear=False)
+    @patch("respan_exporter_langchain.exporter.requests.post")
+    def test_no_api_key_skips_export(self, mock_post):
+        # Ensure RESPAN_API_KEY is not set so the handler truly has no key
+        env = os.environ.copy()
+        env.pop("RESPAN_API_KEY", None)
+        with patch.dict(os.environ, env, clear=True):
+            with _patch_inline_thread():
+                handler = RespanCallbackHandler()  # no api key
+                root_id = uuid.uuid4()
+                handler.on_chain_start(
+                    serialized={"name": "Test"},
+                    inputs={"input": "hello"},
+                    run_id=root_id,
+                )
+                handler.on_chain_end(outputs={"output": "world"}, run_id=root_id)
+            # Should not have made any network call
+            mock_post.assert_not_called()
