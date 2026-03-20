@@ -96,16 +96,24 @@ def _batch_export_wrapper(wrapped, instance, args, kwargs):
     if not microsoft_agents_spans:
         return wrapped(*args, **kwargs)
 
+    export_result = SpanExportResult.SUCCESS
     try:
-        _export_microsoft_agents_spans(spans=microsoft_agents_spans)
+        export_result = _export_microsoft_agents_spans(spans=microsoft_agents_spans)
     except Exception as exc:
         logger.warning("Failed to export microsoft_agents spans: %s", exc, exc_info=True)
+        export_result = SpanExportResult.FAILURE
 
     if _ACTIVE_PASSTHROUGH:
         return wrapped(*args, **kwargs)
     if other_spans:
-        return wrapped(other_spans, **kwargs)
-    return SpanExportResult.SUCCESS
+        wrapped_result = wrapped(other_spans, **kwargs)
+        if (
+            wrapped_result == SpanExportResult.FAILURE
+            or export_result == SpanExportResult.FAILURE
+        ):
+            return SpanExportResult.FAILURE
+        return SpanExportResult.SUCCESS
+    return export_result
 
 
 def _on_end_wrapper(wrapped, instance, args, kwargs):

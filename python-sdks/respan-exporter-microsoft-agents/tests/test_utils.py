@@ -68,6 +68,24 @@ class TestIsMicrosoftAgentsSpan:
         )
         assert is_microsoft_agents_span(span=span) is False
 
+    def test_detects_semantic_hyphen_kernel_scope(self):
+        from respan_exporter_microsoft_agents.utils import is_microsoft_agents_span
+
+        span = SimpleNamespace(
+            instrumentation_scope=SimpleNamespace(name="semantic-kernel.ai"),
+            attributes={},
+        )
+        assert is_microsoft_agents_span(span=span) is True
+
+    def test_detects_microsoft_scope(self):
+        from respan_exporter_microsoft_agents.utils import is_microsoft_agents_span
+
+        span = SimpleNamespace(
+            instrumentation_scope=SimpleNamespace(name="microsoft.agents"),
+            attributes={},
+        )
+        assert is_microsoft_agents_span(span=span) is True
+
     def test_detects_ag_prefix_attributes(self):
         from respan_exporter_microsoft_agents.utils import is_microsoft_agents_span
 
