@@ -186,8 +186,13 @@ class RespanDSPyExporter:
         span_name = get_attr(span, "name", "span_name", "operation_name")
         span_kind = get_attr(span, "type", "span_type", "kind")
 
+        span_path = get_attr(span, "span_path", "path")
+
         span_metadata = as_dict(value=get_attr(span, "metadata", "attributes", "tags", "data")) or {}
         span_metadata = merge_openinference_metadata(metadata=span_metadata)
+
+        if not span_path:
+            span_path = pick_metadata_value(span_metadata, "graph.node.id")
 
         if span_kind is None:
             span_kind = pick_metadata_value(span_metadata, "openinference.span.kind", "span.kind")
@@ -258,7 +263,13 @@ class RespanDSPyExporter:
         span_hex_id = span_id_map.get(span_id_str) if span_id_map else normalize_span_id(span_id=span_id_str, trace_id=trace_context.trace_id)
         if not span_hex_id:
             span_hex_id = normalize_span_id(span_id=span_id_str, trace_id=trace_context.trace_id)
-        parent_hex_id = span_id_map.get(str(parent_id)) if span_id_map and parent_id else (normalize_span_id(span_id=str(parent_id), trace_id=trace_context.trace_id) if parent_id else None)
+        if parent_id:
+            parent_hex_id = (
+                (span_id_map.get(str(parent_id)) if span_id_map else None)
+                or normalize_span_id(span_id=str(parent_id), trace_id=trace_context.trace_id)
+            )
+        else:
+            parent_hex_id = None
 
         if "dspy_trace_id" not in merged_metadata:
             merged_metadata["dspy_trace_id"] = trace_context.trace_id
@@ -276,6 +287,7 @@ class RespanDSPyExporter:
             "span_unique_id": span_hex_id,
             "span_parent_id": parent_hex_id,
             "span_name": str(span_name) if span_name else None,
+            "span_path": span_path,
             "span_workflow_name": trace_context.workflow_name,
             "trace_id": trace_hex_id,
             "span_id": span_hex_id,
