@@ -96,16 +96,18 @@ def _batch_export_wrapper(wrapped, instance, args, kwargs):
     if not smolagents_spans:
         return wrapped(*args, **kwargs)
 
+    result = SpanExportResult.SUCCESS
     try:
-        _export_smolagents_spans(spans=smolagents_spans)
+        result = _export_smolagents_spans(spans=smolagents_spans)
     except Exception as exc:
         logger.warning("Failed to export smolagents spans: %s", exc, exc_info=True)
+        result = SpanExportResult.FAILURE
 
     if _ACTIVE_PASSTHROUGH:
         return wrapped(*args, **kwargs)
     if other_spans:
         return wrapped(other_spans, **kwargs)
-    return SpanExportResult.SUCCESS
+    return result
 
 
 def _on_end_wrapper(wrapped, instance, args, kwargs):
