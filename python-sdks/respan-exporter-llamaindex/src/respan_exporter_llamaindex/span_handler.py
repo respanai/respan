@@ -154,10 +154,6 @@ class RespanSpanHandler(BaseSpanHandler[SimpleSpan]):
             trace_span_ids = self._collect_trace_span_ids(root_span_id)
             trace_spans = [self._spans[sid] for sid in trace_span_ids if sid in self._spans]
 
-            for sid in trace_span_ids:
-                self._spans.pop(sid, None)
-                self._root_span_ids.discard(sid)
-
         if not trace_spans:
             return
 
@@ -173,6 +169,13 @@ class RespanSpanHandler(BaseSpanHandler[SimpleSpan]):
             )
         except Exception as exc:
             logger.warning("Failed to export LlamaIndex trace: %s", exc)
+            return
+
+        # Only remove spans after successful export to avoid data loss
+        with self._lock:
+            for sid in trace_span_ids:
+                self._spans.pop(sid, None)
+                self._root_span_ids.discard(sid)
 
     def _collect_trace_span_ids(self, root_id: str) -> List[str]:
         """Collect all span IDs belonging to a trace (root + descendants)."""

@@ -153,7 +153,7 @@ class RespanLlamaIndexExporter:
         # Preserve caller-supplied hex IDs when already normalized;
         # otherwise derive deterministic hex via uuid5.
         if _is_hex(trace_id, 32):
-            trace_hex_id = trace_id
+            trace_hex_id = trace_id.lower()
         else:
             trace_hex_id = uuid.uuid5(uuid.NAMESPACE_DNS, trace_id).hex
         if not trace_name:
@@ -165,7 +165,7 @@ class RespanLlamaIndexExporter:
             sid = span.get("span_id", "")
             if sid:
                 if _is_hex(sid, 16):
-                    span_id_map[sid] = sid
+                    span_id_map[sid] = sid.lower()
                 else:
                     span_id_map[sid] = uuid.uuid5(uuid.NAMESPACE_DNS, f"{trace_id}:{sid}").hex[:16]
 
@@ -265,9 +265,9 @@ class RespanLlamaIndexExporter:
         if any(v is not None for v in (prompt_tokens, completion_tokens, total_tokens)):
             payload["prompt_tokens"] = prompt_tokens
             payload["completion_tokens"] = completion_tokens
-            if total_tokens:
+            if total_tokens is not None:
                 payload["total_request_tokens"] = total_tokens
-            elif prompt_tokens or completion_tokens:
+            elif prompt_tokens is not None or completion_tokens is not None:
                 payload["total_request_tokens"] = (prompt_tokens or 0) + (completion_tokens or 0)
 
         if error:
