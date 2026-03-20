@@ -83,6 +83,11 @@ def _serialize(value: Any) -> Optional[str]:
         return str(value)
 
 
+def _is_hex(s: str, expected_len: int) -> bool:
+    """Check if string is a valid hex ID of expected length."""
+    return len(s) == expected_len and all(c in "0123456789abcdef" for c in s.lower())
+
+
 class RespanLlamaIndexExporter:
     """Export LlamaIndex span records to Respan."""
 
@@ -145,7 +150,12 @@ class RespanLlamaIndexExporter:
         if not spans:
             return []
 
-        trace_hex_id = uuid.uuid5(uuid.NAMESPACE_DNS, trace_id).hex
+        # Preserve caller-supplied hex IDs when already normalized;
+        # otherwise derive deterministic hex via uuid5.
+        if _is_hex(trace_id, 32):
+            trace_hex_id = trace_id
+        else:
+            trace_hex_id = uuid.uuid5(uuid.NAMESPACE_DNS, trace_id).hex
         if not trace_name:
             trace_name = trace_id
 
@@ -154,7 +164,10 @@ class RespanLlamaIndexExporter:
         for span in spans:
             sid = span.get("span_id", "")
             if sid:
-                span_id_map[sid] = uuid.uuid5(uuid.NAMESPACE_DNS, f"{trace_id}:{sid}").hex[:16]
+                if _is_hex(sid, 16):
+                    span_id_map[sid] = sid
+                else:
+                    span_id_map[sid] = uuid.uuid5(uuid.NAMESPACE_DNS, f"{trace_id}:{sid}").hex[:16]
 
         payloads: List[Dict[str, Any]] = []
         for span in spans:
