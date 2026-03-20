@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "respan-exporter-langchain"
+version = "1.0.0"
+description = "Respan exporter for LangChain traces"
+authors = ["Respan <team@respan.ai>"]
+readme = "README.md"
+packages = [{include = "respan_exporter_langchain", from = "src"}]
+
+[tool.poetry.dependencies]
+python = ">=3.12,<3.15"
+requests = "^2.32.5"
+langchain-core = ">=0.2.0"
+respan-sdk = ">=2.6.1"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^9.0.2"
+langchain = ">=0.2.0"
+langchain-openai = ">=0.1.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
