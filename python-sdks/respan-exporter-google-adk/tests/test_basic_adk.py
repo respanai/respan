@@ -1,11 +1,8 @@
 """Unit and integration tests for Respan Google ADK exporter."""
 
-import asyncio
 import json
 import os
 from types import SimpleNamespace
-from unittest.mock import patch
-
 import pytest
 
 from respan_exporter_google_adk.utils import (
@@ -260,6 +257,8 @@ class TestBuildPayload:
         payload = payloads[0]
         assert payload["log_type"] == "tool"
         assert payload["span_tools"] == ["get_weather"]
+        parent_keys = ("parent_id", "span_parent_id")
+        assert any(k in payload and payload[k] is not None for k in parent_keys)
 
     def test_llm_config_in_metadata(self):
         span = _make_span(

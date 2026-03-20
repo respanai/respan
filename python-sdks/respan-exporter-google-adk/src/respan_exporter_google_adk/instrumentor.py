@@ -175,10 +175,12 @@ class RespanGoogleAdkInstrumentor(BaseInstrumentor):
         logger.info("Respan Google ADK instrumentation enabled")
 
     def _uninstrument(self, **kwargs) -> None:
-        global _ACTIVE_EXPORTER, _ACTIVE_PASSTHROUGH
+        global _ACTIVE_EXPORTER, _ACTIVE_DEDUPE, _ACTIVE_PASSTHROUGH
         _ACTIVE_EXPORTER = None
+        _ACTIVE_DEDUPE = None
         _ACTIVE_PASSTHROUGH = False
         self._exporter = None
+        self._dedupe = _SpanDedupeCache()
         logger.info("Respan Google ADK instrumentation disabled")
 
     def _patch_span_processors(self) -> None:
