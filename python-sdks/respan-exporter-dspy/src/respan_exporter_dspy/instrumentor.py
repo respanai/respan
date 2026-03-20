@@ -96,16 +96,18 @@ def _batch_export_wrapper(wrapped, instance, args, kwargs):
     if not dspy_spans:
         return wrapped(*args, **kwargs)
 
+    dspy_result = SpanExportResult.SUCCESS
     try:
-        _export_dspy_spans(spans=dspy_spans)
+        dspy_result = _export_dspy_spans(spans=dspy_spans)
     except Exception as exc:
         logger.warning("Failed to export dspy spans: %s", exc, exc_info=True)
+        dspy_result = SpanExportResult.FAILURE
 
     if _ACTIVE_PASSTHROUGH:
         return wrapped(*args, **kwargs)
     if other_spans:
         return wrapped(other_spans, **kwargs)
-    return SpanExportResult.SUCCESS
+    return dspy_result
 
 
 def _on_end_wrapper(wrapped, instance, args, kwargs):

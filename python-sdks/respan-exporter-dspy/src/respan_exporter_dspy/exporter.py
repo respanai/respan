@@ -247,8 +247,15 @@ class RespanDSPyExporter:
             end_time = start_time
 
         latency = get_attr(span, "latency", "duration")
+        if latency is not None:
+            try:
+                latency = float(latency)
+            except (TypeError, ValueError):
+                latency = None
         if latency is None and start_time and end_time:
             latency = (end_time - start_time).total_seconds()
+        if latency is not None and latency < 0:
+            latency = 0
 
         if not span_id:
             span_id = str(uuid.uuid4())
