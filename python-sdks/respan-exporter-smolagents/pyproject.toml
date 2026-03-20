@@ -1,0 +1,25 @@
+[tool.poetry]
+name = "respan-exporter-smolagents"
+version = "1.0.0"
+description = "Respan exporter for smolagents traces"
+authors = ["Respan <team@respan.ai>"]
+readme = "README.md"
+packages = [{include = "respan_exporter_smolagents", from = "src"}]
+
+[tool.poetry.dependencies]
+python = ">=3.12,<3.14"
+requests = "^2.32.5"
+wrapt = "^1.16.0"
+opentelemetry-sdk = "^1.20.0"
+opentelemetry-api = "^1.20.0"
+opentelemetry-instrumentation = "^0.41b0"
+respan-sdk = ">=2.6.1"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^9.0.2"
+smolagents = {version = ">=1.0.0", extras = ["telemetry"]}
+openinference-instrumentation-smolagents = ">=0.1.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
