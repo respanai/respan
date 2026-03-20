@@ -1,8 +1,11 @@
 """Respan — unified entry point for tracing and instrumentation plugins."""
 
+import json
 import logging
 import os
+import uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
 from respan_tracing import RespanTelemetry
@@ -139,6 +142,8 @@ class Respan:
             group_identifier: Group related traces.
             environment: Environment name (e.g. ``"production"``).
             metadata: Dict of custom key-value pairs (merged, not replaced).
+            prompt: Dict with ``prompt_id`` and ``variables`` for prompt
+                logging.  The backend resolves the template automatically.
 
         Example::
 
@@ -148,9 +153,144 @@ class Respan:
                 metadata={"plan": "pro"},
             ):
                 result = await Runner.run(agent, "Hello")
+
+            with respan.propagate_attributes(
+                prompt={"prompt_id": "abc123", "variables": {"x": "y"}},
+            ):
+                result = await Runner.run(agent, "Hello")
         """
         with _propagate_attributes(**kwargs):
             yield
+
+    def log_batch_results(
+        self,
+        requests: List[Dict[str, Any]],
+        results: List[Dict[str, Any]],
+        trace_id: Optional[str] = None,
+    ) -> None:
+        """Log OpenAI Batch API results as individual chat completion spans.
+
+        Trace linking (in priority order):
+
+        1. **OTEL context** — when called inside a ``@task`` / ``@workflow``
+           decorated function, auto-links to the active trace and nests
+           completions under the current span.
+        2. **Explicit** ``trace_id`` — for async batches where results
+           arrive in a separate process (e.g. 24 hours later).  Adds a
+           ``batch_results`` task span to the original trace with
+           completions nested underneath.
+        3. **Auto-generated** — creates a new standalone trace if neither
+           is available.
+
+        Args:
+            requests: Original batch request dicts (from the input JSONL).
+                Each must have ``custom_id`` and ``body.messages``.
+            results: Batch result dicts (from the output JSONL).
+                Each must have ``custom_id`` and ``response.body``.
+            trace_id: Explicit trace ID to link results to.  Use this for
+                async batches where results arrive in a separate process.
+
+        Examples::
+
+            # Same process — auto-links to active OTEL span
+            @task(name="download_results")
+            def download_results(output_file_id: str):
+                ...
+                respan.log_batch_results(requests, results)
+
+            # Different process (24h later) — links back to original trace
+            respan.log_batch_results(requests, results, trace_id=saved_trace_id)
+        """
+        from respan_tracing import get_client
+
+        # Resolve trace context: OTEL > explicit > auto-generated.
+        # OTEL returns all-zero IDs when no active span — treat as absent.
+        rc = get_client()
+        otel_trace_id = rc.get_current_trace_id()
+        otel_span_id = rc.get_current_span_id()
+        if otel_trace_id and int(otel_trace_id, 16) == 0:
+            otel_trace_id = None
+        if otel_span_id and int(otel_span_id, 16) == 0:
+            otel_span_id = None
+        resolved_trace_id = otel_trace_id or trace_id or uuid.uuid4().hex
+
+        # Determine the parent for completion spans.
+        # With OTEL context: nest under the active span directly.
+        # Without: create a synthetic "batch_results" task span.
+        if otel_span_id:
+            parent_span_id = otel_span_id
+        else:
+            parent_span_id = uuid.uuid4().hex
+
+        # Index original requests by custom_id
+        requests_by_id = {r["custom_id"]: r.get("body", {}) for r in requests}
+
+        logs = []
+
+        # When no OTEL context, create a grouping "batch_results" task span
+        # so completions are nested, not floating at trace root.
+        if not otel_span_id:
+            logs.append({
+                "trace_unique_id": resolved_trace_id,
+                "span_unique_id": parent_span_id,
+                "span_name": "batch_results",
+                "log_type": "task",
+                "status_code": 200,
+                "status": "success",
+            })
+
+        completion_timestamps = []
+
+        for result in results:
+            custom_id = result.get("custom_id", "")
+            response = result.get("response", {})
+            body = response.get("body", {})
+            status_code = response.get("status_code", 200)
+
+            # Match with original request
+            original = requests_by_id.get(custom_id, {})
+            messages = original.get("messages", [])
+
+            # Extract completion and usage
+            choices = body.get("choices", [{}])
+            output = choices[0].get("message", {}) if choices else {}
+            usage = body.get("usage", {})
+
+            # Extract timestamp from OpenAI response (unix epoch → ISO 8601)
+            created = body.get("created")
+            timestamp = None
+            if created:
+                ts = datetime.fromtimestamp(created, tz=timezone.utc)
+                timestamp = ts.isoformat()
+                completion_timestamps.append(ts)
+
+            log: Dict[str, Any] = {
+                "trace_unique_id": resolved_trace_id,
+                "span_unique_id": uuid.uuid4().hex,
+                "span_parent_id": parent_span_id,
+                "span_name": f"batch:{custom_id}",
+                "log_type": "chat",
+                "model": body.get("model", original.get("model", "")),
+                "input": json.dumps(messages),
+                "output": output,
+                "prompt_tokens": usage.get("prompt_tokens", 0),
+                "completion_tokens": usage.get("completion_tokens", 0),
+                "status_code": status_code,
+                "status": "error" if status_code >= 400 else "success",
+            }
+            if timestamp:
+                log["timestamp"] = timestamp
+            logs.append(log)
+
+        # Set the batch_results parent span timestamps to cover all completions
+        if not otel_span_id and completion_timestamps and logs:
+            earliest = min(completion_timestamps).isoformat()
+            latest = max(completion_timestamps).isoformat()
+            logs[0]["start_time"] = earliest
+            logs[0]["timestamp"] = latest
+
+        if logs:
+            self.exporter.export(logs)
 
     def flush(self) -> None:
         """Flush both the OTEL pipeline and the plugin exporter."""

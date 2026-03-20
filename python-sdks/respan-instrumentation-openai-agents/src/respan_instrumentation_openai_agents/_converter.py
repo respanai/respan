@@ -6,9 +6,13 @@ Produces flat dicts matching the backend ``/v1/traces/ingest`` contract:
 - ``output`` → completion message dict
 - ``prompt_tokens`` / ``completion_tokens`` at top level
 - ``model``, ``log_type``, ``span_name``, tracing IDs, etc.
+
+Uses ``RespanTextLogParams`` from ``respan-sdk`` for schema validation.
 """
 
+import json
 import logging
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
 
 from agents.tracing.span_data import (
@@ -22,6 +26,16 @@ from agents.tracing.span_data import (
 )
 from agents.tracing.spans import Span, SpanImpl
 from agents.tracing.traces import Trace
+from respan_sdk.constants.llm_logging import (
+    LOG_TYPE_AGENT,
+    LOG_TYPE_CUSTOM,
+    LOG_TYPE_GENERATION,
+    LOG_TYPE_GUARDRAIL,
+    LOG_TYPE_HANDOFF,
+    LOG_TYPE_RESPONSE,
+    LOG_TYPE_TOOL,
+)
+from respan_sdk.respan_types.param_types import RespanTextLogParams
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +165,6 @@ def _format_input_messages(raw_input: Any) -> List[Dict[str, Any]]:
         return [{"role": "user", "content": serialized}]
     # Dict (e.g. function args) → wrap as user message with JSON content
     if isinstance(serialized, dict):
-        import json
         return [{"role": "user", "content": json.dumps(serialized, default=str)}]
     return [{"role": "user", "content": str(serialized)}]
 
@@ -209,147 +222,142 @@ def _format_output(resp_output: Any) -> Dict[str, Any]:
     return {"role": "assistant", "content": str(serialized)}
 
 
-def _base_span_dict(item: SpanImpl) -> Dict[str, Any]:
-    """Build the common fields every span shares."""
+def _parse_ts(ts: str) -> datetime:
+    """Parse an ISO-8601 timestamp string to datetime."""
+    ts = ts.replace("Z", "+00:00")
+    return datetime.fromisoformat(ts)
+
+
+def _build_base_params(item: SpanImpl) -> RespanTextLogParams:
+    """Build a ``RespanTextLogParams`` with the common fields every span shares."""
     started = item.started_at  # ISO-8601 string or None
     ended = item.ended_at
 
     latency = 0.0
     if started and ended:
-        from datetime import datetime, timezone
-
-        def _parse_ts(ts: str) -> datetime:
-            # Handle both 'Z' suffix and '+00:00'
-            ts = ts.replace("Z", "+00:00")
-            return datetime.fromisoformat(ts)
-
         try:
             latency = (_parse_ts(ended) - _parse_ts(started)).total_seconds()
         except Exception:
             pass
 
-    d: Dict[str, Any] = {
-        "trace_unique_id": item.trace_id,
-        "span_unique_id": item.span_id,
-        "span_parent_id": item.parent_id or item.trace_id,
-        "start_time": started,
-        "timestamp": ended,
-        "latency": latency,
-        "status_code": 400 if item.error else 200,
-        "status": "error" if item.error else "success",
-    }
-    if item.error:
-        d["error_message"] = str(item.error)
-    return d
+    return RespanTextLogParams(
+        trace_unique_id=item.trace_id,
+        span_unique_id=item.span_id,
+        span_parent_id=item.parent_id or item.trace_id,
+        start_time=started,
+        timestamp=ended,
+        latency=latency,
+        status_code=400 if item.error else 200,
+        status="error" if item.error else "success",
+        error_message=str(item.error) if item.error else None,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Span-type converters  (mutate *d* in-place)
+# Span-type converters  (mutate *params* in-place)
 # ---------------------------------------------------------------------------
 
 
-def _convert_response(d: Dict[str, Any], span_data: ResponseSpanData) -> None:
+def _convert_response(params: RespanTextLogParams, span_data: ResponseSpanData) -> None:
     """ResponseSpanData → has the actual LLM call with model + tokens."""
-    d["span_name"] = "response"
-    d["log_type"] = "response"
-    d["input"] = _format_input_messages(span_data.input)
+    params.span_name = "response"
+    params.log_type = LOG_TYPE_RESPONSE
+    params.input = _format_input_messages(span_data.input)
 
     resp = span_data.response
     if resp is None:
         return
 
-    d["model"] = getattr(resp, "model", None) or ""
+    params.model = getattr(resp, "model", None) or ""
 
     # Format output as proper {"role": "assistant", "content": "..."} message
     if hasattr(resp, "output") and resp.output:
-        d["output"] = _format_output(resp.output)
+        params.output = _format_output(resp.output)
 
     # token usage — ResponseUsage uses input_tokens/output_tokens
     usage = getattr(resp, "usage", None)
     if usage:
-        d["prompt_tokens"] = getattr(usage, "input_tokens", 0) or 0
-        d["completion_tokens"] = getattr(usage, "output_tokens", 0) or 0
+        params.prompt_tokens = getattr(usage, "input_tokens", 0) or 0
+        params.completion_tokens = getattr(usage, "output_tokens", 0) or 0
 
 
-def _convert_function(d: Dict[str, Any], span_data: FunctionSpanData) -> None:
-    d["span_name"] = span_data.name
-    d["log_type"] = "tool"
+def _convert_function(params: RespanTextLogParams, span_data: FunctionSpanData) -> None:
+    params.span_name = span_data.name
+    params.log_type = LOG_TYPE_TOOL
     # Tool input = function arguments
     input_str = _serialize(span_data.input) or ""
     if not isinstance(input_str, str):
-        import json
         input_str = json.dumps(input_str, default=str)
-    d["input"] = [{"role": "tool", "content": input_str}]
+    params.input = [{"role": "tool", "content": input_str}]
     # Tool output = function result
     output_str = _serialize(span_data.output) or ""
     if not isinstance(output_str, str):
-        import json
         output_str = json.dumps(output_str, default=str)
-    d["output"] = {"role": "tool", "content": output_str}
-    d["span_tools"] = [span_data.name]
+    params.output = {"role": "tool", "content": output_str}
+    params.span_tools = [span_data.name]
 
 
-def _convert_generation(d: Dict[str, Any], span_data: GenerationSpanData) -> None:
-    d["span_name"] = "generation"
-    d["log_type"] = "generation"
-    d["model"] = span_data.model or ""
-    d["input"] = _format_input_messages(span_data.input)
-    d["output"] = _format_output(span_data.output)
+def _convert_generation(params: RespanTextLogParams, span_data: GenerationSpanData) -> None:
+    params.span_name = "generation"
+    params.log_type = LOG_TYPE_GENERATION
+    params.model = span_data.model or ""
+    params.input = _format_input_messages(span_data.input)
+    params.output = _format_output(span_data.output)
     if span_data.usage:
         u = span_data.usage
-        d["prompt_tokens"] = u.get("prompt_tokens") or u.get("input_tokens") or 0
-        d["completion_tokens"] = u.get("completion_tokens") or u.get("output_tokens") or 0
+        params.prompt_tokens = u.get("prompt_tokens") or u.get("input_tokens") or 0
+        params.completion_tokens = u.get("completion_tokens") or u.get("output_tokens") or 0
 
 
-def _convert_agent(d: Dict[str, Any], span_data: AgentSpanData) -> None:
-    d["span_name"] = span_data.name
-    d["log_type"] = "agent"
-    d["span_workflow_name"] = span_data.name
+def _convert_agent(params: RespanTextLogParams, span_data: AgentSpanData) -> None:
+    params.span_name = span_data.name
+    params.log_type = LOG_TYPE_AGENT
+    params.span_workflow_name = span_data.name
     meta: Dict[str, str] = {"agent_name": span_data.name}
     if span_data.output_type:
         meta["output_type"] = span_data.output_type
-    d["metadata"] = meta
+    params.metadata = meta
     if span_data.tools:
-        d["span_tools"] = span_data.tools
+        params.span_tools = span_data.tools
     if span_data.handoffs:
-        d["span_handoffs"] = span_data.handoffs
+        params.span_handoffs = span_data.handoffs
 
 
-def _convert_handoff(d: Dict[str, Any], span_data: HandoffSpanData) -> None:
+def _convert_handoff(params: RespanTextLogParams, span_data: HandoffSpanData) -> None:
     from_agent = span_data.from_agent or ""
     to_agent = span_data.to_agent or ""
-    d["span_name"] = "handoff"
-    d["log_type"] = "handoff"
-    d["span_handoffs"] = [f"{from_agent} -> {to_agent}"]
-    d["input"] = from_agent
-    d["output"] = to_agent
-    d["metadata"] = {
+    params.span_name = "handoff"
+    params.log_type = LOG_TYPE_HANDOFF
+    params.span_handoffs = [f"{from_agent} -> {to_agent}"]
+    params.input = from_agent
+    params.output = to_agent
+    params.metadata = {
         "from_agent": from_agent,
         "to_agent": to_agent,
     }
 
 
-def _convert_guardrail(d: Dict[str, Any], span_data: GuardrailSpanData) -> None:
-    d["span_name"] = f"guardrail:{span_data.name}"
-    d["log_type"] = "guardrail"
-    d["metadata"] = {
+def _convert_guardrail(params: RespanTextLogParams, span_data: GuardrailSpanData) -> None:
+    params.span_name = f"guardrail:{span_data.name}"
+    params.log_type = LOG_TYPE_GUARDRAIL
+    params.metadata = {
         "guardrail_name": span_data.name,
         "triggered": str(span_data.triggered),
     }
 
 
-def _convert_custom(d: Dict[str, Any], span_data: CustomSpanData) -> None:
-    d["span_name"] = span_data.name
-    d["log_type"] = "custom"
-    d["metadata"] = {k: str(v) for k, v in (span_data.data or {}).items()}
+def _convert_custom(params: RespanTextLogParams, span_data: CustomSpanData) -> None:
+    params.span_name = span_data.name
+    params.log_type = LOG_TYPE_CUSTOM
+    params.metadata = {k: str(v) for k, v in (span_data.data or {}).items()}
     # Promote well-known keys
     for key in ("model", "prompt_tokens", "completion_tokens"):
         if key in span_data.data:
-            d[key] = span_data.data[key]
+            setattr(params, key, span_data.data[key])
     if "input" in span_data.data:
-        d["input"] = span_data.data["input"]
+        params.input = span_data.data["input"]
     if "output" in span_data.data:
-        d["output"] = span_data.data["output"]
+        params.output = span_data.data["output"]
 
 
 # ---------------------------------------------------------------------------
@@ -375,24 +383,28 @@ def convert_to_respan_log(
     The returned dict matches the ``/v1/traces/ingest`` contract:
     ``input``, ``output``, ``prompt_tokens``,
     ``completion_tokens``, ``model``, etc.
+
+    Uses ``RespanTextLogParams`` for schema validation, then serializes
+    via ``model_dump(mode="json", exclude_none=True)``.
     """
     if isinstance(item, Trace):
-        return {
-            "trace_unique_id": item.trace_id,
-            "span_unique_id": item.trace_id,
-            "span_name": item.name,
-            "log_type": "agent",
-        }
+        params = RespanTextLogParams(
+            trace_unique_id=item.trace_id,
+            span_unique_id=item.trace_id,
+            span_name=item.name,
+            log_type=LOG_TYPE_AGENT,
+        )
+        return params.model_dump(mode="json", exclude_none=True)
 
     if isinstance(item, SpanImpl):
-        d = _base_span_dict(item)
+        params = _build_base_params(item)
         converter = _CONVERTERS.get(type(item.span_data))
         if converter is None:
             logger.warning("Unknown span data type: %s", type(item.span_data).__name__)
             return None
         try:
-            converter(d, item.span_data)
-            return d
+            converter(params, item.span_data)
+            return params.model_dump(mode="json", exclude_none=True)
         except Exception:
             logger.exception("Error converting %s", type(item.span_data).__name__)
             return None
