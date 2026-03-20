@@ -10,6 +10,7 @@ packages = [{include = "respan_exporter_llamaindex", from = "src"}]
 python = ">=3.12,<3.14"
 requests = "^2.32.5"
 llama-index-core = ">=0.11.0"
+respan-sdk = ">=2.6.1"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.0.2"
