@@ -204,11 +204,12 @@ class RespanSpanHandler(BaseSpanHandler[SimpleSpan]):
                 value = args[key]
                 if value is not None:
                     return str(value) if not isinstance(value, (str, list, dict)) else value
-        if args:
-            first_key = next(iter(args))
-            first_val = args[first_key]
-            if first_key not in _SKIP_ARG_NAMES and first_val is not None:
-                return str(first_val) if not isinstance(first_val, (str, list, dict)) else first_val
+        # Fallback: iterate all args, skip common non-input ones
+        for key, value in args.items():
+            if key in _SKIP_ARG_NAMES:
+                continue
+            if value is not None:
+                return str(value) if not isinstance(value, (str, list, dict)) else value
         return None
 
     @staticmethod
@@ -216,4 +217,8 @@ class RespanSpanHandler(BaseSpanHandler[SimpleSpan]):
         """Infer a span name from the instance and bound args."""
         if instance is not None:
             return type(instance).__name__
-        return "unknown"
+        # Fall back to first non-skipped argument name
+        for name in bound_args.arguments:
+            if name not in _SKIP_ARG_NAMES:
+                return name
+        return "span"

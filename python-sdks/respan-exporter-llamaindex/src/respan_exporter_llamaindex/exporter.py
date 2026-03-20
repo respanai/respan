@@ -55,6 +55,22 @@ def _is_agent_span(instance_class: Optional[str], span_name: Optional[str]) -> b
     return False
 
 
+def _coerce_int(value: Any) -> Optional[int]:
+    """Coerce value to int if possible."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value.strip()))
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
 def _serialize(value: Any) -> Optional[str]:
     """Serialize value to JSON string."""
     if value is None:
@@ -229,14 +245,17 @@ class RespanLlamaIndexExporter:
             "disable_log": False,
         }
 
-        # Token usage from metadata
-        prompt_tokens = metadata.get("prompt_tokens") or metadata.get("llm.token_count.prompt")
-        completion_tokens = metadata.get("completion_tokens") or metadata.get("llm.token_count.completion")
-        total_tokens = metadata.get("total_tokens") or metadata.get("llm.token_count.total")
+        # Token usage from metadata (coerce to int)
+        prompt_tokens = _coerce_int(metadata.get("prompt_tokens") or metadata.get("llm.token_count.prompt"))
+        completion_tokens = _coerce_int(metadata.get("completion_tokens") or metadata.get("llm.token_count.completion"))
+        total_tokens = _coerce_int(metadata.get("total_tokens") or metadata.get("llm.token_count.total"))
         if any(v is not None for v in (prompt_tokens, completion_tokens, total_tokens)):
             payload["prompt_tokens"] = prompt_tokens
             payload["completion_tokens"] = completion_tokens
-            payload["total_request_tokens"] = total_tokens
+            if total_tokens:
+                payload["total_request_tokens"] = total_tokens
+            elif prompt_tokens or completion_tokens:
+                payload["total_request_tokens"] = (prompt_tokens or 0) + (completion_tokens or 0)
 
         if error:
             payload["error_message"] = str(error)
@@ -259,7 +278,7 @@ class RespanLlamaIndexExporter:
             return "generation"
         if _is_agent_span(instance_class, span_name):
             return "agent"
-        if metadata.get("model"):
+        if metadata.get("model") or metadata.get("llm.model_name"):
             return "generation"
         if parent_id is None:
             return "workflow"
