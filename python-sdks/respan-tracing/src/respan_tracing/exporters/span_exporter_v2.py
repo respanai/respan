@@ -42,6 +42,7 @@ _SUPPORTED_ATTRIBUTE_KEYS = frozenset({
     "group_identifier",
     "environment",
     "metadata",
+    "prompt",
 })
 
 
@@ -56,11 +57,16 @@ def propagate_attributes(**kwargs):
     Supported attributes:
         customer_identifier, customer_email, customer_name,
         thread_identifier, custom_identifier, group_identifier,
-        environment, metadata (dict — merged, not replaced).
+        environment, metadata (dict — merged, not replaced),
+        prompt (dict with prompt_id + variables — triggers server-side
+        template resolution).
 
     Example::
 
         with propagate_attributes(customer_identifier="user_123"):
+            result = await Runner.run(agent, "Hello")
+
+        with propagate_attributes(prompt={"prompt_id": "abc", "variables": {"x": "y"}}):
             result = await Runner.run(agent, "Hello")
     """
     # Merge with any already-active attributes (supports nesting)
@@ -165,7 +171,7 @@ class RespanSpanExporterV2:
         # Build merged attributes: defaults < context < span fields
         merged_attrs: Dict[str, Any] = {}
         for key in _SUPPORTED_ATTRIBUTE_KEYS:
-            if key == "metadata":
+            if key in ("metadata", "prompt"):
                 continue  # handled separately below
             val = ctx_attrs.get(key) or self._default_attributes.get(key)
             if val is not None:
@@ -176,6 +182,9 @@ class RespanSpanExporterV2:
         ctx_meta = ctx_attrs.get("metadata", {})
         merged_meta = {**default_meta, **ctx_meta}
 
+        # Build prompt logging fields from propagated prompt config
+        prompt_cfg = ctx_attrs.get("prompt") or self._default_attributes.get("prompt")
+
         # Apply to each span dict (don't overwrite fields already on the span)
         enriched = []
         for item in data:
@@ -183,6 +192,19 @@ class RespanSpanExporterV2:
             for key, val in merged_attrs.items():
                 if not enriched_item.get(key):
                     enriched_item[key] = val
+            # Prompt logging: send prompt fields + completion_message
+            if isinstance(prompt_cfg, dict):
+                # Nested prompt object for prompt resolution
+                enriched_item.setdefault("prompt", prompt_cfg)
+                # Flat fields as fallback (supported by /v1/traces/ingest)
+                if "prompt_id" in prompt_cfg:
+                    enriched_item.setdefault("prompt_id", prompt_cfg["prompt_id"])
+                if "variables" in prompt_cfg:
+                    enriched_item.setdefault("variables", prompt_cfg["variables"])
+                # completion_message from output
+                output = enriched_item.get("output")
+                if isinstance(output, dict) and "role" in output:
+                    enriched_item.setdefault("completion_message", output)
             if merged_meta:
                 existing_meta = enriched_item.get("metadata") or {}
                 enriched_item["metadata"] = {**merged_meta, **existing_meta}

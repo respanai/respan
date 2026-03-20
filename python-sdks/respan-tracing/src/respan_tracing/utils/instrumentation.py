@@ -151,7 +151,7 @@ def _init_openai() -> bool:
         _patch_chat_prompt_capture()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize OpenAI instrumentation: {e}")
+        logging.debug(f"Failed to initialize OpenAI instrumentation: {e}")
         return False
 
 
@@ -319,7 +319,7 @@ def _init_anthropic() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize Anthropic instrumentation: {e}")
+        logging.debug(f"Failed to initialize Anthropic instrumentation: {e}")
         return False
 
 
@@ -335,7 +335,7 @@ def _init_cohere() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize Cohere instrumentation: {e}")
+        logging.debug(f"Failed to initialize Cohere instrumentation: {e}")
         return False
 
 
@@ -351,7 +351,7 @@ def _init_mistral() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize Mistral instrumentation: {e}")
+        logging.debug(f"Failed to initialize Mistral instrumentation: {e}")
         return False
 
 
@@ -367,7 +367,7 @@ def _init_ollama() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize Ollama instrumentation: {e}")
+        logging.debug(f"Failed to initialize Ollama instrumentation: {e}")
         return False
 
 
@@ -383,7 +383,7 @@ def _init_groq() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize Groq instrumentation: {e}")
+        logging.debug(f"Failed to initialize Groq instrumentation: {e}")
         return False
 
 
@@ -399,7 +399,7 @@ def _init_together() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize Together instrumentation: {e}")
+        logging.debug(f"Failed to initialize Together instrumentation: {e}")
         return False
 
 
@@ -415,7 +415,7 @@ def _init_replicate() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize Replicate instrumentation: {e}")
+        logging.debug(f"Failed to initialize Replicate instrumentation: {e}")
         return False
 
 
@@ -431,7 +431,7 @@ def _init_transformers() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize Transformers instrumentation: {e}")
+        logging.debug(f"Failed to initialize Transformers instrumentation: {e}")
         return False
 
 
@@ -447,7 +447,7 @@ def _init_bedrock() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize Bedrock instrumentation: {e}")
+        logging.debug(f"Failed to initialize Bedrock instrumentation: {e}")
         return False
 
 
@@ -463,7 +463,7 @@ def _init_sagemaker() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize SageMaker instrumentation: {e}")
+        logging.debug(f"Failed to initialize SageMaker instrumentation: {e}")
         return False
 
 
@@ -479,7 +479,7 @@ def _init_vertexai() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize Vertex AI instrumentation: {e}")
+        logging.debug(f"Failed to initialize Vertex AI instrumentation: {e}")
         return False
 
 
@@ -495,7 +495,7 @@ def _init_google_generativeai() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize Google Generative AI instrumentation: {e}")
+        logging.debug(f"Failed to initialize Google Generative AI instrumentation: {e}")
         return False
 
 
@@ -511,7 +511,7 @@ def _init_watsonx() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize Watson X instrumentation: {e}")
+        logging.debug(f"Failed to initialize Watson X instrumentation: {e}")
         return False
 
 
@@ -527,7 +527,7 @@ def _init_alephalpha() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize Aleph Alpha instrumentation: {e}")
+        logging.debug(f"Failed to initialize Aleph Alpha instrumentation: {e}")
         return False
 
 
@@ -543,7 +543,7 @@ def _init_pinecone() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize Pinecone instrumentation: {e}")
+        logging.debug(f"Failed to initialize Pinecone instrumentation: {e}")
         return False
 
 
@@ -559,7 +559,7 @@ def _init_qdrant() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize Qdrant instrumentation: {e}")
+        logging.debug(f"Failed to initialize Qdrant instrumentation: {e}")
         return False
 
 
@@ -575,7 +575,7 @@ def _init_chroma() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize Chroma instrumentation: {e}")
+        logging.debug(f"Failed to initialize Chroma instrumentation: {e}")
         return False
 
 
@@ -591,7 +591,7 @@ def _init_milvus() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize Milvus instrumentation: {e}")
+        logging.debug(f"Failed to initialize Milvus instrumentation: {e}")
         return False
 
 
@@ -607,7 +607,7 @@ def _init_weaviate() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize Weaviate instrumentation: {e}")
+        logging.debug(f"Failed to initialize Weaviate instrumentation: {e}")
         return False
 
 
@@ -623,7 +623,7 @@ def _init_lancedb() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize LanceDB instrumentation: {e}")
+        logging.debug(f"Failed to initialize LanceDB instrumentation: {e}")
         return False
 
 
@@ -639,7 +639,7 @@ def _init_marqo() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize Marqo instrumentation: {e}")
+        logging.debug(f"Failed to initialize Marqo instrumentation: {e}")
         return False
 
 
@@ -655,7 +655,7 @@ def _init_langchain() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize LangChain instrumentation: {e}")
+        logging.debug(f"Failed to initialize LangChain instrumentation: {e}")
         return False
 
 
@@ -671,7 +671,7 @@ def _init_llama_index() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize LlamaIndex instrumentation: {e}")
+        logging.debug(f"Failed to initialize LlamaIndex instrumentation: {e}")
         return False
 
 
@@ -687,7 +687,7 @@ def _init_haystack() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize Haystack instrumentation: {e}")
+        logging.debug(f"Failed to initialize Haystack instrumentation: {e}")
         return False
 
 
@@ -703,7 +703,7 @@ def _init_crew() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize CrewAI instrumentation: {e}")
+        logging.debug(f"Failed to initialize CrewAI instrumentation: {e}")
         return False
 
 
@@ -719,7 +719,7 @@ def _init_mcp() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize MCP instrumentation: {e}")
+        logging.debug(f"Failed to initialize MCP instrumentation: {e}")
         return False
 
 
@@ -735,7 +735,7 @@ def _init_redis() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize Redis instrumentation: {e}")
+        logging.debug(f"Failed to initialize Redis instrumentation: {e}")
         return False
 
 
@@ -751,7 +751,7 @@ def _init_requests() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize Requests instrumentation: {e}")
+        logging.debug(f"Failed to initialize Requests instrumentation: {e}")
         return False
 
 
@@ -767,7 +767,7 @@ def _init_urllib3() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize urllib3 instrumentation: {e}")
+        logging.debug(f"Failed to initialize urllib3 instrumentation: {e}")
         return False
 
 
@@ -783,7 +783,7 @@ def _init_pymysql() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize PyMySQL instrumentation: {e}")
+        logging.debug(f"Failed to initialize PyMySQL instrumentation: {e}")
         return False
 
 
@@ -796,5 +796,5 @@ def _init_threading() -> bool:
             instrumentor.instrument()
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize Threading instrumentation: {e}")
+        logging.debug(f"Failed to initialize Threading instrumentation: {e}")
         return False 

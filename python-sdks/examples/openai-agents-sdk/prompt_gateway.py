@@ -24,14 +24,15 @@ from agents import Agent, Runner, set_default_openai_client, trace
 respan = Respan(instrumentations=[OpenAIAgentsInstrumentor()])
 
 PROMPT_ID = "d767498c1cbb4951bb122eef423b5f76"
+PROMPT_VARIABLES = {
+    "feature_request": "Add dark mode support to the dashboard",
+}
 
 respan_params = {
     "prompt": {
         "prompt_id": PROMPT_ID,
         "schema_version": 2,
-        "variables": {
-            "feature_request": "Add dark mode support to the dashboard",
-        },
+        "variables": PROMPT_VARIABLES,
     }
 }
 
@@ -54,10 +55,16 @@ agent = Agent(
 
 async def main():
     with trace("Prompt gateway"):
-        result = await Runner.run(
-            agent, "Add dark mode support to the dashboard"
-        )
-        print(result.final_output)
+        with respan.propagate_attributes(
+            prompt={
+                "prompt_id": PROMPT_ID,
+                "variables": PROMPT_VARIABLES,
+            },
+        ):
+            result = await Runner.run(
+                agent, "Add dark mode support to the dashboard"
+            )
+            print(result.final_output)
     respan.flush()
 
 
