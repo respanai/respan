@@ -403,3 +403,62 @@ def test_adk_tracing_exporter_basic():
 
     asyncio.run(_run())
     tracer_provider.force_flush()
+
+
+# ---------------------------------------------------------------------------
+# Uninstrument passthrough tests
+# ---------------------------------------------------------------------------
+
+
+class TestUninstrumentPassthrough:
+    """Verify wrappers become transparent pass-throughs when _ACTIVE_EXPORTER is None."""
+
+    def test_batch_wrapper_passes_through_when_no_exporter(self):
+        """After uninstrument, _batch_export_wrapper should forward all spans unchanged."""
+        import respan_exporter_google_adk.instrumentor as inst
+
+        original_exporter = inst._ACTIVE_EXPORTER
+        try:
+            inst._ACTIVE_EXPORTER = None
+
+            adk_span = _make_span(scope_name="google_adk", name="call_llm")
+            non_adk_span = _make_span(scope_name="other_lib", name="other_op", attributes={})
+            all_spans = [adk_span, non_adk_span]
+
+            received_args = {}
+
+            def fake_wrapped(*args, **kwargs):
+                received_args["args"] = args
+                received_args["kwargs"] = kwargs
+                return "original_result"
+
+            result = inst._batch_export_wrapper(fake_wrapped, None, (all_spans,), {})
+
+            assert result == "original_result"
+            assert received_args["args"] == (all_spans,)
+        finally:
+            inst._ACTIVE_EXPORTER = original_exporter
+
+    def test_on_end_wrapper_passes_through_when_no_exporter(self):
+        """After uninstrument, _on_end_wrapper should forward ADK spans unchanged."""
+        import respan_exporter_google_adk.instrumentor as inst
+
+        original_exporter = inst._ACTIVE_EXPORTER
+        try:
+            inst._ACTIVE_EXPORTER = None
+
+            adk_span = _make_span(scope_name="google_adk", name="agent_run")
+
+            received_args = {}
+
+            def fake_wrapped(*args, **kwargs):
+                received_args["args"] = args
+                received_args["kwargs"] = kwargs
+                return "original_result"
+
+            result = inst._on_end_wrapper(fake_wrapped, None, (adk_span,), {})
+
+            assert result == "original_result"
+            assert received_args["args"] == (adk_span,)
+        finally:
+            inst._ACTIVE_EXPORTER = original_exporter

@@ -91,6 +91,8 @@ def _export_agno_spans(spans: Iterable[object]) -> SpanExportResult:
 
 def _batch_export_wrapper(wrapped, instance, args, kwargs):
     """Wrapper for BatchSpanProcessor._export method."""
+    if _ACTIVE_EXPORTER is None:
+        return wrapped(*args, **kwargs)
     spans = list(args[0]) if args else list(kwargs.get("spans", []))
     if not spans:
         return wrapped(*args, **kwargs)
@@ -116,6 +118,7 @@ def _batch_export_wrapper(wrapped, instance, args, kwargs):
         return wrapped(*args, **kwargs)
 
     if other_spans:
+        kwargs.pop("spans", None)
         return wrapped(other_spans, **kwargs)
 
     return export_result
@@ -123,6 +126,8 @@ def _batch_export_wrapper(wrapped, instance, args, kwargs):
 
 def _on_end_wrapper(wrapped, instance, args, kwargs):
     """Wrapper for SimpleSpanProcessor.on_end method."""
+    if _ACTIVE_EXPORTER is None:
+        return wrapped(*args, **kwargs)
     span = args[0] if args else kwargs.get("span")
     if span is None or not is_agno_span(span=span):
         return wrapped(*args, **kwargs)
@@ -170,6 +175,10 @@ class RespanAgnoInstrumentor(BaseInstrumentor):
         logger.info("Respan Agno instrumentation enabled")
 
     def _uninstrument(self, **kwargs) -> None:
+        global _ACTIVE_EXPORTER, _ACTIVE_PASSTHROUGH
+        _ACTIVE_EXPORTER = None
+        _ACTIVE_PASSTHROUGH = False
+        self._exporter = None
         logger.info("Respan Agno instrumentation disabled")
 
     def _patch_span_processors(self) -> None:

@@ -91,6 +91,8 @@ def _export_adk_spans(spans: Iterable[object]) -> SpanExportResult:
 
 def _batch_export_wrapper(wrapped, instance, args, kwargs):
     """Wrapper for BatchSpanProcessor._export method."""
+    if _ACTIVE_EXPORTER is None:
+        return wrapped(*args, **kwargs)
     spans = list(args[0]) if args else list(kwargs.get("spans", []))
     if not spans:
         return wrapped(*args, **kwargs)
@@ -116,6 +118,7 @@ def _batch_export_wrapper(wrapped, instance, args, kwargs):
         return wrapped(*args, **kwargs)
 
     if other_spans:
+        kwargs.pop("spans", None)
         return wrapped(other_spans, **kwargs)
 
     return export_result
@@ -123,6 +126,8 @@ def _batch_export_wrapper(wrapped, instance, args, kwargs):
 
 def _on_end_wrapper(wrapped, instance, args, kwargs):
     """Wrapper for SimpleSpanProcessor.on_end method."""
+    if _ACTIVE_EXPORTER is None:
+        return wrapped(*args, **kwargs)
     span = args[0] if args else kwargs.get("span")
     if span is None or not is_adk_span(span=span):
         return wrapped(*args, **kwargs)
