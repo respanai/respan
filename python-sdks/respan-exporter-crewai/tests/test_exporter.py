@@ -248,6 +248,26 @@ class TestBuildPayload:
 
         assert payloads[0]["customer_identifier"] == "user-42"
 
+    def test_parent_id_fallback_when_parent_not_in_trace(self):
+        """parent_id should fall back to normalize_span_id when the parent span is not in trace_or_spans."""
+        from respan_exporter_crewai.exporter import RespanCrewAIExporter
+
+        exporter = RespanCrewAIExporter(api_key="test")
+        # Child span whose parent_id does NOT appear as any span's span_id
+        child_span = self._make_span_dict(
+            span_id="aaaaaaaaaaaaaaaa",
+            parent_id="missing_parent_id_123",
+            name="Orphan Task",
+            span_type="CHAIN",
+            kind="CHAIN",
+        )
+        payloads = exporter.build_payload(trace_or_spans=[child_span])
+
+        assert len(payloads) == 1
+        # parent_id must not be None; it should be a normalized hex value
+        assert payloads[0]["parent_id"] is not None
+        assert len(payloads[0]["parent_id"]) > 0
+
 
 class TestExport:
     """Test the export (send) functionality."""
