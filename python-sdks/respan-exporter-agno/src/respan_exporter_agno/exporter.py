@@ -615,7 +615,7 @@ class RespanAgnoExporter:
                 logger.warning(
                     "Respan export failed with status %s: %s",
                     response.status_code,
-                    response.text,
+                    response.text[:200],
                 )
                 return
             raise RuntimeError(
@@ -624,6 +624,11 @@ class RespanAgnoExporter:
             )
 
         try:
+            # NOTE: RetryHandler.execute uses time.sleep for backoff, which blocks
+            # the calling thread. This is an acceptable tradeoff for a sync exporter;
+            # making retries fully configurable or async is tracked as future work.
             self._retry_handler.execute(_do_request, context="Respan Agno export")
         except Exception as exc:
-            logger.error("Respan Agno export failed after retries: %s", exc)
+            logger.exception(
+                "Respan Agno export failed after retries, giving up: %s", exc
+            )
