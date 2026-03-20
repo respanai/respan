@@ -170,8 +170,10 @@ class RespanCrewAIInstrumentor(BaseInstrumentor):
         logger.info("Respan CrewAI instrumentation enabled")
 
     def _uninstrument(self, **kwargs) -> None:
-        global _ACTIVE_EXPORTER
+        global _ACTIVE_EXPORTER, _ACTIVE_DEDUPE, _ACTIVE_PASSTHROUGH
         _ACTIVE_EXPORTER = None
+        _ACTIVE_DEDUPE = None
+        _ACTIVE_PASSTHROUGH = True
         logger.info("Respan CrewAI instrumentation disabled")
 
     def _patch_span_processors(self) -> None:

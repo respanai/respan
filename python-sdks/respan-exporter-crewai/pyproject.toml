@@ -17,7 +17,6 @@ respan-sdk = ">=2.6.1"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.0.2"
-setuptools = "<81"
 crewai = ">=0.80.0"
 openinference-instrumentation-crewai = ">=0.1.0"
 openai = "^1.0.0"
