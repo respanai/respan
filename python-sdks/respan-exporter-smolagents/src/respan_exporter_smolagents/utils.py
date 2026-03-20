@@ -13,7 +13,9 @@ from respan_sdk.utils.data_processing.id_processing import (
 
 def ns_to_datetime(value: Optional[int]) -> Optional[datetime]:
     """Convert nanoseconds timestamp to datetime."""
-    if not value:
+    if value is None:
+        return None
+    if not isinstance(value, (int, float)):
         return None
     return datetime.fromtimestamp(value / 1e9, tz=timezone.utc)
 
@@ -146,17 +148,20 @@ def coerce_datetime(value: Any, reference: Optional[datetime] = None) -> Optiona
             return value.replace(tzinfo=timezone.utc)
         return value
     if isinstance(value, (int, float)):
-        numeric_value = float(value)
-        if reference and numeric_value < 1_000_000_000:
-            return reference + timedelta(seconds=numeric_value)
-        if numeric_value > 100_000_000_000:
-            return datetime.fromtimestamp(numeric_value / 1000, tz=timezone.utc)
-        return datetime.fromtimestamp(numeric_value, tz=timezone.utc)
+        try:
+            numeric_value = float(value)
+            if reference and numeric_value < 1_000_000_000:
+                return reference + timedelta(seconds=numeric_value)
+            if numeric_value > 100_000_000_000:
+                return datetime.fromtimestamp(numeric_value / 1000, tz=timezone.utc)
+            return datetime.fromtimestamp(numeric_value, tz=timezone.utc)
+        except (ValueError, OverflowError, OSError):
+            return None
     if isinstance(value, str):
         trimmed = value.strip()
         try:
             return datetime.fromisoformat(trimmed.replace("Z", "+00:00"))
-        except ValueError:
+        except (ValueError, OverflowError, OSError):
             try:
                 numeric_value = float(trimmed)
                 if reference and numeric_value < 1_000_000_000:
@@ -164,7 +169,7 @@ def coerce_datetime(value: Any, reference: Optional[datetime] = None) -> Optiona
                 if numeric_value > 100_000_000_000:
                     return datetime.fromtimestamp(numeric_value / 1000, tz=timezone.utc)
                 return datetime.fromtimestamp(numeric_value, tz=timezone.utc)
-            except ValueError:
+            except (ValueError, OverflowError, OSError):
                 return None
     return None
 
@@ -176,14 +181,17 @@ def coerce_token_count(value: Any) -> Optional[int]:
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return int(value)
+        try:
+            return int(value)
+        except (ValueError, OverflowError):
+            return None
     if isinstance(value, str):
         stripped = value.strip()
         if not stripped:
             return None
         try:
             return int(float(stripped))
-        except ValueError:
+        except (ValueError, OverflowError):
             return None
     return None
 
