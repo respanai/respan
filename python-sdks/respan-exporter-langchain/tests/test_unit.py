@@ -350,6 +350,52 @@ class TestRespanCallbackHandler:
         tool_payload = next(p for p in payloads if p["log_type"] == "tool")
         assert tool_payload["span_tools"] == ["calculator"]
 
+    @patch("respan_exporter_langchain.exporter.requests.post")
+    def test_token_usage_from_usage_metadata(self, mock_post):
+        """Token usage extracted from AIMessage.usage_metadata should populate payload."""
+        mock_post.return_value = MagicMock(status_code=200)
+        with _patch_inline_thread():
+            handler = RespanCallbackHandler(api_key="test-key")
+
+            root_id = uuid.uuid4()
+            llm_id = uuid.uuid4()
+
+            handler.on_chain_start(
+                serialized={"name": "Chain", "id": ["langchain", "Chain"]},
+                inputs={"input": "hi"},
+                run_id=root_id,
+            )
+            handler.on_chat_model_start(
+                serialized={"name": "ChatOpenAI", "id": ["langchain", "ChatOpenAI"], "kwargs": {"model_name": "gpt-4o"}},
+                messages=[[MagicMock(type="human", content="hi")]],
+                run_id=llm_id,
+                parent_run_id=root_id,
+            )
+
+            # Build an LLMResult whose AIMessage carries usage_metadata
+            from langchain_core.outputs import LLMResult, ChatGeneration
+            from langchain_core.messages import AIMessage
+
+            ai_msg = AIMessage(content="hello back")
+            ai_msg.usage_metadata = {
+                "input_tokens": 12,
+                "output_tokens": 8,
+                "total_tokens": 20,
+            }
+            result = LLMResult(
+                generations=[[ChatGeneration(message=ai_msg)]],
+                llm_output={},  # no token_usage here
+            )
+            handler.on_llm_end(response=result, run_id=llm_id, parent_run_id=root_id)
+            handler.on_chain_end(outputs={"output": "hello back"}, run_id=root_id)
+
+        mock_post.assert_called_once()
+        payloads = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1].get("json")
+        gen_payload = next(p for p in payloads if p["log_type"] == "generation")
+        assert gen_payload["prompt_tokens"] == 12
+        assert gen_payload["completion_tokens"] == 8
+        assert gen_payload["total_request_tokens"] == 20
+
     @patch.dict(os.environ, {}, clear=False)
     @patch("respan_exporter_langchain.exporter.requests.post")
     def test_no_api_key_skips_export(self, mock_post):

@@ -170,7 +170,7 @@ class RespanLangchainExporter:
             root_span = spans[0]
 
         # Use root span's run_id as trace_id
-        trace_id = str(root_span.get("span_id", uuid.uuid4())) if root_span else str(uuid.uuid4())
+        trace_id = str(root_span.get("span_id") or uuid.uuid4()) if root_span else str(uuid.uuid4())
 
         if not trace_name and root_span:
             trace_name = root_span.get("name")

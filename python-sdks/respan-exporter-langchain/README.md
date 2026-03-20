@@ -23,8 +23,7 @@ handler = RespanCallbackHandler(api_key="your-respan-api-key")
 llm = ChatOpenAI(model="gpt-4o-mini")
 result = llm.invoke("Hello!", config={"callbacks": [handler]})
 
-# Or pass it globally
-from langchain_core.globals import set_llm_cache
+# Or pass it to a chain
 chain = prompt | llm | parser
 chain.invoke({"input": "Hello!"}, config={"callbacks": [handler]})
 ```

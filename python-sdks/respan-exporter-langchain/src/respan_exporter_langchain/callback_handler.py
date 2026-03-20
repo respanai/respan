@@ -332,8 +332,25 @@ class RespanCallbackHandler(BaseCallbackHandler):
         for group in messages:
             flat_messages.extend(group)
         prompt_messages = langchain_messages_to_dicts(flat_messages)
+        def _content_to_str(content: Any) -> str:
+            """Coerce message content to a plain string."""
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                # Handle structured content (list of dicts with "text" key)
+                parts: List[str] = []
+                for item in content:
+                    if isinstance(item, dict):
+                        parts.append(str(item.get("text", "")))
+                    elif isinstance(item, str):
+                        parts.append(item)
+                    else:
+                        parts.append(str(item))
+                return " ".join(parts)
+            return str(content) if content is not None else ""
+
         input_text = "\n".join(
-            m.get("content", "") for m in prompt_messages if isinstance(m, dict)
+            _content_to_str(m.get("content", "")) for m in prompt_messages if isinstance(m, dict)
         )
         self._register_span(
             run_id=run_id,
