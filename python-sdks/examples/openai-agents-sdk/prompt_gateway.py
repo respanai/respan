@@ -1,11 +1,16 @@
-"""Prompt Gateway — Use Respan prompt management with the Agents SDK.
+"""Prompt Gateway — Use a Respan-managed prompt with the Agents SDK.
 
-NOTE: The Agents SDK uses OpenAI's Responses API internally, which does
-not support Respan's prompt management feature (chat completions only).
-For prompt management, use the OpenAI SDK directly — see examples/openai-sdk/prompt.py.
+The Agents SDK calls the Responses API internally, so prompt config is
+passed via the X-Data-Respan-Params header on the OpenAI client.
+The gateway converts prompt messages into `instructions` for the response.
+
+NOTE: The header applies to every request made by the client, so all agents
+sharing this client will use the same prompt template.
 """
 
 import os
+import json
+import base64
 import asyncio
 from dotenv import load_dotenv
 
@@ -18,21 +23,40 @@ from agents import Agent, Runner, set_default_openai_client, trace
 
 respan = Respan(instrumentations=[OpenAIAgentsInstrumentor()])
 
+PROMPT_ID = "d767498c1cbb4951bb122eef423b5f76"
+
+respan_params = {
+    "prompt": {
+        "prompt_id": PROMPT_ID,
+        "schema_version": 2,
+        "variables": {
+            "feature_request": "Add dark mode support to the dashboard",
+        },
+    }
+}
+
 client = AsyncOpenAI(
     api_key=os.getenv("RESPAN_API_KEY"),
     base_url=os.getenv("RESPAN_BASE_URL", "https://api.respan.ai/api"),
+    default_headers={
+        "X-Data-Respan-Params": base64.b64encode(
+            json.dumps(respan_params).encode()
+        ).decode(),
+    },
 )
 set_default_openai_client(client)
 
 agent = Agent(
-    name="Assistant",
-    instructions="You are a helpful assistant. Be concise.",
+    name="Planner",
+    instructions="You are a helpful assistant.",
 )
 
 
 async def main():
     with trace("Prompt gateway"):
-        result = await Runner.run(agent, "What is prompt management and why is it useful?")
+        result = await Runner.run(
+            agent, "Add dark mode support to the dashboard"
+        )
         print(result.final_output)
     respan.flush()
 
