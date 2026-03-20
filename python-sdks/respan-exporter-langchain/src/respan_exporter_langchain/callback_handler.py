@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 from langchain_core.callbacks import BaseCallbackHandler
-from langchain_core.outputs import ChatGenerationChunk, GenerationChunk, LLMResult
+from langchain_core.outputs import LLMResult
 
 from respan_exporter_langchain.types import SpanRecord
 from respan_exporter_langchain.utils import langchain_messages_to_dicts
@@ -149,15 +149,20 @@ class RespanCallbackHandler(BaseCallbackHandler):
         root = self._spans.get(root_run_id)
         if root is None:
             return result
+        # Build parent→children index for O(n) traversal
+        children_map: Dict[str, List[str]] = {}
+        for span in self._spans.values():
+            if span.parent_run_id is not None:
+                children_map.setdefault(span.parent_run_id, []).append(span.run_id)
         result.append(root)
-        # BFS to find all children
         queue = [root_run_id]
         while queue:
             parent = queue.pop(0)
-            for span in self._spans.values():
-                if span.parent_run_id == parent and span not in result:
-                    result.append(span)
-                    queue.append(span.run_id)
+            for child_id in children_map.get(parent, []):
+                child = self._spans.get(child_id)
+                if child is not None and child not in result:
+                    result.append(child)
+                    queue.append(child_id)
         return result
 
     def _do_export(self, spans: List[SpanRecord]) -> None:
@@ -418,9 +423,11 @@ class RespanCallbackHandler(BaseCallbackHandler):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> None:
-        name = serialized.get("name") or serialized.get("id", [None])[-1] if serialized.get("id") else None
-        if name is None:
-            name = serialized.get("name")
+        name = serialized.get("name")
+        if not name:
+            id_list = serialized.get("id")
+            if isinstance(id_list, list) and id_list:
+                name = str(id_list[-1])
         self._register_span(
             run_id=run_id,
             parent_run_id=parent_run_id,

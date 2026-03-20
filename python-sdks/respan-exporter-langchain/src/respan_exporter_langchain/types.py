@@ -1,7 +1,8 @@
 """Type definitions for Respan LangChain exporter."""
 from datetime import datetime
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
+from pydantic import Field
 from respan_sdk.respan_types.base_types import RespanBaseModel
 
 
@@ -36,5 +37,5 @@ class SpanRecord(RespanBaseModel):
     total_tokens: Optional[int] = None
     prompt_messages: Any = None
     completion_message: Any = None
-    metadata: Dict[str, Any] = {}
-    tags: list = []
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    tags: List[str] = Field(default_factory=list)

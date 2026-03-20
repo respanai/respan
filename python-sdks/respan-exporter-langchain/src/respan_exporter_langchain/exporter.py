@@ -347,6 +347,10 @@ class RespanLangchainExporter:
         }
         payload["disable_log"] = False
 
+        # Populate span_tools for tool spans (matches Agno exporter pattern)
+        if log_type == "tool" and span_name:
+            payload["span_tools"] = [str(span_name)]
+
         # Token usage
         prompt_tokens = span.get("prompt_tokens")
         completion_tokens = span.get("completion_tokens")

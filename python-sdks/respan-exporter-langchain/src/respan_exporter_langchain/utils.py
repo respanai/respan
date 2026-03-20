@@ -149,7 +149,10 @@ def langchain_messages_to_dicts(messages: Sequence[Any]) -> List[Dict[str, Any]]
         tool_calls = getattr(msg, "tool_calls", None)
         if tool_calls:
             entry["tool_calls"] = [
-                tc if isinstance(tc, dict) else tc.dict()
+                tc if isinstance(tc, dict)
+                else tc.model_dump() if hasattr(tc, "model_dump")
+                else tc.dict() if hasattr(tc, "dict")
+                else str(tc)
                 for tc in tool_calls
             ]
         result.append(entry)

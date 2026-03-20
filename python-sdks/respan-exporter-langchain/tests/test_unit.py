@@ -260,6 +260,73 @@ class TestRespanCallbackHandler:
         assert payloads[0]["status_code"] == 500
         assert "test error" in payloads[0]["error_message"]
 
+    @patch("respan_exporter_langchain.exporter.requests.post")
+    def test_retriever_span(self, mock_post):
+        mock_post.return_value = MagicMock(status_code=200)
+        handler = RespanCallbackHandler(api_key="test-key")
+
+        root_id = uuid.uuid4()
+        retriever_id = uuid.uuid4()
+
+        handler.on_chain_start(
+            serialized={"name": "RAGChain", "id": ["langchain", "RAGChain"]},
+            inputs={"input": "what is respan?"},
+            run_id=root_id,
+        )
+        handler.on_retriever_start(
+            serialized={"name": "VectorStoreRetriever"},
+            query="what is respan?",
+            run_id=retriever_id,
+            parent_run_id=root_id,
+        )
+
+        # Simulate Document objects
+        class FakeDoc:
+            def __init__(self, content, metadata):
+                self.page_content = content
+                self.metadata = metadata
+
+        handler.on_retriever_end(
+            documents=[FakeDoc("Respan is an observability platform", {"source": "docs"})],
+            run_id=retriever_id,
+            parent_run_id=root_id,
+        )
+        handler.on_chain_end(outputs={"output": "Respan is..."}, run_id=root_id)
+
+        time.sleep(0.5)
+        mock_post.assert_called_once()
+        payloads = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1].get("json")
+
+        retriever_payload = next(p for p in payloads if p["span_name"] == "VectorStoreRetriever")
+        assert retriever_payload["log_type"] == "tool"
+
+    @patch("respan_exporter_langchain.exporter.requests.post")
+    def test_tool_span_has_span_tools(self, mock_post):
+        mock_post.return_value = MagicMock(status_code=200)
+        handler = RespanCallbackHandler(api_key="test-key")
+
+        root_id = uuid.uuid4()
+        tool_id = uuid.uuid4()
+
+        handler.on_chain_start(
+            serialized={"name": "Chain"},
+            inputs={"input": "test"},
+            run_id=root_id,
+        )
+        handler.on_tool_start(
+            serialized={"name": "calculator"},
+            input_str="2+2",
+            run_id=tool_id,
+            parent_run_id=root_id,
+        )
+        handler.on_tool_end(output="4", run_id=tool_id, parent_run_id=root_id)
+        handler.on_chain_end(outputs={"output": "4"}, run_id=root_id)
+
+        time.sleep(0.5)
+        payloads = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1].get("json")
+        tool_payload = next(p for p in payloads if p["log_type"] == "tool")
+        assert tool_payload["span_tools"] == ["calculator"]
+
     def test_no_api_key_skips_export(self):
         handler = RespanCallbackHandler()  # no api key
         root_id = uuid.uuid4()
