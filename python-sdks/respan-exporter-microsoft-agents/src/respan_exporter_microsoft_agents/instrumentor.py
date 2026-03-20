@@ -85,8 +85,13 @@ def _batch_export_wrapper(wrapped, instance, args, kwargs):
     if not spans:
         return wrapped(*args, **kwargs)
 
-    microsoft_agents_spans = [s for s in spans if is_microsoft_agents_span(span=s)]
-    other_spans = [s for s in spans if not is_microsoft_agents_span(span=s)]
+    microsoft_agents_spans = []
+    other_spans = []
+    for s in spans:
+        if is_microsoft_agents_span(span=s):
+            microsoft_agents_spans.append(s)
+        else:
+            other_spans.append(s)
 
     if not microsoft_agents_spans:
         return wrapped(*args, **kwargs)
@@ -153,7 +158,7 @@ class RespanMicrosoftAgentsInstrumentor(BaseInstrumentor):
     def _uninstrument(self, **kwargs) -> None:
         global _ACTIVE_EXPORTER, _ACTIVE_DEDUPE, _ACTIVE_PASSTHROUGH
         _ACTIVE_EXPORTER = None
-        _ACTIVE_DEDUPE = None
+        _ACTIVE_DEDUPE = _SpanDedupeCache()
         _ACTIVE_PASSTHROUGH = True
         logger.info("Respan microsoft_agents instrumentation disabled")
 
