@@ -375,7 +375,7 @@ def test_adk_tracing_exporter_basic():
     )
 
     import asyncio
-    from google.adk import Agent
+    from google.adk.agents import Agent
     from google.adk.runners import InMemoryRunner
     from google.genai import types
 

@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from collections import OrderedDict
 from threading import Lock
-from typing import Collection, Dict, Iterable, List, Optional, Sequence
+from typing import Collection, Dict, Iterable, List, Optional
 
 import wrapt
 from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
@@ -47,7 +47,7 @@ class _SpanDedupeCache:
 
 
 _ACTIVE_EXPORTER: Optional[RespanGoogleAdkExporter] = None
-_ACTIVE_DEDUPE = _SpanDedupeCache()
+_ACTIVE_DEDUPE: Optional[_SpanDedupeCache] = _SpanDedupeCache()
 _ACTIVE_PASSTHROUGH = False
 
 
