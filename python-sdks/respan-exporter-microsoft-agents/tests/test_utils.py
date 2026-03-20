@@ -1,5 +1,33 @@
 """Tests for Microsoft Agents exporter utility functions."""
+from datetime import datetime, timezone
 from types import SimpleNamespace
+
+
+class TestNsToDatetime:
+    """Test nanosecond timestamp conversion."""
+
+    def test_returns_none_for_none(self):
+        from respan_exporter_microsoft_agents.utils import ns_to_datetime
+
+        assert ns_to_datetime(value=None) is None
+
+    def test_converts_zero_to_epoch(self):
+        from respan_exporter_microsoft_agents.utils import ns_to_datetime
+
+        result = ns_to_datetime(value=0)
+        assert result == datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+    def test_converts_valid_nanoseconds(self):
+        from respan_exporter_microsoft_agents.utils import ns_to_datetime
+
+        result = ns_to_datetime(value=1_700_000_000_000_000_000)
+        assert result is not None
+        assert result.year == 2023
+
+    def test_returns_none_for_non_numeric(self):
+        from respan_exporter_microsoft_agents.utils import ns_to_datetime
+
+        assert ns_to_datetime(value="not_a_number") is None
 
 
 class TestIsMicrosoftAgentsSpan:

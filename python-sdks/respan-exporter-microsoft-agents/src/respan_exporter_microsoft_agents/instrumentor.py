@@ -106,7 +106,8 @@ def _batch_export_wrapper(wrapped, instance, args, kwargs):
     if _ACTIVE_PASSTHROUGH:
         return wrapped(*args, **kwargs)
     if other_spans:
-        wrapped_result = wrapped(other_spans, **kwargs)
+        fwd_kwargs = {k: v for k, v in kwargs.items() if k != "spans"}
+        wrapped_result = wrapped(other_spans, **fwd_kwargs)
         if (
             wrapped_result == SpanExportResult.FAILURE
             or export_result == SpanExportResult.FAILURE

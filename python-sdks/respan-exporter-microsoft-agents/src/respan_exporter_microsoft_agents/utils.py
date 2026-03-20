@@ -13,7 +13,9 @@ from respan_sdk.utils.data_processing.id_processing import (
 
 def ns_to_datetime(value: Optional[int]) -> Optional[datetime]:
     """Convert nanoseconds timestamp to datetime."""
-    if not value:
+    if value is None:
+        return None
+    if not isinstance(value, (int, float)):
         return None
     return datetime.fromtimestamp(value / 1e9, tz=timezone.utc)
 
