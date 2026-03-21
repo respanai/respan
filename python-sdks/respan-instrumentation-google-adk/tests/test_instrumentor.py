@@ -20,7 +20,7 @@ from respan_instrumentation_google_adk.converter import AdkSpanConverter
 from respan_instrumentation_google_adk.utils import otel_span_to_dict
 from respan_sdk.constants.llm_logging import (
     LOG_TYPE_AGENT,
-    LOG_TYPE_CHAT,
+    LOG_TYPE_GENERATION,
     LOG_TYPE_TOOL,
     LOG_TYPE_WORKFLOW,
 )
@@ -184,7 +184,7 @@ class TestMultiTurnPipeline:
         log_types = [p["log_type"] for p in captured_payloads]
         assert log_types.count(LOG_TYPE_WORKFLOW) >= 3
         assert log_types.count(LOG_TYPE_AGENT) >= 3
-        assert log_types.count(LOG_TYPE_CHAT) >= 3
+        assert log_types.count(LOG_TYPE_GENERATION) >= 3
 
     def test_multi_turn_conversation_id_preserved(self, captured_payloads):
         tracer = _create_adk_tracer()
@@ -226,7 +226,7 @@ class TestMultiTurnPipeline:
             agent.end()
             inv.end()
 
-        gens = [p for p in captured_payloads if p["log_type"] == LOG_TYPE_CHAT]
+        gens = [p for p in captured_payloads if p["log_type"] == LOG_TYPE_GENERATION]
         token_counts = sorted([g.get("prompt_tokens", 0) for g in gens])
         assert token_counts == [10, 40, 70]
 
@@ -269,7 +269,7 @@ class TestStreamingPipeline:
 
         assert len(captured_payloads) >= 3
 
-        gen = next(p for p in captured_payloads if p["log_type"] == LOG_TYPE_CHAT)
+        gen = next(p for p in captured_payloads if p["log_type"] == LOG_TYPE_GENERATION)
         assert gen["prompt_tokens"] == 25
         assert gen["completion_tokens"] == 200
         assert gen["model"] == "gemini-2.0-flash"
@@ -356,7 +356,7 @@ class TestStreamingPipeline:
         agent.end()
         inv.end()
 
-        gen = next(p for p in captured_payloads if p["log_type"] == LOG_TYPE_CHAT)
+        gen = next(p for p in captured_payloads if p["log_type"] == LOG_TYPE_GENERATION)
         assert gen["metadata"]["llm_config"]["temperature"] == 0.9
         assert gen["metadata"]["llm_config"]["top_p"] == 0.95
 
@@ -422,7 +422,7 @@ class TestToolCallsPipeline:
 
         assert type_counts.get(LOG_TYPE_WORKFLOW, 0) >= 1
         assert type_counts.get(LOG_TYPE_AGENT, 0) >= 1
-        assert type_counts.get(LOG_TYPE_CHAT, 0) >= 2
+        assert type_counts.get(LOG_TYPE_GENERATION, 0) >= 2
         assert type_counts.get(LOG_TYPE_TOOL, 0) >= 1
 
     def test_tool_name_captured(self, captured_payloads):
@@ -574,11 +574,11 @@ class TestMultiTurnE2E:
 
         wf = next(p for p in captured_payloads if p["log_type"] == LOG_TYPE_WORKFLOW)
         agent = next(p for p in captured_payloads if p["log_type"] == LOG_TYPE_AGENT)
-        gen = next(p for p in captured_payloads if p["log_type"] == LOG_TYPE_CHAT)
+        gen = next(p for p in captured_payloads if p["log_type"] == LOG_TYPE_GENERATION)
 
         assert wf["log_type"] == LOG_TYPE_WORKFLOW
         assert agent["log_type"] == LOG_TYPE_AGENT
-        assert gen["log_type"] == LOG_TYPE_CHAT
+        assert gen["log_type"] == LOG_TYPE_GENERATION
 
         assert wf["status"] == "success"
         assert agent["status"] == "success"
@@ -601,7 +601,7 @@ class TestMultiTurnE2E:
 
         wf = next(p for p in captured_payloads if p["log_type"] == LOG_TYPE_WORKFLOW)
         agent = next(p for p in captured_payloads if p["log_type"] == LOG_TYPE_AGENT)
-        gen = next(p for p in captured_payloads if p["log_type"] == LOG_TYPE_CHAT)
+        gen = next(p for p in captured_payloads if p["log_type"] == LOG_TYPE_GENERATION)
 
         assert wf.get("parent_id") is None
         assert agent["parent_id"] == wf["span_id"]
