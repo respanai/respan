@@ -1,0 +1,25 @@
+[tool.poetry]
+name = "respan-exporter-google-adk"
+version = "0.1.0"
+description = "Exporter for Respan Google ADK"
+authors = ["Respan <team@respan.ai>"]
+license = "Apache 2.0"
+packages = [
+    { include = "respan_exporter_google_adk", from = "./src" },
+]
+
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.15"
+respan-sdk = ">=1.0.0"
+opentelemetry-sdk = ">=1.20.0"
+httpx = ">=0.24.0"
+
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.0.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
