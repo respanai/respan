@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Union
 from agents.tracing.processor_interface import TracingProcessor
 from agents.tracing.spans import Span
 from agents.tracing.traces import Trace
+from respan_tracing.exporters.span_exporter_v2 import _PROPAGATED_ATTRIBUTES
 
 from ._converter import convert_to_respan_log
 
@@ -14,26 +15,62 @@ logger = logging.getLogger(__name__)
 
 
 class _RespanTracingProcessor(TracingProcessor):
-    """OpenAI Agents SDK TracingProcessor that forwards spans to RespanSpanExporterV2."""
+    """OpenAI Agents SDK TracingProcessor that forwards spans to RespanSpanExporterV2.
+
+    Captures context-propagated attributes (customer_identifier, thread_identifier,
+    etc.) at span/trace *start* time.  This ensures the attributes are available at
+    *end* time even when ``propagate_attributes`` is nested inside the trace scope
+    and has already exited by the time ``on_trace_end`` fires.
+    """
 
     def __init__(self, exporter: Any) -> None:
         self._exporter = exporter
+        # Snapshot of propagated attributes captured at start, keyed by object id
+        self._captured_ctx: Dict[int, Dict[str, Any]] = {}
+        self._lock = threading.Lock()
 
     def on_trace_start(self, trace: Trace) -> None:
-        pass
+        ctx = _PROPAGATED_ATTRIBUTES.get()
+        if ctx:
+            with self._lock:
+                self._captured_ctx[id(trace)] = ctx
 
     def on_trace_end(self, trace: Trace) -> None:
+        with self._lock:
+            captured = self._captured_ctx.pop(id(trace), None)
         data = convert_to_respan_log(trace)
         if data:
-            self._exporter.export([data])
+            self._export_with_ctx(data, captured)
 
     def on_span_start(self, span: Span[Any]) -> None:
-        pass
+        ctx = _PROPAGATED_ATTRIBUTES.get()
+        if ctx:
+            with self._lock:
+                self._captured_ctx[id(span)] = ctx
 
     def on_span_end(self, span: Span[Any]) -> None:
+        with self._lock:
+            captured = self._captured_ctx.pop(id(span), None)
         data = convert_to_respan_log(span)
         if data:
+            self._export_with_ctx(data, captured)
+
+    def _export_with_ctx(
+        self, data: Dict[str, Any], captured: Optional[Dict[str, Any]]
+    ) -> None:
+        """Export data, restoring the captured context if the current one is empty."""
+        current = _PROPAGATED_ATTRIBUTES.get()
+        if current or not captured:
+            # Context is still active (normal on_span_end) or nothing was captured
             self._exporter.export([data])
+            return
+        # Context was lost (e.g. on_trace_end after propagate_attributes exited).
+        # Temporarily restore the snapshot so the exporter can merge attributes.
+        token = _PROPAGATED_ATTRIBUTES.set(captured)
+        try:
+            self._exporter.export([data])
+        finally:
+            _PROPAGATED_ATTRIBUTES.reset(token)
 
     def shutdown(self) -> None:
         pass

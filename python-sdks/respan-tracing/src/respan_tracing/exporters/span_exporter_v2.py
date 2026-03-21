@@ -37,7 +37,9 @@ _SUPPORTED_ATTRIBUTE_KEYS = frozenset({
     "customer_identifier",
     "customer_email",
     "customer_name",
+    "evaluation_identifier",
     "thread_identifier",
+    "session_identifier",
     "custom_identifier",
     "group_identifier",
     "environment",
@@ -56,8 +58,8 @@ def propagate_attributes(**kwargs):
 
     Supported attributes:
         customer_identifier, customer_email, customer_name,
-        thread_identifier, custom_identifier, group_identifier,
-        environment, metadata (dict — merged, not replaced),
+        evaluation_identifier, thread_identifier, custom_identifier,
+        group_identifier, environment, metadata (dict — merged, not replaced),
         prompt (dict with prompt_id + variables — triggers server-side
         template resolution).
 

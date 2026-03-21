@@ -85,9 +85,11 @@ class RespanTracer:
         if auto_instrument:
             self._setup_instrumentations(instruments, block_instruments)
         
-        # Add default Respan processor for backward compatibility
-        # Only if api_key is provided (user wants to send to Respan)
-        if api_key:
+        # Add default Respan processor for backward compatibility.
+        # Only when api_key is provided AND auto_instrument is enabled.
+        # When auto_instrument is False, plugins handle tracing via their own
+        # exporter — the default OTEL processor would cause duplicate exports.
+        if api_key and auto_instrument:
             self._setup_default_processor()
         
         # Register cleanup
