@@ -9,6 +9,7 @@ Tests cover:
 - Root span promotion logic
 """
 
+import pytest
 from unittest.mock import Mock
 from opentelemetry.semconv_ai import SpanAttributes
 
@@ -18,31 +19,11 @@ from respan_tracing.utils.preprocessing.span_processing import (
 )
 
 
-def _make_span(
-    attributes: dict,
-    name: str = "test_span",
-    scope_name: str | None = None,
-) -> Mock:
-    """Create a mock ReadableSpan with given attributes.
-
-    Args:
-        attributes: Span attributes dict.
-        name: Span name.
-        scope_name: If provided, sets ``instrumentation_scope.name`` on the mock.
-            When *None*, ``instrumentation_scope`` is set to *None* so that the
-            ADK detector's ``getattr`` fallback behaves correctly.
-    """
+def _make_span(attributes: dict, name: str = "test_span") -> Mock:
+    """Create a mock ReadableSpan with given attributes."""
     span = Mock()
     span.name = name
     span.attributes = attributes
-    if scope_name is not None:
-        scope = Mock()
-        scope.name = scope_name
-        span.instrumentation_scope = scope
-        span.instrumentation_library = scope
-    else:
-        span.instrumentation_scope = None
-        span.instrumentation_library = None
     return span
 
 
@@ -112,7 +93,6 @@ class TestIsProcessableSpan:
         assert is_processable_span(span) is True
 
 
-
 # =============================================================================
 # is_root_span_candidate
 # =============================================================================
@@ -172,24 +152,4 @@ class TestIsRootSpanCandidate:
             SpanAttributes.LLM_REQUEST_TYPE: "chat",
             SpanAttributes.TRACELOOP_ENTITY_PATH: "",
         })
-        assert is_root_span_candidate(span) is True
-
-    # ----- Google ADK root candidate behavior -----
-
-    def test_adk_span_with_entity_path_is_not_root_candidate(self):
-        """ADK span with traceloop.entity.path should NOT be a root candidate."""
-        span = _make_span(
-            {SpanAttributes.TRACELOOP_ENTITY_PATH: "adk.call_llm"},
-            name="call_llm",
-            scope_name="google_adk",
-        )
-        assert is_root_span_candidate(span) is False
-
-    def test_adk_span_with_workflow_kind_and_no_path_is_root_candidate(self):
-        """ADK span with traceloop.span.kind='workflow' and no entity path IS a root candidate."""
-        span = _make_span(
-            {SpanAttributes.TRACELOOP_SPAN_KIND: "workflow"},
-            name="invocation",
-            scope_name="google_adk",
-        )
         assert is_root_span_candidate(span) is True

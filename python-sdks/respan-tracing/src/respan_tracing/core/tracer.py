@@ -112,14 +112,14 @@ class RespanTracer:
             api_key=self.api_key,
             headers=self.headers,
         )
-
+        
         # Add without name or filter - receives ALL spans (backward compatible behavior)
         self.add_processor(
             exporter=exporter,
             name=None,  # No name = no filtering
             filter_fn=None,  # No filter = all spans
         )
-
+    
     def add_processor(
         self,
         exporter: Union[SpanExporter, str],

@@ -117,7 +117,7 @@ def _convert_attributes(attributes: Any) -> List[Dict[str, Any]]:
 
 
 def _span_to_otlp_json(span: ReadableSpan) -> Dict[str, Any]:
-    """Convert a ReadableSpan (or EnrichedSpan) to OTLP JSON span dict."""
+    """Convert a ReadableSpan (or ModifiedSpan) to OTLP JSON span dict."""
     ctx = span.get_span_context()
 
     trace_id = format(ctx.trace_id, "032x") if ctx else ""
