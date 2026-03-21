@@ -1,4 +1,6 @@
-"""Tests for the GoogleAdkInstrumentor no-op marker class."""
+"""Tests for the GoogleAdkInstrumentor class."""
+from unittest.mock import patch
+
 from respan_instrumentation_google_adk import GoogleAdkInstrumentor
 
 
@@ -14,28 +16,26 @@ class TestInstrumentationProtocol:
         inst = GoogleAdkInstrumentor()
         assert isinstance(inst, Instrumentation)
 
-    def test_activate_does_not_raise(self):
+    def test_activate_takes_no_arguments(self):
+        """activate() matches the Instrumentation protocol (no args)."""
         instrumentor = GoogleAdkInstrumentor()
-        instrumentor.activate(exporter=None)
+        with patch("respan_instrumentation_google_adk.instrumentor.patch_span_processors"):
+            instrumentor.activate()
 
-    def test_activate_with_exporter_does_not_raise(self):
+    def test_activate_calls_patch_span_processors(self):
         instrumentor = GoogleAdkInstrumentor()
-        instrumentor.activate(exporter=object())
+        with patch("respan_instrumentation_google_adk.instrumentor.patch_span_processors") as mock_patch:
+            instrumentor.activate()
+            mock_patch.assert_called_once()
 
     def test_deactivate_does_not_raise(self):
         instrumentor = GoogleAdkInstrumentor()
-        instrumentor.deactivate()
-
-    def test_activate_then_deactivate(self):
-        instrumentor = GoogleAdkInstrumentor()
-        instrumentor.activate(exporter=object())
         instrumentor.deactivate()
 
     def test_constructor_accepts_kwargs(self):
         instrumentor = GoogleAdkInstrumentor(
             environment="staging",
             customer_identifier="user-42",
-            passthrough=True,
             some_future_param="value",
         )
         assert instrumentor.name == "google-adk"

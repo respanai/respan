@@ -2,8 +2,6 @@ from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.semconv_ai import SpanAttributes
 import logging
 
-from respan_sdk.constants.adk_constants import is_adk_span
-
 logger = logging.getLogger(__name__)
 
 
@@ -12,11 +10,17 @@ def is_processable_span(span: ReadableSpan) -> bool:
     Determine if a span should be processed based on Respan/Traceloop attributes.
 
     Logic:
-    - If span is from a known instrumentation plugin (e.g. Google ADK) → process
     - If span has TRACELOOP_SPAN_KIND: it's a user-decorated span → process
     - If span has TRACELOOP_ENTITY_PATH: it's a child span within entity context → process
     - If span has LLM_REQUEST_TYPE: it's an auto-instrumented LLM call → process
     - If span has none of the above: it's auto-instrumentation noise → filter out
+
+    GAP: The LLM_REQUEST_TYPE check is a duck-tape fix for standalone auto-instrumented
+    LLM spans. It won't cover non-LLM instrumentors (vector DB, retrieval, tool-use, etc.)
+    that also lack Traceloop decorator context. The proper fix is an allowlist of recognized
+    instrumentation scope names (e.g. "opentelemetry.instrumentation.openai") so we can
+    accept any span from a known instrumentor without requiring decorator context or
+    checking for provider-specific attributes.
 
     Args:
         span: The span to evaluate
@@ -24,14 +28,6 @@ def is_processable_span(span: ReadableSpan) -> bool:
     Returns:
         bool: True if span should be processed, False if it should be filtered out
     """
-    # Instrumentation plugin spans (e.g. Google ADK) — allowlisted so the default
-    # OTLP exporter (RespanSpanExporter) can enrich and export them
-    if is_adk_span(span):
-        logger.debug(
-            "[Respan Debug] Processing Google ADK span: %s", span.name
-        )
-        return True
-
     span_kind = span.attributes.get(SpanAttributes.TRACELOOP_SPAN_KIND)
     entity_path = span.attributes.get(SpanAttributes.TRACELOOP_ENTITY_PATH, "")
 

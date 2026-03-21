@@ -11,7 +11,8 @@ packages = [{include = "respan_instrumentation_google_adk", from = "src"}]
 python = ">=3.11,<3.14"
 opentelemetry-sdk = "^1.20.0"
 opentelemetry-api = "^1.20.0"
-respan-sdk = ">=2.5.0"
+respan-tracing = {path = "../respan-tracing", develop = true}
+wrapt = ">=1.14.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.0.2"

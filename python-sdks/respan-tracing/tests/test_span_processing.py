@@ -7,7 +7,6 @@ Tests cover:
 - Standalone auto-instrumented LLM spans (LLM_REQUEST_TYPE)
 - Auto-instrumentation noise (HTTP, DB, etc.) — should be filtered
 - Root span promotion logic
-- Google ADK span allowlisting (scope-name detection and span-name+gen_ai.* fallback)
 """
 
 from unittest.mock import Mock
@@ -112,51 +111,6 @@ class TestIsProcessableSpan:
         })
         assert is_processable_span(span) is True
 
-    # ----- Google ADK allowlisting: scope-name detection -----
-
-    def test_adk_span_with_google_adk_scope_is_processable(self):
-        """ADK span identified by scope name 'google_adk' should be processed."""
-        span = _make_span({}, name="call_llm", scope_name="google_adk")
-        assert is_processable_span(span) is True
-
-    def test_adk_span_with_gcp_vertex_scope_is_processable(self):
-        """ADK span identified by scope name 'gcp.vertex.agent' should be processed."""
-        span = _make_span({}, name="execute_tool", scope_name="gcp.vertex.agent")
-        assert is_processable_span(span) is True
-
-    def test_adk_span_with_google_dash_adk_scope_is_processable(self):
-        """ADK span identified by scope name 'google-adk' should be processed."""
-        span = _make_span({}, name="agent_run", scope_name="google-adk")
-        assert is_processable_span(span) is True
-
-    # ----- Google ADK allowlisting: span-name + gen_ai.* fallback -----
-
-    def test_adk_span_with_known_name_and_gen_ai_attr_is_processable(self):
-        """ADK span with known name and gen_ai.* attribute should be processed (fallback path)."""
-        span = _make_span(
-            {"gen_ai.usage.input_tokens": 42},
-            name="call_llm",
-            scope_name="unknown_scope",
-        )
-        assert is_processable_span(span) is True
-
-    def test_adk_span_with_known_name_but_no_gen_ai_attr_is_not_processable(self):
-        """ADK span with known name but NO gen_ai.* attributes should NOT be processed."""
-        span = _make_span(
-            {"http.method": "POST"},
-            name="call_llm",
-            scope_name="unknown_scope",
-        )
-        assert is_processable_span(span) is False
-
-    def test_adk_span_generate_content_is_processable(self):
-        """ADK 'generate_content' span with gen_ai.* attribute should be processed."""
-        span = _make_span(
-            {"gen_ai.system": "vertex_ai"},
-            name="generate_content",
-            scope_name="some_other_scope",
-        )
-        assert is_processable_span(span) is True
 
 
 # =============================================================================

@@ -1,20 +1,35 @@
 """Respan instrumentation for Google ADK traces.
 
-ADK spans are standard OTel ReadableSpan objects. They flow through the
-standard OTel pipeline (RespanSpanProcessor -> BatchSpanProcessor ->
-RespanSpanExporter) without any custom interception or conversion.
+Patches OTel span processors to intercept ADK spans, enrich them with
+traceloop attributes, and pass enriched versions through the normal
+OTEL pipeline (RespanSpanExporter -> /v2/traces).
+
+Follows the same wrapt-based processor patching pattern as
+respan-exporter-agno.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
+
+from .processor import patch_span_processors
+
+logger = logging.getLogger(__name__)
 
 
 class GoogleAdkInstrumentor:
-    """No-op marker for Google ADK instrumentation.
+    """Instrument OTel span processors to enrich Google ADK traces.
 
-    ADK spans are OTel ReadableSpans handled natively by RespanSpanProcessor.
-    This class exists to satisfy the Instrumentation protocol so that users
-    can register it via ``Respan(instrumentations=[GoogleAdkInstrumentor()])``.
+    Patches BatchSpanProcessor._export() and SimpleSpanProcessor.on_end()
+    to intercept ADK spans, add traceloop attributes, and pass enriched
+    versions through the normal OTEL pipeline.
+
+    Usage::
+
+        from respan import Respan
+        from respan_instrumentation_google_adk import GoogleAdkInstrumentor
+
+        respan = Respan(instrumentations=[GoogleAdkInstrumentor()])
     """
 
     name = "google-adk"
@@ -28,8 +43,11 @@ class GoogleAdkInstrumentor:
         self.environment = environment
         self.customer_identifier = customer_identifier
 
-    def activate(self, exporter: Any = None) -> None:
-        pass  # No-op: ADK spans are OTel ReadableSpans, handled by RespanSpanProcessor
+    def activate(self) -> None:
+        """Patch span processors for ADK enrichment."""
+        patch_span_processors()
+        logger.info("Google ADK instrumentation activated")
 
     def deactivate(self) -> None:
-        pass
+        """Deactivate instrumentation (wrapt patches are permanent)."""
+        logger.info("Google ADK instrumentation deactivated")

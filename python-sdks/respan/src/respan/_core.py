@@ -78,14 +78,6 @@ class Respan:
             "RESPAN_BASE_URL", "https://api.respan.ai/api"
         )
 
-        # Extract config from instrumentors (so instrumentor-level config
-        # is used as fallback if Respan-level isn't set)
-        for inst in instrumentations or []:
-            if not customer_identifier:
-                customer_identifier = getattr(inst, "customer_identifier", None)
-            if not environment:
-                environment = getattr(inst, "environment", None)
-
         # Build default attributes from init params
         default_attributes: Dict[str, Any] = {}
         if customer_identifier:
@@ -123,10 +115,6 @@ class Respan:
         for inst in instrumentations or []:
             name = getattr(inst, "name", type(inst).__name__)
             self._activate(name, inst)
-            # Register OTLP enrichers for plugins that enrich spans
-            if name == "google-adk":
-                from respan_tracing.exporters.adk_enrichment import _enrich_adk_spans
-                self.telemetry.register_enricher(_enrich_adk_spans)
 
     def _activate(self, name: str, inst: object) -> None:
         """Activate a single instrumentor."""

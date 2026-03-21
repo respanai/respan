@@ -1,20 +1,24 @@
 """ADK span enrichment for OpenLLMetry-compatible export.
 
-Extracted from respan.py to keep the core OTLP exporter free of
-ADK-specific logic.  Registered as an enricher on RespanSpanExporter
-by _core.py when a Google ADK instrumentor is present.
+Converts raw ADK OTel spans into enriched ReadableSpan objects with
+traceloop.* and gen_ai.* attributes that the Respan backend expects.
+Uses build_readable_span() from respan_tracing to construct new spans.
 """
 
 import json
-from typing import Dict, Optional, Sequence, List, Any
+import logging
+from typing import Dict, List, Optional, Sequence, Any
 
 from opentelemetry.sdk.trace import ReadableSpan
 
-from respan_sdk.constants.adk_constants import is_adk_span
-from .respan import EnrichedSpan
+from respan_tracing.utils.span_factory import build_readable_span
+
+from .adk_detection import is_adk_span
+
+logger = logging.getLogger(__name__)
 
 
-# Internal/redundant ADK attributes that should NOT appear as custom properties.
+# Internal/redundant ADK attributes that should NOT be copied to enriched spans.
 _ADK_STRIP_ATTRS = {
     # Internal tracking IDs
     "gcp.vertex.agent.event_id",
@@ -70,13 +74,59 @@ def _extract_adk_output(llm_response_json: str) -> Optional[str]:
         return None
 
 
-def _enrich_adk_spans(spans: Sequence[ReadableSpan]) -> List[ReadableSpan]:
+def _build_enriched_span(
+    original: ReadableSpan,
+    extra_attrs: Dict[str, Any],
+    name_override: Optional[str] = None,
+    is_root: bool = False,
+) -> ReadableSpan:
+    """Build a new ReadableSpan with enriched attributes.
+
+    Copies trace_id, span_id, timestamps from the original span.
+    Copies original attributes (minus stripped ones), adds extra_attrs.
+    """
+    ctx = original.get_span_context()
+    trace_id = format(ctx.trace_id, "032x") if ctx else None
+    span_id = format(ctx.span_id, "016x") if ctx else None
+
+    parent_id = None
+    if not is_root and original.parent:
+        parent_id = format(original.parent.span_id, "016x")
+
+    # Copy attributes, stripping internal ADK ones
+    attrs: Dict[str, Any] = {}
+    for key, value in (original.attributes or {}).items():
+        if key not in _ADK_STRIP_ATTRS:
+            attrs[key] = value
+    attrs.update(extra_attrs)
+
+    # Determine error state from original span
+    error_message = None
+    status_code = 200
+    if original.status and original.status.status_code:
+        from opentelemetry.trace import StatusCode
+        if original.status.status_code == StatusCode.ERROR:
+            status_code = 500
+            error_message = original.status.description
+
+    return build_readable_span(
+        name=name_override or original.name,
+        trace_id=trace_id,
+        span_id=span_id,
+        parent_id=parent_id,
+        start_time_ns=original.start_time,
+        end_time_ns=original.end_time,
+        attributes=attrs,
+        status_code=status_code,
+        error_message=error_message,
+    )
+
+
+def enrich_adk_batch(spans: Sequence[ReadableSpan]) -> List[ReadableSpan]:
     """Enrich ADK spans with OpenLLMetry-compatible attributes.
 
-    Maps ADK-specific attributes to the conventions the backend expects:
-    - Root "invocation" span: rename to agent name, add input/output, mark as workflow
-    - LLM spans: add llm.request.type, map token attribute names
-    - All child spans: add traceloop.entity.path to prevent root promotion
+    Separates ADK spans from other spans, groups ADK spans by trace ID,
+    enriches each group, and returns the combined result.
     """
     adk_spans = []
     other_spans = []
@@ -117,7 +167,7 @@ def _enrich_adk_trace_group(spans: List[ReadableSpan]) -> List[ReadableSpan]:
         if prefix == "invoke_agent" and not agent_name:
             agent_name = attrs.get("gen_ai.agent.name")
 
-        # Collect input/output from LLM spans (prefer gen_ai.*, fall back to ADK attrs)
+        # Collect input/output from LLM spans
         if prefix in ("call_llm", "generate_content"):
             if first_input is None:
                 first_input = (
@@ -133,7 +183,7 @@ def _enrich_adk_trace_group(spans: List[ReadableSpan]) -> List[ReadableSpan]:
             if output:
                 last_output = output
 
-        # Also check invoke_agent spans (ADK sometimes puts llm_request/response here)
+        # Also check invoke_agent spans
         elif prefix == "invoke_agent":
             llm_req = attrs.get("gcp.vertex.agent.llm_request", "")
             llm_resp = attrs.get("gcp.vertex.agent.llm_response", "")
@@ -148,8 +198,7 @@ def _enrich_adk_trace_group(spans: List[ReadableSpan]) -> List[ReadableSpan]:
         if not session_id:
             session_id = attrs.get("gen_ai.conversation.id")
 
-    # Read identifiers from span attributes (bridged by RespanSpanProcessor
-    # from _PROPAGATED_ATTRIBUTES ContextVar set in _core.py)
+    # Read identifiers from span attributes (propagated from ContextVar)
     customer_id = None
     thread_id = None
     for span in spans:
@@ -166,6 +215,7 @@ def _enrich_adk_trace_group(spans: List[ReadableSpan]) -> List[ReadableSpan]:
         attrs = span.attributes or {}
         extra: Dict[str, Any] = {}
         new_name = None
+        is_root = False
 
         if prefix == "invocation":
             # Root span: rename to agent name, add workflow kind, propagate I/O
@@ -176,13 +226,12 @@ def _enrich_adk_trace_group(spans: List[ReadableSpan]) -> List[ReadableSpan]:
                 extra["traceloop.entity.input"] = first_input
             if last_output:
                 extra["traceloop.entity.output"] = last_output
-            # Inject identifiers from resource attributes
             if customer_id:
                 extra["respan.customer_params.customer_identifier"] = customer_id
-            # Use session_id as thread if not explicitly set
             effective_thread = thread_id or session_id
             if effective_thread:
                 extra["respan.threads.thread_identifier"] = effective_thread
+            is_root = True
         else:
             # Child spans: add entity path to prevent root promotion
             extra["traceloop.entity.path"] = f"adk.{prefix}"
@@ -196,7 +245,7 @@ def _enrich_adk_trace_group(spans: List[ReadableSpan]) -> List[ReadableSpan]:
                     extra["gen_ai.usage.prompt_tokens"] = input_tokens
                 if output_tokens is not None:
                     extra["gen_ai.usage.completion_tokens"] = output_tokens
-                # Map input/output to traceloop entity attributes (with ADK fallback)
+                # Map input/output
                 messages_in = (
                     attrs.get("gen_ai.input.messages")
                     or attrs.get("gen_ai.prompt")
@@ -220,9 +269,6 @@ def _enrich_adk_trace_group(spans: List[ReadableSpan]) -> List[ReadableSpan]:
                 if tool_resp:
                     extra["traceloop.entity.output"] = tool_resp
 
-        if new_name or extra:
-            enriched.append(EnrichedSpan(span, extra_attrs=extra, name=new_name, stripped_keys=_ADK_STRIP_ATTRS))
-        else:
-            enriched.append(span)
+        enriched.append(_build_enriched_span(span, extra, name_override=new_name, is_root=is_root))
 
     return enriched

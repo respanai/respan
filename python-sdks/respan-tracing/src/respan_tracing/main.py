@@ -199,15 +199,6 @@ class RespanTelemetry:
             is_batching_enabled=is_batching_enabled,
         )
     
-    def register_enricher(self, fn) -> None:
-        """Register an enricher on the default OTLP exporter.
-
-        The enricher receives a list of spans and returns a (possibly
-        modified) list.  It runs before root-span promotion on every
-        export batch.
-        """
-        self.tracer.register_enricher(fn)
-
     def flush(self):
         """Force flush all pending spans"""
         self.tracer.flush()

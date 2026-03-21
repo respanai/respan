@@ -1,4 +1,4 @@
-"""Constants and detection utilities for Google ADK spans."""
+"""Detection utilities for Google ADK spans."""
 
 # Instrumentation scope names that identify Google ADK spans
 ADK_SCOPE_NAMES = {"gcp.vertex.agent", "google_adk", "google-adk"}
@@ -15,7 +15,7 @@ def is_adk_span(span: object) -> bool:
 
     Works with any span-like object that has instrumentation_scope/name/attributes.
     Uses ``object`` type hint to avoid requiring opentelemetry-sdk as a
-    dependency of respan-sdk.
+    dependency of this module.
     """
     scope = getattr(span, "instrumentation_scope", None) or getattr(
         span, "instrumentation_library", None

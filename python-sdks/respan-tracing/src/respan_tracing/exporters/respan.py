@@ -1,6 +1,6 @@
 import base64
 import json
-from typing import Callable, Dict, Optional, Sequence, List, Any
+from typing import Dict, Optional, Sequence, List, Any
 
 import requests
 from opentelemetry.context import attach, detach, set_value
@@ -51,34 +51,25 @@ logger = get_respan_logger(LOGGER_NAME_EXPORTER)
 
 
 class EnrichedSpan:
-    """A proxy wrapper that can clear parent (root promotion), inject/strip attributes, and override name."""
+    """A proxy wrapper that can clear parent (root promotion) and inject extra attributes."""
 
     def __init__(
         self,
         original_span: ReadableSpan,
         extra_attrs: Optional[Dict[str, Any]] = None,
         clear_parent: bool = False,
-        name: Optional[str] = None,
-        stripped_keys: Optional[set] = None,
     ):
         self._original_span = original_span
         self._extra_attrs = extra_attrs or {}
         self._clear_parent = clear_parent
-        self._name_override = name
-        self._stripped_keys = stripped_keys or set()
-
-    @property
-    def name(self):
-        return self._name_override if self._name_override is not None else self._original_span.name
 
     @property
     def attributes(self):
-        attrs = dict(self._original_span.attributes) if self._original_span.attributes else {}
-        for key in self._stripped_keys:
-            attrs.pop(key, None)
-        if self._extra_attrs:
-            attrs.update(self._extra_attrs)
-        return attrs
+        if not self._extra_attrs:
+            return self._original_span.attributes
+        merged = dict(self._original_span.attributes) if self._original_span.attributes else {}
+        merged.update(self._extra_attrs)
+        return merged
 
     def __getattr__(self, name):
         if name == "attributes":
@@ -303,7 +294,6 @@ class RespanSpanExporter:
         self.api_key = api_key
         self.timeout = timeout
         self._is_shutdown = False
-        self._enrichers: List[Callable] = []
 
         # Persistent session for TCP connection reuse across export() calls.
         # At 1% prod sampling with 3-5 traces per request, connection overhead matters.
@@ -323,28 +313,14 @@ class RespanSpanExporter:
         self._traces_url = f"{self.endpoint}/v2/traces"
         logger.debug("OTLP JSON traces endpoint: %s", self._traces_url)
 
-    def register_enricher(self, fn: Callable) -> None:
-        """Register an enricher function to run on spans before export.
-
-        Each enricher receives a list of spans and returns a (possibly
-        modified) list.  Enrichers run in registration order, before
-        root-span promotion.
-        """
-        self._enrichers.append(fn)
-
     def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
         """Export spans as OTLP JSON to /v2/traces."""
         if self._is_shutdown:
             return SpanExportResult.FAILURE
 
-        # Run registered enrichers (e.g. ADK span enrichment)
-        enriched_spans = list(spans)
-        for enricher in self._enrichers:
-            enriched_spans = enricher(enriched_spans)
-
         # Apply root-span promotion and attribute enrichment
         modified_spans: List[ReadableSpan] = []
-        for span in enriched_spans:
+        for span in spans:
             clear_parent = is_root_span_candidate(span)
             extra_attrs = _get_enrichment_attrs(span)
 

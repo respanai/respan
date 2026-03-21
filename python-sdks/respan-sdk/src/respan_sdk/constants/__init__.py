@@ -43,12 +43,6 @@ from respan_sdk.constants.otlp_constants import (
     ERROR_MESSAGE_ATTR,
 )
 
-from respan_sdk.constants.adk_constants import (
-    ADK_SCOPE_NAMES,
-    ADK_SPAN_NAMES,
-    is_adk_span,
-)
-
 DEFAULT_EVAL_LLM_ENGINE = "gpt-4o-mini"
 EVAL_COST_FALLBACK = 0.001
 LLM_ENGINE_FIELD_NAME = "llm_engine"
@@ -102,8 +96,4 @@ __all__ = [
     "OTEL_SCOPE_NAME_KEY",
     "OTEL_SCOPE_VERSION_KEY",
     "ERROR_MESSAGE_ATTR",
-    # ADK detection
-    "ADK_SCOPE_NAMES",
-    "ADK_SPAN_NAMES",
-    "is_adk_span",
 ]
