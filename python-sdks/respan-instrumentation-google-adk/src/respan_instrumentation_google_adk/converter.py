@@ -25,6 +25,7 @@ from respan_instrumentation_google_adk.utils import (
 )
 from respan_sdk.constants.llm_logging import (
     LOG_TYPE_AGENT,
+    LOG_TYPE_CHAT,
     LOG_TYPE_GENERATION,
     LOG_TYPE_MAP,
     LOG_TYPE_TASK,
@@ -36,18 +37,35 @@ from respan_sdk.respan_types.log_types import RespanFullLogParams
 logger = logging.getLogger(__name__)
 
 # Mapping from ADK span names to Respan log types
+# TODO(llm_call_count): The backend does not increment llm_call_count for
+# spans arriving via /v1/traces/ingest regardless of log_type.  The OTEL
+# auto-instrumentation path (/v2/traces) counts via the llm.request.type
+# attribute which plugin instrumentations don't emit.  Once the backend is
+# updated to count from log_type (or a new field), revisit the mapping here.
 _ADK_LOG_TYPE_MAP: Dict[str, str] = {
     "invocation": LOG_TYPE_WORKFLOW,
     "agent_run": LOG_TYPE_AGENT,
     "invoke_agent": LOG_TYPE_AGENT,
-    "call_llm": LOG_TYPE_GENERATION,
-    "generate_content": LOG_TYPE_GENERATION,
+    "call_llm": LOG_TYPE_CHAT,
+    "generate_content": LOG_TYPE_CHAT,
     "execute_tool": LOG_TYPE_TOOL,
 }
 
 # ADK root run label — replaced with `adk_agent_name` when available (see
 # `_resolve_root_workflow_span_name`).
 _GENERIC_ADK_ROOT_SPAN_NAMES: frozenset[str] = frozenset({"invocation"})
+
+# Span attribute keys to extract session/thread identity from ADK spans.
+_SESSION_ATTR_KEYS: Tuple[str, ...] = (
+    "gcp.vertex.agent.session_id",
+    "gen_ai.session.id",
+)
+
+# Span attribute keys to extract customer/user identity from ADK spans.
+_CUSTOMER_ATTR_KEYS: Tuple[str, ...] = (
+    "gen_ai.user.id",
+    "gcp.vertex.agent.user_id",
+)
 
 
 class AdkSpanConverter:
@@ -95,18 +113,19 @@ class AdkSpanConverter:
         if payloads:
             self._propagate_trace_output(payloads=payloads)
             self._propagate_trace_input(payloads=payloads)
+            self._populate_span_handoffs(payloads=payloads)
             self._resolve_root_workflow_span_name(payloads=payloads)
         return payloads
 
     def _propagate_trace_output(self, payloads: List[Dict[str, Any]]) -> None:
-        """Propagate output from generation spans to workflow/agent/task spans."""
+        """Propagate output from LLM spans to workflow/agent/task spans."""
         trace_output: Optional[str] = None
         for payload in payloads:
             output_value = payload.get("output")
             if is_blank_value(value=output_value):
                 continue
             log_type = payload.get("log_type")
-            if log_type == LOG_TYPE_GENERATION:
+            if log_type in (LOG_TYPE_CHAT, LOG_TYPE_GENERATION):
                 trace_output = output_value
                 break
             if trace_output is None:
@@ -123,14 +142,14 @@ class AdkSpanConverter:
                     payload["output"] = trace_output
 
     def _propagate_trace_input(self, payloads: List[Dict[str, Any]]) -> None:
-        """Propagate input from generation spans to workflow/agent spans."""
+        """Propagate input from LLM spans to workflow/agent spans."""
         trace_input: Optional[str] = None
         for payload in payloads:
             input_value = payload.get("input")
             if is_blank_value(value=input_value):
                 continue
             log_type = payload.get("log_type")
-            if log_type == LOG_TYPE_GENERATION:
+            if log_type in (LOG_TYPE_CHAT, LOG_TYPE_GENERATION):
                 trace_input = input_value
                 break
             if trace_input is None:
@@ -145,6 +164,32 @@ class AdkSpanConverter:
                     LOG_TYPE_TASK,
                 ):
                     payload["input"] = trace_input
+
+    def _populate_span_handoffs(self, payloads: List[Dict[str, Any]]) -> None:
+        """Populate span_handoffs for invoke_agent spans."""
+        # Build span_id -> agent_name lookup
+        agent_by_span_id: Dict[str, str] = {}
+        for p in payloads:
+            sid = p.get("span_id")
+            meta = p.get("metadata") or {}
+            name = meta.get("adk_agent_name")
+            if sid and name:
+                agent_by_span_id[sid] = name
+
+        for p in payloads:
+            raw_name = p.get("span_name") or ""
+            if not raw_name.startswith("invoke_agent"):
+                continue
+            meta = p.get("metadata") or {}
+            target = meta.get("adk_agent_name")
+            if not target:
+                parts = raw_name.split(" ", 1)
+                target = parts[1] if len(parts) > 1 else None
+            if not target:
+                continue
+            parent_id = p.get("parent_id") or p.get("span_parent_id")
+            source = agent_by_span_id.get(parent_id, "") if parent_id else ""
+            p["span_handoffs"] = [f"{source} -> {target}"]
 
     def _resolve_root_workflow_span_name(self, payloads: List[Dict[str, Any]]) -> None:
         """Replace generic ADK root labels (e.g. ``invocation``) with a real agent name.
@@ -283,6 +328,46 @@ class AdkSpanConverter:
         conversation_id = root_attrs.get("gen_ai.conversation.id")
         if not session_identifier and conversation_id:
             session_identifier = conversation_id
+
+        # Extract session from ADK-specific span attributes
+        if not session_identifier:
+            for key in _SESSION_ATTR_KEYS:
+                val = root_attrs.get(key)
+                if val:
+                    session_identifier = str(val)
+                    break
+        if not session_identifier:
+            for span in spans:
+                child_attrs = as_dict(
+                    value=get_attr(span, "attributes", "metadata", "tags", "data")
+                ) or {}
+                for key in _SESSION_ATTR_KEYS:
+                    val = child_attrs.get(key)
+                    if val:
+                        session_identifier = str(val)
+                        break
+                if session_identifier:
+                    break
+
+        # Extract customer from ADK-specific span attributes
+        if not customer_identifier:
+            for key in _CUSTOMER_ATTR_KEYS:
+                val = root_attrs.get(key)
+                if val:
+                    customer_identifier = str(val)
+                    break
+        if not customer_identifier:
+            for span in spans:
+                child_attrs = as_dict(
+                    value=get_attr(span, "attributes", "metadata", "tags", "data")
+                ) or {}
+                for key in _CUSTOMER_ATTR_KEYS:
+                    val = child_attrs.get(key)
+                    if val:
+                        customer_identifier = str(val)
+                        break
+                if customer_identifier:
+                    break
 
         if not trace_start_time:
             trace_start_time = infer_trace_start_time(spans=spans)
@@ -501,6 +586,7 @@ class AdkSpanConverter:
             "environment": self.environment,
             "customer_identifier": trace_context.customer_identifier,
             "log_type": log_type,
+            "log_method": "tracing_integration",
             "start_time": format_rfc3339(value=start_time),
             "timestamp": format_rfc3339(value=end_time),
             "latency": latency,
@@ -509,6 +595,7 @@ class AdkSpanConverter:
             "model": model,
             "metadata": span_metadata or None,
             "session_identifier": trace_context.session_identifier,
+            "thread_identifier": trace_context.session_identifier,
             "trace_group_identifier": trace_context.trace_group_identifier,
         }
         if prompt_messages is not None:
@@ -537,8 +624,10 @@ class AdkSpanConverter:
         if error:
             payload["error_message"] = str(error)
             payload["status_code"] = 500
+            payload["status"] = "error"
         else:
             payload["status_code"] = get_attr(span, "status_code") or 200
+            payload["status"] = "success"
 
         # Tool info
         tool_name = (
@@ -657,7 +746,7 @@ class AdkSpanConverter:
                 if key in name_lower:
                     return value
         if model:
-            return LOG_TYPE_GENERATION
+            return LOG_TYPE_CHAT
         if parent_id is None:
             return LOG_TYPE_WORKFLOW
         return LOG_TYPE_TASK

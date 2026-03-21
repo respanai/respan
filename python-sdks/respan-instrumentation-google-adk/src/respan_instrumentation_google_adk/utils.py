@@ -333,34 +333,38 @@ def to_prompt_messages(value: Any) -> Optional[List[Dict[str, Any]]]:
     parsed = parse_json_value(value=value)
     if isinstance(parsed, list) and parsed and all(isinstance(item, dict) for item in parsed):
         if all("role" in item and "content" in item for item in parsed):
-            return parsed
+            return [_normalize_message_role(m) for m in parsed]
     if isinstance(parsed, dict):
         if isinstance(parsed.get("messages"), list):
             messages = parsed.get("messages") or []
             if messages and all(isinstance(item, dict) for item in messages):
-                return messages
+                return [_normalize_message_role(m) for m in messages]
         if "role" in parsed and "content" in parsed:
-            return [parsed]
+            return [_normalize_message_role(parsed)]
     return None
 
 
 def to_completion_message(value: Any) -> Optional[Dict[str, Any]]:
     """Convert value to completion message format."""
     parsed = parse_json_value(value=value)
+    result: Optional[Dict[str, Any]] = None
     if isinstance(parsed, dict):
         if "role" in parsed and "content" in parsed:
-            return parsed
-        choices = parsed.get("choices")
-        if isinstance(choices, list) and choices:
-            first = choices[0]
-            if isinstance(first, dict):
-                message = first.get("message")
-                if isinstance(message, dict) and "content" in message:
-                    return message
-    if isinstance(parsed, list) and parsed:
+            result = parsed
+        else:
+            choices = parsed.get("choices")
+            if isinstance(choices, list) and choices:
+                first = choices[0]
+                if isinstance(first, dict):
+                    message = first.get("message")
+                    if isinstance(message, dict) and "content" in message:
+                        result = message
+    if result is None and isinstance(parsed, list) and parsed:
         first = parsed[0]
         if isinstance(first, dict) and "content" in first:
-            return first
+            result = first
+    if result is not None:
+        return _normalize_message_role(result)
     return None
 
 
@@ -382,6 +386,13 @@ def messages_to_text(messages: Sequence[Dict[str, Any]]) -> Optional[str]:
     return "\n".join(parts)
 
 
+def _normalize_message_role(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize Gemini ``"model"`` role to ``"assistant"`` for OpenAI compatibility."""
+    if message.get("role") == "model":
+        message = {**message, "role": "assistant"}
+    return message
+
+
 def extract_genai_messages(
     attributes: Dict[str, Any],
     key: str,
@@ -399,9 +410,9 @@ def extract_genai_messages(
         messages = []
         for item in parsed:
             if isinstance(item, dict):
-                messages.append(item)
+                messages.append(_normalize_message_role(item))
         if messages:
             return messages
     if isinstance(parsed, dict) and ("role" in parsed or "content" in parsed):
-        return [parsed]
+        return [_normalize_message_role(parsed)]
     return None

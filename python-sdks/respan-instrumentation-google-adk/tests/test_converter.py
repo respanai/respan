@@ -135,13 +135,13 @@ class TestMapLogType:
         assert self.converter._map_log_type("agent_run", "parent", None) == "agent"
 
     def test_call_llm(self):
-        assert self.converter._map_log_type("call_llm", "parent", None) == "generation"
+        assert self.converter._map_log_type("call_llm", "parent", None) == "chat"
 
     def test_execute_tool(self):
         assert self.converter._map_log_type("execute_tool", "parent", None) == "tool"
 
     def test_fallback_model(self):
-        assert self.converter._map_log_type("unknown_span", None, "gemini-2.0") == "generation"
+        assert self.converter._map_log_type("unknown_span", None, "gemini-2.0") == "chat"
 
     def test_fallback_no_parent(self):
         assert self.converter._map_log_type("unknown_span", None, None) == "workflow"
@@ -173,7 +173,7 @@ class TestExtractGenaiMessages:
         result = extract_genai_messages(attrs, "gen_ai.output.messages")
         assert result is not None
         assert len(result) == 1
-        assert result[0]["role"] == "model"
+        assert result[0]["role"] == "assistant"  # "model" normalized to "assistant"
 
     def test_missing_key(self):
         result = extract_genai_messages({}, "gen_ai.input.messages")
@@ -220,7 +220,7 @@ class TestConvert:
 
         assert len(payloads) == 1
         payload = payloads[0]
-        assert payload["log_type"] == "generation"
+        assert payload["log_type"] == "chat"
         assert payload["model"] == "gemini-2.0-flash"
         assert payload["prompt_tokens"] == 10
         assert payload["completion_tokens"] == 20
@@ -298,6 +298,82 @@ class TestConvert:
 
         payload = payloads[0]
         assert payload["session_identifier"] == "conv-abc-123"
+        assert payload["thread_identifier"] == "conv-abc-123"
+
+    def test_session_id_from_adk_attribute(self):
+        """Session extracted from gcp.vertex.agent.session_id."""
+        span = _make_span(
+            name="invocation",
+            attributes={
+                "gcp.vertex.agent.session_id": "adk-session-42",
+            },
+        )
+        span_dict = otel_span_to_dict(span)
+        payloads = self.converter.convert(trace_or_spans=[span_dict])
+
+        payload = payloads[0]
+        assert payload["session_identifier"] == "adk-session-42"
+        assert payload["thread_identifier"] == "adk-session-42"
+
+    def test_session_id_from_child_span(self):
+        """Session extracted from a child span when root lacks it."""
+        root = _make_span(
+            name="invocation",
+            span_id=0x1111111111111111,
+            attributes={},
+        )
+        child = _make_span(
+            name="agent_run",
+            span_id=0x2222222222222222,
+            parent_span_id=0x1111111111111111,
+            attributes={"gcp.vertex.agent.session_id": "child-session-99"},
+        )
+        payloads = self.converter.convert(
+            trace_or_spans=_spans_to_dicts([root, child])
+        )
+        wf = next(p for p in payloads if p["log_type"] == "workflow")
+        assert wf["session_identifier"] == "child-session-99"
+        assert wf["thread_identifier"] == "child-session-99"
+
+    def test_customer_id_from_adk_attribute(self):
+        """Customer extracted from gen_ai.user.id on root span."""
+        span = _make_span(
+            name="invocation",
+            attributes={"gen_ai.user.id": "user-abc"},
+        )
+        payloads = self.converter.convert(
+            trace_or_spans=_spans_to_dicts([span])
+        )
+        assert payloads[0]["customer_identifier"] == "user-abc"
+
+    def test_customer_id_from_child_span(self):
+        """Customer extracted from child span when root lacks it."""
+        root = _make_span(
+            name="invocation",
+            span_id=0x1111111111111111,
+            attributes={},
+        )
+        child = _make_span(
+            name="call_llm",
+            span_id=0x2222222222222222,
+            parent_span_id=0x1111111111111111,
+            attributes={"gcp.vertex.agent.user_id": "child-user-7"},
+        )
+        payloads = self.converter.convert(
+            trace_or_spans=_spans_to_dicts([root, child])
+        )
+        wf = next(p for p in payloads if p["log_type"] == "workflow")
+        assert wf["customer_identifier"] == "child-user-7"
+
+    def test_constructor_customer_not_overridden_by_span(self):
+        """Constructor customer_identifier takes precedence over span attributes."""
+        converter = AdkSpanConverter(customer_identifier="explicit-user")
+        span = _make_span(
+            name="invocation",
+            attributes={"gen_ai.user.id": "span-user"},
+        )
+        payloads = converter.convert(trace_or_spans=_spans_to_dicts([span]))
+        assert payloads[0]["customer_identifier"] == "explicit-user"
 
     def test_multi_span_trace(self):
         """Test a realistic multi-span ADK trace."""
@@ -331,10 +407,10 @@ class TestConvert:
 
         assert len(payloads) == 3
         log_types = {p["log_type"] for p in payloads}
-        assert log_types == {"workflow", "agent", "generation"}
+        assert log_types == {"workflow", "agent", "chat"}
 
         # Output should propagate from generation to workflow/agent
-        gen_payload = next(p for p in payloads if p["log_type"] == "generation")
+        gen_payload = next(p for p in payloads if p["log_type"] == "chat")
         assert gen_payload["output"] is not None
 
         wf_payload = next(p for p in payloads if p["log_type"] == "workflow")
@@ -393,12 +469,12 @@ class TestMultiTurnPattern:
         return [invocation, agent_run, call_llm]
 
     def test_single_turn_produces_correct_log_types(self):
-        from respan_sdk.constants.llm_logging import LOG_TYPE_WORKFLOW, LOG_TYPE_AGENT, LOG_TYPE_GENERATION
+        from respan_sdk.constants.llm_logging import LOG_TYPE_WORKFLOW, LOG_TYPE_AGENT, LOG_TYPE_CHAT
         spans = self._make_turn(0, "Hi! My name is Alex.", "Hello Alex!")
         payloads = self.converter.convert(trace_or_spans=_spans_to_dicts(spans))
         assert len(payloads) == 3
         log_types = {p["log_type"] for p in payloads}
-        assert log_types == {LOG_TYPE_WORKFLOW, LOG_TYPE_AGENT, LOG_TYPE_GENERATION}
+        assert log_types == {LOG_TYPE_WORKFLOW, LOG_TYPE_AGENT, LOG_TYPE_CHAT}
 
     def test_conversation_id_propagates(self):
         conv_id = "session-mt-abc"
@@ -412,8 +488,8 @@ class TestMultiTurnPattern:
         turn2 = self._make_turn(2, "Tell me a fun fact.", "42 is the answer.")
         p0 = self.converter.convert(trace_or_spans=_spans_to_dicts(turn0))
         p2 = self.converter.convert(trace_or_spans=_spans_to_dicts(turn2))
-        gen0 = next(p for p in p0 if p["log_type"] == "generation")
-        gen2 = next(p for p in p2 if p["log_type"] == "generation")
+        gen0 = next(p for p in p0 if p["log_type"] == "chat")
+        gen2 = next(p for p in p2 if p["log_type"] == "chat")
         assert gen2["prompt_tokens"] > gen0["prompt_tokens"]
 
     def test_output_propagates_to_workflow_and_agent(self):
@@ -421,7 +497,7 @@ class TestMultiTurnPattern:
         payloads = self.converter.convert(trace_or_spans=_spans_to_dicts(spans))
         wf = next(p for p in payloads if p["log_type"] == "workflow")
         agent = next(p for p in payloads if p["log_type"] == "agent")
-        gen = next(p for p in payloads if p["log_type"] == "generation")
+        gen = next(p for p in payloads if p["log_type"] == "chat")
         assert gen["output"] is not None
         assert wf["output"] is not None
         assert agent["output"] is not None
@@ -431,7 +507,7 @@ class TestMultiTurnPattern:
         payloads = self.converter.convert(trace_or_spans=_spans_to_dicts(spans))
         wf = next(p for p in payloads if p["log_type"] == "workflow")
         agent = next(p for p in payloads if p["log_type"] == "agent")
-        gen = next(p for p in payloads if p["log_type"] == "generation")
+        gen = next(p for p in payloads if p["log_type"] == "chat")
         assert wf.get("parent_id") is None
         assert agent.get("parent_id") == wf["span_id"] or agent.get("span_parent_id") == wf["span_id"]
         assert gen.get("parent_id") == agent["span_id"] or gen.get("span_parent_id") == agent["span_id"]
@@ -480,17 +556,17 @@ class TestStreamingPattern:
         return [invocation, agent_run, call_llm]
 
     def test_streaming_produces_three_spans(self):
-        from respan_sdk.constants.llm_logging import LOG_TYPE_WORKFLOW, LOG_TYPE_AGENT, LOG_TYPE_GENERATION
+        from respan_sdk.constants.llm_logging import LOG_TYPE_WORKFLOW, LOG_TYPE_AGENT, LOG_TYPE_CHAT
         spans = self._make_streaming_spans()
         payloads = self.converter.convert(trace_or_spans=_spans_to_dicts(spans))
         assert len(payloads) == 3
         log_types = {p["log_type"] for p in payloads}
-        assert log_types == {LOG_TYPE_WORKFLOW, LOG_TYPE_AGENT, LOG_TYPE_GENERATION}
+        assert log_types == {LOG_TYPE_WORKFLOW, LOG_TYPE_AGENT, LOG_TYPE_CHAT}
 
     def test_streaming_token_counts(self):
         spans = self._make_streaming_spans()
         payloads = self.converter.convert(trace_or_spans=_spans_to_dicts(spans))
-        gen = next(p for p in payloads if p["log_type"] == "generation")
+        gen = next(p for p in payloads if p["log_type"] == "chat")
         assert gen["prompt_tokens"] == 25
         assert gen["completion_tokens"] == 200
         assert gen["total_request_tokens"] == 225
@@ -498,7 +574,7 @@ class TestStreamingPattern:
     def test_streaming_llm_config_preserved(self):
         spans = self._make_streaming_spans()
         payloads = self.converter.convert(trace_or_spans=_spans_to_dicts(spans))
-        gen = next(p for p in payloads if p["log_type"] == "generation")
+        gen = next(p for p in payloads if p["log_type"] == "chat")
         llm_config = gen["metadata"]["llm_config"]
         assert llm_config["temperature"] == 0.9
         assert llm_config["top_p"] == 0.95
@@ -506,7 +582,7 @@ class TestStreamingPattern:
     def test_streaming_latency_reflects_duration(self):
         spans = self._make_streaming_spans()
         payloads = self.converter.convert(trace_or_spans=_spans_to_dicts(spans))
-        gen = next(p for p in payloads if p["log_type"] == "generation")
+        gen = next(p for p in payloads if p["log_type"] == "chat")
         assert gen["latency"] is not None
         assert gen["latency"] > 4.0
 
@@ -516,7 +592,7 @@ class TestToolCallsPattern:
         self.converter = AdkSpanConverter()
 
     def _make_tool_call_spans(self):
-        from respan_sdk.constants.llm_logging import LOG_TYPE_WORKFLOW, LOG_TYPE_AGENT, LOG_TYPE_GENERATION, LOG_TYPE_TOOL
+        from respan_sdk.constants.llm_logging import LOG_TYPE_WORKFLOW, LOG_TYPE_AGENT, LOG_TYPE_CHAT, LOG_TYPE_TOOL
         base = 1_700_000_000_000_000_000
         invocation = _make_span(name="invocation", span_id=0xB000000000000001, start_time=base, end_time=base + 4_000_000_000)
         agent_run = _make_span(name="agent_run", span_id=0xB000000000000002, parent_span_id=0xB000000000000001, attributes={"gen_ai.agent.name": "weather_agent"}, start_time=base + 50_000_000, end_time=base + 3_950_000_000)
@@ -531,7 +607,7 @@ class TestToolCallsPattern:
         assert len(payloads) == 5
 
     def test_tool_call_log_types(self):
-        from respan_sdk.constants.llm_logging import LOG_TYPE_WORKFLOW, LOG_TYPE_AGENT, LOG_TYPE_GENERATION, LOG_TYPE_TOOL
+        from respan_sdk.constants.llm_logging import LOG_TYPE_WORKFLOW, LOG_TYPE_AGENT, LOG_TYPE_CHAT, LOG_TYPE_TOOL
         spans = self._make_tool_call_spans()
         payloads = self.converter.convert(trace_or_spans=_spans_to_dicts(spans))
         type_counts = {}
@@ -540,7 +616,7 @@ class TestToolCallsPattern:
             type_counts[lt] = type_counts.get(lt, 0) + 1
         assert type_counts[LOG_TYPE_WORKFLOW] == 1
         assert type_counts[LOG_TYPE_AGENT] == 1
-        assert type_counts[LOG_TYPE_GENERATION] == 2
+        assert type_counts[LOG_TYPE_CHAT] == 2
         assert type_counts[LOG_TYPE_TOOL] == 1
 
     def test_tool_span_has_tool_name(self):
@@ -552,7 +628,7 @@ class TestToolCallsPattern:
     def test_generation_spans_have_different_token_counts(self):
         spans = self._make_tool_call_spans()
         payloads = self.converter.convert(trace_or_spans=_spans_to_dicts(spans))
-        gens = [p for p in payloads if p["log_type"] == "generation"]
+        gens = [p for p in payloads if p["log_type"] == "chat"]
         assert len(gens) == 2
         gens.sort(key=lambda p: p.get("prompt_tokens", 0))
         assert gens[0]["prompt_tokens"] == 30
@@ -569,6 +645,69 @@ class TestToolCallsPattern:
 # Uninstrument passthrough tests
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# Status, handoffs, and OpenLLMetry metadata tests
+# ---------------------------------------------------------------------------
+
+
+class TestStatusAndHandoffs:
+    def setup_method(self):
+        self.converter = AdkSpanConverter()
+
+    def test_success_status(self):
+        span = _make_span(name="call_llm", attributes={"gen_ai.request.model": "gemini-2.0-flash"})
+        span_dict = otel_span_to_dict(span)
+        payloads = self.converter.convert(trace_or_spans=[span_dict])
+        payload = payloads[0]
+        assert payload["status"] == "success"
+        assert payload["status_code"] == 200
+
+    def test_error_status(self):
+        span = _make_span(name="call_llm", status_name="ERROR")
+        span.status.description = "Something went wrong"
+        span_dict = otel_span_to_dict(span)
+        payloads = self.converter.convert(trace_or_spans=[span_dict])
+        payload = payloads[0]
+        assert payload["status"] == "error"
+        assert payload["status_code"] == 500
+
+    def test_invoke_agent_handoffs(self):
+        router = _make_span(
+            name="agent_run",
+            span_id=0x1111111111111111,
+            attributes={"gen_ai.agent.name": "router_agent"},
+        )
+        invoke = _make_span(
+            name="invoke_agent greeting_agent",
+            span_id=0x2222222222222222,
+            parent_span_id=0x1111111111111111,
+            attributes={"gen_ai.agent.name": "greeting_agent"},
+        )
+        span_dicts = _spans_to_dicts([router, invoke])
+        payloads = self.converter.convert(trace_or_spans=span_dicts)
+        invoke_payload = next(
+            p for p in payloads if (p.get("span_name") or "").startswith("invoke_agent")
+        )
+        assert invoke_payload["span_handoffs"] == ["router_agent -> greeting_agent"]
+
+    def test_invoke_agent_no_parent_agent(self):
+        root = _make_span(
+            name="invocation",
+            span_id=0x1111111111111111,
+        )
+        invoke = _make_span(
+            name="invoke_agent target_agent",
+            span_id=0x2222222222222222,
+            parent_span_id=0x1111111111111111,
+            attributes={"gen_ai.agent.name": "target_agent"},
+        )
+        span_dicts = _spans_to_dicts([root, invoke])
+        payloads = self.converter.convert(trace_or_spans=span_dicts)
+        invoke_payload = next(
+            p for p in payloads if (p.get("span_name") or "").startswith("invoke_agent")
+        )
+        assert invoke_payload["span_handoffs"] == [" -> target_agent"]
 
 class TestUninstrumentPassthrough:
     def test_batch_wrapper_passes_through_when_no_exporter(self):

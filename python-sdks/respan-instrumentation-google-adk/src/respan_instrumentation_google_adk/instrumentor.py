@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import wrapt
 from opentelemetry.sdk.trace.export import SpanExportResult
+from respan_tracing.exporters.span_exporter_v2 import _PROPAGATED_ATTRIBUTES
 
 from respan_instrumentation_google_adk.converter import AdkSpanConverter
 from respan_instrumentation_google_adk.utils import group_spans_by_trace, is_adk_span, otel_span_to_dict
@@ -58,10 +59,20 @@ _ACTIVE_TRACE_BUFFER_MAX_SPANS: Optional[int] = _DEFAULT_TRACE_BUFFER_MAX_SPANS
 _TRACE_BUFFER: Dict[str, List[object]] = {}
 _TRACE_BUFFER_LOCK = Lock()
 
+# Snapshot of propagated context attributes captured on the user thread.
+# Keyed by trace_id.  Without this, propagate_attributes() context would be
+# lost because BatchSpanProcessor._export runs on a background thread where
+# the ContextVar is empty.  Mirrors the pattern from the OpenAI Agents SDK
+# instrumentation (_RespanTracingProcessor._captured_ctx).
+_TRACE_CTX_CACHE: Dict[str, Dict[str, Any]] = {}
+
 _ADK_ROOT_SPAN_NAMES = {"invocation"}
 
 
-def _export_adk_spans(spans: Iterable[object]) -> SpanExportResult:
+def _export_adk_spans(
+    spans: Iterable[object],
+    captured_ctx: Optional[Dict[str, Any]] = None,
+) -> SpanExportResult:
     """Export ADK spans to Respan via the active exporter."""
     exporter = _ACTIVE_EXPORTER
     converter = _ACTIVE_CONVERTER
@@ -92,7 +103,19 @@ def _export_adk_spans(spans: Iterable[object]) -> SpanExportResult:
     if not payloads:
         return SpanExportResult.SUCCESS
 
-    exporter.export(payloads)
+    # Restore captured propagate_attributes context if the current thread
+    # doesn't have it (e.g. the context manager already exited, or we're on
+    # the BatchSpanProcessor background thread).
+    current_ctx = _PROPAGATED_ATTRIBUTES.get()
+    if captured_ctx and not current_ctx:
+        token = _PROPAGATED_ATTRIBUTES.set(captured_ctx)
+        try:
+            exporter.export(payloads)
+        finally:
+            _PROPAGATED_ATTRIBUTES.reset(token)
+    else:
+        exporter.export(payloads)
+
     return SpanExportResult.SUCCESS
 
 
@@ -101,11 +124,16 @@ def _flush_pending_trace_buffer() -> None:
     with _TRACE_BUFFER_LOCK:
         pending = list(_TRACE_BUFFER.items())
         _TRACE_BUFFER.clear()
-    for _trace_id, spans in pending:
+        pending_ctx = dict(_TRACE_CTX_CACHE)
+        _TRACE_CTX_CACHE.clear()
+    for trace_id, spans in pending:
         if not spans:
             continue
         try:
-            _export_adk_spans(spans=spans)
+            _export_adk_spans(
+                spans=spans,
+                captured_ctx=pending_ctx.get(trace_id),
+            )
         except Exception as exc:
             logger.warning(
                 "Failed to export buffered ADK spans on shutdown: %s",
@@ -115,29 +143,20 @@ def _flush_pending_trace_buffer() -> None:
 
 
 def _batch_export_wrapper(wrapped, instance, args, kwargs):
-    """Wrapper for BatchSpanProcessor._export method."""
+    """Wrapper for BatchSpanProcessor._export method.
+
+    ADK spans are normally intercepted earlier in on_end (on the user thread)
+    and never reach the batch queue.  This wrapper is a safety net that filters
+    out any ADK spans that slip through (e.g. race conditions) to prevent
+    double-export.
+    """
     if _ACTIVE_EXPORTER is None:
         return wrapped(*args, **kwargs)
     spans = list(args[0]) if args else list(kwargs.get("spans", []))
     if not spans:
         return wrapped(*args, **kwargs)
 
-    adk_spans = []
-    other_spans = []
-    for span in spans:
-        if is_adk_span(span=span):
-            adk_spans.append(span)
-        else:
-            other_spans.append(span)
-
-    if not adk_spans:
-        return wrapped(*args, **kwargs)
-
-    try:
-        export_result = _export_adk_spans(spans=adk_spans)
-    except Exception as exc:
-        logger.warning("Failed to export ADK spans: %s", exc, exc_info=True)
-        export_result = SpanExportResult.FAILURE
+    other_spans = [s for s in spans if not is_adk_span(span=s)]
 
     if _ACTIVE_PASSTHROUGH:
         return wrapped(*args, **kwargs)
@@ -146,15 +165,16 @@ def _batch_export_wrapper(wrapped, instance, args, kwargs):
         kwargs.pop("spans", None)
         return wrapped(other_spans, **kwargs)
 
-    return export_result
+    return SpanExportResult.SUCCESS
 
 
 def _on_end_wrapper(wrapped, instance, args, kwargs):
-    """Wrapper for SimpleSpanProcessor.on_end method.
+    """Wrapper for span processor on_end.
 
-    Buffers child spans per trace and flushes the entire trace through the
-    converter when the root "invocation" span arrives (it always ends last).
-    This ensures cross-span propagation (input/output, agent name) works.
+    Intercepts ADK spans on the **user thread** (where ContextVars from
+    ``propagate_attributes`` are available), buffers them per trace, and
+    flushes the entire trace through the converter when the root
+    "invocation" span arrives.
     """
     if _ACTIVE_EXPORTER is None:
         return wrapped(*args, **kwargs)
@@ -168,8 +188,17 @@ def _on_end_wrapper(wrapped, instance, args, kwargs):
     trace_id = format(ctx.trace_id, "032x") if ctx else None
     is_root = span_name in _ADK_ROOT_SPAN_NAMES
 
+    # Capture propagated attributes on the user thread.  First write wins
+    # (the outermost propagate_attributes scope is the most complete).
+    prop_ctx = _PROPAGATED_ATTRIBUTES.get()
+    if prop_ctx and trace_id:
+        with _TRACE_BUFFER_LOCK:
+            if trace_id not in _TRACE_CTX_CACHE:
+                _TRACE_CTX_CACHE[trace_id] = prop_ctx
+
     if trace_id:
         all_spans: Optional[List[object]] = None
+        captured_ctx: Optional[Dict[str, Any]] = None
         overflow_flush = False
         with _TRACE_BUFFER_LOCK:
             buf = _TRACE_BUFFER.setdefault(trace_id, [])
@@ -178,12 +207,14 @@ def _on_end_wrapper(wrapped, instance, args, kwargs):
             overflow_flush = max_spans is not None and len(buf) > max_spans
             if overflow_flush:
                 all_spans = _TRACE_BUFFER.pop(trace_id)
+                captured_ctx = _TRACE_CTX_CACHE.pop(trace_id, None)
             elif not is_root:
                 if _ACTIVE_PASSTHROUGH:
                     return wrapped(*args, **kwargs)
                 return None
             else:
                 all_spans = _TRACE_BUFFER.pop(trace_id)
+                captured_ctx = _TRACE_CTX_CACHE.pop(trace_id, None)
 
         if overflow_flush:
             logger.warning(
@@ -193,13 +224,16 @@ def _on_end_wrapper(wrapped, instance, args, kwargs):
                 trace_id[:16],
             )
         try:
-            _export_adk_spans(spans=all_spans or [])
+            _export_adk_spans(
+                spans=all_spans or [],
+                captured_ctx=captured_ctx,
+            )
         except Exception as exc:
             logger.warning("Failed to export ADK spans: %s", exc, exc_info=True)
     else:
         # No trace_id — export individually (fallback)
         try:
-            _export_adk_spans(spans=[span])
+            _export_adk_spans(spans=[span], captured_ctx=prop_ctx or None)
         except Exception as exc:
             logger.warning("Failed to export ADK span: %s", exc, exc_info=True)
 
@@ -280,17 +314,22 @@ class GoogleAdkInstrumentor:
         try:
             from opentelemetry.sdk.trace import export as trace_export
 
+            # Always patch on_end to intercept ADK spans on the user thread.
+            # This is where we capture propagate_attributes context and buffer
+            # spans per-trace.
+            wrapt.wrap_function_wrapper(
+                module="opentelemetry.sdk.trace.export",
+                name="BatchSpanProcessor.on_end",
+                wrapper=_on_end_wrapper,
+            )
+
+            # Also patch _export as a safety net: any ADK spans that somehow
+            # reach the batch queue are filtered out to prevent double-export.
             if hasattr(trace_export.BatchSpanProcessor, "_export"):
                 wrapt.wrap_function_wrapper(
                     module="opentelemetry.sdk.trace.export",
                     name="BatchSpanProcessor._export",
                     wrapper=_batch_export_wrapper,
-                )
-            else:
-                wrapt.wrap_function_wrapper(
-                    module="opentelemetry.sdk.trace.export",
-                    name="BatchSpanProcessor.on_end",
-                    wrapper=_on_end_wrapper,
                 )
         except Exception as exc:
             logger.debug("Failed to patch BatchSpanProcessor: %s", exc)
