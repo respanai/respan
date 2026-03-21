@@ -25,17 +25,6 @@ respan = Respan(instrumentations=[GoogleAdkInstrumentor(environment="development
 | `GOOGLE_API_KEY` | Your Google Gemini API key |
 | `ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS` | Set to `true` for input/output capture |
 
-## ADK Span Mapping
-
-| ADK Span Name | Respan Log Type |
-|---|---|
-| `invocation` | `workflow` |
-| `agent_run` | `agent` |
-| `call_llm` | `generation` |
-| `execute_tool` | `tool` |
-
 ## Architecture
 
-`GoogleAdkInstrumentor` implements the Respan Instrumentation protocol (`name`, `activate(exporter)`, `deactivate()`). It patches OpenTelemetry span processors to intercept ADK spans, converts them to Respan payload format via `AdkSpanConverter`, and exports them through the provided exporter. Transport (HTTP, auth, retries) is handled by the exporter, not this package.
-
-Spans for a trace are buffered until the ADK root span (`invocation`) ends so the converter can propagate fields across the full trace. On `deactivate()`, any pending buffer is flushed. If a trace grows beyond `trace_buffer_max_spans` (default `8192`, or `None` to disable the cap), that trace is flushed early with a warning.
+Google ADK produces standard OpenTelemetry spans. `GoogleAdkInstrumentor` is a no-op marker class that satisfies the Respan `Instrumentation` protocol. ADK spans flow through the standard OTel pipeline (`RespanSpanProcessor` -> `BatchSpanProcessor` -> `RespanSpanExporter`) without any custom interception or conversion.

@@ -77,6 +77,14 @@ class Respan:
             "RESPAN_BASE_URL", "https://api.respan.ai/api"
         )
 
+        # Extract config from instrumentors (so instrumentor-level config
+        # is used as fallback if Respan-level isn't set)
+        for inst in instrumentations or []:
+            if not customer_identifier:
+                customer_identifier = getattr(inst, "customer_identifier", None)
+            if not environment:
+                environment = getattr(inst, "environment", None)
+
         # Build default attributes from init params
         default_attributes: Dict[str, Any] = {}
         if customer_identifier:
@@ -94,6 +102,18 @@ class Respan:
             auto_instrument = not bool(instrumentations)
 
         # 1. OTEL TracerProvider + optional auto-instrumentation
+        # Pass environment and identifiers as resource attributes so they're
+        # available in the OTLP pipeline (not just the V2 plugin exporter).
+        ra = telemetry_kwargs.get("resource_attributes") or {}
+        if environment:
+            ra["deployment.environment"] = environment
+        if customer_identifier:
+            ra["respan.customer_params.customer_identifier"] = customer_identifier
+        if thread_identifier:
+            ra["respan.threads.thread_identifier"] = thread_identifier
+        if ra:
+            telemetry_kwargs["resource_attributes"] = ra
+
         self.telemetry = RespanTelemetry(
             app_name=app_name,
             api_key=api_key,
