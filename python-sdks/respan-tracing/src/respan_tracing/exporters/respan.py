@@ -51,25 +51,21 @@ logger = get_respan_logger(LOGGER_NAME_EXPORTER)
 
 
 class EnrichedSpan:
-    """Proxy wrapper for span enrichment and root promotion.
-
-    Handles both attribute injection/stripping (for ADK and future enrichment)
-    and parent nullification (for root span promotion).
-    """
+    """A proxy wrapper that can clear parent (root promotion), inject/strip attributes, and override name."""
 
     def __init__(
         self,
         original_span: ReadableSpan,
+        extra_attrs: Optional[Dict[str, Any]] = None,
+        clear_parent: bool = False,
         name: Optional[str] = None,
-        extra_attributes: Optional[Dict[str, Any]] = None,
         stripped_keys: Optional[set] = None,
-        promote_to_root: bool = False,
     ):
         self._original_span = original_span
+        self._extra_attrs = extra_attrs or {}
+        self._clear_parent = clear_parent
         self._name_override = name
-        self._extra_attributes = extra_attributes or {}
         self._stripped_keys = stripped_keys or set()
-        self._promote_to_root = promote_to_root
 
     @property
     def name(self):
@@ -77,14 +73,17 @@ class EnrichedSpan:
 
     @property
     def attributes(self):
-        attrs = dict(self._original_span.attributes or {})
+        attrs = dict(self._original_span.attributes) if self._original_span.attributes else {}
         for key in self._stripped_keys:
             attrs.pop(key, None)
-        attrs.update(self._extra_attributes)
+        if self._extra_attrs:
+            attrs.update(self._extra_attrs)
         return attrs
 
     def __getattr__(self, name):
-        if self._promote_to_root and name in ("parent_span_id", "parent", "_parent"):
+        if name == "attributes":
+            return self.attributes
+        if self._clear_parent and name in ("parent_span_id", "parent", "_parent"):
             return None
         return getattr(self._original_span, name)
 
@@ -265,6 +264,23 @@ def _build_otlp_payload(spans: Sequence[ReadableSpan]) -> Dict[str, Any]:
     return {OTLP_RESOURCE_SPANS_KEY: resource_spans}
 
 
+def _get_enrichment_attrs(span: ReadableSpan) -> Dict[str, Any]:
+    """Return extra attributes to inject into a span before export.
+
+    Currently handles one case: GenAI spans (e.g. ``openai.response``) that
+    carry ``gen_ai.system`` but lack ``llm.request.type``.  The Respan backend
+    uses ``llm.request.type`` to trigger prompt/completion/model/token parsing,
+    so we inject ``"chat"`` to ensure the backend processes these spans.
+    """
+    attrs = span.attributes or {}
+    extra: Dict[str, Any] = {}
+
+    if attrs.get("gen_ai.system") and not attrs.get("llm.request.type"):
+        extra["llm.request.type"] = "chat"
+
+    return extra
+
+
 class RespanSpanExporter:
     """
     Custom span exporter for Respan that serializes spans as OTLP JSON
@@ -326,12 +342,19 @@ class RespanSpanExporter:
         for enricher in self._enrichers:
             enriched_spans = enricher(enriched_spans)
 
-        # Apply root-span promotion logic
+        # Apply root-span promotion and attribute enrichment
         modified_spans: List[ReadableSpan] = []
         for span in enriched_spans:
-            if is_root_span_candidate(span):
+            clear_parent = is_root_span_candidate(span)
+            extra_attrs = _get_enrichment_attrs(span)
+
+            if clear_parent:
                 logger.debug("Making span a root span: %s", span.name)
-                modified_spans.append(EnrichedSpan(span, promote_to_root=True))
+            if extra_attrs:
+                logger.debug("Enriching span with %s: %s", list(extra_attrs), span.name)
+
+            if clear_parent or extra_attrs:
+                modified_spans.append(EnrichedSpan(span, extra_attrs, clear_parent))
             else:
                 modified_spans.append(span)
 

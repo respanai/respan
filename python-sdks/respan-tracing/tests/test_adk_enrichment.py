@@ -212,7 +212,7 @@ class TestEnrichedSpan:
     def test_extra_attributes_merged(self):
         """Extra attributes appear in .attributes."""
         original = _make_adk_span("span", {"orig": "value"})
-        enriched = EnrichedSpan(original, extra_attributes={"extra": "new"})
+        enriched = EnrichedSpan(original, extra_attrs={"extra": "new"})
         assert enriched.attributes["extra"] == "new"
 
     def test_stripped_keys_removed(self):
@@ -239,7 +239,7 @@ class TestEnrichedSpan:
     def test_extra_overrides_original(self):
         """Extra attributes override same-key originals."""
         original = _make_adk_span("span", {"shared_key": "old"})
-        enriched = EnrichedSpan(original, extra_attributes={"shared_key": "new"})
+        enriched = EnrichedSpan(original, extra_attrs={"shared_key": "new"})
         assert enriched.attributes["shared_key"] == "new"
 
     def test_getattr_delegation(self):
@@ -323,17 +323,21 @@ def _make_standard_trace_group(
     tool_call_args=None,
     tool_response=None,
 ):
-    """Build a standard ADK trace group: invocation + invoke_agent + call_llm + optional execute_tool."""
+    """Build a standard ADK trace group: invocation + invoke_agent + call_llm + optional execute_tool.
+
+    resource_attrs are merged into span attributes to simulate RespanSpanProcessor
+    bridging _PROPAGATED_ATTRIBUTES onto spans at on_start() time.
+    """
     trace_id = 0xF00D
-    res_attrs = resource_attrs or {}
+    propagated = resource_attrs or {}
 
     invocation = _make_adk_span(
-        "invocation", {}, trace_id=trace_id, span_id=0x0001, resource_attrs=res_attrs,
+        "invocation", {**propagated}, trace_id=trace_id, span_id=0x0001,
     )
     invoke_agent = _make_adk_span(
         "invoke_agent",
-        {"gen_ai.agent.name": agent_name},
-        trace_id=trace_id, span_id=0x0002, parent_span_id=0x0001, resource_attrs=res_attrs,
+        {"gen_ai.agent.name": agent_name, **propagated},
+        trace_id=trace_id, span_id=0x0002, parent_span_id=0x0001,
     )
     call_llm = _make_adk_span(
         "call_llm",
@@ -343,8 +347,9 @@ def _make_standard_trace_group(
             "gen_ai.usage.input_tokens": input_tokens,
             "gen_ai.usage.output_tokens": output_tokens,
             "gen_ai.conversation.id": session_id,
+            **propagated,
         },
-        trace_id=trace_id, span_id=0x0003, parent_span_id=0x0002, resource_attrs=res_attrs,
+        trace_id=trace_id, span_id=0x0003, parent_span_id=0x0002,
     )
 
     spans = [invocation, invoke_agent, call_llm]
@@ -355,8 +360,9 @@ def _make_standard_trace_group(
             {
                 "gcp.vertex.agent.tool_call_args": tool_call_args,
                 "gcp.vertex.agent.tool_response": tool_response or '{"result": "ok"}',
+                **propagated,
             },
-            trace_id=trace_id, span_id=0x0004, parent_span_id=0x0002, resource_attrs=res_attrs,
+            trace_id=trace_id, span_id=0x0004, parent_span_id=0x0002,
         )
         spans.append(execute_tool)
 
@@ -453,7 +459,7 @@ class TestEnrichAdkTraceGroup:
         assert enriched[0].attributes["respan.threads.thread_identifier"] == "session-xyz"
 
     def test_customer_identifier_propagated(self):
-        """Resource-level customer_identifier is propagated to the root span."""
+        """Span-level customer_identifier is propagated to the root span."""
         spans = _make_standard_trace_group(
             resource_attrs={"respan.customer_params.customer_identifier": "cust-42"},
         )
@@ -494,8 +500,8 @@ class TestEnrichAdkTraceGroup:
         root_input = json.loads(enriched[0].attributes["traceloop.entity.input"])
         assert root_input == [{"role": "user", "content": "fallback input"}]
 
-    def test_resource_thread_id_takes_precedence(self):
-        """When resource has explicit thread_identifier, it takes precedence over session_id."""
+    def test_explicit_thread_id_takes_precedence(self):
+        """When span has explicit thread_identifier, it takes precedence over session_id."""
         spans = _make_standard_trace_group(
             session_id="session-from-adk",
             resource_attrs={"respan.threads.thread_identifier": "explicit-thread-id"},

@@ -9,8 +9,10 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
 from respan_tracing import RespanTelemetry
-from respan_tracing.exporters import RespanSpanExporterV2
-from respan_tracing.exporters.span_exporter_v2 import (
+from respan_tracing.utils.span_factory import (
+    _PROPAGATED_ATTRIBUTES,
+    build_readable_span,
+    inject_span,
     propagate_attributes as _propagate_attributes,
 )
 
@@ -26,9 +28,8 @@ class Respan:
     1. ``RespanTelemetry`` — OTEL TracerProvider for decorators and, when no
        plugins are provided, auto-instrumentation of LLM SDKs (OpenAI,
        Anthropic, etc.) via the OTEL pipeline.
-    2. ``RespanSpanExporterV2`` for plugin instrumentations to send spans
-       to ``/v1/traces/ingest``.
-    3. Activates any instrumentors passed via the ``instrumentations`` list.
+    2. Activates any instrumentors passed via the ``instrumentations`` list.
+       Plugins emit ``ReadableSpan`` objects into the same OTEL pipeline.
 
     When ``instrumentations`` are provided, OTEL auto-instrumentation is
     disabled by default to avoid duplicate spans (plugins capture LLM calls
@@ -96,24 +97,14 @@ class Respan:
         if environment:
             default_attributes["environment"] = environment
 
-        # Auto-instrument LLM SDKs when no plugins are provided,
-        # disable when plugins handle tracing to avoid duplicate spans.
+        # Explicit plugin pattern: auto_instrument defaults to False.
+        # Users must pass instrumentations=[...] for SDK-specific tracing.
+        # Set auto_instrument=True to enable respan-tracing's built-in
+        # auto-instrumentation (OpenAI, Anthropic, etc.) alongside plugins.
         if auto_instrument is None:
-            auto_instrument = not bool(instrumentations)
+            auto_instrument = False
 
         # 1. OTEL TracerProvider + optional auto-instrumentation
-        # Pass environment and identifiers as resource attributes so they're
-        # available in the OTLP pipeline (not just the V2 plugin exporter).
-        ra = telemetry_kwargs.get("resource_attributes") or {}
-        if environment:
-            ra["deployment.environment"] = environment
-        if customer_identifier:
-            ra["respan.customer_params.customer_identifier"] = customer_identifier
-        if thread_identifier:
-            ra["respan.threads.thread_identifier"] = thread_identifier
-        if ra:
-            telemetry_kwargs["resource_attributes"] = ra
-
         self.telemetry = RespanTelemetry(
             app_name=app_name,
             api_key=api_key,
@@ -122,13 +113,10 @@ class Respan:
             **telemetry_kwargs,
         )
 
-        # 2. Plugin exporter → /v1/traces/ingest
-        ingest_endpoint = f"{base_url.rstrip('/')}/v1/traces/ingest"
-        self.exporter = RespanSpanExporterV2(
-            api_key=api_key,
-            endpoint=ingest_endpoint,
-            default_attributes=default_attributes,
-        )
+        # 2. Seed propagated attributes with defaults so all spans
+        #    (both auto-instrumented and plugin-injected) get them.
+        if default_attributes:
+            _PROPAGATED_ATTRIBUTES.set(default_attributes)
 
         # 3. Activate instrumentations
         self._instrumentations: Dict[str, object] = {}
@@ -143,7 +131,7 @@ class Respan:
     def _activate(self, name: str, inst: object) -> None:
         """Activate a single instrumentor."""
         try:
-            inst.activate(self.exporter)  # type: ignore[union-attr]
+            inst.activate()  # type: ignore[union-attr]
             self._instrumentations[name] = inst
             logger.info("Activated instrumentation: %s", name)
         except Exception as exc:
@@ -249,21 +237,13 @@ class Respan:
         # Index original requests by custom_id
         requests_by_id = {r["custom_id"]: r.get("body", {}) for r in requests}
 
-        logs = []
+        completion_timestamps = []
 
         # When no OTEL context, create a grouping "batch_results" task span
         # so completions are nested, not floating at trace root.
         if not otel_span_id:
-            logs.append({
-                "trace_unique_id": resolved_trace_id,
-                "span_unique_id": parent_span_id,
-                "span_name": "batch_results",
-                "log_type": "task",
-                "status_code": 200,
-                "status": "success",
-            })
-
-        completion_timestamps = []
+            # We'll set timestamps after processing all results
+            pass
 
         for result in results:
             custom_id = result.get("custom_id", "")
@@ -282,51 +262,65 @@ class Respan:
 
             # Extract timestamp from OpenAI response (unix epoch → ISO 8601)
             created = body.get("created")
-            timestamp = None
+            start_iso = end_iso = None
             if created:
                 ts = datetime.fromtimestamp(created, tz=timezone.utc)
-                timestamp = ts.isoformat()
+                end_iso = ts.isoformat()
                 completion_timestamps.append(ts)
 
-            log: Dict[str, Any] = {
-                "trace_unique_id": resolved_trace_id,
-                "span_unique_id": uuid.uuid4().hex,
-                "span_parent_id": parent_span_id,
-                "span_name": f"batch:{custom_id}",
-                "log_type": "chat",
-                "model": body.get("model", original.get("model", "")),
-                "input": json.dumps(messages),
-                "output": output,
-                "prompt_tokens": usage.get("prompt_tokens", 0),
-                "completion_tokens": usage.get("completion_tokens", 0),
-                "status_code": status_code,
-                "status": "error" if status_code >= 400 else "success",
-            }
-            if timestamp:
-                log["timestamp"] = timestamp
-            logs.append(log)
+            model = body.get("model", original.get("model", ""))
 
-        # Set the batch_results parent span timestamps to cover all completions
-        if not otel_span_id and completion_timestamps and logs:
-            earliest = min(completion_timestamps).isoformat()
-            latest = max(completion_timestamps).isoformat()
-            logs[0]["start_time"] = earliest
-            logs[0]["timestamp"] = latest
+            span = build_readable_span(
+                name=f"batch:{custom_id}",
+                trace_id=resolved_trace_id,
+                parent_id=parent_span_id,
+                end_time_iso=end_iso,
+                attributes={
+                    "llm.request.type": "chat",
+                    "gen_ai.request.model": model,
+                    "gen_ai.usage.prompt_tokens": usage.get("prompt_tokens", 0),
+                    "gen_ai.usage.completion_tokens": usage.get("completion_tokens", 0),
+                    "traceloop.entity.input": json.dumps(messages, default=str),
+                    "traceloop.entity.output": json.dumps(output, default=str),
+                    "traceloop.entity.path": "batch_results",
+                    "traceloop.span.kind": "task",
+                    "respan.entity.log_type": "chat",
+                },
+                status_code=status_code,
+            )
+            inject_span(span)
 
-        if logs:
-            self.exporter.export(logs)
+        # Create the grouping "batch_results" task span (when no OTEL context)
+        if not otel_span_id:
+            earliest_iso = latest_iso = None
+            if completion_timestamps:
+                earliest_iso = min(completion_timestamps).isoformat()
+                latest_iso = max(completion_timestamps).isoformat()
+
+            parent_span = build_readable_span(
+                name="batch_results.task",
+                trace_id=resolved_trace_id,
+                span_id=parent_span_id,
+                start_time_iso=earliest_iso,
+                end_time_iso=latest_iso,
+                attributes={
+                    "traceloop.span.kind": "task",
+                    "traceloop.entity.name": "batch_results",
+                    "traceloop.entity.path": "",
+                    "respan.entity.log_type": "task",
+                },
+            )
+            inject_span(parent_span)
 
     def flush(self) -> None:
-        """Flush both the OTEL pipeline and the plugin exporter."""
+        """Flush the OTEL pipeline."""
         self.telemetry.flush()
-        self.exporter.flush()
 
     def shutdown(self) -> None:
-        """Deactivate plugins and shut down exporters."""
+        """Deactivate plugins and shut down the OTEL pipeline."""
         for name, inst in self._instrumentations.items():
             try:
                 inst.deactivate()  # type: ignore[union-attr]
             except Exception as exc:
                 logger.warning("Error deactivating %s: %s", name, exc)
         self._instrumentations.clear()
-        self.exporter.shutdown()

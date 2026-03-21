@@ -1,7 +1,7 @@
 """Unit + integration tests for the unified respan stack.
 
 Tests all three packages together:
-1. respan-tracing (auto_instrument param, RespanSpanExporterV2)
+1. respan-tracing (auto_instrument param)
 2. respan (Respan class, explicit instrumentations, decorator re-exports)
 3. respan-instrumentation-openai-agents (converter, instrumentor, LocalSpanCollector)
 """
@@ -50,76 +50,7 @@ class TestAutoInstrument:
 
 
 # ---------------------------------------------------------------------------
-# 2. respan-tracing: RespanSpanExporterV2
-# ---------------------------------------------------------------------------
-
-class TestRespanSpanExporterV2:
-    def test_import(self):
-        from respan_tracing.exporters import RespanSpanExporterV2
-        assert RespanSpanExporterV2 is not None
-
-    def test_init_defaults(self):
-        from respan_tracing.exporters import RespanSpanExporterV2
-        exp = RespanSpanExporterV2(api_key="test-key")
-        assert exp.endpoint == "https://api.respan.ai/api/v1/traces/ingest"
-        assert exp.api_key == "test-key"
-        assert exp.max_batch_size == 128
-        assert exp.flush_interval == 5.0
-        exp.shutdown()
-
-    def test_export_enqueues_data(self):
-        from respan_tracing.exporters import RespanSpanExporterV2
-        exp = RespanSpanExporterV2(api_key="test-key", flush_interval=999)
-        exp.export([{"trace_id": "abc", "span_name": "test"}])
-        assert len(exp._queue) == 1
-        exp.shutdown()
-
-    def test_export_skips_when_shutdown(self):
-        from respan_tracing.exporters import RespanSpanExporterV2
-        exp = RespanSpanExporterV2(api_key="test-key", flush_interval=999)
-        exp.shutdown()
-        exp.export([{"data": "should be dropped"}])
-        assert len(exp._queue) == 0
-
-    def test_send_batch_posts_to_endpoint(self):
-        from respan_tracing.exporters import RespanSpanExporterV2
-        exp = RespanSpanExporterV2(api_key="test-key", flush_interval=999)
-
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        with patch.object(exp._session, "post", return_value=mock_response) as mock_post:
-            exp.export([{"trace_id": "abc"}])
-            exp.flush()
-            mock_post.assert_called_once()
-            call_kwargs = mock_post.call_args
-            payload = json.loads(call_kwargs.kwargs.get("data", call_kwargs[1].get("data", "")))
-            assert payload == {"data": [{"trace_id": "abc"}]}
-        exp.shutdown()
-
-    def test_no_retry_on_4xx(self):
-        from respan_tracing.exporters import RespanSpanExporterV2
-        exp = RespanSpanExporterV2(api_key="test-key", flush_interval=999, max_retries=3)
-
-        mock_response = MagicMock()
-        mock_response.status_code = 400
-        mock_response.text = "Bad Request"
-        with patch.object(exp._session, "post", return_value=mock_response) as mock_post:
-            exp.export([{"trace_id": "abc"}])
-            exp.flush()
-            assert mock_post.call_count == 1  # No retries on 4xx
-        exp.shutdown()
-
-    def test_queue_maxlen_drops_oldest(self):
-        from respan_tracing.exporters import RespanSpanExporterV2
-        exp = RespanSpanExporterV2(api_key="test-key", max_queue_size=3, flush_interval=999)
-        exp.export([{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}])
-        assert len(exp._queue) == 3
-        assert exp._queue[0] == {"id": 2}  # oldest dropped
-        exp.shutdown()
-
-
-# ---------------------------------------------------------------------------
-# 3. respan package: imports and Respan class
+# 2. respan package: imports and Respan class
 # ---------------------------------------------------------------------------
 
 class TestRespanPackage:
@@ -143,7 +74,7 @@ class TestRespanPackage:
 
         class MyPlugin:
             name = "test"
-            def activate(self, exporter): pass
+            def activate(self): pass
             def deactivate(self): pass
 
         assert isinstance(MyPlugin(), Instrumentation)
@@ -152,8 +83,6 @@ class TestRespanPackage:
         from respan import Respan
         r = Respan(api_key="test-key")
         assert r.telemetry is not None
-        assert r.exporter is not None
-        assert r.exporter.endpoint == "https://api.respan.ai/api/v1/traces/ingest"
         assert len(r._instrumentations) == 0
         r.shutdown()
 
@@ -164,13 +93,12 @@ class TestRespanPackage:
 
         class FakeInstrumentor:
             name = "fake"
-            def activate(self, exporter):
-                activated.append(exporter)
+            def activate(self):
+                activated.append(True)
             def deactivate(self): pass
 
         r = Respan(api_key="test-key", instrumentations=[FakeInstrumentor()])
         assert len(activated) == 1
-        assert activated[0] is r.exporter
         assert "fake" in r._instrumentations
         r.shutdown()
 
@@ -182,7 +110,7 @@ class TestRespanPackage:
 
 
 # ---------------------------------------------------------------------------
-# 4. respan-instrumentation-openai-agents
+# 3. respan-instrumentation-openai-agents
 # ---------------------------------------------------------------------------
 
 class TestInstrumentationPackage:
@@ -228,7 +156,7 @@ class TestInstrumentationPackage:
 
 
 # ---------------------------------------------------------------------------
-# 5. End-to-end: explicit instrumentations
+# 4. End-to-end: explicit instrumentations
 # ---------------------------------------------------------------------------
 
 class TestEndToEnd:
@@ -242,27 +170,23 @@ class TestEndToEnd:
         r.shutdown()
 
     def test_end_to_end_trace_export(self):
-        """Trace → converter → exporter.export() → HTTP POST."""
+        """Trace → emitter → inject_span() → OTEL pipeline."""
         from respan import Respan
         from respan_instrumentation_openai_agents import OpenAIAgentsInstrumentor
+        from respan_tracing.utils.span_factory import inject_span
 
         r = Respan(api_key="test-key", instrumentations=[OpenAIAgentsInstrumentor()])
 
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        with patch.object(r.exporter._session, "post", return_value=mock_response) as mock_post:
+        # Patch inject_span to capture calls
+        injected_spans = []
+        with patch("respan_instrumentation_openai_agents._otel_emitter.inject_span", side_effect=lambda s: injected_spans.append(s)):
             trace = _make_trace("e2e-test", "e2e-workflow")
             processor = r._instrumentations["openai-agents"]._processor
             processor.on_trace_end(trace)
 
-            r.exporter.flush()
-
-            assert mock_post.call_count == 1
-            call_kwargs = mock_post.call_args
-            payload = json.loads(call_kwargs.kwargs.get("data", call_kwargs[1].get("data", "")))
-            assert len(payload["data"]) == 1
-            assert payload["data"][0]["trace_unique_id"] == "e2e-test"
-            assert payload["data"][0]["span_name"] == "e2e-workflow"
+            assert len(injected_spans) == 1
+            span = injected_spans[0]
+            assert span.attributes.get("traceloop.entity.name") == "e2e-workflow"
 
         r.shutdown()
 
@@ -274,12 +198,12 @@ class TestEndToEnd:
 
         class FakeInstrumentorA:
             name = "fake-a"
-            def activate(self, exporter): activated_names.append("a")
+            def activate(self): activated_names.append("a")
             def deactivate(self): pass
 
         class FakeInstrumentorB:
             name = "fake-b"
-            def activate(self, exporter): activated_names.append("b")
+            def activate(self): activated_names.append("b")
             def deactivate(self): pass
 
         r = Respan(api_key="test-key", instrumentations=[FakeInstrumentorA(), FakeInstrumentorB()])

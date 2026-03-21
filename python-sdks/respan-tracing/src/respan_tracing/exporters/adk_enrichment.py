@@ -148,11 +148,16 @@ def _enrich_adk_trace_group(spans: List[ReadableSpan]) -> List[ReadableSpan]:
         if not session_id:
             session_id = attrs.get("gen_ai.conversation.id")
 
-    # Read resource-level identifiers (set by _core.py from instrumentor config)
-    resource = getattr(spans[0], "resource", None) if spans else None
-    resource_attrs = resource.attributes if resource else {}
-    customer_id = resource_attrs.get("respan.customer_params.customer_identifier")
-    thread_id = resource_attrs.get("respan.threads.thread_identifier")
+    # Read identifiers from span attributes (bridged by RespanSpanProcessor
+    # from _PROPAGATED_ATTRIBUTES ContextVar set in _core.py)
+    customer_id = None
+    thread_id = None
+    for span in spans:
+        span_attrs = span.attributes or {}
+        if not customer_id:
+            customer_id = span_attrs.get("respan.customer_params.customer_identifier")
+        if not thread_id:
+            thread_id = span_attrs.get("respan.threads.thread_identifier")
 
     # --- Second pass: enrich each span ---
     enriched = []
@@ -216,7 +221,7 @@ def _enrich_adk_trace_group(spans: List[ReadableSpan]) -> List[ReadableSpan]:
                     extra["traceloop.entity.output"] = tool_resp
 
         if new_name or extra:
-            enriched.append(EnrichedSpan(span, name=new_name, extra_attributes=extra, stripped_keys=_ADK_STRIP_ATTRS))
+            enriched.append(EnrichedSpan(span, extra_attrs=extra, name=new_name, stripped_keys=_ADK_STRIP_ATTRS))
         else:
             enriched.append(span)
 

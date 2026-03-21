@@ -29,23 +29,6 @@ def respan_base_url():
 class TestRealBackend:
     """Tests that send real traces to the Respan backend."""
 
-    def test_exporter_v2_sends_to_respan(self, respan_api_key, respan_base_url):
-        """RespanSpanExporterV2 can POST to the real /v1/traces/ingest endpoint."""
-        from respan_tracing.exporters import RespanSpanExporterV2
-
-        endpoint = f"{respan_base_url.rstrip('/')}/v1/traces/ingest"
-        exp = RespanSpanExporterV2(api_key=respan_api_key, endpoint=endpoint)
-
-        trace = _make_trace("e2e-exporter-test", "exporter-v2-test")
-        from respan_instrumentation_openai_agents import convert_to_respan_log
-        data = convert_to_respan_log(trace)
-        assert data is not None
-
-        exp.export([data])
-        exp.flush()
-        exp.shutdown()
-        # If no exception, the POST was accepted (HTTP < 300)
-
     def test_respan_full_pipeline(self, respan_api_key, respan_base_url):
         """Full Respan pipeline: init → instrumentor → trace → flush."""
         from respan import Respan

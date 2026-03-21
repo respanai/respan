@@ -7,8 +7,9 @@ load_dotenv(override=True)
 
 from openai import OpenAI
 from respan import Respan
+from respan_instrumentation_openai import OpenAIInstrumentor
 
-respan = Respan()
+respan = Respan(instrumentations=[OpenAIInstrumentor()])
 
 client = OpenAI(
     api_key=os.getenv("RESPAN_API_KEY"),

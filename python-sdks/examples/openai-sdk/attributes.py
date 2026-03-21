@@ -7,8 +7,10 @@ load_dotenv(override=True)
 
 from openai import OpenAI
 from respan import Respan, workflow, propagate_attributes
+from respan_instrumentation_openai import OpenAIInstrumentor
 
 respan = Respan(
+    instrumentations=[OpenAIInstrumentor()],
     metadata={"service": "chat-api", "version": "1.0.0"},
 )
 

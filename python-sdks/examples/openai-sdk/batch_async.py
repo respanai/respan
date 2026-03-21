@@ -17,8 +17,9 @@ load_dotenv()
 
 from openai import OpenAI
 from respan import Respan, workflow, task, get_client
+from respan_instrumentation_openai import OpenAIInstrumentor
 
-respan = Respan()
+respan = Respan(instrumentations=[OpenAIInstrumentor()])
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 TOPICS = [
