@@ -2,34 +2,9 @@ from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.semconv_ai import SpanAttributes
 import logging
 
+from respan_sdk.constants.adk_constants import is_adk_span as _is_adk_span
+
 logger = logging.getLogger(__name__)
-
-# Instrumentation scope names that identify Google ADK spans
-# NOTE: This duplicates detection logic in respan_instrumentation_google_adk.utils.
-# We cannot import from that package here because respan_tracing is a core dependency
-# of respan_instrumentation_google_adk — importing the other direction would create a
-# circular dependency. Consider moving to respan_sdk if this grows.
-_ADK_SCOPE_NAMES = {"gcp.vertex.agent", "google_adk", "google-adk"}
-
-# Span names that indicate a Google ADK instrumented span
-_ADK_SPAN_NAMES = {"invocation", "agent_run", "call_llm", "execute_tool", "invoke_agent", "generate_content"}
-
-
-def _is_adk_span(span: ReadableSpan) -> bool:
-    """Check if a span originates from Google ADK instrumentation."""
-    scope = getattr(span, "instrumentation_scope", None) or getattr(
-        span, "instrumentation_library", None
-    )
-    scope_name = getattr(scope, "name", "") or ""
-    if scope_name in _ADK_SCOPE_NAMES:
-        return True
-    # Fallback: check span name + gen_ai attributes
-    span_name = (getattr(span, "name", "") or "").split(" ")[0]
-    if span_name in _ADK_SPAN_NAMES:
-        attributes = getattr(span, "attributes", None) or {}
-        if any(key.startswith("gen_ai.") for key in attributes):
-            return True
-    return False
 
 
 def is_processable_span(span: ReadableSpan) -> bool:
