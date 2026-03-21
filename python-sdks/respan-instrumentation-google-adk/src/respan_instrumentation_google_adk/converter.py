@@ -46,8 +46,8 @@ _ADK_LOG_TYPE_MAP: Dict[str, str] = {
     "invocation": LOG_TYPE_WORKFLOW,
     "agent_run": LOG_TYPE_AGENT,
     "invoke_agent": LOG_TYPE_AGENT,
-    "call_llm": LOG_TYPE_CHAT,
-    "generate_content": LOG_TYPE_CHAT,
+    "call_llm": LOG_TYPE_GENERATION,
+    "generate_content": LOG_TYPE_GENERATION,
     "execute_tool": LOG_TYPE_TOOL,
 }
 

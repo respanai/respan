@@ -5,6 +5,10 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Instrumentation scope names that identify Google ADK spans
+# NOTE: This duplicates detection logic in respan_instrumentation_google_adk.utils.
+# We cannot import from that package here because respan_tracing is a core dependency
+# of respan_instrumentation_google_adk — importing the other direction would create a
+# circular dependency. Consider moving to respan_sdk if this grows.
 _ADK_SCOPE_NAMES = {"gcp.vertex.agent", "google_adk", "google-adk"}
 
 # Span names that indicate a Google ADK instrumented span
@@ -49,7 +53,7 @@ def is_processable_span(span: ReadableSpan) -> bool:
     # own exporters, so let them through the filter
     if _is_adk_span(span):
         logger.debug(
-            f"[Respan Debug] Processing Google ADK span: {span.name}"
+            "[Respan Debug] Processing Google ADK span: %s", span.name
         )
         return True
 
