@@ -1,5 +1,5 @@
 """Tests for wrapt-based processor patching."""
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import Mock, patch
 
 from respan_instrumentation_google_adk.processor import (
     _respan_processor_on_end_wrapper,

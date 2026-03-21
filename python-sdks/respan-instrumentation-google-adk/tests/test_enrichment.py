@@ -2,10 +2,7 @@
 import json
 from unittest.mock import Mock
 
-import pytest
-
 from respan_instrumentation_google_adk.enrichment import (
-    _ADK_STRIP_ATTRS,
     _extract_adk_input,
     _extract_adk_output,
     enrich_adk_batch,
