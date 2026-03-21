@@ -43,6 +43,7 @@ class Respan:
             via OTEL.  Defaults to ``True`` when no plugins are provided,
             ``False`` when plugins are provided (to avoid duplicate spans).
         customer_identifier: Default customer/user identifier for all spans.
+        evaluation_identifier: Default evaluation identifier for all spans.
         thread_identifier: Default conversation thread ID for all spans.
         metadata: Default metadata dict merged into all spans.
         environment: Default environment (e.g. ``"production"``).
@@ -67,6 +68,7 @@ class Respan:
         instrumentations: Optional[Sequence[object]] = None,
         auto_instrument: Optional[bool] = None,
         customer_identifier: Optional[str] = None,
+        evaluation_identifier: Optional[str] = None,
         thread_identifier: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
         environment: Optional[str] = None,
@@ -81,6 +83,8 @@ class Respan:
         default_attributes: Dict[str, Any] = {}
         if customer_identifier:
             default_attributes["customer_identifier"] = customer_identifier
+        if evaluation_identifier:
+            default_attributes["evaluation_identifier"] = evaluation_identifier
         if thread_identifier:
             default_attributes["thread_identifier"] = thread_identifier
         if metadata:
@@ -137,6 +141,7 @@ class Respan:
             customer_identifier: User/customer identifier.
             customer_email: Customer email address.
             customer_name: Customer display name.
+            evaluation_identifier: Evaluation run identifier.
             thread_identifier: Conversation thread ID.
             custom_identifier: Indexed custom identifier.
             group_identifier: Group related traces.
