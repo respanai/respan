@@ -2,7 +2,7 @@ from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.semconv_ai import SpanAttributes
 import logging
 
-from respan_sdk.constants.adk_constants import is_adk_span as _is_adk_span
+from respan_sdk.constants.adk_constants import is_adk_span
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,7 @@ def is_processable_span(span: ReadableSpan) -> bool:
     """
     # Instrumentation plugin spans (e.g. Google ADK) — allowlisted so the default
     # OTLP exporter (RespanSpanExporter) can enrich and export them
-    if _is_adk_span(span):
+    if is_adk_span(span):
         logger.debug(
             "[Respan Debug] Processing Google ADK span: %s", span.name
         )

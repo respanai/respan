@@ -14,8 +14,8 @@ import json
 import pytest
 from unittest.mock import Mock
 
+from respan_tracing.exporters.respan import EnrichedSpan
 from respan_tracing.exporters.adk_enrichment import (
-    EnrichedSpan,
     _ADK_STRIP_ATTRS,
     _extract_adk_input,
     _extract_adk_output,

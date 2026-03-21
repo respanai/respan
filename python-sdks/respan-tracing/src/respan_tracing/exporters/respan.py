@@ -1,6 +1,6 @@
 import base64
 import json
-from typing import Dict, Optional, Sequence, List, Any
+from typing import Callable, Dict, Optional, Sequence, List, Any
 
 import requests
 from opentelemetry.context import attach, detach, set_value
@@ -46,21 +46,46 @@ from respan_sdk.constants.otlp_constants import (
 from ..utils.logging import get_respan_logger, build_spans_export_preview
 from ..utils.preprocessing.span_processing import is_root_span_candidate
 from ..constants.generic_constants import LOGGER_NAME_EXPORTER
-from .adk_enrichment import _enrich_adk_spans
 
 logger = get_respan_logger(LOGGER_NAME_EXPORTER)
 
 
-class ModifiedSpan:
-    """A proxy wrapper that forwards all attributes to the original span except parent_span_id"""
+class EnrichedSpan:
+    """Proxy wrapper for span enrichment and root promotion.
 
-    def __init__(self, original_span: ReadableSpan):
+    Handles both attribute injection/stripping (for ADK and future enrichment)
+    and parent nullification (for root span promotion).
+    """
+
+    def __init__(
+        self,
+        original_span: ReadableSpan,
+        name: Optional[str] = None,
+        extra_attributes: Optional[Dict[str, Any]] = None,
+        stripped_keys: Optional[set] = None,
+        promote_to_root: bool = False,
+    ):
         self._original_span = original_span
+        self._name_override = name
+        self._extra_attributes = extra_attributes or {}
+        self._stripped_keys = stripped_keys or set()
+        self._promote_to_root = promote_to_root
+
+    @property
+    def name(self):
+        return self._name_override if self._name_override is not None else self._original_span.name
+
+    @property
+    def attributes(self):
+        attrs = dict(self._original_span.attributes or {})
+        for key in self._stripped_keys:
+            attrs.pop(key, None)
+        attrs.update(self._extra_attributes)
+        return attrs
 
     def __getattr__(self, name):
-        """Forward all attribute access to the original span"""
-        if name in ("parent_span_id", "parent", "_parent"):
-            return None  # Override parent to None for root-promoted spans
+        if self._promote_to_root and name in ("parent_span_id", "parent", "_parent"):
+            return None
         return getattr(self._original_span, name)
 
 
@@ -102,7 +127,7 @@ def _convert_attributes(attributes: Any) -> List[Dict[str, Any]]:
 
 
 def _span_to_otlp_json(span: ReadableSpan) -> Dict[str, Any]:
-    """Convert a ReadableSpan (or ModifiedSpan) to OTLP JSON span dict."""
+    """Convert a ReadableSpan (or EnrichedSpan) to OTLP JSON span dict."""
     ctx = span.get_span_context()
 
     trace_id = format(ctx.trace_id, "032x") if ctx else ""
@@ -262,6 +287,7 @@ class RespanSpanExporter:
         self.api_key = api_key
         self.timeout = timeout
         self._is_shutdown = False
+        self._enrichers: List[Callable] = []
 
         # Persistent session for TCP connection reuse across export() calls.
         # At 1% prod sampling with 3-5 traces per request, connection overhead matters.
@@ -281,21 +307,31 @@ class RespanSpanExporter:
         self._traces_url = f"{self.endpoint}/v2/traces"
         logger.debug("OTLP JSON traces endpoint: %s", self._traces_url)
 
+    def register_enricher(self, fn: Callable) -> None:
+        """Register an enricher function to run on spans before export.
+
+        Each enricher receives a list of spans and returns a (possibly
+        modified) list.  Enrichers run in registration order, before
+        root-span promotion.
+        """
+        self._enrichers.append(fn)
+
     def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
         """Export spans as OTLP JSON to /v2/traces."""
         if self._is_shutdown:
             return SpanExportResult.FAILURE
 
-        # Enrich ADK spans with OpenLLMetry-compatible attributes before
-        # root promotion so the enriched traceloop.span.kind is visible.
-        enriched_spans = _enrich_adk_spans(spans)
+        # Run registered enrichers (e.g. ADK span enrichment)
+        enriched_spans = list(spans)
+        for enricher in self._enrichers:
+            enriched_spans = enricher(enriched_spans)
 
         # Apply root-span promotion logic
         modified_spans: List[ReadableSpan] = []
         for span in enriched_spans:
             if is_root_span_candidate(span):
                 logger.debug("Making span a root span: %s", span.name)
-                modified_spans.append(ModifiedSpan(span))
+                modified_spans.append(EnrichedSpan(span, promote_to_root=True))
             else:
                 modified_spans.append(span)
 

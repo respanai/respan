@@ -1,8 +1,8 @@
 """ADK span enrichment for OpenLLMetry-compatible export.
 
 Extracted from respan.py to keep the core OTLP exporter free of
-ADK-specific logic. Called by RespanSpanExporter.export() when ADK
-spans are present in the batch.
+ADK-specific logic.  Registered as an enricher on RespanSpanExporter
+by _core.py when a Google ADK instrumentor is present.
 """
 
 import json
@@ -10,42 +10,8 @@ from typing import Dict, Optional, Sequence, List, Any
 
 from opentelemetry.sdk.trace import ReadableSpan
 
-from ..utils.preprocessing.span_processing import _is_adk_span
-
-
-class EnrichedSpan:
-    """Proxy wrapper that overrides span name and/or injects extra attributes.
-
-    Used to enrich ADK spans with OpenLLMetry-compatible attributes so the
-    backend can extract trace-level fields (name, input, output, tokens).
-    """
-
-    def __init__(
-        self,
-        original_span: ReadableSpan,
-        name: Optional[str] = None,
-        extra_attributes: Optional[Dict[str, Any]] = None,
-        stripped_keys: Optional[set] = None,
-    ):
-        self._original_span = original_span
-        self._name_override = name
-        self._extra_attributes = extra_attributes or {}
-        self._stripped_keys = stripped_keys or set()
-
-    @property
-    def name(self):
-        return self._name_override if self._name_override is not None else self._original_span.name
-
-    @property
-    def attributes(self):
-        attrs = dict(self._original_span.attributes or {})
-        for key in self._stripped_keys:
-            attrs.pop(key, None)
-        attrs.update(self._extra_attributes)
-        return attrs
-
-    def __getattr__(self, name):
-        return getattr(self._original_span, name)
+from respan_sdk.constants.adk_constants import is_adk_span
+from .respan import EnrichedSpan
 
 
 # Internal/redundant ADK attributes that should NOT appear as custom properties.
@@ -115,7 +81,7 @@ def _enrich_adk_spans(spans: Sequence[ReadableSpan]) -> List[ReadableSpan]:
     adk_spans = []
     other_spans = []
     for span in spans:
-        if _is_adk_span(span):
+        if is_adk_span(span):
             adk_spans.append(span)
         else:
             other_spans.append(span)

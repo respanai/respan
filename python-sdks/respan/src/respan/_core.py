@@ -135,6 +135,10 @@ class Respan:
         for inst in instrumentations or []:
             name = getattr(inst, "name", type(inst).__name__)
             self._activate(name, inst)
+            # Register OTLP enrichers for plugins that enrich spans
+            if name == "google-adk":
+                from respan_tracing.exporters.adk_enrichment import _enrich_adk_spans
+                self.telemetry.register_enricher(_enrich_adk_spans)
 
     def _activate(self, name: str, inst: object) -> None:
         """Activate a single instrumentor."""
