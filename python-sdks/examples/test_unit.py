@@ -1,7 +1,7 @@
 """Unit + integration tests for the unified respan stack.
 
 Tests all three packages together:
-1. respan-tracing (auto_instrument param, RespanSpanExporterV2)
+1. respan-tracing (auto_instrument param)
 2. respan (Respan class, explicit instrumentations, decorator re-exports)
 3. respan-instrumentation-openai-agents (converter, instrumentor, LocalSpanCollector)
 """
@@ -50,76 +50,7 @@ class TestAutoInstrument:
 
 
 # ---------------------------------------------------------------------------
-# 2. respan-tracing: RespanSpanExporterV2 (kept for backward compat)
-# ---------------------------------------------------------------------------
-
-class TestRespanSpanExporterV2:
-    def test_import(self):
-        from respan_tracing.exporters import RespanSpanExporterV2
-        assert RespanSpanExporterV2 is not None
-
-    def test_init_defaults(self):
-        from respan_tracing.exporters import RespanSpanExporterV2
-        exp = RespanSpanExporterV2(api_key="test-key")
-        assert exp.endpoint == "https://api.respan.ai/api/v1/traces/ingest"
-        assert exp.api_key == "test-key"
-        assert exp.max_batch_size == 128
-        assert exp.flush_interval == 5.0
-        exp.shutdown()
-
-    def test_export_enqueues_data(self):
-        from respan_tracing.exporters import RespanSpanExporterV2
-        exp = RespanSpanExporterV2(api_key="test-key", flush_interval=999)
-        exp.export([{"trace_id": "abc", "span_name": "test"}])
-        assert len(exp._queue) == 1
-        exp.shutdown()
-
-    def test_export_skips_when_shutdown(self):
-        from respan_tracing.exporters import RespanSpanExporterV2
-        exp = RespanSpanExporterV2(api_key="test-key", flush_interval=999)
-        exp.shutdown()
-        exp.export([{"data": "should be dropped"}])
-        assert len(exp._queue) == 0
-
-    def test_send_batch_posts_to_endpoint(self):
-        from respan_tracing.exporters import RespanSpanExporterV2
-        exp = RespanSpanExporterV2(api_key="test-key", flush_interval=999)
-
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        with patch.object(exp._session, "post", return_value=mock_response) as mock_post:
-            exp.export([{"trace_id": "abc"}])
-            exp.flush()
-            mock_post.assert_called_once()
-            call_kwargs = mock_post.call_args
-            payload = json.loads(call_kwargs.kwargs.get("data", call_kwargs[1].get("data", "")))
-            assert payload == {"data": [{"trace_id": "abc"}]}
-        exp.shutdown()
-
-    def test_no_retry_on_4xx(self):
-        from respan_tracing.exporters import RespanSpanExporterV2
-        exp = RespanSpanExporterV2(api_key="test-key", flush_interval=999, max_retries=3)
-
-        mock_response = MagicMock()
-        mock_response.status_code = 400
-        mock_response.text = "Bad Request"
-        with patch.object(exp._session, "post", return_value=mock_response) as mock_post:
-            exp.export([{"trace_id": "abc"}])
-            exp.flush()
-            assert mock_post.call_count == 1  # No retries on 4xx
-        exp.shutdown()
-
-    def test_queue_maxlen_drops_oldest(self):
-        from respan_tracing.exporters import RespanSpanExporterV2
-        exp = RespanSpanExporterV2(api_key="test-key", max_queue_size=3, flush_interval=999)
-        exp.export([{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}])
-        assert len(exp._queue) == 3
-        assert exp._queue[0] == {"id": 2}  # oldest dropped
-        exp.shutdown()
-
-
-# ---------------------------------------------------------------------------
-# 3. respan package: imports and Respan class
+# 2. respan package: imports and Respan class
 # ---------------------------------------------------------------------------
 
 class TestRespanPackage:
@@ -179,7 +110,7 @@ class TestRespanPackage:
 
 
 # ---------------------------------------------------------------------------
-# 4. respan-instrumentation-openai-agents
+# 3. respan-instrumentation-openai-agents
 # ---------------------------------------------------------------------------
 
 class TestInstrumentationPackage:
@@ -225,7 +156,7 @@ class TestInstrumentationPackage:
 
 
 # ---------------------------------------------------------------------------
-# 5. End-to-end: explicit instrumentations
+# 4. End-to-end: explicit instrumentations
 # ---------------------------------------------------------------------------
 
 class TestEndToEnd:

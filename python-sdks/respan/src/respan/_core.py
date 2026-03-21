@@ -9,11 +9,12 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
 from respan_tracing import RespanTelemetry
-from respan_tracing.exporters.span_exporter_v2 import (
+from respan_tracing.utils.span_factory import (
     _PROPAGATED_ATTRIBUTES,
+    build_readable_span,
+    inject_span,
     propagate_attributes as _propagate_attributes,
 )
-from respan_tracing.utils.span_factory import build_readable_span, inject_span
 
 from ._types import Instrumentation
 
