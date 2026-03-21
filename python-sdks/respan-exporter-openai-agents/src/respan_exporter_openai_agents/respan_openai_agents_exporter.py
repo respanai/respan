@@ -146,10 +146,8 @@ def _agent_data_to_respan_log(
     if span_data.handoffs:
         data.span_handoffs = span_data.handoffs
 
-    data.metadata = {
-        "output_type": span_data.output_type,
-        "agent_name": span_data.name,
-    }
+    if span_data.output_type:
+        data.metadata = {"output_type": span_data.output_type}
 
 
 def _guardrail_data_to_respan_log(
