@@ -10,7 +10,7 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
-from conftest import _make_trace
+from conftest import _make_trace, _make_adk_spans
 
 
 # ---------------------------------------------------------------------------
@@ -286,4 +286,113 @@ class TestEndToEnd:
         assert activated_names == ["a", "b"]
         assert "fake-a" in r._instrumentations
         assert "fake-b" in r._instrumentations
+        r.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# 6. respan-instrumentation-google-adk
+# ---------------------------------------------------------------------------
+
+class TestGoogleAdkInstrumentationPackage:
+    def test_import(self):
+        from respan_instrumentation_google_adk import GoogleAdkInstrumentor
+        from respan_instrumentation_google_adk.converter import AdkSpanConverter
+        assert GoogleAdkInstrumentor is not None
+        assert AdkSpanConverter is not None
+
+    def test_instrumentor_satisfies_protocol(self):
+        from respan import Instrumentation
+        from respan_instrumentation_google_adk import GoogleAdkInstrumentor
+        inst = GoogleAdkInstrumentor()
+        assert isinstance(inst, Instrumentation)
+        assert inst.name == "google-adk"
+
+    def test_converter_with_spans(self):
+        from respan_instrumentation_google_adk.converter import AdkSpanConverter
+
+        converter = AdkSpanConverter(environment="test", customer_identifier="user-1")
+        spans = _make_adk_spans()
+        payloads = converter.convert(trace_or_spans=spans)
+
+        assert len(payloads) == 3
+
+        log_types = [p["log_type"] for p in payloads]
+        assert "workflow" in log_types
+        assert "agent" in log_types
+        assert "generation" in log_types
+
+        # All payloads share the same trace ID
+        trace_ids = {p["trace_unique_id"] for p in payloads}
+        assert len(trace_ids) == 1
+
+    def test_converter_environment_and_customer(self):
+        from respan_instrumentation_google_adk.converter import AdkSpanConverter
+
+        converter = AdkSpanConverter(
+            environment="staging",
+            customer_identifier="customer-42",
+        )
+        spans = _make_adk_spans()
+        payloads = converter.convert(trace_or_spans=spans)
+
+        for payload in payloads:
+            assert payload["environment"] == "staging"
+            assert payload["customer_identifier"] == "customer-42"
+
+
+# ---------------------------------------------------------------------------
+# 7. End-to-end: Google ADK instrumentations
+# ---------------------------------------------------------------------------
+
+class TestGoogleAdkEndToEnd:
+    def test_respan_with_google_adk_instrumentor(self):
+        """Respan(instrumentations=[GoogleAdkInstrumentor()]) activates the plugin."""
+        from respan import Respan
+        from respan_instrumentation_google_adk import GoogleAdkInstrumentor
+
+        r = Respan(api_key="test-key", instrumentations=[GoogleAdkInstrumentor()])
+        assert "google-adk" in r._instrumentations
+        r.shutdown()
+
+    def test_end_to_end_converter_to_exporter(self):
+        """Converter → mock exporter.export → verify payload structure."""
+        from respan import Respan
+        from respan_instrumentation_google_adk import GoogleAdkInstrumentor
+        from respan_instrumentation_google_adk.converter import AdkSpanConverter
+
+        r = Respan(api_key="test-key", instrumentations=[GoogleAdkInstrumentor()])
+
+        converter = AdkSpanConverter(environment="test")
+        spans = _make_adk_spans()
+        payloads = converter.convert(trace_or_spans=spans)
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        with patch.object(r.exporter._session, "post", return_value=mock_response) as mock_post:
+            r.exporter.export(payloads)
+            r.exporter.flush()
+
+            assert mock_post.call_count == 1
+            call_kwargs = mock_post.call_args
+            posted_data = json.loads(call_kwargs.kwargs.get("data", call_kwargs[1].get("data", "")))
+            assert len(posted_data["data"]) == 3
+
+        r.shutdown()
+
+    def test_multiple_instrumentations_including_adk(self):
+        """Both FakeInstrumentor and GoogleAdkInstrumentor can be active together."""
+        from respan import Respan
+        from respan_instrumentation_google_adk import GoogleAdkInstrumentor
+
+        class FakeInstrumentor:
+            name = "fake"
+            def activate(self, exporter): pass
+            def deactivate(self): pass
+
+        r = Respan(
+            api_key="test-key",
+            instrumentations=[FakeInstrumentor(), GoogleAdkInstrumentor()],
+        )
+        assert "fake" in r._instrumentations
+        assert "google-adk" in r._instrumentations
         r.shutdown()

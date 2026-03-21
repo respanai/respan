@@ -10,7 +10,7 @@ import os
 from unittest.mock import MagicMock, patch
 
 import pytest
-from conftest import _make_trace
+from conftest import _make_trace, _make_adk_spans
 
 
 @pytest.fixture
@@ -88,6 +88,102 @@ class TestRealBackend:
         )
         result = await Runner.run(agent, "Say hi")
         print(f"Agent output: {result.final_output}")
+
+        r.flush()
+        r.shutdown()
+
+
+@pytest.fixture
+def google_api_key():
+    key = os.getenv("GOOGLE_API_KEY")
+    if not key:
+        pytest.skip("GOOGLE_API_KEY not set")
+    return key
+
+
+class TestGoogleAdkRealBackend:
+    """Tests that send Google ADK traces to the real Respan backend."""
+
+    def test_google_adk_exporter_sends_to_respan(self, respan_api_key, respan_base_url):
+        """RespanSpanExporterV2 + AdkSpanConverter -> POST to real endpoint."""
+        from respan_tracing.exporters import RespanSpanExporterV2
+        from respan_instrumentation_google_adk.converter import AdkSpanConverter
+
+        endpoint = f"{respan_base_url.rstrip('/')}/v1/traces/ingest"
+        exp = RespanSpanExporterV2(api_key=respan_api_key, endpoint=endpoint)
+
+        converter = AdkSpanConverter(environment="test")
+        spans = _make_adk_spans()
+        payloads = converter.convert(trace_or_spans=spans)
+        assert len(payloads) == 3
+
+        exp.export(payloads)
+        exp.flush()
+        exp.shutdown()
+
+    def test_google_adk_full_pipeline(self, respan_api_key, respan_base_url):
+        """Full Respan pipeline with GoogleAdkInstrumentor: init -> convert -> flush."""
+        from respan import Respan
+        from respan_instrumentation_google_adk import GoogleAdkInstrumentor
+        from respan_instrumentation_google_adk.converter import AdkSpanConverter
+
+        r = Respan(
+            api_key=respan_api_key,
+            base_url=respan_base_url,
+            instrumentations=[GoogleAdkInstrumentor(environment="test")],
+        )
+
+        converter = AdkSpanConverter(environment="test")
+        spans = _make_adk_spans()
+        payloads = converter.convert(trace_or_spans=spans)
+
+        r.exporter.export(payloads)
+        r.flush()
+        r.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_google_adk_real_agent_run(self, respan_api_key, respan_base_url, google_api_key):
+        """Run a real ADK agent and verify traces are sent to Respan."""
+        from google.adk.agents import Agent
+        from google.adk.runners import InMemoryRunner
+        from google.genai import types
+
+        from respan import Respan
+        from respan_instrumentation_google_adk import GoogleAdkInstrumentor
+
+        os.environ["ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS"] = "true"
+
+        r = Respan(
+            api_key=respan_api_key,
+            base_url=respan_base_url,
+            instrumentations=[GoogleAdkInstrumentor(environment="test")],
+        )
+
+        agent = Agent(
+            name="TestAgent",
+            model="gemini-2.5-flash",
+            instruction="You only respond with the word 'hello'.",
+        )
+
+        runner = InMemoryRunner(agent=agent, app_name="e2e_test")
+        session = await runner.session_service.create_session(
+            app_name="e2e_test", user_id="test-user"
+        )
+
+        message = types.Content(
+            role="user",
+            parts=[types.Part(text="Say hi")],
+        )
+
+        async for event in runner.run_async(
+            user_id=session.user_id,
+            session_id=session.id,
+            new_message=message,
+        ):
+            if event.content and event.content.parts:
+                for part in event.content.parts:
+                    if part.text:
+                        print(f"Agent output: {part.text}")
 
         r.flush()
         r.shutdown()
