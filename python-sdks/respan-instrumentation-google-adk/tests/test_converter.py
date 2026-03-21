@@ -135,13 +135,13 @@ class TestMapLogType:
         assert self.converter._map_log_type("agent_run", "parent", None) == "agent"
 
     def test_call_llm(self):
-        assert self.converter._map_log_type("call_llm", "parent", None) == "chat"
+        assert self.converter._map_log_type("call_llm", "parent", None) == "generation"
 
     def test_execute_tool(self):
         assert self.converter._map_log_type("execute_tool", "parent", None) == "tool"
 
     def test_fallback_model(self):
-        assert self.converter._map_log_type("unknown_span", None, "gemini-2.0") == "chat"
+        assert self.converter._map_log_type("unknown_span", None, "gemini-2.0") == "generation"
 
     def test_fallback_no_parent(self):
         assert self.converter._map_log_type("unknown_span", None, None) == "workflow"
@@ -220,7 +220,7 @@ class TestConvert:
 
         assert len(payloads) == 1
         payload = payloads[0]
-        assert payload["log_type"] == "chat"
+        assert payload["log_type"] == "generation"
         assert payload["model"] == "gemini-2.0-flash"
         assert payload["prompt_tokens"] == 10
         assert payload["completion_tokens"] == 20
@@ -407,10 +407,10 @@ class TestConvert:
 
         assert len(payloads) == 3
         log_types = {p["log_type"] for p in payloads}
-        assert log_types == {"workflow", "agent", "chat"}
+        assert log_types == {"workflow", "agent", "generation"}
 
         # Output should propagate from generation to workflow/agent
-        gen_payload = next(p for p in payloads if p["log_type"] == "chat")
+        gen_payload = next(p for p in payloads if p["log_type"] == "generation")
         assert gen_payload["output"] is not None
 
         wf_payload = next(p for p in payloads if p["log_type"] == "workflow")
@@ -469,12 +469,12 @@ class TestMultiTurnPattern:
         return [invocation, agent_run, call_llm]
 
     def test_single_turn_produces_correct_log_types(self):
-        from respan_sdk.constants.llm_logging import LOG_TYPE_WORKFLOW, LOG_TYPE_AGENT, LOG_TYPE_CHAT
+        from respan_sdk.constants.llm_logging import LOG_TYPE_WORKFLOW, LOG_TYPE_AGENT, LOG_TYPE_GENERATION
         spans = self._make_turn(0, "Hi! My name is Alex.", "Hello Alex!")
         payloads = self.converter.convert(trace_or_spans=_spans_to_dicts(spans))
         assert len(payloads) == 3
         log_types = {p["log_type"] for p in payloads}
-        assert log_types == {LOG_TYPE_WORKFLOW, LOG_TYPE_AGENT, LOG_TYPE_CHAT}
+        assert log_types == {LOG_TYPE_WORKFLOW, LOG_TYPE_AGENT, LOG_TYPE_GENERATION}
 
     def test_conversation_id_propagates(self):
         conv_id = "session-mt-abc"
@@ -488,8 +488,8 @@ class TestMultiTurnPattern:
         turn2 = self._make_turn(2, "Tell me a fun fact.", "42 is the answer.")
         p0 = self.converter.convert(trace_or_spans=_spans_to_dicts(turn0))
         p2 = self.converter.convert(trace_or_spans=_spans_to_dicts(turn2))
-        gen0 = next(p for p in p0 if p["log_type"] == "chat")
-        gen2 = next(p for p in p2 if p["log_type"] == "chat")
+        gen0 = next(p for p in p0 if p["log_type"] == "generation")
+        gen2 = next(p for p in p2 if p["log_type"] == "generation")
         assert gen2["prompt_tokens"] > gen0["prompt_tokens"]
 
     def test_output_propagates_to_workflow_and_agent(self):
@@ -497,7 +497,7 @@ class TestMultiTurnPattern:
         payloads = self.converter.convert(trace_or_spans=_spans_to_dicts(spans))
         wf = next(p for p in payloads if p["log_type"] == "workflow")
         agent = next(p for p in payloads if p["log_type"] == "agent")
-        gen = next(p for p in payloads if p["log_type"] == "chat")
+        gen = next(p for p in payloads if p["log_type"] == "generation")
         assert gen["output"] is not None
         assert wf["output"] is not None
         assert agent["output"] is not None
@@ -507,7 +507,7 @@ class TestMultiTurnPattern:
         payloads = self.converter.convert(trace_or_spans=_spans_to_dicts(spans))
         wf = next(p for p in payloads if p["log_type"] == "workflow")
         agent = next(p for p in payloads if p["log_type"] == "agent")
-        gen = next(p for p in payloads if p["log_type"] == "chat")
+        gen = next(p for p in payloads if p["log_type"] == "generation")
         assert wf.get("parent_id") is None
         assert agent.get("parent_id") == wf["span_id"] or agent.get("span_parent_id") == wf["span_id"]
         assert gen.get("parent_id") == agent["span_id"] or gen.get("span_parent_id") == agent["span_id"]
@@ -556,17 +556,17 @@ class TestStreamingPattern:
         return [invocation, agent_run, call_llm]
 
     def test_streaming_produces_three_spans(self):
-        from respan_sdk.constants.llm_logging import LOG_TYPE_WORKFLOW, LOG_TYPE_AGENT, LOG_TYPE_CHAT
+        from respan_sdk.constants.llm_logging import LOG_TYPE_WORKFLOW, LOG_TYPE_AGENT, LOG_TYPE_GENERATION
         spans = self._make_streaming_spans()
         payloads = self.converter.convert(trace_or_spans=_spans_to_dicts(spans))
         assert len(payloads) == 3
         log_types = {p["log_type"] for p in payloads}
-        assert log_types == {LOG_TYPE_WORKFLOW, LOG_TYPE_AGENT, LOG_TYPE_CHAT}
+        assert log_types == {LOG_TYPE_WORKFLOW, LOG_TYPE_AGENT, LOG_TYPE_GENERATION}
 
     def test_streaming_token_counts(self):
         spans = self._make_streaming_spans()
         payloads = self.converter.convert(trace_or_spans=_spans_to_dicts(spans))
-        gen = next(p for p in payloads if p["log_type"] == "chat")
+        gen = next(p for p in payloads if p["log_type"] == "generation")
         assert gen["prompt_tokens"] == 25
         assert gen["completion_tokens"] == 200
         assert gen["total_request_tokens"] == 225
@@ -574,7 +574,7 @@ class TestStreamingPattern:
     def test_streaming_llm_config_preserved(self):
         spans = self._make_streaming_spans()
         payloads = self.converter.convert(trace_or_spans=_spans_to_dicts(spans))
-        gen = next(p for p in payloads if p["log_type"] == "chat")
+        gen = next(p for p in payloads if p["log_type"] == "generation")
         llm_config = gen["metadata"]["llm_config"]
         assert llm_config["temperature"] == 0.9
         assert llm_config["top_p"] == 0.95
@@ -582,7 +582,7 @@ class TestStreamingPattern:
     def test_streaming_latency_reflects_duration(self):
         spans = self._make_streaming_spans()
         payloads = self.converter.convert(trace_or_spans=_spans_to_dicts(spans))
-        gen = next(p for p in payloads if p["log_type"] == "chat")
+        gen = next(p for p in payloads if p["log_type"] == "generation")
         assert gen["latency"] is not None
         assert gen["latency"] > 4.0
 
@@ -592,7 +592,7 @@ class TestToolCallsPattern:
         self.converter = AdkSpanConverter()
 
     def _make_tool_call_spans(self):
-        from respan_sdk.constants.llm_logging import LOG_TYPE_WORKFLOW, LOG_TYPE_AGENT, LOG_TYPE_CHAT, LOG_TYPE_TOOL
+        from respan_sdk.constants.llm_logging import LOG_TYPE_WORKFLOW, LOG_TYPE_AGENT, LOG_TYPE_GENERATION, LOG_TYPE_TOOL
         base = 1_700_000_000_000_000_000
         invocation = _make_span(name="invocation", span_id=0xB000000000000001, start_time=base, end_time=base + 4_000_000_000)
         agent_run = _make_span(name="agent_run", span_id=0xB000000000000002, parent_span_id=0xB000000000000001, attributes={"gen_ai.agent.name": "weather_agent"}, start_time=base + 50_000_000, end_time=base + 3_950_000_000)
@@ -607,7 +607,7 @@ class TestToolCallsPattern:
         assert len(payloads) == 5
 
     def test_tool_call_log_types(self):
-        from respan_sdk.constants.llm_logging import LOG_TYPE_WORKFLOW, LOG_TYPE_AGENT, LOG_TYPE_CHAT, LOG_TYPE_TOOL
+        from respan_sdk.constants.llm_logging import LOG_TYPE_WORKFLOW, LOG_TYPE_AGENT, LOG_TYPE_GENERATION, LOG_TYPE_TOOL
         spans = self._make_tool_call_spans()
         payloads = self.converter.convert(trace_or_spans=_spans_to_dicts(spans))
         type_counts = {}
@@ -616,7 +616,7 @@ class TestToolCallsPattern:
             type_counts[lt] = type_counts.get(lt, 0) + 1
         assert type_counts[LOG_TYPE_WORKFLOW] == 1
         assert type_counts[LOG_TYPE_AGENT] == 1
-        assert type_counts[LOG_TYPE_CHAT] == 2
+        assert type_counts[LOG_TYPE_GENERATION] == 2
         assert type_counts[LOG_TYPE_TOOL] == 1
 
     def test_tool_span_has_tool_name(self):
@@ -628,7 +628,7 @@ class TestToolCallsPattern:
     def test_generation_spans_have_different_token_counts(self):
         spans = self._make_tool_call_spans()
         payloads = self.converter.convert(trace_or_spans=_spans_to_dicts(spans))
-        gens = [p for p in payloads if p["log_type"] == "chat"]
+        gens = [p for p in payloads if p["log_type"] == "generation"]
         assert len(gens) == 2
         gens.sort(key=lambda p: p.get("prompt_tokens", 0))
         assert gens[0]["prompt_tokens"] == 30
