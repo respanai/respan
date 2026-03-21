@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 _ADK_SCOPE_NAMES = {"gcp.vertex.agent", "google_adk", "google-adk"}
 
 # Span names that indicate a Google ADK instrumented span
-_ADK_SPAN_NAMES = {"invocation", "agent_run", "call_llm", "execute_tool", "invoke_agent"}
+_ADK_SPAN_NAMES = {"invocation", "agent_run", "call_llm", "execute_tool", "invoke_agent", "generate_content"}
 
 
 def _is_adk_span(span: ReadableSpan) -> bool:

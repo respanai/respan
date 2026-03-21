@@ -23,7 +23,7 @@ def format_span_id(span_id: int) -> str:
 
 
 _ADK_SCOPE_NAMES = {"gcp.vertex.agent", "google_adk", "google-adk"}
-_ADK_SPAN_NAMES = {"invocation", "agent_run", "call_llm", "execute_tool", "invoke_agent"}
+_ADK_SPAN_NAMES = {"invocation", "agent_run", "call_llm", "execute_tool", "invoke_agent", "generate_content"}
 
 
 def is_adk_span(span: object) -> bool:
