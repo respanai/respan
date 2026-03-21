@@ -10,3 +10,4 @@
 **/*/.DS_Store
 **/poetry.lock
 _verify_sdks/
+.mcp.json
