@@ -49,8 +49,8 @@ def is_processable_span(span: ReadableSpan) -> bool:
     Returns:
         bool: True if span should be processed, False if it should be filtered out
     """
-    # Instrumentation plugin spans (e.g. Google ADK) — these are handled by their
-    # own exporters, so let them through the filter
+    # Instrumentation plugin spans (e.g. Google ADK) — allowlisted so the default
+    # OTLP exporter (RespanSpanExporter) can enrich and export them
     if _is_adk_span(span):
         logger.debug(
             "[Respan Debug] Processing Google ADK span: %s", span.name
