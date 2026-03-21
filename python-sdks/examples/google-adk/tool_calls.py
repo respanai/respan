@@ -25,7 +25,10 @@ from respan import Respan
 from respan_instrumentation_google_adk import GoogleAdkInstrumentor
 
 # Enable Respan instrumentation
-respan = Respan(instrumentations=[GoogleAdkInstrumentor(environment="development")])
+respan = Respan(
+    instrumentations=[GoogleAdkInstrumentor()],
+    environment="development",
+)
 
 os.environ["ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS"] = "true"
 

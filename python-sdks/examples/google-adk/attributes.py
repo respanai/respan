@@ -24,12 +24,9 @@ from respan import Respan
 from respan_instrumentation_google_adk import GoogleAdkInstrumentor
 
 respan = Respan(
-    instrumentations=[
-        GoogleAdkInstrumentor(
-            environment="development",
-            customer_identifier="default-user",
-        )
-    ],
+    instrumentations=[GoogleAdkInstrumentor()],
+    environment="development",
+    customer_identifier="default-user",
     metadata={"service": "chat-api", "version": "1.0.0"},
 )
 

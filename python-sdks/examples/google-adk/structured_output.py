@@ -23,7 +23,10 @@ from google.genai import types
 from respan import Respan
 from respan_instrumentation_google_adk import GoogleAdkInstrumentor
 
-respan = Respan(instrumentations=[GoogleAdkInstrumentor(environment="development")])
+respan = Respan(
+    instrumentations=[GoogleAdkInstrumentor()],
+    environment="development",
+)
 
 os.environ["ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS"] = "true"
 

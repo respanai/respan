@@ -10,7 +10,6 @@ respan-exporter-agno.
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
 
 from .processor import patch_span_processors
 
@@ -29,19 +28,14 @@ class GoogleAdkInstrumentor:
         from respan import Respan
         from respan_instrumentation_google_adk import GoogleAdkInstrumentor
 
-        respan = Respan(instrumentations=[GoogleAdkInstrumentor()])
+        respan = Respan(
+            instrumentations=[GoogleAdkInstrumentor()],
+            environment="development",
+            customer_identifier="demo-user",
+        )
     """
 
     name = "google-adk"
-
-    def __init__(
-        self,
-        environment: Optional[str] = None,
-        customer_identifier: Optional[str] = None,
-        **kwargs: Any,
-    ) -> None:
-        self.environment = environment
-        self.customer_identifier = customer_identifier
 
     def activate(self) -> None:
         """Patch span processors for ADK enrichment."""

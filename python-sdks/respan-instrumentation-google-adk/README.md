@@ -14,7 +14,10 @@ pip install respan-instrumentation-google-adk
 from respan import Respan
 from respan_instrumentation_google_adk import GoogleAdkInstrumentor
 
-respan = Respan(instrumentations=[GoogleAdkInstrumentor(environment="development")])
+respan = Respan(
+    instrumentations=[GoogleAdkInstrumentor()],
+    environment="development",
+)
 ```
 
 ## Environment Variables
