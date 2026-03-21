@@ -164,7 +164,7 @@ def _enrich_adk_trace_group(spans: List[ReadableSpan]) -> List[ReadableSpan]:
         prefix = (span.name or "").split(" ")[0]
         attrs = span.attributes or {}
 
-        if prefix == "invoke_agent" and not agent_name:
+        if not agent_name:
             agent_name = attrs.get("gen_ai.agent.name")
 
         # Collect input/output from LLM spans

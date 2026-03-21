@@ -187,6 +187,22 @@ class TestEnrichAdkBatch:
         assert len(root) == 1
         assert root[0].name == "MyAgent"
 
+    def test_agent_name_from_agent_run_span(self):
+        """Agent name on agent_run span should rename invocation (single-agent case)."""
+        invocation = _make_adk_span("invocation", {
+            "gen_ai.system": "google_genai",
+        }, trace_id=0xBBBB, span_id=0x1111)
+
+        agent_run = _make_adk_span("agent_run", {
+            "gen_ai.agent.name": "greeting_agent",
+            "gen_ai.system": "google_genai",
+        }, trace_id=0xBBBB, span_id=0x2222, parent_span_id=0x1111)
+
+        result = enrich_adk_batch([invocation, agent_run])
+        root = [s for s in result if s.attributes.get("traceloop.span.kind") == "workflow"]
+        assert len(root) == 1
+        assert root[0].name == "greeting_agent"
+
     def test_mixed_adk_and_non_adk_batch(self):
         """Batch with both ADK and non-ADK spans should handle both correctly."""
         non_adk = Mock()
