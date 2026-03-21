@@ -9,31 +9,25 @@ from agents.tracing.spans import Span
 from agents.tracing.traces import Trace
 
 from ._converter import convert_to_respan_log
+from ._otel_emitter import emit_sdk_item
 
 logger = logging.getLogger(__name__)
 
 
 class _RespanTracingProcessor(TracingProcessor):
-    """OpenAI Agents SDK TracingProcessor that forwards spans to RespanSpanExporterV2."""
-
-    def __init__(self, exporter: Any) -> None:
-        self._exporter = exporter
+    """OpenAI Agents SDK TracingProcessor that emits spans into the OTEL pipeline."""
 
     def on_trace_start(self, trace: Trace) -> None:
         pass
 
     def on_trace_end(self, trace: Trace) -> None:
-        data = convert_to_respan_log(trace)
-        if data:
-            self._exporter.export([data])
+        emit_sdk_item(trace)
 
     def on_span_start(self, span: Span[Any]) -> None:
         pass
 
     def on_span_end(self, span: Span[Any]) -> None:
-        data = convert_to_respan_log(span)
-        if data:
-            self._exporter.export([data])
+        emit_sdk_item(span)
 
     def shutdown(self) -> None:
         pass
@@ -46,8 +40,9 @@ class OpenAIAgentsInstrumentor:
     """Respan instrumentor for the OpenAI Agents SDK.
 
     Registers a ``TracingProcessor`` that converts OpenAI Agents SDK
-    traces/spans to Respan log dicts and exports them via the provided
-    exporter.
+    traces/spans to OTEL ``ReadableSpan`` objects and injects them into
+    the single OTEL pipeline (``TracerProvider`` → ``RespanSpanExporter``
+    → ``/v2/traces``).
 
     Usage::
 
@@ -62,18 +57,15 @@ class OpenAIAgentsInstrumentor:
     def __init__(self) -> None:
         self._processor: Optional[_RespanTracingProcessor] = None
 
-    def activate(self, exporter: Any) -> None:
+    def activate(self) -> None:
         """Register the tracing processor with the OpenAI Agents SDK.
 
         Replaces the default OpenAI backend processor so traces are only
         sent to Respan, not to OpenAI's tracing endpoint.
-
-        Args:
-            exporter: A ``RespanSpanExporterV2`` instance (or compatible).
         """
         from agents.tracing import set_trace_processors
 
-        self._processor = _RespanTracingProcessor(exporter)
+        self._processor = _RespanTracingProcessor()
         set_trace_processors([self._processor])
         logger.info("OpenAI Agents SDK instrumentation activated")
 

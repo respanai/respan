@@ -19,8 +19,9 @@ load_dotenv()
 
 from openai import OpenAI
 from respan import Respan, workflow, task
+from respan_instrumentation_openai import OpenAIInstrumentor
 
-respan = Respan()
+respan = Respan(instrumentations=[OpenAIInstrumentor()])
 
 # Batch API requires direct OpenAI access (not gateway).
 # The .env has a direct OPENAI_API_KEY (not the Respan gateway key).

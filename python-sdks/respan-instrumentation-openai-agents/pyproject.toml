@@ -12,6 +12,7 @@ packages = [
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
 respan-ai = ">=3.0.0"
+respan-tracing = ">=2.3.0"
 respan-sdk = ">=2.5.0"
 openai-agents = ">=0.3.1"
 

@@ -1,6 +1,6 @@
 """Instrumentation protocol for Respan plugins."""
 
-from typing import Any, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 
 @runtime_checkable
@@ -9,17 +9,17 @@ class Instrumentation(Protocol):
 
     Plugins are discovered via the ``respan.instrumentations`` entry-point
     group and activated by the ``Respan`` class at startup.
+
+    Plugins hook into external SDKs and emit ``ReadableSpan`` objects into
+    the single OTEL pipeline via ``inject_span()``.  No exporter argument
+    is needed — spans flow through the ``TracerProvider``'s processor chain
+    automatically.
     """
 
     name: str
 
-    def activate(self, exporter: Any) -> None:
-        """Start intercepting spans and forwarding them to *exporter*.
-
-        Args:
-            exporter: A ``RespanSpanExporterV2`` instance (or compatible)
-                      whose ``export([dict, ...])`` method accepts log dicts.
-        """
+    def activate(self) -> None:
+        """Start intercepting spans and injecting them into the OTEL pipeline."""
         ...
 
     def deactivate(self) -> None:
