@@ -11,6 +11,7 @@ import logging
 from respan_tracing.constants.generic_constants import LOGGER_NAME
 from typing import Any, Dict, List
 from opentelemetry.trace import SpanContext
+from opentelemetry.semconv_ai import SpanAttributes
 
 from respan_tracing.constants.respan_config import (
     HIGHLIGHTED_ATTRIBUTE_KEY_SUBSTRINGS,
@@ -91,8 +92,8 @@ def build_spans_export_preview(spans: List[Any]) -> List[Dict[str, Any]]:
                     "trace_id": format(ctx.trace_id, "032x") if ctx else None,
                     "span_id": format(ctx.span_id, "016x") if ctx else None,
                     "parent_span_id": getattr(s._parent, "span_id", None),
-                    "kind": attrs.get("traceloop.span.kind"),
-                    "entity_path": attrs.get("traceloop.entity.path"),
+                    "kind": attrs.get(SpanAttributes.TRACELOOP_SPAN_KIND),
+                    "entity_path": attrs.get(SpanAttributes.TRACELOOP_ENTITY_PATH),
                     "attributes_count": len(attrs),
                     "highlighted_attributes": {
                         str(k): _safe_value_for_preview(attrs.get(k))

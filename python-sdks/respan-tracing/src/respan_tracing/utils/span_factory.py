@@ -36,6 +36,17 @@ from respan_sdk.utils.data_processing.id_processing import (
     ensure_trace_id,
     ensure_span_id,
 )
+from respan_tracing.constants.context_constants import (
+    PROP_CUSTOMER_IDENTIFIER,
+    PROP_CUSTOMER_EMAIL,
+    PROP_CUSTOMER_NAME,
+    PROP_THREAD_IDENTIFIER,
+    PROP_CUSTOM_IDENTIFIER,
+    PROP_GROUP_IDENTIFIER,
+    PROP_ENVIRONMENT,
+    PROP_METADATA,
+    PROP_PROMPT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,15 +71,15 @@ _PROPAGATED_ATTRIBUTES: contextvars.ContextVar[Dict[str, Any]] = contextvars.Con
 
 # Keys that are merged into every span when set via propagate_attributes
 _SUPPORTED_ATTRIBUTE_KEYS = frozenset({
-    "customer_identifier",
-    "customer_email",
-    "customer_name",
-    "thread_identifier",
-    "custom_identifier",
-    "group_identifier",
-    "environment",
-    "metadata",
-    "prompt",
+    PROP_CUSTOMER_IDENTIFIER,
+    PROP_CUSTOMER_EMAIL,
+    PROP_CUSTOMER_NAME,
+    PROP_THREAD_IDENTIFIER,
+    PROP_CUSTOM_IDENTIFIER,
+    PROP_GROUP_IDENTIFIER,
+    PROP_ENVIRONMENT,
+    PROP_METADATA,
+    PROP_PROMPT,
 })
 
 
@@ -102,9 +113,9 @@ def propagate_attributes(**kwargs):
         if key not in _SUPPORTED_ATTRIBUTE_KEYS:
             logger.warning("Ignoring unsupported attribute: %s", key)
             continue
-        if key == "metadata" and isinstance(value, dict):
+        if key == PROP_METADATA and isinstance(value, dict):
             # Merge metadata dicts instead of replacing
-            merged["metadata"] = {**merged.get("metadata", {}), **value}
+            merged[PROP_METADATA] = {**merged.get(PROP_METADATA, {}), **value}
         else:
             merged[key] = value
 
@@ -135,15 +146,15 @@ def read_propagated_attributes() -> Dict[str, Any]:
 
     result: Dict[str, Any] = {}
     for key, value in ctx_attrs.items():
-        if key == "metadata" and isinstance(value, dict):
+        if key == PROP_METADATA and isinstance(value, dict):
             # Metadata is stored as individual respan.metadata.<key> attributes
             for mk, mv in value.items():
                 attr_key = f"{RespanSpanAttributes.RESPAN_METADATA.value}.{mk}"
                 result[attr_key] = str(mv) if not isinstance(mv, str) else mv
-        elif key == "prompt" and isinstance(value, dict):
+        elif key == PROP_PROMPT and isinstance(value, dict):
             # Prompt config: store as JSON string for the exporter to pick up
             result[RESPAN_PROMPT] = json.dumps(value, default=str)
-        elif key == "environment":
+        elif key == PROP_ENVIRONMENT:
             result[RESPAN_ENVIRONMENT] = value
         elif key in RESPAN_SPAN_ATTRIBUTES_MAP:
             result[RESPAN_SPAN_ATTRIBUTES_MAP[key]] = value

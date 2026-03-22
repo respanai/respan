@@ -23,7 +23,7 @@ from respan_tracing.utils.logging import get_respan_logger
 
 
 from ..constants.generic_constants import LOGGER_NAME_SPAN
-from ..constants.context_constants import PENDING_SPAN_LINKS_KEY
+from ..constants.context_constants import PENDING_SPAN_LINKS_KEY, PROP_METADATA
 
 __all__ = ["SpanLink", "span_link_to_otel", "span_to_link", "respan_span_attributes", "attach_span_links"]
 
@@ -168,7 +168,7 @@ def respan_span_attributes(respan_params: Union[Dict[str, Any], RespanParams]):
         )
         
         for key, value in validated_params.model_dump(mode="json").items():
-            if key in RESPAN_SPAN_ATTRIBUTES_MAP and key != "metadata":
+            if key in RESPAN_SPAN_ATTRIBUTES_MAP and key != PROP_METADATA:
                 try:
                     current_span.set_attribute(RESPAN_SPAN_ATTRIBUTES_MAP[key], value)
                 except (ValueError, TypeError) as e:
@@ -176,7 +176,7 @@ def respan_span_attributes(respan_params: Union[Dict[str, Any], RespanParams]):
                         f"Failed to set span attribute {RESPAN_SPAN_ATTRIBUTES_MAP[key]}={value}: {str(e)}"
                     )
             # Treat metadata as a special case
-            if key == "metadata":
+            if key == PROP_METADATA:
                 for metadata_key, metadata_value in value.items():
                     current_span.set_attribute(f"{RespanSpanAttributes.RESPAN_METADATA.value}.{metadata_key}", metadata_value)
         yield
