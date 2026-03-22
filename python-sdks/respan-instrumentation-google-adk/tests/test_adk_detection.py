@@ -1,6 +1,8 @@
 """Tests for ADK span detection."""
 from unittest.mock import Mock
 
+from opentelemetry.semconv_ai import SpanAttributes
+
 from respan_instrumentation_google_adk.adk_detection import (
     ADK_SCOPE_NAMES,
     ADK_SPAN_NAMES,
@@ -39,7 +41,7 @@ class TestIsAdkSpan:
     def test_unknown_scope_with_adk_name_and_gen_ai(self):
         span = _make_span(
             name="call_llm",
-            attributes={"gen_ai.system": "vertex_ai"},
+            attributes={SpanAttributes.LLM_SYSTEM: "vertex_ai"},
             scope_name="unknown",
         )
         assert is_adk_span(span) is True
@@ -59,7 +61,7 @@ class TestIsAdkSpan:
     def test_generate_content_with_gen_ai(self):
         span = _make_span(
             name="generate_content",
-            attributes={"gen_ai.system": "vertex_ai"},
+            attributes={SpanAttributes.LLM_SYSTEM: "vertex_ai"},
             scope_name="other",
         )
         assert is_adk_span(span) is True
@@ -73,7 +75,7 @@ class TestIsAdkSpan:
         for span_name in ADK_SPAN_NAMES:
             span = _make_span(
                 name=span_name,
-                attributes={"gen_ai.request.model": "gemini-2.5-flash"},
+                attributes={SpanAttributes.LLM_REQUEST_MODEL: "gemini-2.5-flash"},
                 scope_name="unknown",
             )
             assert is_adk_span(span) is True

@@ -7,16 +7,25 @@ events, links, status) without rebuilding from scratch.
 """
 
 import json
-import logging
 from typing import Dict, List, Optional, Sequence, Any, Set
 
 from opentelemetry.sdk.trace import ReadableSpan
+from opentelemetry.semconv_ai import SpanAttributes, TraceloopSpanKindValues
 
+from respan_sdk.constants.llm_logging import (
+    LOG_TYPE_CHAT,
+    LOG_TYPE_TOOL,
+    LOG_TYPE_WORKFLOW,
+    LogMethodChoices,
+)
+from respan_sdk.constants.otlp_constants import OTEL_SCOPE_NAME_KEY, OTEL_SCOPE_VERSION_KEY
+from respan_sdk.respan_types.span_types import RespanSpanAttributes
 from respan_tracing.exporters.respan import EnrichedSpan
+from respan_tracing.utils.logging import get_respan_logger
 
 from .adk_detection import is_adk_span
 
-logger = logging.getLogger(__name__)
+logger = get_respan_logger("instrumentation.google_adk")
 
 
 # Internal/redundant ADK attributes that should NOT appear in enriched spans.
@@ -33,8 +42,8 @@ _ADK_STRIP_ATTRS: Set[str] = {
     "gcp.vertex.agent.tool_call_args",
     "gcp.vertex.agent.tool_response",
     # Infrastructure attributes
-    "otel.scope.name",
-    "otel.scope.version",
+    OTEL_SCOPE_NAME_KEY,
+    OTEL_SCOPE_VERSION_KEY,
     "service.name",
     # Empty/redundant gen_ai attributes
     "gen_ai.agent.description",
@@ -135,12 +144,12 @@ def _enrich_adk_trace_group(spans: List[ReadableSpan]) -> List[ReadableSpan]:
             if first_input is None:
                 first_input = (
                     attrs.get("gen_ai.input.messages")
-                    or attrs.get("gen_ai.prompt")
+                    or attrs.get(SpanAttributes.LLM_PROMPTS)
                     or _extract_adk_input(attrs.get("gcp.vertex.agent.llm_request", ""))
                 )
             output = (
                 attrs.get("gen_ai.output.messages")
-                or attrs.get("gen_ai.completion")
+                or attrs.get(SpanAttributes.LLM_COMPLETIONS)
                 or _extract_adk_output(attrs.get("gcp.vertex.agent.llm_response", ""))
             )
             if output:
@@ -174,51 +183,57 @@ def _enrich_adk_trace_group(spans: List[ReadableSpan]) -> List[ReadableSpan]:
             # Root span: rename to agent name, add workflow kind, propagate I/O
             if agent_name:
                 name_override = agent_name
-            extra["traceloop.span.kind"] = "workflow"
+            extra[SpanAttributes.TRACELOOP_SPAN_KIND] = TraceloopSpanKindValues.WORKFLOW.value
+            extra[RespanSpanAttributes.LOG_TYPE.value] = LOG_TYPE_WORKFLOW
+            extra[RespanSpanAttributes.LOG_METHOD.value] = LogMethodChoices.TRACING_INTEGRATION.value
             if first_input:
-                extra["traceloop.entity.input"] = first_input
+                extra[SpanAttributes.TRACELOOP_ENTITY_INPUT] = first_input
             if last_output:
-                extra["traceloop.entity.output"] = last_output
+                extra[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = last_output
             # Fall back to ADK session_id when no thread_identifier was propagated
-            if session_id and not attrs.get("respan.threads.thread_identifier"):
-                extra["respan.threads.thread_identifier"] = session_id
+            if session_id and not attrs.get(RespanSpanAttributes.RESPAN_THREADS_ID.value):
+                extra[RespanSpanAttributes.RESPAN_THREADS_ID.value] = session_id
             is_root = True
         else:
             # Child spans: add entity path to prevent root promotion
-            extra["traceloop.entity.path"] = f"adk.{prefix}"
+            extra[SpanAttributes.TRACELOOP_ENTITY_PATH] = f"adk.{prefix}"
 
             if prefix in ("call_llm", "generate_content"):
                 # LLM spans: add request type + map token attributes
-                extra["llm.request.type"] = "chat"
+                extra[SpanAttributes.LLM_REQUEST_TYPE] = "chat"
+                extra[RespanSpanAttributes.LOG_TYPE.value] = LOG_TYPE_CHAT
+                extra[RespanSpanAttributes.LOG_METHOD.value] = LogMethodChoices.TRACING_INTEGRATION.value
                 input_tokens = attrs.get("gen_ai.usage.input_tokens")
                 output_tokens = attrs.get("gen_ai.usage.output_tokens")
                 if input_tokens is not None:
-                    extra["gen_ai.usage.prompt_tokens"] = input_tokens
+                    extra[SpanAttributes.LLM_USAGE_PROMPT_TOKENS] = input_tokens
                 if output_tokens is not None:
-                    extra["gen_ai.usage.completion_tokens"] = output_tokens
+                    extra[SpanAttributes.LLM_USAGE_COMPLETION_TOKENS] = output_tokens
                 # Map input/output
                 messages_in = (
                     attrs.get("gen_ai.input.messages")
-                    or attrs.get("gen_ai.prompt")
+                    or attrs.get(SpanAttributes.LLM_PROMPTS)
                     or _extract_adk_input(attrs.get("gcp.vertex.agent.llm_request", ""))
                 )
                 if messages_in:
-                    extra["traceloop.entity.input"] = messages_in
+                    extra[SpanAttributes.TRACELOOP_ENTITY_INPUT] = messages_in
                 messages_out = (
                     attrs.get("gen_ai.output.messages")
-                    or attrs.get("gen_ai.completion")
+                    or attrs.get(SpanAttributes.LLM_COMPLETIONS)
                     or _extract_adk_output(attrs.get("gcp.vertex.agent.llm_response", ""))
                 )
                 if messages_out:
-                    extra["traceloop.entity.output"] = messages_out
+                    extra[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = messages_out
 
             elif prefix == "execute_tool":
+                extra[RespanSpanAttributes.LOG_TYPE.value] = LOG_TYPE_TOOL
+                extra[RespanSpanAttributes.LOG_METHOD.value] = LogMethodChoices.TRACING_INTEGRATION.value
                 tool_args = attrs.get("gcp.vertex.agent.tool_call_args")
                 if tool_args:
-                    extra["traceloop.entity.input"] = tool_args
+                    extra[SpanAttributes.TRACELOOP_ENTITY_INPUT] = tool_args
                 tool_resp = attrs.get("gcp.vertex.agent.tool_response")
                 if tool_resp:
-                    extra["traceloop.entity.output"] = tool_resp
+                    extra[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = tool_resp
 
         enriched.append(EnrichedSpan(
             span,

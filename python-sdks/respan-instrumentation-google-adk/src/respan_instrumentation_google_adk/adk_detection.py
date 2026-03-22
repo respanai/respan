@@ -1,4 +1,17 @@
-"""Detection utilities for Google ADK spans."""
+"""Detection utilities for Google ADK spans.
+
+Why this exists instead of using is_processable_span() from respan-tracing:
+
+Raw ADK spans lack the attributes that is_processable_span() checks for
+(traceloop.span.kind, traceloop.entity.path, llm.request.type, gen_ai.system).
+They carry gen_ai.agent.name and gcp.vertex.agent.* instead, so they'd be
+dropped as auto-instrumentation noise.  We need framework-specific detection
+to (1) bypass that filter and (2) route spans into the two-pass ADK enrichment.
+
+Once span_processing.py gets an instrumentation scope allowlist (see the GAP
+comment there), the bypass half could be removed and this module would only
+serve the enrichment routing purpose.
+"""
 
 # Instrumentation scope names that identify Google ADK spans
 ADK_SCOPE_NAMES = {"gcp.vertex.agent", "google_adk", "google-adk"}

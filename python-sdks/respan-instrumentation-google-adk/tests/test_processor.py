@@ -1,10 +1,11 @@
 """Tests for wrapt-based processor patching."""
 from unittest.mock import Mock, patch
 
+from opentelemetry.semconv_ai import SpanAttributes
+
 from respan_instrumentation_google_adk.processor import (
     _respan_processor_on_end_wrapper,
-    _batch_export_wrapper,
-    _on_end_wrapper,
+    _exporter_export_wrapper,
     patch_span_processors,
 )
 
@@ -12,7 +13,7 @@ from respan_instrumentation_google_adk.processor import (
 def _make_adk_span(name="call_llm"):
     span = Mock()
     span.name = name
-    span.attributes = {"gen_ai.system": "google_genai"}
+    span.attributes = {SpanAttributes.LLM_SYSTEM: "google_genai"}
     scope = Mock()
     scope.name = "google_adk"
     span.instrumentation_scope = scope
@@ -64,14 +65,14 @@ class TestRespanProcessorOnEndWrapper:
         wrapped.assert_called_once_with(span)
 
 
-class TestBatchExportWrapper:
+class TestExporterExportWrapper:
     def test_non_adk_batch_passes_through(self):
         """Batch with only non-ADK spans should pass through unchanged."""
         wrapped = Mock()
         instance = Mock()
 
         spans = [_make_non_adk_span(), _make_non_adk_span()]
-        _batch_export_wrapper(wrapped, instance, (spans,), {})
+        _exporter_export_wrapper(wrapped, instance, (spans,), {})
 
         wrapped.assert_called_once()
         call_args = wrapped.call_args[0][0]
@@ -82,7 +83,7 @@ class TestBatchExportWrapper:
 
     def test_empty_batch_passes_through(self):
         wrapped = Mock()
-        _batch_export_wrapper(wrapped, Mock(), ([],), {})
+        _exporter_export_wrapper(wrapped, Mock(), ([],), {})
         wrapped.assert_called_once()
 
     def test_adk_batch_gets_enriched(self):
@@ -91,30 +92,13 @@ class TestBatchExportWrapper:
         instance = Mock()
 
         spans = [_make_adk_span("call_llm")]
-        _batch_export_wrapper(wrapped, instance, (spans,), {})
+        _exporter_export_wrapper(wrapped, instance, (spans,), {})
 
         wrapped.assert_called_once()
         enriched = wrapped.call_args[0][0]
         assert len(enriched) == 1
         # Enriched span should have traceloop attributes
-        assert enriched[0].attributes.get("traceloop.entity.path") == "adk.call_llm"
-
-
-class TestOnEndWrapper:
-    def test_non_adk_span_passes_through(self):
-        wrapped = Mock()
-        span = _make_non_adk_span()
-        _on_end_wrapper(wrapped, Mock(), (span,), {})
-        wrapped.assert_called_once_with(span)
-
-    def test_adk_span_gets_enriched(self):
-        wrapped = Mock()
-        span = _make_adk_span("call_llm")
-        _on_end_wrapper(wrapped, Mock(), (span,), {})
-
-        wrapped.assert_called_once()
-        enriched = wrapped.call_args[0][0]
-        assert enriched.attributes.get("traceloop.entity.path") == "adk.call_llm"
+        assert enriched[0].attributes.get(SpanAttributes.TRACELOOP_ENTITY_PATH) == "adk.call_llm"
 
 
 class TestPatchSpanProcessors:

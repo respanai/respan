@@ -43,7 +43,7 @@ async def handle_request(user_id: str, text: str):
     """Simulate an API request handler with per-user attributes."""
     with respan.propagate_attributes(
         customer_identifier=user_id,
-        session_identifier=f"session_{user_id}",
+        thread_identifier=f"session_{user_id}",
         metadata={"plan": "pro"},
     ):
         runner = InMemoryRunner(agent=agent, app_name="attributes")

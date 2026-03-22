@@ -9,11 +9,11 @@ respan-exporter-agno.
 """
 from __future__ import annotations
 
-import logging
+from respan_tracing.utils.logging import get_respan_logger
 
 from .processor import patch_span_processors
 
-logger = logging.getLogger(__name__)
+logger = get_respan_logger("instrumentation.google_adk")
 
 
 class GoogleAdkInstrumentor:
