@@ -17,7 +17,9 @@ Key functions:
 import contextvars
 import json
 import logging
+import time
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Any, Dict, Optional, Sequence
 
 from opentelemetry import trace
@@ -33,11 +35,20 @@ from respan_sdk.respan_types.span_types import (
 from respan_sdk.utils.data_processing.id_processing import (
     ensure_trace_id,
     ensure_span_id,
-    iso_to_ns,
-    now_ns,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _iso_to_ns(iso_str: Optional[str]) -> Optional[int]:
+    """Convert an ISO-8601 timestamp to nanoseconds since epoch."""
+    if not iso_str:
+        return None
+    try:
+        return int(datetime.fromisoformat(iso_str).timestamp() * 1e9)
+    except Exception:
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Context-propagated attributes
@@ -208,9 +219,9 @@ def build_readable_span(
 
     # Resolve timestamps
     if start_time_ns is None:
-        start_time_ns = iso_to_ns(start_time_iso) or now_ns()
+        start_time_ns = _iso_to_ns(start_time_iso) or time.time_ns()
     if end_time_ns is None:
-        end_time_ns = iso_to_ns(end_time_iso) or now_ns()
+        end_time_ns = _iso_to_ns(end_time_iso) or time.time_ns()
 
     # Build attributes
     attrs: Dict[str, Any] = dict(attributes or {})
