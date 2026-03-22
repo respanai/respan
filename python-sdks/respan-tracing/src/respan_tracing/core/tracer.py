@@ -57,12 +57,12 @@ class RespanTracer:
         propagator: Optional[TextMapPropagator] = None,
         span_postprocess_callback: Optional[Callable[[ReadableSpan], None]] = None,
         is_enabled: bool = True,
-        auto_instrument: bool = True,
+        is_auto_instrument: bool = True,
     ):
         # Prevent re-initialization
         if hasattr(self, '_initialized'):
             return
-            
+
         self._initialized = True
         self.is_enabled = is_enabled
         self.api_endpoint = api_endpoint
@@ -70,19 +70,19 @@ class RespanTracer:
         self.headers = headers or {}
         self.is_batching_enabled = is_batching_enabled
         self.span_postprocess_callback = span_postprocess_callback
-        
+
         if not is_enabled:
             logger.info("Respan tracing is disabled")
             return
-            
+
         # Setup resource attributes
         resource_attributes = resource_attributes or {}
         resource_attributes[SERVICE_NAME] = app_name
-        
+
         # Initialize OpenTelemetry components
         self._setup_tracer_provider(resource_attributes)
         self._setup_propagation(propagator)
-        if auto_instrument:
+        if is_auto_instrument:
             self._setup_instrumentations(instruments, block_instruments)
         
         # Add default Respan processor for backward compatibility

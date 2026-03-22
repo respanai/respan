@@ -2,6 +2,8 @@ from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.semconv_ai import SpanAttributes
 import logging
 
+from respan_tracing.constants.tracing import GEN_AI_SYSTEM_ATTR
+
 logger = logging.getLogger(__name__)
 
 
@@ -75,7 +77,7 @@ def is_processable_span(span: ReadableSpan) -> bool:
     # Standalone GenAI span (has gen_ai.system, e.g. "openai")
     # This covers spans from OTEL instrumentors that don't set llm.request.type,
     # such as the OpenAI Responses API instrumentor.
-    if span.attributes.get("gen_ai.system"):
+    if span.attributes.get(GEN_AI_SYSTEM_ATTR):
         logger.debug(
             f"[Respan Debug] Processing standalone GenAI span: {span.name} "
             f"(gen_ai.system: {span.attributes.get('gen_ai.system')})"
@@ -136,7 +138,7 @@ def is_root_span_candidate(span: ReadableSpan) -> bool:
         return True
 
     # Standalone GenAI span (gen_ai.system) without entity path should become root
-    gen_ai_system = span.attributes.get("gen_ai.system")
+    gen_ai_system = span.attributes.get(GEN_AI_SYSTEM_ATTR)
     if gen_ai_system and span_kind is None and not llm_request_type and has_no_entity_path:
         logger.debug(f"[Respan Debug] Span is root candidate (standalone GenAI): {span.name}")
         return True

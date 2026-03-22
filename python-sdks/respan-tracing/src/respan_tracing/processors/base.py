@@ -23,6 +23,7 @@ from respan_tracing.constants.context_constants import (
 from respan_tracing.filters import evaluate_export_filter
 from respan_tracing.utils.preprocessing.span_processing import is_processable_span
 from respan_tracing.utils.context import get_entity_path
+from respan_tracing.utils.span_factory import read_propagated_attributes
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +101,6 @@ class RespanSpanProcessor:
         # This ensures spans created by OTEL auto-instrumentors (OpenAI, Anthropic, etc.)
         # carry the same user-context attributes as plugin-injected spans.
         try:
-            from respan_tracing.utils.span_factory import read_propagated_attributes
             propagated = read_propagated_attributes()
             for attr_key, attr_val in propagated.items():
                 if not span.attributes.get(attr_key):

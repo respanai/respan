@@ -51,9 +51,14 @@ from respan_sdk.constants.otlp_constants import (
     OTEL_STATUS_MESSAGE_KEY,
 )
 
-from ..utils.logging import get_respan_logger, build_spans_export_preview
-from ..utils.preprocessing.span_processing import is_root_span_candidate
-from ..constants.generic_constants import LOGGER_NAME_EXPORTER
+from respan_tracing.utils.logging import get_respan_logger, build_spans_export_preview
+from respan_tracing.utils.preprocessing.span_processing import is_root_span_candidate
+from respan_tracing.constants.generic_constants import LOGGER_NAME_EXPORTER
+from respan_tracing.constants.tracing import (
+    GEN_AI_SYSTEM_ATTR,
+    LLM_REQUEST_TYPE_ATTR,
+    LLM_REQUEST_TYPE_CHAT,
+)
 
 logger = get_respan_logger(LOGGER_NAME_EXPORTER)
 
@@ -342,8 +347,8 @@ def _get_enrichment_attrs(span: ReadableSpan) -> Dict[str, Any]:
     attrs = span.attributes or {}
     extra: Dict[str, Any] = {}
 
-    if attrs.get("gen_ai.system") and not attrs.get("llm.request.type"):
-        extra["llm.request.type"] = "chat"
+    if attrs.get(GEN_AI_SYSTEM_ATTR) and not attrs.get(LLM_REQUEST_TYPE_ATTR):
+        extra[LLM_REQUEST_TYPE_ATTR] = LLM_REQUEST_TYPE_CHAT
 
     return extra
 

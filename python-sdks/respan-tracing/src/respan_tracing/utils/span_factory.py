@@ -15,6 +15,7 @@ Key functions:
 """
 
 import contextvars
+import hashlib
 import json
 import logging
 import time
@@ -32,6 +33,7 @@ from respan_sdk.respan_types.span_types import (
     RESPAN_SPAN_ATTRIBUTES_MAP,
     RespanSpanAttributes,
 )
+from respan_tracing.constants.tracing import RESPAN_PROMPT_ATTR, RESPAN_ENVIRONMENT_ATTR
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +119,6 @@ def _str_to_int(val: str, bits: int) -> int:
         return int(cleaned, 16) & ((1 << bits) - 1)
     except ValueError:
         # Deterministic hash for non-hex strings
-        import hashlib
         h = hashlib.md5(cleaned.encode(), usedforsecurity=False).hexdigest()
         return int(h, 16) & ((1 << bits) - 1)
 
@@ -180,9 +181,9 @@ def read_propagated_attributes() -> Dict[str, Any]:
                 result[attr_key] = str(mv) if not isinstance(mv, str) else mv
         elif key == "prompt" and isinstance(value, dict):
             # Prompt config: store as JSON string for the exporter to pick up
-            result["respan.prompt"] = json.dumps(value, default=str)
+            result[RESPAN_PROMPT_ATTR] = json.dumps(value, default=str)
         elif key == "environment":
-            result["respan.environment"] = value
+            result[RESPAN_ENVIRONMENT_ATTR] = value
         elif key in RESPAN_SPAN_ATTRIBUTES_MAP:
             result[RESPAN_SPAN_ATTRIBUTES_MAP[key]] = value
     return result
@@ -207,7 +208,7 @@ def build_readable_span(
     status_code: int = 200,
     error_message: Optional[str] = None,
     kind: SpanKind = SpanKind.INTERNAL,
-    merge_propagated: bool = True,
+    is_merge_propagated: bool = True,
 ) -> ReadableSpan:
     """Construct a ``ReadableSpan`` with explicit IDs and attributes.
 
@@ -227,7 +228,7 @@ def build_readable_span(
         status_code: HTTP-style status code (< 400 → OK, >= 400 → ERROR).
         error_message: Error description (sets span status to ERROR).
         kind: OTEL SpanKind (default INTERNAL).
-        merge_propagated: If True, merge propagated attributes from ContextVar.
+        is_merge_propagated: If True, merge propagated attributes from ContextVar.
 
     Returns:
         A fully-formed ``ReadableSpan`` ready to be injected via ``inject_span()``.
@@ -265,7 +266,7 @@ def build_readable_span(
     attrs: Dict[str, Any] = dict(attributes or {})
 
     # Merge propagated attributes (customer_identifier, thread_id, etc.)
-    if merge_propagated:
+    if is_merge_propagated:
         propagated = read_propagated_attributes()
         for k, v in propagated.items():
             attrs.setdefault(k, v)
