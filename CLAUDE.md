@@ -133,3 +133,26 @@ respan.addProcessor({
 - `respan-tracing` depends on `respan-sdk`
 - TypeScript `@respan/tracing` depends on `@respan/respan-sdk`
 - Both use OpenTelemetry SDK for tracing infrastructure
+
+## Development Rules
+
+### Don't reinvent the wheel
+Before writing any utility function, **always check** these locations first:
+1. Python stdlib (e.g. `time.time_ns()`, `datetime.fromisoformat()`, `uuid.uuid4()`)
+2. OpenTelemetry SDK / `opentelemetry.semconv_ai` for span attribute constants
+3. `respan_sdk/utils/` for existing shared helpers
+4. `respan_sdk/constants/` for existing constants
+
+**Never create wrapper functions** for stdlib one-liners (e.g. `now_ns()` wrapping `time.time_ns()`).
+
+### Constants: use canonical sources
+- **OTEL/GenAI/Traceloop attributes**: import from `opentelemetry.semconv_ai.SpanAttributes` — never redefine as local constants
+- **Respan-specific attributes** (`respan.*`): define in `respan_sdk/constants/span_attributes.py`
+- **Log types**: use `respan_sdk/constants/llm_logging.py`
+- **OTLP wire format keys**: use `respan_sdk/constants/otlp_constants.py`
+
+### Shared utilities (Python `respan_sdk/utils/`)
+- `data_processing/id_processing.py` — `str_to_int()`, `ensure_trace_id()`, `ensure_span_id()` (non-hex ID conversion with MD5 fallback)
+- `serialization.py` — `serialize_value()` (recursive Pydantic/dict/datetime to JSON-safe types)
+- `time.py` — time utilities
+- `pre_processing.py` — data preprocessing
