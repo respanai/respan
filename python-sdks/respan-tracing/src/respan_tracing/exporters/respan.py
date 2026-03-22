@@ -80,16 +80,23 @@ def _prepare_spans_for_export(spans: Sequence[ReadableSpan]) -> List[ReadableSpa
     prepared_spans: List[ReadableSpan] = []
 
     for span in spans:
+        overrides: Dict[str, Any] = {}
+
         if is_root_span_candidate(span):
             logger.debug("Making span a root span: %s", span.name)
+            overrides["parent"] = None
+            overrides["_parent"] = None
+
+        extra_attrs = _get_enrichment_attrs(span)
+        if extra_attrs:
+            logger.debug("Enriching span with %s: %s", list(extra_attrs), span.name)
+            merged_attrs = dict(span.attributes or {})
+            merged_attrs.update(extra_attrs)
+            overrides["attributes"] = merged_attrs
+
+        if overrides:
             prepared_spans.append(
-                ModifiedSpan(
-                    original_span=span,
-                    overrides={
-                        "parent": None,
-                        "_parent": None,
-                    },
-                )
+                ModifiedSpan(original_span=span, overrides=overrides)
             )
         else:
             prepared_spans.append(span)
@@ -322,6 +329,23 @@ def _build_otlp_payload(spans: Sequence[ReadableSpan]) -> Dict[str, Any]:
         resource_spans.append(rs_entry)
 
     return {OTLP_RESOURCE_SPANS_KEY: resource_spans}
+
+
+def _get_enrichment_attrs(span: ReadableSpan) -> Dict[str, Any]:
+    """Return extra attributes to inject into a span before export.
+
+    Currently handles one case: GenAI spans (e.g. ``openai.response``) that
+    carry ``gen_ai.system`` but lack ``llm.request.type``.  The Respan backend
+    uses ``llm.request.type`` to trigger prompt/completion/model/token parsing,
+    so we inject ``"chat"`` to ensure the backend processes these spans.
+    """
+    attrs = span.attributes or {}
+    extra: Dict[str, Any] = {}
+
+    if attrs.get("gen_ai.system") and not attrs.get("llm.request.type"):
+        extra["llm.request.type"] = "chat"
+
+    return extra
 
 
 class RespanSpanExporter:

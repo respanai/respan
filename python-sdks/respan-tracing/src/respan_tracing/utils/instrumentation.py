@@ -142,9 +142,11 @@ def init_instrumentations(
     return True
 
 
+
 # ---------------------------------------------------------------------------
 # Post-init hooks — special-case patches that run after instrument()
 # ---------------------------------------------------------------------------
+
 
 @_register_hook("openai")
 def _patch_chat_prompt_capture():

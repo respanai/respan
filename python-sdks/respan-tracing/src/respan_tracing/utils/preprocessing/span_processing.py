@@ -72,6 +72,16 @@ def is_processable_span(span: ReadableSpan) -> bool:
         )
         return True
 
+    # Standalone GenAI span (has gen_ai.system, e.g. "openai")
+    # This covers spans from OTEL instrumentors that don't set llm.request.type,
+    # such as the OpenAI Responses API instrumentor.
+    if span.attributes.get("gen_ai.system"):
+        logger.debug(
+            f"[Respan Debug] Processing standalone GenAI span: {span.name} "
+            f"(gen_ai.system: {span.attributes.get('gen_ai.system')})"
+        )
+        return True
+
     # Pydantic AI native spans can be model, agent, or tool spans.
     if _is_pydantic_ai_span(span):
         logger.debug(
@@ -123,6 +133,12 @@ def is_root_span_candidate(span: ReadableSpan) -> bool:
     # Standalone LLM span without entity path should become root
     if llm_request_type and span_kind is None and has_no_entity_path:
         logger.debug(f"[Respan Debug] Span is root candidate (standalone LLM): {span.name}")
+        return True
+
+    # Standalone GenAI span (gen_ai.system) without entity path should become root
+    gen_ai_system = span.attributes.get("gen_ai.system")
+    if gen_ai_system and span_kind is None and not llm_request_type and has_no_entity_path:
+        logger.debug(f"[Respan Debug] Span is root candidate (standalone GenAI): {span.name}")
         return True
 
     # Pydantic AI native span without entity path should become root

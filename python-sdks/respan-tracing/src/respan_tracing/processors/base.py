@@ -95,6 +95,19 @@ class RespanSpanProcessor:
             for key, value in respan_params.items():
                 span.set_attribute(f"{SDK_PREFIX}.{key}", value)
 
+        # Bridge propagated attributes (customer_identifier, thread_id, etc.)
+        # from the _PROPAGATED_ATTRIBUTES ContextVar onto auto-instrumented spans.
+        # This ensures spans created by OTEL auto-instrumentors (OpenAI, Anthropic, etc.)
+        # carry the same user-context attributes as plugin-injected spans.
+        try:
+            from respan_tracing.utils.span_factory import read_propagated_attributes
+            propagated = read_propagated_attributes()
+            for attr_key, attr_val in propagated.items():
+                if not span.attributes.get(attr_key):
+                    span.set_attribute(attr_key, attr_val)
+        except Exception:
+            pass  # Don't break span creation if propagation fails
+
         # Call original processor's on_start
         self.processor.on_start(span, parent_context)
 
