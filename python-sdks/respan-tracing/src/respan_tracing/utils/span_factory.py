@@ -15,13 +15,9 @@ Key functions:
 """
 
 import contextvars
-import hashlib
 import json
 import logging
-import time
-import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Sequence
 
 from opentelemetry import trace
@@ -29,11 +25,17 @@ from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.trace import SpanContext, SpanKind, TraceFlags
 from opentelemetry.trace.status import Status, StatusCode
 
+from respan_sdk.constants.span_attributes import RESPAN_PROMPT, RESPAN_ENVIRONMENT
 from respan_sdk.respan_types.span_types import (
     RESPAN_SPAN_ATTRIBUTES_MAP,
     RespanSpanAttributes,
 )
-from respan_tracing.constants.tracing import RESPAN_PROMPT_ATTR, RESPAN_ENVIRONMENT_ATTR
+from respan_sdk.utils.data_processing.id_processing import (
+    ensure_trace_id,
+    ensure_span_id,
+    iso_to_ns,
+    now_ns,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -103,58 +105,6 @@ def propagate_attributes(**kwargs):
 
 
 # ---------------------------------------------------------------------------
-# ID helpers
-# ---------------------------------------------------------------------------
-
-
-def _str_to_int(val: str, bits: int) -> int:
-    """Convert a string ID to int.
-
-    If *val* is valid hex, parse it directly.  Otherwise, use a deterministic
-    hash so that non-hex trace IDs (e.g. UUIDs with hyphens, or arbitrary
-    strings from external SDKs) still produce a stable numeric ID.
-    """
-    cleaned = val.replace("-", "")
-    try:
-        return int(cleaned, 16) & ((1 << bits) - 1)
-    except ValueError:
-        # Deterministic hash for non-hex strings
-        h = hashlib.md5(cleaned.encode(), usedforsecurity=False).hexdigest()
-        return int(h, 16) & ((1 << bits) - 1)
-
-
-def _ensure_trace_id(val: Optional[str] = None) -> int:
-    """Return a 128-bit trace ID as int.  Generates one if *val* is ``None``."""
-    if val:
-        return _str_to_int(val, 128)
-    return uuid.uuid4().int & ((1 << 128) - 1)
-
-
-def _ensure_span_id(val: Optional[str] = None) -> int:
-    """Return a 64-bit span ID as int.  Generates one if *val* is ``None``."""
-    if val:
-        return _str_to_int(val, 64)
-    return uuid.uuid4().int & ((1 << 64) - 1)
-
-
-def _iso_to_ns(iso_str: Optional[str]) -> Optional[int]:
-    """Convert an ISO-8601 timestamp to nanoseconds since epoch."""
-    if not iso_str:
-        return None
-    try:
-        ts = iso_str.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(ts)
-        return int(dt.timestamp() * 1e9)
-    except Exception:
-        return None
-
-
-def _now_ns() -> int:
-    """Current time as nanoseconds since epoch."""
-    return int(time.time() * 1e9)
-
-
-# ---------------------------------------------------------------------------
 # Propagated attributes bridge
 # ---------------------------------------------------------------------------
 
@@ -181,9 +131,9 @@ def read_propagated_attributes() -> Dict[str, Any]:
                 result[attr_key] = str(mv) if not isinstance(mv, str) else mv
         elif key == "prompt" and isinstance(value, dict):
             # Prompt config: store as JSON string for the exporter to pick up
-            result[RESPAN_PROMPT_ATTR] = json.dumps(value, default=str)
+            result[RESPAN_PROMPT] = json.dumps(value, default=str)
         elif key == "environment":
-            result[RESPAN_ENVIRONMENT_ATTR] = value
+            result[RESPAN_ENVIRONMENT] = value
         elif key in RESPAN_SPAN_ATTRIBUTES_MAP:
             result[RESPAN_SPAN_ATTRIBUTES_MAP[key]] = value
     return result
@@ -234,13 +184,13 @@ def build_readable_span(
         A fully-formed ``ReadableSpan`` ready to be injected via ``inject_span()``.
     """
     # Resolve IDs
-    tid = _ensure_trace_id(trace_id)
-    sid = _ensure_span_id(span_id)
+    tid = ensure_trace_id(trace_id)
+    sid = ensure_span_id(span_id)
 
     # Build parent SpanContext (or None for root)
     parent = None
     if parent_id:
-        pid = _ensure_span_id(parent_id)
+        pid = ensure_span_id(parent_id)
         parent = SpanContext(
             trace_id=tid,
             span_id=pid,
@@ -258,9 +208,9 @@ def build_readable_span(
 
     # Resolve timestamps
     if start_time_ns is None:
-        start_time_ns = _iso_to_ns(start_time_iso) or _now_ns()
+        start_time_ns = iso_to_ns(start_time_iso) or now_ns()
     if end_time_ns is None:
-        end_time_ns = _iso_to_ns(end_time_iso) or _now_ns()
+        end_time_ns = iso_to_ns(end_time_iso) or now_ns()
 
     # Build attributes
     attrs: Dict[str, Any] = dict(attributes or {})

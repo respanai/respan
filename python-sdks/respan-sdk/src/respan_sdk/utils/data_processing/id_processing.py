@@ -1,12 +1,16 @@
+"""ID processing utilities for OTEL trace/span IDs."""
+
+import hashlib
+import uuid
+from typing import Optional
+
 TRACE_ID_HEX_LENGTH = 32
 SPAN_ID_HEX_LENGTH = 16
 
 
-def generate_unique_id():
-    """Generate a unique ID - placeholder implementation"""
-    import uuid
-
-    return str(uuid.uuid4()).replace("-", "")
+def generate_unique_id() -> str:
+    """Generate a unique hex ID."""
+    return uuid.uuid4().hex
 
 
 def format_trace_id(trace_id: int) -> str:
@@ -55,3 +59,32 @@ def normalize_hex_id(identifier: str, expected_length: int, field_name: str) -> 
         raise ValueError(f"{field_name} must be a hexadecimal string") from exc
 
     return normalized
+
+
+def str_to_int(val: str, bits: int) -> int:
+    """Convert a string ID to int.
+
+    If *val* is valid hex, parse it directly.  Otherwise, use a deterministic
+    hash so that non-hex trace IDs (e.g. UUIDs with hyphens, or arbitrary
+    strings from external SDKs) still produce a stable numeric ID.
+    """
+    cleaned = val.replace("-", "")
+    try:
+        return int(cleaned, 16) & ((1 << bits) - 1)
+    except ValueError:
+        h = hashlib.md5(cleaned.encode(), usedforsecurity=False).hexdigest()
+        return int(h, 16) & ((1 << bits) - 1)
+
+
+def ensure_trace_id(val: Optional[str] = None) -> int:
+    """Return a 128-bit trace ID as int.  Generates one if *val* is ``None``."""
+    if val:
+        return str_to_int(val, 128)
+    return uuid.uuid4().int & ((1 << 128) - 1)
+
+
+def ensure_span_id(val: Optional[str] = None) -> int:
+    """Return a 64-bit span ID as int.  Generates one if *val* is ``None``."""
+    if val:
+        return str_to_int(val, 64)
+    return uuid.uuid4().int & ((1 << 64) - 1)
