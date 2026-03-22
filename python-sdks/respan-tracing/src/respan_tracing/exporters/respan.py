@@ -51,27 +51,42 @@ logger = get_respan_logger(LOGGER_NAME_EXPORTER)
 
 
 class EnrichedSpan:
-    """A proxy wrapper that can clear parent (root promotion) and inject extra attributes."""
+    """A proxy wrapper that can clear parent (root promotion), inject extra
+    attributes, override the span name, and strip unwanted attributes."""
 
     def __init__(
         self,
         original_span: ReadableSpan,
         extra_attrs: Optional[Dict[str, Any]] = None,
         clear_parent: bool = False,
+        name_override: Optional[str] = None,
+        strip_attrs: Optional[set] = None,
     ):
         self._original_span = original_span
         self._extra_attrs = extra_attrs or {}
         self._clear_parent = clear_parent
+        self._name_override = name_override
+        self._strip_attrs = strip_attrs
+
+    @property
+    def name(self):
+        return self._name_override if self._name_override else self._original_span.name
 
     @property
     def attributes(self):
-        if not self._extra_attrs:
-            return self._original_span.attributes
-        merged = dict(self._original_span.attributes) if self._original_span.attributes else {}
+        original = self._original_span.attributes
+        if not self._extra_attrs and not self._strip_attrs:
+            return original
+        merged = dict(original) if original else {}
+        if self._strip_attrs:
+            for key in self._strip_attrs:
+                merged.pop(key, None)
         merged.update(self._extra_attrs)
         return merged
 
     def __getattr__(self, name):
+        if name == "name":
+            return self.name
         if name == "attributes":
             return self.attributes
         if self._clear_parent and name in ("parent_span_id", "parent", "_parent"):

@@ -1,25 +1,26 @@
 """ADK span enrichment for OpenLLMetry-compatible export.
 
-Converts raw ADK OTel spans into enriched ReadableSpan objects with
-traceloop.* and gen_ai.* attributes that the Respan backend expects.
-Uses build_readable_span() from respan_tracing to construct new spans.
+Converts raw ADK OTel spans into enriched spans with traceloop.* and
+gen_ai.* attributes that the Respan backend expects.  Uses EnrichedSpan
+from respan_tracing to wrap originals — preserving all metadata (resource,
+events, links, status) without rebuilding from scratch.
 """
 
 import json
 import logging
-from typing import Dict, List, Optional, Sequence, Any
+from typing import Dict, List, Optional, Sequence, Any, Set
 
 from opentelemetry.sdk.trace import ReadableSpan
 
-from respan_tracing.utils.span_factory import build_readable_span
+from respan_tracing.exporters.respan import EnrichedSpan
 
 from .adk_detection import is_adk_span
 
 logger = logging.getLogger(__name__)
 
 
-# Internal/redundant ADK attributes that should NOT be copied to enriched spans.
-_ADK_STRIP_ATTRS = {
+# Internal/redundant ADK attributes that should NOT appear in enriched spans.
+_ADK_STRIP_ATTRS: Set[str] = {
     # Internal tracking IDs
     "gcp.vertex.agent.event_id",
     "gcp.vertex.agent.invocation_id",
@@ -74,54 +75,6 @@ def _extract_adk_output(llm_response_json: str) -> Optional[str]:
         return None
 
 
-def _build_enriched_span(
-    original: ReadableSpan,
-    extra_attrs: Dict[str, Any],
-    name_override: Optional[str] = None,
-    is_root: bool = False,
-) -> ReadableSpan:
-    """Build a new ReadableSpan with enriched attributes.
-
-    Copies trace_id, span_id, timestamps from the original span.
-    Copies original attributes (minus stripped ones), adds extra_attrs.
-    """
-    ctx = original.get_span_context()
-    trace_id = format(ctx.trace_id, "032x") if ctx else None
-    span_id = format(ctx.span_id, "016x") if ctx else None
-
-    parent_id = None
-    if not is_root and original.parent:
-        parent_id = format(original.parent.span_id, "016x")
-
-    # Copy attributes, stripping internal ADK ones
-    attrs: Dict[str, Any] = {}
-    for key, value in (original.attributes or {}).items():
-        if key not in _ADK_STRIP_ATTRS:
-            attrs[key] = value
-    attrs.update(extra_attrs)
-
-    # Determine error state from original span
-    error_message = None
-    status_code = 200
-    if original.status and original.status.status_code:
-        from opentelemetry.trace import StatusCode
-        if original.status.status_code == StatusCode.ERROR:
-            status_code = 500
-            error_message = original.status.description
-
-    return build_readable_span(
-        name=name_override or original.name,
-        trace_id=trace_id,
-        span_id=span_id,
-        parent_id=parent_id,
-        start_time_ns=original.start_time,
-        end_time_ns=original.end_time,
-        attributes=attrs,
-        status_code=status_code,
-        error_message=error_message,
-    )
-
-
 def enrich_adk_batch(spans: Sequence[ReadableSpan]) -> List[ReadableSpan]:
     """Enrich ADK spans with OpenLLMetry-compatible attributes.
 
@@ -153,7 +106,17 @@ def enrich_adk_batch(spans: Sequence[ReadableSpan]) -> List[ReadableSpan]:
 
 
 def _enrich_adk_trace_group(spans: List[ReadableSpan]) -> List[ReadableSpan]:
-    """Enrich a group of ADK spans from the same trace."""
+    """Enrich a group of ADK spans from the same trace.
+
+    Two-pass algorithm:
+    1. Collect cross-span info (agent name, first input, last output, session ID).
+    2. Wrap each span with EnrichedSpan — adds traceloop attributes, strips
+       internal ADK attributes, and optionally renames/clears parent.
+
+    Customer identifier and thread identifier are already on the original spans
+    (bridged by RespanSpanProcessor.on_start from the _PROPAGATED_ATTRIBUTES
+    ContextVar) and are preserved automatically by EnrichedSpan.
+    """
     # --- First pass: collect cross-span info ---
     agent_name = None
     first_input = None
@@ -194,19 +157,9 @@ def _enrich_adk_trace_group(spans: List[ReadableSpan]) -> List[ReadableSpan]:
                 if parsed_output:
                     last_output = parsed_output
 
-        # Collect session ID for thread_identifier
+        # Collect session ID for thread_identifier fallback
         if not session_id:
             session_id = attrs.get("gen_ai.conversation.id")
-
-    # Read identifiers from span attributes (propagated from ContextVar)
-    customer_id = None
-    thread_id = None
-    for span in spans:
-        span_attrs = span.attributes or {}
-        if not customer_id:
-            customer_id = span_attrs.get("respan.customer_params.customer_identifier")
-        if not thread_id:
-            thread_id = span_attrs.get("respan.threads.thread_identifier")
 
     # --- Second pass: enrich each span ---
     enriched = []
@@ -214,23 +167,21 @@ def _enrich_adk_trace_group(spans: List[ReadableSpan]) -> List[ReadableSpan]:
         prefix = (span.name or "").split(" ")[0]
         attrs = span.attributes or {}
         extra: Dict[str, Any] = {}
-        new_name = None
+        name_override = None
         is_root = False
 
         if prefix == "invocation":
             # Root span: rename to agent name, add workflow kind, propagate I/O
             if agent_name:
-                new_name = agent_name
+                name_override = agent_name
             extra["traceloop.span.kind"] = "workflow"
             if first_input:
                 extra["traceloop.entity.input"] = first_input
             if last_output:
                 extra["traceloop.entity.output"] = last_output
-            if customer_id:
-                extra["respan.customer_params.customer_identifier"] = customer_id
-            effective_thread = thread_id or session_id
-            if effective_thread:
-                extra["respan.threads.thread_identifier"] = effective_thread
+            # Fall back to ADK session_id when no thread_identifier was propagated
+            if session_id and not attrs.get("respan.threads.thread_identifier"):
+                extra["respan.threads.thread_identifier"] = session_id
             is_root = True
         else:
             # Child spans: add entity path to prevent root promotion
@@ -269,6 +220,12 @@ def _enrich_adk_trace_group(spans: List[ReadableSpan]) -> List[ReadableSpan]:
                 if tool_resp:
                     extra["traceloop.entity.output"] = tool_resp
 
-        enriched.append(_build_enriched_span(span, extra, name_override=new_name, is_root=is_root))
+        enriched.append(EnrichedSpan(
+            span,
+            extra_attrs=extra,
+            clear_parent=is_root,
+            name_override=name_override,
+            strip_attrs=_ADK_STRIP_ATTRS,
+        ))
 
     return enriched

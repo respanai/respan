@@ -14,7 +14,9 @@ respan/
 │   ├── respan-sdk/            # Core types, preprocessing, API payload helpers
 │   ├── respan-tracing/        # Main tracing library with OpenTelemetry
 │   ├── respan-exporter-*/     # Integration exporters (litellm, agno, haystack, openai-agents, langfuse)
-│   └── respan/                # Standalone package
+│   ├── respan-instrumentation-*/  # Instrumentation plugins (google-adk)
+│   ├── respan/                # Standalone package
+│   └── examples/              # Usage examples by framework (google-adk/, etc.)
 ├── javascript-sdks/       # JavaScript/TypeScript packages (Yarn)
 │   ├── respan-sdk/            # Core types and SDK (@respan/respan-sdk)
 │   ├── respan-tracing/        # Main tracing library (@respan/tracing)
@@ -131,5 +133,72 @@ respan.addProcessor({
 ## Package Dependencies
 
 - `respan-tracing` depends on `respan-sdk`
+- `respan-instrumentation-*` packages depend on `respan-tracing`
 - TypeScript `@respan/tracing` depends on `@respan/respan-sdk`
 - Both use OpenTelemetry SDK for tracing infrastructure
+
+## Instrumentation Plugin Architecture
+
+Instrumentation packages (`respan-instrumentation-*`) follow a plugin pattern that enriches third-party spans in-place as they flow through the standard OTLP pipeline.
+
+### Pattern: How Instrumentors Work
+
+```
+Third-party framework (e.g. Google ADK) generates raw OTel spans
+         ↓
+Instrumentor.activate() patches OTel span processors via wrapt
+         ↓
+RespanSpanProcessor (patched to accept spans lacking traceloop attributes)
+         ↓
+BatchSpanProcessor._export() (patched to enrich spans before export)
+         ↓
+Enriched spans with OpenLLMetry-compatible attributes
+         ↓
+RespanSpanExporter → Respan backend
+```
+
+Key rules:
+- **Instrumentors are stateless** — they contain no config or mutable state. Config like `environment` and `customer_identifier` belongs on `Respan()`, not on the instrumentor.
+- **No custom export paths** — instrumentors enrich spans in-place through the existing pipeline, never create their own exporters.
+- **Enrichment converts** third-party attributes to OpenLLMetry format (`traceloop.span.kind`, `traceloop.entity.input`, etc.) and strips redundant internal attributes.
+
+### Example: Google ADK Instrumentation
+
+```python
+from respan_instrumentation_google_adk import GoogleAdkInstrumentor
+
+respan = Respan(
+    instrumentations=[GoogleAdkInstrumentor()],
+    environment="development",
+    customer_identifier="demo-user",
+)
+```
+
+Package structure for `respan-instrumentation-google-adk`:
+- `instrumentor.py` — Stateless entry point, calls `patch_span_processors()`
+- `processor.py` — wrapt patches on `RespanSpanProcessor.on_end()`, `BatchSpanProcessor._export()`, `SimpleSpanProcessor.on_end()`
+- `enrichment.py` — Two-pass span enrichment (collect cross-span info, then enrich by span type)
+- `adk_detection.py` — Detects ADK spans by instrumentation scope name
+
+## Development Rules
+
+### Don't reinvent the wheel
+Before writing any utility function, **always check** these locations first:
+1. Python stdlib (e.g. `time.time_ns()`, `datetime.fromisoformat()`, `uuid.uuid4()`)
+2. OpenTelemetry SDK / `opentelemetry.semconv_ai` for span attribute constants
+3. `respan_sdk/utils/` for existing shared helpers
+4. `respan_sdk/constants/` for existing constants
+
+**Never create wrapper functions** for stdlib one-liners (e.g. `now_ns()` wrapping `time.time_ns()`).
+
+### Constants: use canonical sources
+- **OTEL/GenAI/Traceloop attributes**: import from `opentelemetry.semconv_ai.SpanAttributes` — never redefine as local constants
+- **Respan-specific attributes** (`respan.*`): define in `respan_sdk/constants/span_attributes.py`
+- **Log types**: use `respan_sdk/constants/llm_logging.py`
+- **OTLP wire format keys**: use `respan_sdk/constants/otlp_constants.py`
+
+### Shared utilities (Python `respan_sdk/utils/`)
+- `data_processing/id_processing.py` — `str_to_int()`, `ensure_trace_id()`, `ensure_span_id()` (non-hex ID conversion with MD5 fallback)
+- `serialization.py` — `serialize_value()` (recursive Pydantic/dict/datetime to JSON-safe types)
+- `time.py` — time utilities
+- `pre_processing.py` — data preprocessing
