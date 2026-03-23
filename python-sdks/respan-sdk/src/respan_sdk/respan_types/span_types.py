@@ -3,48 +3,51 @@ from typing import Any, Dict, Optional
 
 from pydantic import ConfigDict, Field
 
-from respan_sdk.constants.span_attributes import (
-    RESPAN_SPAN_CUSTOM_ID,
-    RESPAN_CUSTOMER_PARAMS_ID,
-    RESPAN_CUSTOMER_PARAMS_EMAIL,
-    RESPAN_CUSTOMER_PARAMS_NAME,
-    RESPAN_EVALUATION_PARAMS_ID,
-    RESPAN_THREADS_ID,
-    RESPAN_TRACE_GROUP_ID,
-    RESPAN_METADATA,
-    RESPAN_LOG_METHOD,
-    RESPAN_LOG_TYPE,
-    RESPAN_LOG_ID,
-    RESPAN_LOG_PARENT_ID,
-    RESPAN_LOG_ROOT_ID,
-    RESPAN_LOG_SOURCE,
-)
 from respan_sdk.respan_types.base_types import RespanBaseModel
 
 
 class RespanSpanAttributes(str, Enum):
-    """Backward-compatible enum re-exporting constants from ``span_attributes.py``.
+    """Respan span attribute key constants.
 
-    The canonical source of truth is ``respan_sdk.constants.span_attributes``.
-    Prefer importing flat constants directly for new code.  This enum exists
-    only so existing callers (e.g. respan-backend) that use
-    ``RespanSpanAttributes.RESPAN_METADATA.value`` continue to work.
+    Single source of truth for all ``respan.*`` attribute keys used across
+    the pipeline.  Both the backend (``RespanSpanAttributes.X.value``) and
+    SDK flat-constant importers (``span_attributes.py``) reference this enum.
     """
 
-    RESPAN_SPAN_CUSTOM_ID = RESPAN_SPAN_CUSTOM_ID
-    RESPAN_CUSTOMER_PARAMS_ID = RESPAN_CUSTOMER_PARAMS_ID
-    RESPAN_CUSTOMER_PARAMS_EMAIL = RESPAN_CUSTOMER_PARAMS_EMAIL
-    RESPAN_CUSTOMER_PARAMS_NAME = RESPAN_CUSTOMER_PARAMS_NAME
-    RESPAN_EVALUATION_PARAMS_ID = RESPAN_EVALUATION_PARAMS_ID
-    RESPAN_THREADS_ID = RESPAN_THREADS_ID
-    RESPAN_TRACE_GROUP_ID = RESPAN_TRACE_GROUP_ID
-    RESPAN_METADATA = RESPAN_METADATA
-    LOG_METHOD = RESPAN_LOG_METHOD
-    LOG_TYPE = RESPAN_LOG_TYPE
-    LOG_ID = RESPAN_LOG_ID
-    LOG_PARENT_ID = RESPAN_LOG_PARENT_ID
-    LOG_ROOT_ID = RESPAN_LOG_ROOT_ID
-    LOG_SOURCE = RESPAN_LOG_SOURCE
+    # Span params
+    RESPAN_SPAN_CUSTOM_ID = "respan.span_params.custom_identifier"
+
+    # Customer params
+    RESPAN_CUSTOMER_PARAMS_ID = "respan.customer_params.customer_identifier"
+    RESPAN_CUSTOMER_PARAMS_EMAIL = "respan.customer_params.email"
+    RESPAN_CUSTOMER_PARAMS_NAME = "respan.customer_params.name"
+
+    # Evaluation params
+    RESPAN_EVALUATION_PARAMS_ID = "respan.evaluation_params.evaluation_identifier"
+
+    # Threads
+    RESPAN_THREADS_ID = "respan.threads.thread_identifier"
+
+    # Trace
+    RESPAN_TRACE_GROUP_ID = "respan.trace.trace_group_identifier"
+
+    # Metadata
+    RESPAN_METADATA = "respan.metadata"
+
+    # Prompt & environment
+    RESPAN_PROMPT = "respan.prompt"
+    RESPAN_ENVIRONMENT = "respan.environment"
+
+    # Span links
+    RESPAN_LINK_TIMESTAMP = "respan.link.timestamp"
+
+    # Logging
+    LOG_METHOD = "respan.entity.log_method"
+    LOG_TYPE = "respan.entity.log_type"
+    LOG_ID = "respan.entity.log_id"
+    LOG_PARENT_ID = "respan.entity.log_parent_id"
+    LOG_ROOT_ID = "respan.entity.log_root_id"
+    LOG_SOURCE = "respan.entity.log_source"
 
 
 class SpanLink(RespanBaseModel):
