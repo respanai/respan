@@ -168,15 +168,16 @@ def respan_span_attributes(respan_params: Union[Dict[str, Any], RespanParams]):
         )
         
         for key, value in validated_params.model_dump(mode="json").items():
-            if key in RESPAN_SPAN_ATTRIBUTES_MAP and key != "metadata":
+            attr_key = RESPAN_SPAN_ATTRIBUTES_MAP.get(key)
+            if attr_key and attr_key != RESPAN_METADATA:
                 try:
-                    current_span.set_attribute(RESPAN_SPAN_ATTRIBUTES_MAP[key], value)
+                    current_span.set_attribute(attr_key, value)
                 except (ValueError, TypeError) as e:
                     logger.warning(
-                        f"Failed to set span attribute {RESPAN_SPAN_ATTRIBUTES_MAP[key]}={value}: {str(e)}"
+                        f"Failed to set span attribute {attr_key}={value}: {str(e)}"
                     )
-            # Treat metadata as a special case
-            if key == "metadata":
+            # Treat metadata as a special case — expand to per-key attributes
+            if attr_key == RESPAN_METADATA:
                 for metadata_key, metadata_value in value.items():
                     current_span.set_attribute(f"{RESPAN_METADATA}.{metadata_key}", metadata_value)
         yield

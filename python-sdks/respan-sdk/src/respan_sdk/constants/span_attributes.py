@@ -62,6 +62,8 @@ RESPAN_SPAN_ATTRIBUTES_MAP = {
     "trace_group_identifier": RESPAN_TRACE_GROUP_ID,
     "group_identifier": RESPAN_TRACE_GROUP_ID,
     "metadata": RESPAN_METADATA,
+    "prompt": RESPAN_PROMPT,
+    "environment": RESPAN_ENVIRONMENT,
 }
 
 # ---------------------------------------------------------------------------

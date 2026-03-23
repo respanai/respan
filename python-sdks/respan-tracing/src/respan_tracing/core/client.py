@@ -145,16 +145,17 @@ class RespanClient:
             
             # Set attributes based on the mapping
             for key, value in validated_params.model_dump(mode="json").items():
-                if key in RESPAN_SPAN_ATTRIBUTES_MAP and key != "metadata":
+                attr_key = RESPAN_SPAN_ATTRIBUTES_MAP.get(key)
+                if attr_key and attr_key != RESPAN_METADATA:
                     try:
-                        span.set_attribute(RESPAN_SPAN_ATTRIBUTES_MAP[key], value)
+                        span.set_attribute(attr_key, value)
                     except (ValueError, TypeError) as e:
                         logger.warning(
-                            f"Failed to set span attribute {RESPAN_SPAN_ATTRIBUTES_MAP[key]}={value}: {str(e)}"
+                            f"Failed to set span attribute {attr_key}={value}: {str(e)}"
                         )
 
-                # Handle metadata specially
-                if key == "metadata" and isinstance(value, dict):
+                # Handle metadata specially — expand to per-key attributes
+                if attr_key == RESPAN_METADATA and isinstance(value, dict):
                     for metadata_key, metadata_value in value.items():
                         try:
                             span.set_attribute(

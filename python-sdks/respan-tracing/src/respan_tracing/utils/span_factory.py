@@ -28,7 +28,6 @@ from opentelemetry.trace.status import Status, StatusCode
 
 from respan_sdk.constants.span_attributes import (
     RESPAN_PROMPT,
-    RESPAN_ENVIRONMENT,
     RESPAN_METADATA,
     RESPAN_SPAN_ATTRIBUTES_MAP,
 )
@@ -49,19 +48,9 @@ _PROPAGATED_ATTRIBUTES: contextvars.ContextVar[Dict[str, Any]] = contextvars.Con
     "respan_propagated_attributes", default={}
 )
 
-# Keys accepted by propagate_attributes() — subset of RESPAN_SPAN_ATTRIBUTES_MAP
-# keys plus the special-cased "environment" and "prompt".
-_SUPPORTED_ATTRIBUTE_KEYS = frozenset({
-    "customer_identifier",
-    "customer_email",
-    "customer_name",
-    "thread_identifier",
-    "custom_identifier",
-    "group_identifier",
-    "environment",
-    "metadata",
-    "prompt",
-})
+# Keys accepted by propagate_attributes() — derived from the canonical
+# RESPAN_SPAN_ATTRIBUTES_MAP so there is a single source of truth.
+_SUPPORTED_ATTRIBUTE_KEYS = frozenset(RESPAN_SPAN_ATTRIBUTES_MAP.keys())
 
 
 @contextmanager
@@ -94,9 +83,9 @@ def propagate_attributes(**kwargs):
         if key not in _SUPPORTED_ATTRIBUTE_KEYS:
             logger.warning("Ignoring unsupported attribute: %s", key)
             continue
-        if key == "metadata" and isinstance(value, dict):
+        if RESPAN_SPAN_ATTRIBUTES_MAP.get(key) == RESPAN_METADATA and isinstance(value, dict):
             # Merge metadata dicts instead of replacing
-            merged["metadata"] = {**merged.get("metadata", {}), **value}
+            merged[key] = {**merged.get(key, {}), **value}
         else:
             merged[key] = value
 
@@ -127,18 +116,18 @@ def read_propagated_attributes() -> Dict[str, Any]:
 
     result: Dict[str, Any] = {}
     for key, value in ctx_attrs.items():
-        if key == "metadata" and isinstance(value, dict):
+        if key not in RESPAN_SPAN_ATTRIBUTES_MAP:
+            continue
+        attr_key = RESPAN_SPAN_ATTRIBUTES_MAP[key]
+        if attr_key == RESPAN_METADATA and isinstance(value, dict):
             # Metadata is stored as individual respan.metadata.<key> attributes
             for mk, mv in value.items():
-                attr_key = f"{RESPAN_METADATA}.{mk}"
-                result[attr_key] = str(mv) if not isinstance(mv, str) else mv
-        elif key == "prompt" and isinstance(value, dict):
+                result[f"{RESPAN_METADATA}.{mk}"] = str(mv) if not isinstance(mv, str) else mv
+        elif attr_key == RESPAN_PROMPT and isinstance(value, dict):
             # Prompt config: store as JSON string for the exporter to pick up
             result[RESPAN_PROMPT] = json.dumps(value, default=str)
-        elif key == "environment":
-            result[RESPAN_ENVIRONMENT] = value
-        elif key in RESPAN_SPAN_ATTRIBUTES_MAP:
-            result[RESPAN_SPAN_ATTRIBUTES_MAP[key]] = value
+        else:
+            result[attr_key] = value
     return result
 
 
