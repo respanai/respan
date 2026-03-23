@@ -49,6 +49,9 @@ from respan_sdk.constants.otlp_constants import (
     OTEL_STATUS_CODE_ERROR,
     OTEL_STATUS_CODE_KEY,
     OTEL_STATUS_MESSAGE_KEY,
+    OTEL_SPAN_PARENT_FIELD,
+    OTEL_SPAN_PARENT_PRIVATE_FIELD,
+    OTEL_SPAN_ATTRIBUTES_FIELD,
 )
 
 from opentelemetry.semconv_ai import SpanAttributes, LLMRequestTypeValues
@@ -58,14 +61,6 @@ from respan_tracing.utils.preprocessing.span_processing import is_root_span_cand
 from respan_tracing.constants.generic_constants import LOGGER_NAME_EXPORTER
 
 logger = get_respan_logger(LOGGER_NAME_EXPORTER)
-
-# ReadableSpan internal attribute names used by ModifiedSpan to override
-# the parent context (for root span promotion).  Both the public property
-# ("parent") and private backing field ("_parent") must be cleared.
-_SPAN_PARENT_KEY = "parent"
-_SPAN_PARENT_PRIVATE_KEY = "_parent"
-_SPAN_ATTRIBUTES_KEY = "attributes"
-
 
 class ModifiedSpan:
     """A proxy wrapper that forwards the original span with optional overrides."""
@@ -93,15 +88,15 @@ def _prepare_spans_for_export(spans: Sequence[ReadableSpan]) -> List[ReadableSpa
 
         if is_root_span_candidate(span):
             logger.debug("Making span a root span: %s", span.name)
-            overrides[_SPAN_PARENT_KEY] = None
-            overrides[_SPAN_PARENT_PRIVATE_KEY] = None
+            overrides[OTEL_SPAN_PARENT_FIELD] = None
+            overrides[OTEL_SPAN_PARENT_PRIVATE_FIELD] = None
 
         extra_attrs = _get_enrichment_attrs(span)
         if extra_attrs:
             logger.debug("Enriching span with %s: %s", list(extra_attrs), span.name)
             merged_attrs = dict(span.attributes or {})
             merged_attrs.update(extra_attrs)
-            overrides[_SPAN_ATTRIBUTES_KEY] = merged_attrs
+            overrides[OTEL_SPAN_ATTRIBUTES_FIELD] = merged_attrs
 
         if overrides:
             prepared_spans.append(
@@ -181,7 +176,7 @@ def _span_to_otlp_json(span: ReadableSpan) -> Dict[str, Any]:
 
     # Parent span ID
     parent_span_id = ""
-    parent = getattr(span, "parent", None)
+    parent = getattr(span, OTEL_SPAN_PARENT_FIELD, None)
     if parent is not None:
         parent_sid = getattr(parent, "span_id", None)
         if parent_sid:

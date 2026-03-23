@@ -80,6 +80,14 @@ OTEL_SCOPE_NAME_KEY = "otel.scope.name"
 OTEL_SCOPE_VERSION_KEY = "otel.scope.version"
 
 # ---------------------------------------------------------------------------
+# OTel Python SDK ReadableSpan internal field names
+# Used by ModifiedSpan proxy to override parent / attributes at export time.
+# ---------------------------------------------------------------------------
+OTEL_SPAN_PARENT_FIELD = "parent"
+OTEL_SPAN_PARENT_PRIVATE_FIELD = "_parent"
+OTEL_SPAN_ATTRIBUTES_FIELD = "attributes"
+
+# ---------------------------------------------------------------------------
 # Error message attribute (non-standard but widely used)
 # ---------------------------------------------------------------------------
 ERROR_MESSAGE_ATTR = "error.message"
