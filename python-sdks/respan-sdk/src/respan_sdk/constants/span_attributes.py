@@ -1,18 +1,67 @@
-"""Flat convenience aliases for span attribute key constants.
+"""Span attribute key constants.
 
-The single source of truth is ``RespanSpanAttributes`` enum in
-``respan_sdk.respan_types.span_types``.  This module re-exports the
-enum values as plain module-level constants for callers that prefer
-``RESPAN_METADATA`` over ``RespanSpanAttributes.RESPAN_METADATA.value``.
+Single source of truth for all ``respan.*`` attribute keys.  The
+``RespanSpanAttributes`` enum and flat convenience aliases both live here
+(per BE convention: enums ARE constants, always in constants.py).
 
 For attribute VALUES (e.g. log type strings like "chat", "workflow"),
 see ``llm_logging.py``.
 """
 
-from respan_sdk.respan_types.span_types import RespanSpanAttributes
+from enum import Enum
+
 
 # ---------------------------------------------------------------------------
-# Respan-specific attribute keys (respan.*)
+# Respan span attribute enum (single source of truth)
+# ---------------------------------------------------------------------------
+
+
+class RespanSpanAttributes(str, Enum):
+    """Respan span attribute key constants.
+
+    All ``respan.*`` attribute keys used across the pipeline.  The backend
+    uses ``RespanSpanAttributes.X.value``; SDK code uses the flat constant
+    aliases defined below.
+    """
+
+    # Span params
+    RESPAN_SPAN_CUSTOM_ID = "respan.span_params.custom_identifier"
+
+    # Customer params
+    RESPAN_CUSTOMER_PARAMS_ID = "respan.customer_params.customer_identifier"
+    RESPAN_CUSTOMER_PARAMS_EMAIL = "respan.customer_params.email"
+    RESPAN_CUSTOMER_PARAMS_NAME = "respan.customer_params.name"
+
+    # Evaluation params
+    RESPAN_EVALUATION_PARAMS_ID = "respan.evaluation_params.evaluation_identifier"
+
+    # Threads
+    RESPAN_THREADS_ID = "respan.threads.thread_identifier"
+
+    # Trace
+    RESPAN_TRACE_GROUP_ID = "respan.trace.trace_group_identifier"
+
+    # Metadata
+    RESPAN_METADATA = "respan.metadata"
+
+    # Prompt & environment
+    RESPAN_PROMPT = "respan.prompt"
+    RESPAN_ENVIRONMENT = "respan.environment"
+
+    # Span links
+    RESPAN_LINK_TIMESTAMP = "respan.link.timestamp"
+
+    # Logging
+    LOG_METHOD = "respan.entity.log_method"
+    LOG_TYPE = "respan.entity.log_type"
+    LOG_ID = "respan.entity.log_id"
+    LOG_PARENT_ID = "respan.entity.log_parent_id"
+    LOG_ROOT_ID = "respan.entity.log_root_id"
+    LOG_SOURCE = "respan.entity.log_source"
+
+
+# ---------------------------------------------------------------------------
+# Flat convenience aliases (avoid .value boilerplate in SDK code)
 # ---------------------------------------------------------------------------
 
 # Span params
@@ -69,7 +118,9 @@ RESPAN_SPAN_ATTRIBUTES_MAP = {
 }
 
 # ---------------------------------------------------------------------------
-# OTEL incubating GenAI attributes (not yet in semconv_ai.SpanAttributes)
+# OTEL incubating GenAI attributes
+# Not yet available in opentelemetry.semconv_ai.SpanAttributes — defined
+# locally until the upstream package includes them.
 # ---------------------------------------------------------------------------
 GEN_AI_OPERATION_NAME = "gen_ai.operation.name"
 GEN_AI_AGENT_NAME = "gen_ai.agent.name"
