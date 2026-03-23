@@ -10,13 +10,12 @@ from respan_sdk.respan_types.span_types import SpanLink
 from respan_sdk.respan_types.param_types import RespanParams
 from pydantic import ValidationError
 
-from .tracer import RespanTracer
-from ..processors import SpanBuffer
-from ..utils.logging import get_respan_logger
-from ..utils.span_setup import setup_span, cleanup_span, LinksParam
+from respan_tracing.core.tracer import RespanTracer
+from respan_tracing.processors import SpanBuffer
+from respan_tracing.utils.logging import get_respan_logger
+from respan_tracing.utils.span_setup import setup_span, cleanup_span, LinksParam
 
-
-from ..constants.generic_constants import LOGGER_NAME_CLIENT
+from respan_tracing.constants.generic_constants import LOGGER_NAME_CLIENT
 
 logger = get_respan_logger(LOGGER_NAME_CLIENT)
 

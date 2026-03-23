@@ -1,9 +1,9 @@
-from .main import RespanTelemetry, get_client
-from .core.client import RespanClient
-from .decorators import workflow, task, agent, tool
-from .contexts.span import SpanLink, span_link_to_otel, span_to_link, respan_span_attributes, attach_span_links
-from .instruments import Instruments
-from .utils.logging import get_respan_logger, get_main_logger
+from respan_tracing.main import RespanTelemetry, get_client
+from respan_tracing.core.client import RespanClient
+from respan_tracing.decorators import workflow, task, agent, tool
+from respan_tracing.contexts.span import SpanLink, span_link_to_otel, span_to_link, respan_span_attributes, attach_span_links
+from respan_tracing.instruments import Instruments
+from respan_tracing.utils.logging import get_respan_logger, get_main_logger
 from respan_sdk.respan_types.param_types import RespanParams
 from respan_sdk import FilterParamDict, MetricFilterParam, FilterBundle
 

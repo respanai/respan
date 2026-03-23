@@ -2,7 +2,7 @@ from typing import Optional
 from opentelemetry import context as context_api
 from opentelemetry.context import Context
 from opentelemetry.semconv_ai import SpanAttributes
-from ..constants.context_constants import WORKFLOW_NAME_KEY, ENTITY_PATH_KEY
+from respan_tracing.constants.context_constants import WORKFLOW_NAME_KEY, ENTITY_PATH_KEY
 
 
 def get_entity_path(ctx: Optional[Context] = None) -> Optional[str]:

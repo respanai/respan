@@ -14,15 +14,15 @@ from opentelemetry.sdk.trace.export import (
 from opentelemetry.propagate import set_global_textmap
 from opentelemetry.propagators.textmap import TextMapPropagator
 
-from ..processors import RespanSpanProcessor, BufferingSpanProcessor, FilteringSpanProcessor
-from ..exporters import RespanSpanExporter
-from ..instruments import Instruments
-from ..utils.notebook import is_notebook
-from ..utils.instrumentation import init_instrumentations
-from ..utils.imports import import_from_string
-from ..utils.logging import get_respan_logger
-from ..constants.tracing import TRACER_NAME, PROCESSORS_ATTR
-from ..constants.generic_constants import LOGGER_NAME_TRACER
+from respan_tracing.processors import RespanSpanProcessor, BufferingSpanProcessor, FilteringSpanProcessor
+from respan_tracing.exporters import RespanSpanExporter
+from respan_tracing.instruments import Instruments
+from respan_tracing.utils.notebook import is_notebook
+from respan_tracing.utils.instrumentation import init_instrumentations
+from respan_tracing.utils.imports import import_from_string
+from respan_tracing.utils.logging import get_respan_logger
+from respan_tracing.constants.tracing import TRACER_NAME, PROCESSORS_ATTR
+from respan_tracing.constants.generic_constants import LOGGER_NAME_TRACER
 
 # Use Respan logger for all logging in this module
 logger = get_respan_logger(LOGGER_NAME_TRACER)

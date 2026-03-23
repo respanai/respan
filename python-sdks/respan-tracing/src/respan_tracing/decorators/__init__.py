@@ -2,7 +2,7 @@ from typing import Optional, Union, List, Callable
 from opentelemetry.semconv_ai import TraceloopSpanKindValues
 from respan_sdk import FilterParamDict
 from respan_sdk.respan_types.span_types import SpanLink
-from .base import create_entity_method, LinksParam
+from respan_tracing.decorators.base import create_entity_method, LinksParam
 
 
 def workflow(

@@ -5,7 +5,7 @@ This module contains various span processors that handle span processing,
 filtering, and buffering functionality.
 """
 
-from .base import RespanSpanProcessor, BufferingSpanProcessor, SpanBuffer, FilteringSpanProcessor
+from respan_tracing.processors.base import RespanSpanProcessor, BufferingSpanProcessor, SpanBuffer, FilteringSpanProcessor
 
 __all__ = [
     "RespanSpanProcessor",

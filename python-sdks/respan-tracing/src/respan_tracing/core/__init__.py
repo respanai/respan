@@ -1,6 +1,6 @@
 # Core OpenTelemetry implementation for Respan
-from .tracer import RespanTracer
-from .client import RespanClient
+from respan_tracing.core.tracer import RespanTracer
+from respan_tracing.core.client import RespanClient
 
 __all__ = [
     "RespanTracer",

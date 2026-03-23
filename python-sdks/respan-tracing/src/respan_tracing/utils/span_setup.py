@@ -14,8 +14,8 @@ from respan_sdk.constants.llm_logging import LogMethodChoices
 from respan_sdk.constants.span_attributes import RESPAN_LOG_METHOD
 from respan_sdk.respan_types.span_types import SpanLink
 
-from ..contexts.span import span_link_to_otel, consume_span_links
-from ..constants.tracing import EXPORT_FILTER_ATTR, PROCESSORS_ATTR, SAMPLE_RATE_ATTR
+from respan_tracing.contexts.span import span_link_to_otel, consume_span_links
+from respan_tracing.constants.tracing import EXPORT_FILTER_ATTR, PROCESSORS_ATTR, SAMPLE_RATE_ATTR
 
 LinksParam = Optional[Union[List[SpanLink], Callable[[], List[SpanLink]]]]
 

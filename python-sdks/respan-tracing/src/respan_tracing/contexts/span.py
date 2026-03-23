@@ -22,8 +22,8 @@ from respan_sdk.utils.data_processing.id_processing import (
 from respan_tracing.utils.logging import get_respan_logger
 
 
-from ..constants.generic_constants import LOGGER_NAME_SPAN
-from ..constants.context_constants import PENDING_SPAN_LINKS_KEY
+from respan_tracing.constants.generic_constants import LOGGER_NAME_SPAN
+from respan_tracing.constants.context_constants import PENDING_SPAN_LINKS_KEY
 
 __all__ = ["SpanLink", "span_link_to_otel", "span_to_link", "respan_span_attributes", "attach_span_links"]
 

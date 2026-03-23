@@ -5,7 +5,7 @@ import logging
 import traceback
 from typing import Optional, Set, Callable
 
-from ..instruments import Instruments
+from respan_tracing.instruments import Instruments
 
 
 logger = logging.getLogger(__name__)
