@@ -20,8 +20,9 @@ from opentelemetry.semconv_ai import SpanAttributes
 
 from respan_tracing import RespanTelemetry, get_client
 from respan_tracing.constants.tracing import EXPORT_FILTER_ATTR, PROCESSORS_ATTR
-from respan_sdk.respan_types.span_types import RespanSpanAttributes, SpanLink
+from respan_sdk.constants.span_attributes import RESPAN_LOG_METHOD
 from respan_sdk.constants.llm_logging import LogMethodChoices
+from respan_sdk.respan_types.span_types import SpanLink
 
 
 class TestStartSpan:
@@ -76,7 +77,7 @@ class TestStartSpan:
         """Span has LOG_METHOD set to python_tracing."""
         with self.client.start_span("my_task") as span:
             attrs = dict(span.attributes)
-            assert attrs[RespanSpanAttributes.LOG_METHOD.value] == LogMethodChoices.PYTHON_TRACING.value
+            assert attrs[RESPAN_LOG_METHOD] == LogMethodChoices.PYTHON_TRACING.value
 
     def test_span_name_format(self):
         """Span name follows the 'name.kind' format."""

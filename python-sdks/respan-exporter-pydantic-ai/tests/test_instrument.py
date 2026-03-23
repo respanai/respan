@@ -19,7 +19,7 @@ from respan_exporter_pydantic_ai.instrument import (
 )
 from respan_sdk.constants.llm_logging import LOG_TYPE_AGENT, LOG_TYPE_CHAT, LOG_TYPE_TASK, LOG_TYPE_TOOL, LogMethodChoices
 from respan_sdk.respan_types.base_types import RespanBaseModel
-from respan_sdk.respan_types.span_types import RespanSpanAttributes
+from respan_sdk.constants.span_attributes import RESPAN_LOG_METHOD, RESPAN_LOG_TYPE
 from respan_sdk.utils.data_processing.id_processing import format_trace_id, format_span_id
 from respan_tracing import RespanTelemetry
 from respan_tracing.core.tracer import RespanTracer
@@ -250,14 +250,14 @@ def test_pydantic_ai_agent_span_enriched_and_stripped():
     agent_span = next(
         span
         for span in spans
-        if (span.attributes or {}).get(RespanSpanAttributes.LOG_TYPE.value) == LOG_TYPE_AGENT
+        if (span.attributes or {}).get(RESPAN_LOG_TYPE) == LOG_TYPE_AGENT
     )
 
     assert RESPAN_TOOLS_ATTR not in agent_span.attributes
     assert RESPAN_RESPONSE_FORMAT_ATTR not in agent_span.attributes
-    assert agent_span.attributes[RespanSpanAttributes.LOG_TYPE.value] == LOG_TYPE_AGENT
+    assert agent_span.attributes[RESPAN_LOG_TYPE] == LOG_TYPE_AGENT
     assert (
-        agent_span.attributes[RespanSpanAttributes.LOG_METHOD.value]
+        agent_span.attributes[RESPAN_LOG_METHOD]
         == LogMethodChoices.TRACING_INTEGRATION.value
     )
     assert agent_span.attributes[SpanAttributes.TRACELOOP_SPAN_KIND] == "agent"
@@ -298,7 +298,7 @@ def test_pydantic_ai_tool_span_maps_to_respan_fields():
         span
         for span in spans
         if span.name == "execute_tool add"
-        and (span.attributes or {}).get(RespanSpanAttributes.LOG_TYPE.value) == LOG_TYPE_TOOL
+        and (span.attributes or {}).get(RESPAN_LOG_TYPE) == LOG_TYPE_TOOL
     )
     running_tools_span = next(
         span
@@ -316,15 +316,15 @@ def test_pydantic_ai_tool_span_maps_to_respan_fields():
     assert json.loads(tool_span.attributes["output"]) == tool_input["a"] + tool_input["b"]
     assert tool_span.attributes[SpanAttributes.TRACELOOP_SPAN_KIND] == "tool"
     assert tool_span.attributes[SpanAttributes.TRACELOOP_ENTITY_NAME] == "add"
-    assert tool_span.attributes[RespanSpanAttributes.LOG_TYPE.value] == LOG_TYPE_TOOL
+    assert tool_span.attributes[RESPAN_LOG_TYPE] == LOG_TYPE_TOOL
     assert (
-        tool_span.attributes[RespanSpanAttributes.LOG_METHOD.value]
+        tool_span.attributes[RESPAN_LOG_METHOD]
         == LogMethodChoices.TRACING_INTEGRATION.value
     )
     assert running_tools_span.attributes["span_tools"] == ["add"]
     assert running_tools_span.attributes[SpanAttributes.TRACELOOP_SPAN_KIND] == "task"
     assert (
-        running_tools_span.attributes[RespanSpanAttributes.LOG_TYPE.value]
+        running_tools_span.attributes[RESPAN_LOG_TYPE]
         == LOG_TYPE_TASK
     )
     assert RESPAN_TOOLS_ATTR not in running_tools_span.attributes

@@ -11,7 +11,8 @@ from opentelemetry.context import Context
 from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
 from opentelemetry.semconv_ai import SpanAttributes
 
-from respan_sdk.respan_types.span_types import RespanSpanAttributes, SpanLink
+from respan_sdk.constants.span_attributes import RESPAN_TRACE_GROUP_ID
+from respan_sdk.respan_types.span_types import SpanLink
 from respan_sdk.utils.data_processing.id_processing import format_span_id
 from respan_tracing.contexts.span import span_link_to_otel
 from respan_tracing.constants.generic_constants import SDK_PREFIX
@@ -74,7 +75,7 @@ class RespanSpanProcessor:
         trace_group_id = context_api.get_value(TRACE_GROUP_ID_KEY)
         if trace_group_id:
             span.set_attribute(
-                RespanSpanAttributes.RESPAN_TRACE_GROUP_ID.value, trace_group_id
+                RESPAN_TRACE_GROUP_ID, trace_group_id
             )
 
         # Inherit processors from parent span when child doesn't have its own.
@@ -106,7 +107,7 @@ class RespanSpanProcessor:
                 if not span.attributes.get(attr_key):
                     span.set_attribute(attr_key, attr_val)
         except Exception:
-            pass  # Don't break span creation if propagation fails
+            logger.debug("Failed to bridge propagated attributes", exc_info=True)
 
         # Call original processor's on_start
         self.processor.on_start(span, parent_context)

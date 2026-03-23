@@ -1,5 +1,18 @@
 from datetime import datetime
-from typing import Union
+from typing import Optional, Union
+
+
+def iso_to_ns(iso_str: Optional[str]) -> Optional[int]:
+    """Convert an ISO-8601 timestamp to nanoseconds since epoch.
+
+    Returns ``None`` if *iso_str* is falsy or unparseable.
+    """
+    if not iso_str:
+        return None
+    try:
+        return int(datetime.fromisoformat(iso_str).timestamp() * 1e9)
+    except Exception:
+        return None
 
 
 def parse_datetime(v: Union[str, datetime]) -> datetime:

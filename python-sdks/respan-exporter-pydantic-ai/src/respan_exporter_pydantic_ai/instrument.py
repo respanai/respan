@@ -20,7 +20,7 @@ from respan_sdk.constants.llm_logging import (
 )
 from respan_sdk.respan_types._internal_types import Function, FunctionTool, TextModelResponseFormat
 from respan_sdk.respan_types.param_types import RespanTextLogParams
-from respan_sdk.respan_types.span_types import RespanSpanAttributes
+from respan_sdk.constants.span_attributes import RESPAN_LOG_METHOD, RESPAN_LOG_TYPE
 from respan_sdk.utils.data_processing.id_processing import format_trace_id, format_span_id
 from respan_tracing.core.tracer import RespanTracer
 
@@ -600,12 +600,12 @@ def _apply_respan_field_mapping(
     log_type = _extract_log_type(span=span, attributes=attributes)
     _set_span_field(
         attributes=enriched_attributes,
-        field_name=RespanSpanAttributes.LOG_METHOD.value,
+        field_name=RESPAN_LOG_METHOD,
         value=LogMethodChoices.TRACING_INTEGRATION.value,
     )
     _set_span_field(
         attributes=enriched_attributes,
-        field_name=RespanSpanAttributes.LOG_TYPE.value,
+        field_name=RESPAN_LOG_TYPE,
         value=log_type,
     )
 

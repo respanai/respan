@@ -5,7 +5,8 @@ from opentelemetry.trace.span import Span
 from opentelemetry.trace import Status, StatusCode
 
 from respan_sdk import FilterParamDict
-from respan_sdk.respan_types.span_types import RESPAN_SPAN_ATTRIBUTES_MAP, RespanSpanAttributes, SpanLink
+from respan_sdk.constants.span_attributes import RESPAN_METADATA, RESPAN_SPAN_ATTRIBUTES_MAP
+from respan_sdk.respan_types.span_types import SpanLink
 from respan_sdk.respan_types.param_types import RespanParams
 from pydantic import ValidationError
 
@@ -158,7 +159,7 @@ class RespanClient:
                     for metadata_key, metadata_value in value.items():
                         try:
                             span.set_attribute(
-                                f"{RespanSpanAttributes.RESPAN_METADATA.value}.{metadata_key}", 
+                                f"{RESPAN_METADATA}.{metadata_key}", 
                                 metadata_value
                             )
                         except (ValueError, TypeError) as e:

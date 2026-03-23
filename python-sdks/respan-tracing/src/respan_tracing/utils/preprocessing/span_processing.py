@@ -2,41 +2,39 @@ from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.semconv_ai import SpanAttributes
 import logging
 
-from respan_sdk.respan_types.span_types import RespanSpanAttributes
+from respan_sdk.constants.span_attributes import (
+    GEN_AI_OPERATION_NAME,
+    GEN_AI_AGENT_NAME,
+    GEN_AI_TOOL_NAME,
+    GEN_AI_TOOL_CALL_ARGUMENTS,
+    GEN_AI_TOOL_CALL_RESULT,
+    PYDANTIC_AI_AGENT_NAME,
+    PYDANTIC_AI_TOOL_ARGUMENTS,
+    PYDANTIC_AI_TOOL_RESPONSE,
+    RESPAN_LOG_TYPE,
+)
 
 logger = logging.getLogger(__name__)
 
-# Gen AI attributes from OTEL incubating conventions, not yet in semconv_ai.SpanAttributes
-_GEN_AI_OPERATION_NAME = "gen_ai.operation.name"
-_GEN_AI_AGENT_NAME = "gen_ai.agent.name"
-_GEN_AI_TOOL_NAME = "gen_ai.tool.name"
-_GEN_AI_TOOL_CALL_ARGUMENTS = "gen_ai.tool.call.arguments"
-_GEN_AI_TOOL_CALL_RESULT = "gen_ai.tool.call.result"
-
-# Pydantic AI specific attributes (non-standard)
-_PYDANTIC_AI_AGENT_NAME = "agent_name"
-_PYDANTIC_AI_TOOL_ARGUMENTS = "tool_arguments"
-_PYDANTIC_AI_TOOL_RESPONSE = "tool_response"
-
-# Attribute names that indicate a Pydantic AI span
-_PYDANTIC_AI_INDICATOR_ATTRS = (
-    _GEN_AI_OPERATION_NAME,
+# Attribute names that indicate a GenAI span (OTEL incubating + Pydantic AI vendor attrs)
+_GENAI_INDICATOR_ATTRS = (
+    GEN_AI_OPERATION_NAME,
     SpanAttributes.LLM_SYSTEM,
-    _GEN_AI_AGENT_NAME,
-    _PYDANTIC_AI_AGENT_NAME,
-    _GEN_AI_TOOL_NAME,
-    _GEN_AI_TOOL_CALL_ARGUMENTS,
-    _GEN_AI_TOOL_CALL_RESULT,
-    _PYDANTIC_AI_TOOL_ARGUMENTS,
-    _PYDANTIC_AI_TOOL_RESPONSE,
+    GEN_AI_AGENT_NAME,
+    PYDANTIC_AI_AGENT_NAME,
+    GEN_AI_TOOL_NAME,
+    GEN_AI_TOOL_CALL_ARGUMENTS,
+    GEN_AI_TOOL_CALL_RESULT,
+    PYDANTIC_AI_TOOL_ARGUMENTS,
+    PYDANTIC_AI_TOOL_RESPONSE,
 )
 
 
-def _is_pydantic_ai_span(span: ReadableSpan) -> bool:
+def _is_genai_span(span: ReadableSpan) -> bool:
     attributes = span.attributes or {}
     return any(
         attributes.get(attr_name) is not None
-        for attr_name in _PYDANTIC_AI_INDICATOR_ATTRS
+        for attr_name in _GENAI_INDICATOR_ATTRS
     )
 
 
@@ -99,19 +97,19 @@ def is_processable_span(span: ReadableSpan) -> bool:
         )
         return True
 
-    # Pydantic AI native spans can be model, agent, or tool spans.
-    if _is_pydantic_ai_span(span):
+    # GenAI native spans can be model, agent, or tool spans.
+    if _is_genai_span(span):
         logger.debug(
-            f"[Respan Debug] Processing Pydantic AI native span: {span.name} "
-            f"(gen_ai.operation.name: {span.attributes.get(_GEN_AI_OPERATION_NAME)})"
+            f"[Respan Debug] Processing GenAI native span: {span.name} "
+            f"(gen_ai.operation.name: {span.attributes.get(GEN_AI_OPERATION_NAME)})"
         )
         return True
 
     # Enriched Respan span (has respan.entity.log_type set by an exporter plugin).
-    if span.attributes.get(RespanSpanAttributes.LOG_TYPE.value):
+    if span.attributes.get(RESPAN_LOG_TYPE):
         logger.debug(
             f"[Respan Debug] Processing enriched Respan span: {span.name} "
-            f"(log_type: {span.attributes.get(RespanSpanAttributes.LOG_TYPE.value)})"
+            f"(log_type: {span.attributes.get(RESPAN_LOG_TYPE)})"
         )
         return True
 
@@ -158,14 +156,14 @@ def is_root_span_candidate(span: ReadableSpan) -> bool:
         logger.debug(f"[Respan Debug] Span is root candidate (standalone GenAI): {span.name}")
         return True
 
-    # Pydantic AI native span without entity path should become root
-    pydantic_ai = _is_pydantic_ai_span(span)
-    if pydantic_ai and span_kind is None and has_no_entity_path:
-        logger.debug(f"[Respan Debug] Span is root candidate (Pydantic AI native): {span.name}")
+    # GenAI native span without entity path should become root
+    is_genai = _is_genai_span(span)
+    if is_genai and span_kind is None and has_no_entity_path:
+        logger.debug(f"[Respan Debug] Span is root candidate (GenAI native): {span.name}")
         return True
 
     # Enriched Respan span without entity path should become root
-    if span.attributes.get(RespanSpanAttributes.LOG_TYPE.value) and span_kind is None and has_no_entity_path:
+    if span.attributes.get(RESPAN_LOG_TYPE) and span_kind is None and has_no_entity_path:
         logger.debug(f"[Respan Debug] Span is root candidate (enriched Respan): {span.name}")
         return True
 

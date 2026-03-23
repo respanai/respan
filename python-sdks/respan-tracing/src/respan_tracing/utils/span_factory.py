@@ -19,7 +19,6 @@ import json
 import logging
 import time
 from contextlib import contextmanager
-from datetime import datetime
 from typing import Any, Dict, Optional, Sequence
 
 from opentelemetry import trace
@@ -27,15 +26,17 @@ from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.trace import SpanContext, SpanKind, TraceFlags
 from opentelemetry.trace.status import Status, StatusCode
 
-from respan_sdk.constants.span_attributes import RESPAN_PROMPT, RESPAN_ENVIRONMENT
-from respan_sdk.respan_types.span_types import (
+from respan_sdk.constants.span_attributes import (
+    RESPAN_PROMPT,
+    RESPAN_ENVIRONMENT,
+    RESPAN_METADATA,
     RESPAN_SPAN_ATTRIBUTES_MAP,
-    RespanSpanAttributes,
 )
 from respan_sdk.utils.data_processing.id_processing import (
     ensure_trace_id,
     ensure_span_id,
 )
+from respan_sdk.utils.time import iso_to_ns
 from respan_tracing.constants.context_constants import (
     PROP_CUSTOMER_IDENTIFIER,
     PROP_CUSTOMER_EMAIL,
@@ -49,16 +50,6 @@ from respan_tracing.constants.context_constants import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _iso_to_ns(iso_str: Optional[str]) -> Optional[int]:
-    """Convert an ISO-8601 timestamp to nanoseconds since epoch."""
-    if not iso_str:
-        return None
-    try:
-        return int(datetime.fromisoformat(iso_str).timestamp() * 1e9)
-    except Exception:
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +140,7 @@ def read_propagated_attributes() -> Dict[str, Any]:
         if key == PROP_METADATA and isinstance(value, dict):
             # Metadata is stored as individual respan.metadata.<key> attributes
             for mk, mv in value.items():
-                attr_key = f"{RespanSpanAttributes.RESPAN_METADATA.value}.{mk}"
+                attr_key = f"{RESPAN_METADATA}.{mk}"
                 result[attr_key] = str(mv) if not isinstance(mv, str) else mv
         elif key == PROP_PROMPT and isinstance(value, dict):
             # Prompt config: store as JSON string for the exporter to pick up
@@ -180,7 +171,7 @@ def build_readable_span(
     status_code: int = 200,
     error_message: Optional[str] = None,
     kind: SpanKind = SpanKind.INTERNAL,
-    is_merge_propagated: bool = True,
+    merge_propagated: bool = True,
 ) -> ReadableSpan:
     """Construct a ``ReadableSpan`` with explicit IDs and attributes.
 
@@ -200,7 +191,7 @@ def build_readable_span(
         status_code: HTTP-style status code (< 400 → OK, >= 400 → ERROR).
         error_message: Error description (sets span status to ERROR).
         kind: OTEL SpanKind (default INTERNAL).
-        is_merge_propagated: If True, merge propagated attributes from ContextVar.
+        merge_propagated: If True, merge propagated attributes from ContextVar.
 
     Returns:
         A fully-formed ``ReadableSpan`` ready to be injected via ``inject_span()``.
@@ -230,15 +221,15 @@ def build_readable_span(
 
     # Resolve timestamps
     if start_time_ns is None:
-        start_time_ns = _iso_to_ns(start_time_iso) or time.time_ns()
+        start_time_ns = iso_to_ns(start_time_iso) or time.time_ns()
     if end_time_ns is None:
-        end_time_ns = _iso_to_ns(end_time_iso) or time.time_ns()
+        end_time_ns = iso_to_ns(end_time_iso) or time.time_ns()
 
     # Build attributes
     attrs: Dict[str, Any] = dict(attributes or {})
 
     # Merge propagated attributes (customer_identifier, thread_id, etc.)
-    if is_merge_propagated:
+    if merge_propagated:
         propagated = read_propagated_attributes()
         for k, v in propagated.items():
             attrs.setdefault(k, v)

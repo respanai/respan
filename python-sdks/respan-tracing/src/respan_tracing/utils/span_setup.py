@@ -11,7 +11,8 @@ from opentelemetry.trace.span import Span
 from opentelemetry.semconv_ai import TraceloopSpanKindValues, SpanAttributes
 from respan_sdk import FilterParamDict
 from respan_sdk.constants.llm_logging import LogMethodChoices
-from respan_sdk.respan_types.span_types import RespanSpanAttributes, SpanLink
+from respan_sdk.constants.span_attributes import RESPAN_LOG_METHOD
+from respan_sdk.respan_types.span_types import SpanLink
 
 from ..contexts.span import span_link_to_otel, consume_span_links
 from ..constants.tracing import EXPORT_FILTER_ATTR, PROCESSORS_ATTR, SAMPLE_RATE_ATTR
@@ -94,7 +95,7 @@ def setup_span(
     span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_NAME, entity_name)
     span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_PATH, entity_path)
     span.set_attribute(
-        RespanSpanAttributes.LOG_METHOD.value,
+        RESPAN_LOG_METHOD,
         LogMethodChoices.PYTHON_TRACING.value,
     )
     if version is not None:

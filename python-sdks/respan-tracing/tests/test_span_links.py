@@ -13,10 +13,8 @@ from respan_sdk.constants.otlp_constants import (
     OTLP_STRING_VALUE,
     OTLP_TRACE_ID_KEY,
 )
-from respan_sdk.respan_types.span_types import RespanSpanAttributes
+from respan_sdk.constants.span_attributes import RESPAN_LINK_TIMESTAMP
 from respan_sdk.utils.data_processing.id_processing import format_span_id, format_trace_id
-
-LINK_TIMESTAMP_ATTR = RespanSpanAttributes.LINK_TIMESTAMP.value
 from respan_tracing import RespanTelemetry, SpanLink, span_link_to_otel, span_to_link, get_client
 from respan_tracing.core.tracer import RespanTracer
 from respan_tracing.exporters.respan import _span_to_otlp_json
@@ -187,7 +185,7 @@ def test_span_link_timestamp_merged_into_attributes():
         timestamp="2026-03-08T12:00:00Z",
     )
     otel_link = span_link_to_otel(link)
-    assert otel_link.attributes[LINK_TIMESTAMP_ATTR] == "2026-03-08T12:00:00Z"
+    assert otel_link.attributes[RESPAN_LINK_TIMESTAMP] == "2026-03-08T12:00:00Z"
     assert otel_link.attributes["link.type"] == "resume"
 
 
@@ -199,7 +197,7 @@ def test_span_link_no_timestamp_no_extra_attribute():
         attributes={"link.type": "resume"},
     )
     otel_link = span_link_to_otel(link)
-    assert LINK_TIMESTAMP_ATTR not in otel_link.attributes
+    assert RESPAN_LINK_TIMESTAMP not in otel_link.attributes
     assert otel_link.attributes == {"link.type": "resume"}
 
 
@@ -213,7 +211,7 @@ def test_span_link_timestamp_does_not_mutate_original_attributes():
         timestamp="2026-03-08T12:00:00Z",
     )
     span_link_to_otel(link)
-    assert LINK_TIMESTAMP_ATTR not in original_attrs
+    assert RESPAN_LINK_TIMESTAMP not in original_attrs
 
 
 # ---------- span_to_link() tests ----------
@@ -280,6 +278,6 @@ def test_span_to_link_roundtrips_through_otel(clean_exporter):
     assert format_trace_id(otel_link.context.trace_id) == format_trace_id(ctx.trace_id)
     assert format_span_id(otel_link.context.span_id) == format_span_id(ctx.span_id)
     # Timestamp should be merged into attributes
-    assert LINK_TIMESTAMP_ATTR in otel_link.attributes
+    assert RESPAN_LINK_TIMESTAMP in otel_link.attributes
     assert otel_link.attributes["link.type"] == "resume"
     telemetry.flush()

@@ -5,12 +5,12 @@ from typing import Any, Dict, List, Optional, Union
 from opentelemetry import trace, context as context_api
 from opentelemetry.trace.span import Span
 from pydantic import ValidationError
-from respan_sdk.respan_types.span_types import (
+from respan_sdk.constants.span_attributes import (
+    RESPAN_LINK_TIMESTAMP,
+    RESPAN_METADATA,
     RESPAN_SPAN_ATTRIBUTES_MAP,
-    RespanSpanAttributes,
-    SpanLink,
 )
-LINK_TIMESTAMP_ATTR = RespanSpanAttributes.LINK_TIMESTAMP.value
+from respan_sdk.respan_types.span_types import SpanLink
 from respan_sdk.respan_types.param_types import RespanParams
 from respan_sdk.utils.data_processing.id_processing import (
     SPAN_ID_HEX_LENGTH,
@@ -48,7 +48,7 @@ def span_link_to_otel(link: SpanLink) -> trace.Link:
     # Merge timestamp into attributes if provided (enables efficient CH lookups)
     attrs = dict(link.attributes)
     if link.timestamp:
-        attrs[LINK_TIMESTAMP_ATTR] = link.timestamp
+        attrs[RESPAN_LINK_TIMESTAMP] = link.timestamp
     return trace.Link(context=span_context, attributes=attrs)
 
 
@@ -178,7 +178,7 @@ def respan_span_attributes(respan_params: Union[Dict[str, Any], RespanParams]):
             # Treat metadata as a special case
             if key == PROP_METADATA:
                 for metadata_key, metadata_value in value.items():
-                    current_span.set_attribute(f"{RespanSpanAttributes.RESPAN_METADATA.value}.{metadata_key}", metadata_value)
+                    current_span.set_attribute(f"{RESPAN_METADATA}.{metadata_key}", metadata_value)
         yield
     except ValidationError as e:
         logger.warning(f"Failed to validate params: {str(e.errors(include_url=False))}")
