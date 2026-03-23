@@ -59,6 +59,13 @@ from respan_tracing.constants.generic_constants import LOGGER_NAME_EXPORTER
 
 logger = get_respan_logger(LOGGER_NAME_EXPORTER)
 
+# ReadableSpan internal attribute names used by ModifiedSpan to override
+# the parent context (for root span promotion).  Both the public property
+# ("parent") and private backing field ("_parent") must be cleared.
+_SPAN_PARENT_KEY = "parent"
+_SPAN_PARENT_PRIVATE_KEY = "_parent"
+_SPAN_ATTRIBUTES_KEY = "attributes"
+
 
 class ModifiedSpan:
     """A proxy wrapper that forwards the original span with optional overrides."""
@@ -86,15 +93,15 @@ def _prepare_spans_for_export(spans: Sequence[ReadableSpan]) -> List[ReadableSpa
 
         if is_root_span_candidate(span):
             logger.debug("Making span a root span: %s", span.name)
-            overrides["parent"] = None
-            overrides["_parent"] = None
+            overrides[_SPAN_PARENT_KEY] = None
+            overrides[_SPAN_PARENT_PRIVATE_KEY] = None
 
         extra_attrs = _get_enrichment_attrs(span)
         if extra_attrs:
             logger.debug("Enriching span with %s: %s", list(extra_attrs), span.name)
             merged_attrs = dict(span.attributes or {})
             merged_attrs.update(extra_attrs)
-            overrides["attributes"] = merged_attrs
+            overrides[_SPAN_ATTRIBUTES_KEY] = merged_attrs
 
         if overrides:
             prepared_spans.append(
