@@ -61,7 +61,7 @@ def normalize_hex_id(identifier: str, expected_length: int, field_name: str) -> 
     return normalized
 
 
-def str_to_int(val: str, bits: int) -> int:
+def _id_to_int(val: str, bits: int) -> int:
     """Convert a string ID to int.
 
     If *val* is valid hex, parse it directly.  Otherwise, use a deterministic
@@ -79,12 +79,12 @@ def str_to_int(val: str, bits: int) -> int:
 def ensure_trace_id(val: Optional[str] = None) -> int:
     """Return a 128-bit trace ID as int.  Generates one if *val* is ``None``."""
     if val:
-        return str_to_int(val, 128)
+        return _id_to_int(val, 128)
     return uuid.uuid4().int & ((1 << 128) - 1)
 
 
 def ensure_span_id(val: Optional[str] = None) -> int:
     """Return a 64-bit span ID as int.  Generates one if *val* is ``None``."""
     if val:
-        return str_to_int(val, 64)
+        return _id_to_int(val, 64)
     return uuid.uuid4().int & ((1 << 64) - 1)
