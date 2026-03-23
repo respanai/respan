@@ -17,7 +17,6 @@ from ..utils.span_setup import setup_span, cleanup_span, LinksParam
 
 
 from ..constants.generic_constants import LOGGER_NAME_CLIENT
-from ..constants.context_constants import PROP_METADATA
 
 logger = get_respan_logger(LOGGER_NAME_CLIENT)
 
@@ -146,7 +145,7 @@ class RespanClient:
             
             # Set attributes based on the mapping
             for key, value in validated_params.model_dump(mode="json").items():
-                if key in RESPAN_SPAN_ATTRIBUTES_MAP and key != PROP_METADATA:
+                if key in RESPAN_SPAN_ATTRIBUTES_MAP and key != "metadata":
                     try:
                         span.set_attribute(RESPAN_SPAN_ATTRIBUTES_MAP[key], value)
                     except (ValueError, TypeError) as e:
@@ -155,7 +154,7 @@ class RespanClient:
                         )
 
                 # Handle metadata specially
-                if key == PROP_METADATA and isinstance(value, dict):
+                if key == "metadata" and isinstance(value, dict):
                     for metadata_key, metadata_value in value.items():
                         try:
                             span.set_attribute(
