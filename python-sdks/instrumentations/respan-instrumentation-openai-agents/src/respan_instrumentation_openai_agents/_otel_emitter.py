@@ -233,12 +233,12 @@ def emit_response(item: SpanImpl, span_data: ResponseSpanData) -> None:
 
             tool_calls = _extract_tool_calls(resp.output)
             if tool_calls:
-                attrs["tool_calls"] = tool_calls
+                attrs["tool_calls"] = _safe_json(tool_calls)
 
         if hasattr(resp, "tools") and resp.tools:
             tools_list = _extract_tools(resp.tools)
             if tools_list:
-                attrs["tools"] = tools_list
+                attrs["tools"] = _safe_json(tools_list)
 
         usage = getattr(resp, "usage", None)
         if usage:
