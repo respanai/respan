@@ -107,6 +107,47 @@ def _safe_json(obj: Any) -> str:
         return str(obj)
 
 
+def _extract_tools(tools: list) -> list:
+    """Convert Response API tool definitions to Chat Completions format."""
+    result = []
+    for tool in tools:
+        tool_dict = serialize_value(tool)
+        if not isinstance(tool_dict, dict):
+            continue
+        tool_type = tool_dict.get("type", "")
+        if tool_type == "function":
+            func = {
+                "name": tool_dict.get("name", ""),
+            }
+            desc = tool_dict.get("description")
+            if desc:
+                func["description"] = desc
+            params = tool_dict.get("parameters")
+            if params:
+                func["parameters"] = params
+            result.append({"type": "function", "function": func})
+        else:
+            result.append(tool_dict)
+    return result
+
+
+def _extract_tool_calls(output: list) -> list:
+    """Extract function tool calls from Response API output items."""
+    result = []
+    for item in output:
+        item_dict = serialize_value(item)
+        if isinstance(item_dict, dict) and item_dict.get("type") == "function_call":
+            result.append({
+                "id": item_dict.get("call_id", ""),
+                "type": "function",
+                "function": {
+                    "name": item_dict.get("name", ""),
+                    "arguments": item_dict.get("arguments", ""),
+                },
+            })
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Per-type emitters
 # ---------------------------------------------------------------------------
@@ -189,6 +230,15 @@ def emit_response(item: SpanImpl, span_data: ResponseSpanData) -> None:
         if hasattr(resp, "output") and resp.output:
             output = _format_output(resp.output)
             attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = _safe_json(output)
+
+            tool_calls = _extract_tool_calls(resp.output)
+            if tool_calls:
+                attrs["tool_calls"] = tool_calls
+
+        if hasattr(resp, "tools") and resp.tools:
+            tools_list = _extract_tools(resp.tools)
+            if tools_list:
+                attrs["tools"] = tools_list
 
         usage = getattr(resp, "usage", None)
         if usage:

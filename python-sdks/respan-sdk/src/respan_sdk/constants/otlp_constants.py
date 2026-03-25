@@ -163,6 +163,8 @@ GEN_AI_PROMOTED_KEYS = frozenset({
     "prompt_tokens",
     "completion_tokens",
     "total_request_tokens",
+    "tools",
+    "tool_calls",
 })
 
 # Union of all promoted keys for quick lookup

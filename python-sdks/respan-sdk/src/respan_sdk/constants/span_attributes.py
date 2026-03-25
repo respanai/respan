@@ -43,6 +43,11 @@ class RespanSpanAttributes(str, Enum):
 
     # Metadata
     RESPAN_METADATA = "respan.metadata"
+    RESPAN_METADATA_AGENT_NAME = "respan.metadata.agent_name"
+    RESPAN_METADATA_FROM_AGENT = "respan.metadata.from_agent"
+    RESPAN_METADATA_TO_AGENT = "respan.metadata.to_agent"
+    RESPAN_METADATA_GUARDRAIL_NAME = "respan.metadata.guardrail_name"
+    RESPAN_METADATA_TRIGGERED = "respan.metadata.triggered"
 
     # Prompt & environment
     RESPAN_PROMPT = "respan.prompt"
@@ -50,6 +55,10 @@ class RespanSpanAttributes(str, Enum):
 
     # Span links
     RESPAN_LINK_TIMESTAMP = "respan.link.timestamp"
+
+    # Span metadata
+    RESPAN_SPAN_TOOLS = "respan.span.tools"
+    RESPAN_SPAN_HANDOFFS = "respan.span.handoffs"
 
     # Logging
     LOG_METHOD = "respan.entity.log_method"
@@ -83,6 +92,11 @@ RESPAN_TRACE_GROUP_ID = RespanSpanAttributes.RESPAN_TRACE_GROUP_ID.value
 
 # Metadata (pattern: "respan.metadata.<key>" where key is customizable)
 RESPAN_METADATA = RespanSpanAttributes.RESPAN_METADATA.value
+RESPAN_METADATA_AGENT_NAME = RespanSpanAttributes.RESPAN_METADATA_AGENT_NAME.value
+RESPAN_METADATA_FROM_AGENT = RespanSpanAttributes.RESPAN_METADATA_FROM_AGENT.value
+RESPAN_METADATA_TO_AGENT = RespanSpanAttributes.RESPAN_METADATA_TO_AGENT.value
+RESPAN_METADATA_GUARDRAIL_NAME = RespanSpanAttributes.RESPAN_METADATA_GUARDRAIL_NAME.value
+RESPAN_METADATA_TRIGGERED = RespanSpanAttributes.RESPAN_METADATA_TRIGGERED.value
 
 # Prompt & environment
 RESPAN_PROMPT = RespanSpanAttributes.RESPAN_PROMPT.value
@@ -90,6 +104,10 @@ RESPAN_ENVIRONMENT = RespanSpanAttributes.RESPAN_ENVIRONMENT.value
 
 # Span links
 RESPAN_LINK_TIMESTAMP = RespanSpanAttributes.RESPAN_LINK_TIMESTAMP.value
+
+# Span metadata
+RESPAN_SPAN_TOOLS = RespanSpanAttributes.RESPAN_SPAN_TOOLS.value
+RESPAN_SPAN_HANDOFFS = RespanSpanAttributes.RESPAN_SPAN_HANDOFFS.value
 
 # Logging
 RESPAN_LOG_METHOD = RespanSpanAttributes.LOG_METHOD.value
