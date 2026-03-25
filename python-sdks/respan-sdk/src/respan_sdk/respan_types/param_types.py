@@ -423,7 +423,8 @@ class RespanParams(RespanBaseModel, PreprocessLogDataMixin):
     # endregion: technical integrations
 
     # region: custom properties
-    metadata: Optional[dict] = None
+    metadata: Optional[dict] = None  # Map(String, String) — all values coerced to strings
+    properties: Optional[dict] = None  # Native JSON — preserves types (numbers, booleans, nested objects)
     # region: Deprecated, clickhouse allow filters to be applied efficiently enough
     metadata_indexed_string_1: Optional[str] = None
     metadata_indexed_string_2: Optional[str] = None
