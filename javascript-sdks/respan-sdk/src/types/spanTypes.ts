@@ -18,6 +18,7 @@ export enum RespanSpanAttributes {
 
     // Metadata
     RESPAN_METADATA = "respan.metadata",
+    RESPAN_PROPERTIES = "respan.properties",
 
     // Prompt & environment
     RESPAN_PROMPT = "respan.prompt",
@@ -62,6 +63,7 @@ export const RESPAN_SPAN_ATTRIBUTES_MAP: { [key: string]: string } = {
     trace_group_identifier: RespanSpanAttributes.RESPAN_TRACE_GROUP_ID,
     group_identifier: RespanSpanAttributes.RESPAN_TRACE_GROUP_ID,
     metadata: RespanSpanAttributes.RESPAN_METADATA,
+    properties: RespanSpanAttributes.RESPAN_PROPERTIES,
     prompt: RespanSpanAttributes.RESPAN_PROMPT,
     environment: RespanSpanAttributes.RESPAN_ENVIRONMENT,
 };

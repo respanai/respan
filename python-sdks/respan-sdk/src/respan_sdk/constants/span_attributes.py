@@ -43,6 +43,7 @@ class RespanSpanAttributes(str, Enum):
 
     # Metadata
     RESPAN_METADATA = "respan.metadata"
+    RESPAN_PROPERTIES = "respan.properties"
 
     # Prompt & environment
     RESPAN_PROMPT = "respan.prompt"
@@ -83,6 +84,7 @@ RESPAN_TRACE_GROUP_ID = RespanSpanAttributes.RESPAN_TRACE_GROUP_ID.value
 
 # Metadata (pattern: "respan.metadata.<key>" where key is customizable)
 RESPAN_METADATA = RespanSpanAttributes.RESPAN_METADATA.value
+RESPAN_PROPERTIES = RespanSpanAttributes.RESPAN_PROPERTIES.value
 
 # Prompt & environment
 RESPAN_PROMPT = RespanSpanAttributes.RESPAN_PROMPT.value
@@ -113,6 +115,7 @@ RESPAN_SPAN_ATTRIBUTES_MAP = {
     "trace_group_identifier": RESPAN_TRACE_GROUP_ID,
     "group_identifier": RESPAN_TRACE_GROUP_ID,
     "metadata": RESPAN_METADATA,
+    "properties": RESPAN_PROPERTIES,
     "prompt": RESPAN_PROMPT,
     "environment": RESPAN_ENVIRONMENT,
 }
