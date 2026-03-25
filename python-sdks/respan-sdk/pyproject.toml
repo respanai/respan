@@ -1,11 +1,11 @@
 [project]
 name = "respan-sdk"
-version = "2.6.14"
+version = "2.6.15"
 description = "Respan SDK allows you to interact with the Respan API smoothly"
 
 [tool.poetry]
 name = "respan-sdk"
-version = "2.6.14"
+version = "2.6.15"
 description = "Respan SDK allows you to interact with the Respan API smoothly"
 authors = ["Respan <team@respan.ai>"]
 license = "MIT"
