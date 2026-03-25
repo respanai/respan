@@ -167,7 +167,7 @@ class Customer(RespanBaseModel):
 
 class CacheOptions(RespanBaseModel):
     cache_by_customer: Optional[bool] = None  # Create cache for each customer_user
-    is_cache_by_model: Optional[bool] = None  # Partition cache by model name
+    is_cached_by_model: Optional[bool] = None  # Partition cache by model name
     omit_log: Optional[bool] = None  # When cache is hit, don't log the request
 
     def model_dump(self, *args, **kwargs) -> Dict[str, Any]:
