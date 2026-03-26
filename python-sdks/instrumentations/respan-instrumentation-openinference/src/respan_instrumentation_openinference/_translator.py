@@ -85,6 +85,35 @@ OI_LLM_TOKEN_COUNT_TOTAL = OISpanAttributes.LLM_TOKEN_COUNT_TOTAL
 OI_LLM_TOKEN_COUNT_CACHE_READ = OISpanAttributes.LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ
 OI_LLM_TOOLS = OISpanAttributes.LLM_TOOLS
 OI_AGENT_NAME = OISpanAttributes.AGENT_NAME
+OI_INPUT_MIME_TYPE = OISpanAttributes.INPUT_MIME_TYPE
+OI_OUTPUT_MIME_TYPE = OISpanAttributes.OUTPUT_MIME_TYPE
+
+# OI scalar attributes to remove after translation (their data has been
+# mapped to Traceloop/OpenLLMetry equivalents).  openinference.span.kind is
+# deliberately kept — the backend uses it for span-type identification.
+_OI_KEYS_TO_REMOVE = frozenset({
+    OI_INPUT_VALUE,
+    OI_INPUT_MIME_TYPE,
+    OI_OUTPUT_VALUE,
+    OI_OUTPUT_MIME_TYPE,
+    OI_LLM_MODEL_NAME,
+    OI_LLM_PROVIDER,
+    OI_LLM_SYSTEM,
+    OI_LLM_INVOCATION_PARAMETERS,
+    OI_LLM_TOKEN_COUNT_PROMPT,
+    OI_LLM_TOKEN_COUNT_COMPLETION,
+    OI_LLM_TOKEN_COUNT_TOTAL,
+    OI_LLM_TOKEN_COUNT_CACHE_READ,
+    OI_LLM_TOOLS,
+    OI_AGENT_NAME,
+})
+
+# OI indexed-attribute prefixes to remove (llm.input_messages.*, llm.output_messages.*)
+_OI_PREFIXES_TO_REMOVE = (
+    "llm.input_messages.",
+    "llm.output_messages.",
+    "llm.tools.",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -279,7 +308,8 @@ class OpenInferenceTranslator(SpanProcessor):
     enriches them with the Traceloop attributes the Respan backend expects.
 
     All mappings are the exact reverse of Arize's openinference-instrumentation-openllmetry.
-    OI attributes are preserved (additive enrichment via setdefault, not destructive).
+    After translation the original OI attributes are removed so they don't
+    leak into the backend's ``metadata`` blob as noise.
     """
 
     def on_start(self, span: Any, parent_context: Any = None) -> None:
@@ -356,6 +386,23 @@ class OpenInferenceTranslator(SpanProcessor):
         # --- LLM-specific: messages, invocation params, tools ---
         if oi_kind_upper in _LLM_KINDS:
             self._translate_llm(attrs)
+
+        # --- Remove translated OI attributes so they don't pollute metadata ---
+        self._remove_oi_attrs(attrs)
+
+    @staticmethod
+    def _remove_oi_attrs(attrs: Dict[str, Any]) -> None:
+        """Remove original OI attributes that have been translated."""
+        keys_to_delete = [
+            k for k in attrs
+            if k in _OI_KEYS_TO_REMOVE
+            or any(k.startswith(p) for p in _OI_PREFIXES_TO_REMOVE)
+        ]
+        for k in keys_to_delete:
+            try:
+                del attrs[k]
+            except (KeyError, TypeError):
+                pass
 
     def _translate_llm(self, attrs: Dict[str, Any]) -> None:
         """Extra translation for LLM/EMBEDDING spans."""
