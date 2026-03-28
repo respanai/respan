@@ -1,6 +1,5 @@
 import json
 import inspect
-import logging
 from functools import wraps
 from typing import Optional, TypeVar, Callable, Any, ParamSpec, Awaitable
 from opentelemetry import context as context_api
@@ -10,7 +9,11 @@ from respan_sdk import FilterParamDict
 from respan_tracing.constants.context_constants import (
     ENABLE_CONTENT_TRACING_KEY
 )
+from respan_tracing.constants.generic_constants import LOGGER_NAME_DECORATORS
+from respan_tracing.utils.logging import get_respan_logger
 from respan_tracing.utils.span_setup import setup_span, cleanup_span, LinksParam
+
+logger = get_respan_logger(LOGGER_NAME_DECORATORS)
 
 
 P = ParamSpec("P")
@@ -190,7 +193,7 @@ def _create_entity_method_decorator(
                 try:
                     return name(*args, **kwargs)
                 except Exception as e:
-                    logging.getLogger("respan_tracing").warning(
+                    logger.warning(
                         f"Dynamic span name callable failed for {fn.__name__}: {e}. "
                         f"Falling back to function name."
                     )
