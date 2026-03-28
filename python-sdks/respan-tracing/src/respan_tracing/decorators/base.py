@@ -181,14 +181,19 @@ def _create_entity_method_decorator(
 
     def decorator(fn: F) -> F:
         # Static name resolved once; callable resolved per-call below
-        is_name_callable = callable(name) and not isinstance(name, str)
+        is_name_callable = callable(name)
         static_name = None if is_name_callable else (name or fn.__name__)
 
         def _resolve_name(*args, **kwargs) -> str:
             if is_name_callable:
                 try:
                     return name(*args, **kwargs)
-                except Exception:
+                except Exception as e:
+                    import logging
+                    logging.getLogger("respan_tracing").warning(
+                        f"Dynamic span name callable failed for {fn.__name__}: {e}. "
+                        f"Falling back to function name."
+                    )
                     return fn.__name__
             return static_name
 

@@ -6,7 +6,7 @@ from respan_tracing.decorators.base import create_entity_method, LinksParam
 
 
 def workflow(
-    name: Optional[str] = None,
+    name: Optional[Union[str, Callable]] = None,
     version: Optional[int] = None,
     method_name: Optional[str] = None,
     processors: Optional[Union[str, List[str]]] = None,
@@ -86,7 +86,7 @@ def task(
 
 
 def agent(
-    name: Optional[str] = None,
+    name: Optional[Union[str, Callable]] = None,
     version: Optional[int] = None,
     method_name: Optional[str] = None,
     processors: Optional[Union[str, List[str]]] = None,
@@ -125,7 +125,7 @@ def agent(
 
 
 def tool(
-    name: Optional[str] = None,
+    name: Optional[Union[str, Callable]] = None,
     version: Optional[int] = None,
     method_name: Optional[str] = None,
     processors: Optional[Union[str, List[str]]] = None,
