@@ -1,5 +1,6 @@
 import json
 import inspect
+import logging
 from functools import wraps
 from typing import Optional, TypeVar, Callable, Any, ParamSpec, Awaitable
 from opentelemetry import context as context_api
@@ -189,7 +190,6 @@ def _create_entity_method_decorator(
                 try:
                     return name(*args, **kwargs)
                 except Exception as e:
-                    import logging
                     logging.getLogger("respan_tracing").warning(
                         f"Dynamic span name callable failed for {fn.__name__}: {e}. "
                         f"Falling back to function name."
