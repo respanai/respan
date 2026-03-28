@@ -45,7 +45,7 @@ def workflow(
 
 
 def task(
-    name: Optional[str] = None,
+    name: Optional[Union[str, Callable]] = None,
     version: Optional[int] = None,
     method_name: Optional[str] = None,
     processors: Optional[Union[str, List[str]]] = None,
@@ -56,7 +56,9 @@ def task(
     """Respan task decorator
 
     Args:
-        name: Optional name for the task
+        name: Name for the task. Can be a string (static) or a callable
+              that receives (*args, **kwargs) and returns a string (dynamic).
+              Dynamic names are resolved at each invocation.
         version: Optional version number
         method_name: Optional method name for class decorators
         processors: Optional processor name(s) to route this task's spans to.
