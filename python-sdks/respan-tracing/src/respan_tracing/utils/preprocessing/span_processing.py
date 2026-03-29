@@ -138,6 +138,8 @@ def is_root_span_candidate(span: ReadableSpan) -> bool:
     Determine if a span should be converted to a root span.
 
     Logic:
+    - Spans with an existing parent are NEVER root candidates — they are
+      children of another span (possibly from a continued trace via SpanBuffer).
     - User-decorated span (TRACELOOP_SPAN_KIND) without entity path should become root
     - Standalone LLM span (LLM_REQUEST_TYPE) without entity path should become root
 
@@ -147,6 +149,12 @@ def is_root_span_candidate(span: ReadableSpan) -> bool:
     Returns:
         bool: True if span should be made a root span
     """
+    # Spans with an existing parent are part of a trace hierarchy.
+    # Never override their parent — this preserves trace continuations
+    # (e.g., workflow pause/resume via SpanBuffer parent context).
+    if span.parent and span.parent.is_valid():
+        return False
+
     span_kind = span.attributes.get(SpanAttributes.TRACELOOP_SPAN_KIND)
     entity_path = span.attributes.get(SpanAttributes.TRACELOOP_ENTITY_PATH, "")
     llm_request_type = span.attributes.get(LLM_REQUEST_TYPE)
