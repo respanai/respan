@@ -371,7 +371,7 @@ class RespanClient:
         # the parent context. Only client.start_span() is affected — decorators
         # use setup_span() directly and are not skipped.
         active_buffer = _active_span_buffer.get(None)
-        if active_buffer and active_buffer.is_continuation:
+        if active_buffer and active_buffer._parent_span_id:
             yield None
             return
 
