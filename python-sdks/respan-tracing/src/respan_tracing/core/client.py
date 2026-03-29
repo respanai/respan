@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from respan_tracing.core.tracer import RespanTracer
 from respan_tracing.processors import SpanBuffer
+from respan_tracing.processors.base import _active_span_buffer
 from respan_tracing.utils.logging import get_respan_logger
 from respan_tracing.utils.span_setup import setup_span, cleanup_span, LinksParam
 
@@ -369,7 +370,6 @@ class RespanClient:
         # (from @task/@workflow decorators via setup_span) attach directly to
         # the parent context. Only client.start_span() is affected — decorators
         # use setup_span() directly and are not skipped.
-        from respan_tracing.processors.base import _active_span_buffer
         active_buffer = _active_span_buffer.get(None)
         if active_buffer and active_buffer.is_continuation:
             yield None
