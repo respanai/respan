@@ -364,6 +364,17 @@ class RespanClient:
             yield None
             return
 
+        # Continuation mode: when inside a SpanBuffer with a parent span,
+        # skip creating wrapper spans — the parent already exists. Child spans
+        # (from @task/@workflow decorators via setup_span) attach directly to
+        # the parent context. Only client.start_span() is affected — decorators
+        # use setup_span() directly and are not skipped.
+        from respan_tracing.processors.base import _active_span_buffer
+        active_buffer = _active_span_buffer.get(None)
+        if active_buffer and active_buffer.is_continuation:
+            yield None
+            return
+
         span, ctx_token, entity_name_token, entity_path_token = setup_span(
             entity_name=name,
             span_kind=kind,

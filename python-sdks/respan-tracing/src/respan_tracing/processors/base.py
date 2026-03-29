@@ -349,6 +349,7 @@ class SpanBuffer:
         self._tracer_provider = tracer_provider
         self._parent_trace_id = parent_trace_id
         self._parent_span_id = parent_span_id
+        self.is_continuation = bool(parent_trace_id and parent_span_id)
     
     def __enter__(self):
         """
