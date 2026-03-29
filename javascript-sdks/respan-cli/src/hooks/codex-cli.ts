@@ -261,6 +261,7 @@ function createSpans(
   const rootSpanId = `codexcli_${traceUniqueId}_root`;
   spans.push({
     trace_unique_id: traceUniqueId,
+    session_identifier: threadId,
     thread_identifier: threadId,
     customer_identifier: customerId,
     span_unique_id: rootSpanId,

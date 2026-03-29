@@ -39,6 +39,7 @@ const CUSTOMER_ID = RespanSpanAttributes.RESPAN_CUSTOMER_PARAMS_ID;
 const CUSTOMER_EMAIL = RespanSpanAttributes.RESPAN_CUSTOMER_PARAMS_EMAIL;
 const CUSTOMER_NAME = RespanSpanAttributes.RESPAN_CUSTOMER_PARAMS_NAME;
 const THREAD_ID = RespanSpanAttributes.RESPAN_THREADS_ID;
+const SESSION_ID = RespanSpanAttributes.RESPAN_SESSION_ID;
 const TRACE_GROUP_ID = RespanSpanAttributes.RESPAN_TRACE_GROUP_ID;
 const RESPAN_SPAN_TOOLS = RespanSpanAttributes.RESPAN_SPAN_TOOLS;
 const RESPAN_METADATA_AGENT_NAME = RespanSpanAttributes.RESPAN_METADATA_AGENT_NAME;
@@ -408,6 +409,9 @@ function enrichMetadata(attrs: Record<string, any>, spanName: string): void {
         break;
       case "customer_name":
         setDefault(attrs, CUSTOMER_NAME, String(value));
+        break;
+      case "session_identifier":
+        setDefault(attrs, SESSION_ID, String(value));
         break;
       case "thread_identifier":
         setDefault(attrs, THREAD_ID, String(value));

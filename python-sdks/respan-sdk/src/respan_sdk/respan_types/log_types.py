@@ -406,6 +406,7 @@ class RespanFullLogParams(RespanLogParams):
     # endregion: usage (additional)
 
     # region: tracing (additional)
+    session_identifier: Optional[Union[str, int]] = None
     thread_identifier: Optional[Union[str, int]] = None
     thread_unique_id: Optional[str] = None
     # endregion: tracing

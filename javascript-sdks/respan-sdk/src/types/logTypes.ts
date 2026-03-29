@@ -565,6 +565,10 @@ const RespanParamsSchema = z.object({
   span_tools: z.array(z.string()).optional(),
   span_workflow_name: z.string().optional(),
 
+  //#region session
+  session_identifier: StringOrNumberSchema.optional(),
+  //#endregion session
+
   //#region thread
   thread_identifier: StringOrNumberSchema.optional(),
   //#endregion thread

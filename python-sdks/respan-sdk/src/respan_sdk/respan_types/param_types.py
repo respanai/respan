@@ -472,6 +472,9 @@ class RespanParams(RespanBaseModel, PreprocessLogDataMixin):
     trace_group_identifier: Optional[Union[str, int]] = (
         None  # The customizable id for grouping traces together
     )
+    # region: session
+    session_identifier: Optional[Union[str, int]] = None
+    # endregion: session
     # region: thread, deprecated
     thread_identifier: Optional[Union[str, int]] = (
         None  # 2025-06-04: Deprecated, merged into tracing as a special case

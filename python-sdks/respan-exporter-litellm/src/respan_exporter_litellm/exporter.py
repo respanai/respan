@@ -318,10 +318,14 @@ class RespanLiteLLMCallback(LiteLLMCustomLogger):
                     f"customer_{k}": v for k, v in cp.items() if k != "customer_identifier"
                 })
         
+        # Session identifier
+        if "session_identifier" in kw_params:
+            payload["session_identifier"] = kw_params["session_identifier"]
+
         # Thread identifier
         if "thread_identifier" in kw_params:
             payload["thread_identifier"] = kw_params["thread_identifier"]
-        
+
         # Custom metadata
         if m := kw_params.get("metadata"):
             if isinstance(m, dict):
@@ -329,7 +333,7 @@ class RespanLiteLLMCallback(LiteLLMCustomLogger):
         
         # Add remaining params as metadata
         excluded = {
-            "customer_identifier", "customer_params", "thread_identifier", "metadata",
+            "customer_identifier", "customer_params", "session_identifier", "thread_identifier", "metadata",
             "workflow_name", "trace_id", "trace_name", "span_id", "parent_span_id", "span_name",
         }
         extra_meta.update({k: v for k, v in kw_params.items() if k not in excluded})

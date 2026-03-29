@@ -38,6 +38,9 @@ class RespanSpanAttributes(str, Enum):
     # Threads
     RESPAN_THREADS_ID = "respan.threads.thread_identifier"
 
+    # Sessions
+    RESPAN_SESSION_ID = "respan.sessions.session_identifier"
+
     # Trace
     RESPAN_TRACE_GROUP_ID = "respan.trace.trace_group_identifier"
 
@@ -79,6 +82,9 @@ RESPAN_EVALUATION_PARAMS_ID = RespanSpanAttributes.RESPAN_EVALUATION_PARAMS_ID.v
 # Threads
 RESPAN_THREADS_ID = RespanSpanAttributes.RESPAN_THREADS_ID.value
 
+# Sessions
+RESPAN_SESSION_ID = RespanSpanAttributes.RESPAN_SESSION_ID.value
+
 # Trace
 RESPAN_TRACE_GROUP_ID = RespanSpanAttributes.RESPAN_TRACE_GROUP_ID.value
 
@@ -111,6 +117,7 @@ RESPAN_SPAN_ATTRIBUTES_MAP = {
     "customer_name": RESPAN_CUSTOMER_PARAMS_NAME,
     "evaluation_identifier": RESPAN_EVALUATION_PARAMS_ID,
     "thread_identifier": RESPAN_THREADS_ID,
+    "session_identifier": RESPAN_SESSION_ID,
     "custom_identifier": RESPAN_SPAN_CUSTOM_ID,
     "trace_group_identifier": RESPAN_TRACE_GROUP_ID,
     "group_identifier": RESPAN_TRACE_GROUP_ID,

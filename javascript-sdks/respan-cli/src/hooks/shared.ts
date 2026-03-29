@@ -39,6 +39,7 @@ export interface SpanData {
   span_name: string;
   span_workflow_name: string;
   span_path?: string;
+  session_identifier?: string;
   thread_identifier?: string;
   customer_identifier?: string;
   model?: string;
@@ -378,6 +379,7 @@ export function toOtlpPayload(spans: SpanData[]): Record<string, unknown> {
     const attrs: Record<string, unknown> = {};
 
     // Respan-specific attributes
+    if (span.session_identifier) attrs['respan.sessions.session_identifier'] = span.session_identifier;
     if (span.thread_identifier) attrs['respan.threads.thread_identifier'] = span.thread_identifier;
     if (span.customer_identifier) attrs['respan.customer_params.customer_identifier'] = span.customer_identifier;
     if (span.span_workflow_name) attrs['traceloop.workflow.name'] = span.span_workflow_name;

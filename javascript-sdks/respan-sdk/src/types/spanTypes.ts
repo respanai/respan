@@ -13,6 +13,9 @@ export enum RespanSpanAttributes {
     // Threads
     RESPAN_THREADS_ID = "respan.threads.thread_identifier",
 
+    // Sessions
+    RESPAN_SESSION_ID = "respan.sessions.session_identifier",
+
     // Trace
     RESPAN_TRACE_GROUP_ID = "respan.trace.trace_group_identifier",
 
@@ -72,6 +75,7 @@ export const RESPAN_SPAN_ATTRIBUTES_MAP: { [key: string]: string } = {
     customer_name: RespanSpanAttributes.RESPAN_CUSTOMER_PARAMS_NAME,
     evaluation_identifier: RespanSpanAttributes.RESPAN_EVALUATION_PARAMS_ID,
     thread_identifier: RespanSpanAttributes.RESPAN_THREADS_ID,
+    session_identifier: RespanSpanAttributes.RESPAN_SESSION_ID,
     custom_identifier: RespanSpanAttributes.RESPAN_SPAN_CUSTOM_ID,
     trace_group_identifier: RespanSpanAttributes.RESPAN_TRACE_GROUP_ID,
     group_identifier: RespanSpanAttributes.RESPAN_TRACE_GROUP_ID,

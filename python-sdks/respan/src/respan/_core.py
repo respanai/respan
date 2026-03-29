@@ -68,6 +68,7 @@ class Respan:
         instrumentations: Optional[Sequence[object]] = None,
         is_auto_instrument: Optional[bool] = None,
         customer_identifier: Optional[str] = None,
+        session_identifier: Optional[str] = None,
         thread_identifier: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
         environment: Optional[str] = None,
@@ -82,6 +83,8 @@ class Respan:
         default_attributes: Dict[str, Any] = {}
         if customer_identifier:
             default_attributes["customer_identifier"] = customer_identifier
+        if session_identifier:
+            default_attributes["session_identifier"] = session_identifier
         if thread_identifier:
             default_attributes["thread_identifier"] = thread_identifier
         if metadata:
