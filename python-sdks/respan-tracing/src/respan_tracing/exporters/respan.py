@@ -61,7 +61,6 @@ from respan_sdk.constants.span_attributes import (
     LLM_REQUEST_TYPE,
 )
 from respan_tracing.utils.logging import get_respan_logger, build_spans_export_preview
-from respan_tracing.utils.preprocessing.span_processing import is_root_span_candidate
 from respan_tracing.constants.generic_constants import LOGGER_NAME_EXPORTER
 
 logger = get_respan_logger(LOGGER_NAME_EXPORTER)
@@ -89,11 +88,6 @@ def _prepare_spans_for_export(spans: Sequence[ReadableSpan]) -> List[ReadableSpa
 
     for span in spans:
         overrides: Dict[str, Any] = {}
-
-        if is_root_span_candidate(span):
-            logger.debug("Making span a root span: %s", span.name)
-            overrides[OTEL_SPAN_PARENT_FIELD] = None
-            overrides[OTEL_SPAN_PARENT_PRIVATE_FIELD] = None
 
         extra_attrs = _get_enrichment_attrs(span)
         if extra_attrs:
