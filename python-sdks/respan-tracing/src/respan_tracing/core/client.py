@@ -372,6 +372,9 @@ class RespanClient:
         # use setup_span() directly and are not skipped.
         active_buffer = _active_span_buffer.get(None)
         if active_buffer and active_buffer._parent_span_id:
+            # Stash processors so child spans inherit via on_start fallback.
+            if processors:
+                active_buffer.continuation_processors = processors if isinstance(processors, str) else ",".join(processors)
             yield None
             return
 

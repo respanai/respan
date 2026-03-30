@@ -94,6 +94,16 @@ class RespanSpanProcessor:
                 if parent_processors:
                     span.set_attribute(PROCESSORS_ATTR, parent_processors)
 
+            # Fallback: in continuation mode, the parent is a NonRecordingSpan
+            # with no attributes. Check the active SpanBuffer for stashed
+            # processors from the skipped client.start_span() call.
+            if not span.attributes.get(PROCESSORS_ATTR):
+                active_buffer = _active_span_buffer.get(None)
+                if active_buffer:
+                    buffer_processors = getattr(active_buffer, "continuation_processors", None)
+                    if buffer_processors:
+                        span.set_attribute(PROCESSORS_ATTR, buffer_processors)
+
         # Add custom parameters if present
         respan_params = context_api.get_value(PARAMS_KEY)
         if respan_params and isinstance(respan_params, dict):
