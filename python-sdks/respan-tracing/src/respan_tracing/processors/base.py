@@ -378,11 +378,27 @@ class SpanBuffer:
         """
         logger.debug(f"[SpanBuffer] Entering buffering context for trace {self.trace_id}")
 
-        # Inject parent context for trace continuation (workflow resume)
+        # Inject trace context so all spans in this buffer share the
+        # caller's trace ID. Without this, the OTel SDK generates a
+        # random trace ID that diverges from the caller's trace_id.
         if self._parent_trace_id and self._parent_span_id:
+            # Resume path: continue an existing trace under a specific parent.
+            inject_trace_id = int(self._parent_trace_id, 16)
+            inject_span_id = int(self._parent_span_id, 16)
+        elif self.trace_id:
+            # Initial path: use the caller's trace_id as the OTel trace.
+            # A synthetic root span ID seeds the trace context — the real
+            # root span becomes a child and inherits this trace_id.
+            inject_trace_id = int(self.trace_id, 16) if len(self.trace_id) == 32 else None
+            inject_span_id = None
+        else:
+            inject_trace_id = None
+            inject_span_id = None
+
+        if inject_trace_id is not None:
             parent_ctx = SpanContext(
-                trace_id=int(self._parent_trace_id, 16),
-                span_id=int(self._parent_span_id, 16),
+                trace_id=inject_trace_id,
+                span_id=inject_span_id or int("0000000000000001", 16),
                 is_remote=True,
                 trace_flags=TraceFlags(TraceFlags.SAMPLED),
             )
@@ -390,8 +406,8 @@ class SpanBuffer:
             ctx = trace.set_span_in_context(parent_span)
             self._parent_context_token = context_api.attach(ctx)
             logger.debug(
-                f"[SpanBuffer] Injected parent context: "
-                f"trace_id={self._parent_trace_id}, span_id={self._parent_span_id}"
+                f"[SpanBuffer] Injected trace context: "
+                f"trace_id={format(inject_trace_id, '032x')}"
             )
 
         # Mark as buffering
