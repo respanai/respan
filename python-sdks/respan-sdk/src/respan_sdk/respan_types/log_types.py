@@ -258,6 +258,25 @@ class RespanLogParams(PreprocessLogDataMixin, RespanBaseModel):
             return json.dumps(v, default=str)
         return v
 
+    @field_validator("metadata", "properties", mode="before")
+    @classmethod
+    def coerce_dict_fields(cls, v):
+        """Coerce JSON strings to dicts for Map/JSON CH columns.
+
+        Span attributes and overridable keys in SpanType.to_request_log()
+        can produce JSON strings for dict-typed fields. Without this
+        coercion, Pydantic validation rejects the value and the log is
+        silently dropped.
+        """
+        if isinstance(v, str):
+            try:
+                parsed = json.loads(v)
+                if isinstance(parsed, dict):
+                    return parsed
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return v
+
     @field_validator("span_name", mode="after")
     def stringify_span_name(cls, v):
         if v:
