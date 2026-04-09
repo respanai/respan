@@ -1228,6 +1228,40 @@ result = process_data("user-123", {"key": "value"})
 
 See [`examples/simple_span_updating_example.py`](examples/simple_span_updating_example.py) for a complete example.
 
+### Flushing Spans
+
+When batching is enabled (`is_batching_enabled=True`, the default), spans are exported in the background on a periodic schedule. In most cases this is transparent — the SDK registers an `atexit` handler that flushes remaining spans when the process exits.
+
+However, there are cases where you need to flush manually:
+
+- **Thread pool workers** — If your code runs in a `ThreadPoolExecutor` (e.g., Temporal activities, custom worker pools), the background flush thread may not export spans before the thread returns to the pool. The spans are created but never reach your backend.
+- **Short-lived processes** — Scripts or serverless functions that exit quickly may terminate before the batch interval fires.
+- **Test assertions** — When verifying spans in tests, you need to flush before checking the exporter.
+
+```python
+from respan_tracing import get_client
+
+@workflow(name="my_worker_task", processors="dogfood")
+def process_item(item):
+    client = get_client()
+    if client:
+        client.update_current_span(attributes={"item.id": item.id})
+
+    result = do_work(item)
+    return result
+
+# In a thread pool worker, flush after the decorated function returns:
+def worker_wrapper(item):
+    try:
+        return process_item(item)
+    finally:
+        client = get_client()
+        if client:
+            client.flush()
+```
+
+`flush()` is safe to call multiple times and is a no-op when there are no pending spans.
+
 ### Manual Span Creation
 
 For fine-grained control, you can manually create custom spans using the tracer directly. This is useful when:
