@@ -138,6 +138,7 @@ class RespanLogParams(PreprocessLogDataMixin, RespanBaseModel):
     prompt_tokens: Optional[int] = None
     prompt_cache_hit_tokens: Optional[int] = None
     prompt_cache_creation_tokens: Optional[int] = None
+    reasoning_tokens: Optional[int] = None
     # endregion: usage
 
     # region: user analytics

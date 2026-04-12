@@ -333,6 +333,7 @@ class RespanParams(RespanBaseModel, PreprocessLogDataMixin):
     prompt_tokens: Optional[int] = None
     prompt_cache_hit_tokens: Optional[int] = None
     prompt_cache_creation_tokens: Optional[int] = None
+    reasoning_tokens: Optional[int] = None
     usage: Optional[Union[Usage, dict]] = (
         None  # The usage object of the LLM response, which includes the token usage details; if cannot be parsed, can be a dict
     )
