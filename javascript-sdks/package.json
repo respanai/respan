@@ -6,6 +6,7 @@
     "respan",
     "respan-cli",
     "instrumentations/respan-instrumentation-anthropic",
+    "instrumentations/respan-instrumentation-claude-agent-sdk",
     "instrumentations/respan-instrumentation-openai",
     "instrumentations/respan-instrumentation-openai-agents",
     "instrumentations/respan-instrumentation-openinference",

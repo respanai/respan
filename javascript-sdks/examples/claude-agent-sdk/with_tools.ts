@@ -2,9 +2,8 @@
 
 import "dotenv/config";
 import * as _ClaudeAgentSDK from "@anthropic-ai/claude-agent-sdk";
-import { ClaudeAgentSDKInstrumentation } from "@arizeai/openinference-instrumentation-claude-agent-sdk";
+import { ClaudeAgentSDKInstrumentor } from "@respan/instrumentation-claude-agent-sdk";
 import { Respan } from "@respan/respan";
-import { OpenInferenceInstrumentor } from "@respan/instrumentation-openinference";
 
 const ClaudeAgentSDK = { ..._ClaudeAgentSDK };
 
@@ -12,7 +11,7 @@ const respan = new Respan({
   apiKey: process.env.RESPAN_API_KEY,
   baseURL: process.env.RESPAN_BASE_URL,
   instrumentations: [
-    new OpenInferenceInstrumentor(ClaudeAgentSDKInstrumentation, ClaudeAgentSDK),
+    new ClaudeAgentSDKInstrumentor({ sdkModule: ClaudeAgentSDK }),
   ],
 });
 await respan.initialize();
