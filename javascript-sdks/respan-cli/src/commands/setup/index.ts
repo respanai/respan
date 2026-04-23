@@ -25,50 +25,43 @@ Use the Respan CLI and SDK for LLM observability — tracing, evals, prompts, da
 
 ## When To Use
 
-- The user asks to **set up Respan** or **add tracing** → read [references/setup.md](references/setup.md)
-- The user asks about **traces, logs, prompts, datasets, evals** → read [references/platform.md](references/platform.md)
-- The user asks about **gateway routing** or **proxying LLM calls** → read [references/gateway.md](references/gateway.md)
-- You need to run a Respan CLI command → check [references/platform.md](references/platform.md) for command reference
+- **Set up Respan** or **add tracing** → read [references/setup.md](references/setup.md)
+- **Advanced tracing** (decorators, propagation, processors) → read [references/tracing.md](references/tracing.md)
+- **Gateway routing** or **proxying LLM calls** → read [references/gateway.md](references/gateway.md)
+- **Prompt management** (create, version, deploy) → read [references/prompts.md](references/prompts.md)
+- **Evals** (datasets, evaluators, experiments) → read [references/evals.md](references/evals.md)
+- **Monitors & automation** (alerts, online evals, webhooks) → read [references/monitors.md](references/monitors.md)
 
 ## Core Principles
 
-1. **Documentation First**: Always fetch current docs before implementing. Respan updates frequently. See docs access methods below.
-2. **CLI for Data Access**: Use \`respan\` CLI when querying/modifying Respan data.
-3. **Check References**: Read the relevant reference file before implementing any workflow.
+1. **Read the reference first.** Each reference file has the exact API patterns, MCP tools, and CLI commands.
+2. **Use MCP tools** for platform operations (prompts, datasets, evaluators, experiments, traces, logs).
+3. **Use CLI** when MCP is not available: \`respan traces list\`, \`respan prompts list\`, etc.
+4. **Fetch docs** for integration-specific details not covered in references.
 
 ## Quick Reference
 
-| Task | Command / Action |
-|------|-----------------|
-| Set up SDK tracing | Follow [references/setup.md](references/setup.md) |
+| Task | Reference / Command |
+|------|--------------------|
+| Set up SDK tracing | [references/setup.md](references/setup.md) |
+| Decorators & propagation | [references/tracing.md](references/tracing.md) |
+| Gateway routing | [references/gateway.md](references/gateway.md) |
+| Prompt management | [references/prompts.md](references/prompts.md) |
+| Evals & experiments | [references/evals.md](references/evals.md) |
+| Monitors & automation | [references/monitors.md](references/monitors.md) |
 | List traces | \`respan traces list --limit 10\` |
 | View a trace | \`respan traces get <id>\` |
-| List prompts | \`respan prompts list\` |
-| Create dataset | \`respan datasets create --name <name>\` |
-| Run evaluator | \`respan evaluators run <id>\` |
 | Check auth | \`respan auth status\` |
-| View logs | \`respan logs list --limit 10\` |
 
 ## Documentation Access
 
-Three methods to access Respan docs, in order of preference:
-
-### 1. Documentation Index (llms.txt)
-
-Fetch the full index of all doc pages:
-\`https://www.respan.ai/docs/llms.txt\`
-
-Use this to discover the right page for a topic, then fetch that page directly.
-
-### 2. Fetch Individual Pages as Markdown
-
-Any integration or SDK doc page can be fetched by changing \`.mdx\` to \`.md\`:
+Any doc page can be fetched as markdown:
 \`https://respan.ai/docs/integrations/openai-sdk.md\`
 \`https://respan.ai/docs/sdks/typescript-sdk/overview.md\`
 
-### 3. Platform
+Full docs index: \`https://www.respan.ai/docs/llms.txt\`
 
-View traces, logs, and analytics at: \`https://platform.respan.ai\`
+Platform: \`https://platform.respan.ai\`
 `;
 
 const GATEWAY_MD = `# Respan Gateway
@@ -259,9 +252,9 @@ Check higher-priority categories first. If a match is found, use that instrument
 | Pydantic AI | \`pydantic-ai\` | — | \`respan-instrumentation-pydantic-ai\` | — | [docs](https://respan.ai/docs/integrations/pydantic-ai.md) |
 | LangChain | \`langchain\` | \`langchain\` | via OpenInference | — | [docs](https://respan.ai/docs/integrations/langchain.md) |
 | LangGraph | \`langgraph\` | — | via OpenInference | — | [docs](https://respan.ai/docs/integrations/langgraph.md) |
-| CrewAI | \`crewai\` | — | via OpenInference | — | [docs](https://respan.ai/docs/integrations/crewai.md) |
+| CrewAI | \`crewai\` | — | \`respan-instrumentation-crewai\` | — | [docs](https://respan.ai/docs/integrations/crewai.md) |
 | LlamaIndex | \`llama-index\` | — | via OpenInference | — | [docs](https://respan.ai/docs/integrations/llama-index.md) |
-| Haystack | \`haystack-ai\` | — | via exporter | — | [docs](https://respan.ai/docs/integrations/haystack.md) |
+| Haystack | \`haystack-ai\` | — | \`respan-instrumentation-haystack\` | — | [docs](https://respan.ai/docs/integrations/haystack.md) |
 | Mastra | — | \`mastra\` | — | via OTEL | [docs](https://respan.ai/docs/integrations/mastra.md) |
 | Google ADK | \`google-adk\` | — | via OpenInference | — | [docs](https://respan.ai/docs/integrations/google-adk.md) |
 
