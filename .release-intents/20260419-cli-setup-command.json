@@ -1,5 +1,5 @@
 {
-  "summary": "Add `respan setup` command with interactive wizard, agent skills, demo trace verification, `respan setup doctor` diagnostics, and auto-instrument skill updates",
+  "summary": "CLI: bump @respan/respan-api to 0.1.16, add `respan eval` one-shot command, refactor skill system prompt, expand reference docs (tracing/prompts/evals/monitors/gateway), and bundle all 6 ref files in `respan setup`",
   "packages": {
     "@respan/cli": "minor"
   }

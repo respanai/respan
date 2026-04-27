@@ -218,4 +218,58 @@ respan evaluators run <id>             # Run an evaluator
 respan experiments list                # List experiments
 respan experiments get <id>            # Get experiment details
 respan experiments create              # Create an experiment
+respan eval <file>                     # Run a one-shot eval defined in a JSON file
 ```
+
+## One-Shot Evals via JSON
+
+`respan eval <file.json>` runs a complete eval pipeline from a single JSON spec —
+creates the prompt, dataset, evaluators, and experiment in one command.
+IDs are written back into the file so reruns reuse existing resources.
+
+### Minimal example
+
+```json
+{
+  "name": "Movie matcher",
+  "prompt": {
+    "name": "movie-matcher",
+    "model": "gpt-5-mini",
+    "messages": [
+      { "role": "system", "content": "Identify the movie. Reply with only the title." },
+      { "role": "user", "content": "{{description}}" }
+    ]
+  },
+  "dataset": {
+    "name": "movie-descriptions",
+    "rows": [
+      { "description": "A detective investigates seven deadly sins.", "expected_output": "Se7en" },
+      { "description": "A hacker learns reality is a simulation.", "expected_output": "The Matrix" }
+    ]
+  },
+  "experiment": {
+    "evaluators": [
+      {
+        "name": "Title match",
+        "type": "llm",
+        "score_value_type": "boolean",
+        "llm_config": {
+          "model": "openai/gpt-5-mini",
+          "evaluator_definition": "Expected: {{expected_output}}. Got: {{output}}. Correct? Reply true or false."
+        }
+      }
+    ]
+  }
+}
+```
+
+Run:
+
+```bash
+respan eval movie-matcher.eval.json
+```
+
+The runner creates the prompt (and deploys version 1), creates the dataset (and bulk-loads rows),
+creates each evaluator + its workflow (and deploys), then creates the experiment linking them.
+Each step writes the resulting IDs back to the JSON file so subsequent runs are idempotent —
+re-running with the same file reuses the existing resources.

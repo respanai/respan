@@ -14,6 +14,12 @@ import {
   ensureDir,
 } from '../../lib/integrate.js';
 import { createSpinner } from '../../lib/spinner.js';
+import {
+  TRACING_MD,
+  PROMPTS_MD,
+  EVALS_MD,
+  MONITORS_MD,
+} from './skill-refs.generated.js';
 
 // ── Shared skill content (same for all agents) ────────────────────────
 
@@ -114,103 +120,6 @@ Combine SDK tracing and gateway routing — initialize Respan for tracing AND po
 - Provider setup: \`https://respan.ai/docs/integrations/providers/openai.md\`
 `;
 
-const PLATFORM_MD = `# Respan Platform
-
-Use the Respan CLI and platform for traces, logs, prompts, datasets, evaluations, and monitoring.
-
-## CLI Commands
-
-### Auth
-\`\`\`bash
-respan auth login          # Log in (browser or API key)
-respan auth status         # Check current auth
-respan auth logout         # Log out
-respan whoami              # Show current user
-\`\`\`
-
-### Traces
-\`\`\`bash
-respan traces list --limit 10          # List recent traces
-respan traces get <trace-id>           # Get trace details
-respan traces summary                  # Trace summary stats
-\`\`\`
-
-### Logs
-\`\`\`bash
-respan logs list --limit 10            # List recent logs
-respan logs get <log-id>               # Get log details
-respan logs summary                    # Log summary stats
-respan logs create --data '{...}'      # Create a log entry
-\`\`\`
-
-### Prompts
-\`\`\`bash
-respan prompts list                    # List all prompts
-respan prompts get <id>                # Get prompt details
-respan prompts create --name <name>    # Create a prompt
-respan prompts update <id>             # Update a prompt
-respan prompts versions <id>           # List prompt versions
-\`\`\`
-
-### Datasets
-\`\`\`bash
-respan datasets list                   # List datasets
-respan datasets create --name <name>   # Create a dataset
-respan datasets get <id>               # Get dataset details
-respan datasets spans <id>             # List dataset spans
-respan datasets add-spans <id>         # Add spans to dataset
-\`\`\`
-
-### Evaluators
-\`\`\`bash
-respan evaluators list                 # List evaluators
-respan evaluators get <id>             # Get evaluator details
-respan evaluators create               # Create an evaluator
-respan evaluators run <id>             # Run an evaluator
-\`\`\`
-
-### Experiments
-\`\`\`bash
-respan experiments list                # List experiments
-respan experiments get <id>            # Get experiment details
-respan experiments create              # Create an experiment
-\`\`\`
-
-### Integration (CLI agent tracing)
-\`\`\`bash
-respan integrate claude-code           # Trace Claude Code conversations
-respan integrate codex-cli             # Trace Codex CLI conversations
-respan integrate gemini-cli            # Trace Gemini CLI conversations
-respan integrate opencode              # Trace OpenCode conversations
-respan integrate <tool> --disable      # Disable tracing
-\`\`\`
-
-### Config
-\`\`\`bash
-respan config list                     # List all config
-respan config get <key>                # Get config value
-respan config set <key> <value>        # Set config value
-\`\`\`
-
-## Platform Features
-
-- **Traces** — structured spans showing LLM call hierarchy, inputs/outputs, tokens, cost
-- **Logs** — request-level logging with metadata
-- **Prompts** — version-controlled prompt templates with deployment
-- **Datasets** — curated test data for evaluations
-- **Evaluators** — automated scoring/grading of LLM outputs
-- **Experiments** — run evals over datasets and compare results
-- **Monitors** — metric-based alerts for production regressions
-- **Views** — saved filters for quick access
-
-## Docs
-
-- Tracing concepts: \`https://respan.ai/docs/documentation/features/tracing/concepts.md\`
-- Evals concepts: \`https://respan.ai/docs/documentation/features/evals/concepts.md\`
-- Prompts: \`https://respan.ai/docs/documentation/features/prompt-management/prompt-management-quickstart.md\`
-- Monitoring: \`https://respan.ai/docs/documentation/features/monitoring/metrics.md\`
-- Full docs: \`https://www.respan.ai/docs/llms.txt\`
-`;
 
 const SETUP_MD = `# Respan Setup
 
@@ -872,8 +781,11 @@ This is the recommended way to get started with Respan.`;
       ensureDir(refsDir);
       writeTextFile(path.join(skillDir, 'SKILL.md'), this.getSkillMd());
       writeTextFile(path.join(refsDir, 'setup.md'), SETUP_MD);
-      writeTextFile(path.join(refsDir, 'platform.md'), PLATFORM_MD);
+      writeTextFile(path.join(refsDir, 'tracing.md'), TRACING_MD);
       writeTextFile(path.join(refsDir, 'gateway.md'), GATEWAY_MD);
+      writeTextFile(path.join(refsDir, 'prompts.md'), PROMPTS_MD);
+      writeTextFile(path.join(refsDir, 'evals.md'), EVALS_MD);
+      writeTextFile(path.join(refsDir, 'monitors.md'), MONITORS_MD);
     };
 
     // Write to ~/.agents/skills/ (Cursor, Codex, Gemini CLI, OpenCode)
