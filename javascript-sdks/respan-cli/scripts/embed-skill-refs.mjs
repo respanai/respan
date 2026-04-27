@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, '../../..');
 const REFS_DIR = resolve(REPO_ROOT, 'skills/references');
-const OUT_FILE = resolve(__dirname, '../src/commands/setup/skill-refs.generated.ts');
+const OUT_FILE = resolve(__dirname, '../src/lib/skill-refs.generated.ts');
 
 const REFS = ['tracing', 'prompts', 'evals', 'monitors'];
 

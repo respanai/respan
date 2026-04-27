@@ -16,7 +16,7 @@ export default class EvalRun extends BaseCommand {
     try {
       const client = this.getClient();
       const filePath = resolve(args.file);
-      const result = await runEval(filePath, client, this.getAuthHeader(), (msg) => this.log(msg));
+      const result = await runEval(filePath, client, this.getAuthHeader(), this.getBaseUrl(), (msg) => this.log(msg));
       this.log('');
       this.log(JSON.stringify(result, null, 2));
     } catch (error) {

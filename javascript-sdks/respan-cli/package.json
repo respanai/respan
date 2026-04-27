@@ -5,6 +5,9 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "imports": {
+    "#lib/*": "./dist/lib/*"
+  },
   "bin": {
     "respan": "./bin/run.js"
   },

@@ -19,7 +19,7 @@ import {
   PROMPTS_MD,
   EVALS_MD,
   MONITORS_MD,
-} from './skill-refs.generated.js';
+} from '#lib/skill-refs.generated.js';
 
 // ── Shared skill content (same for all agents) ────────────────────────
 

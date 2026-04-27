@@ -20,6 +20,7 @@ export async function runEval(
   filePath: string,
   client: RespanClient,
   authHeader: string,
+  baseUrl: string,
   log: (msg: string) => void = () => {},
 ): Promise<RunEvalResult> {
   const raw = readFileSync(filePath, 'utf8');
@@ -31,7 +32,7 @@ export async function runEval(
   const datasetResult = await ensureDataset(evalFile, client, authHeader, log);
   persist(filePath, evalFile);
 
-  const evaluatorResult = await ensureEvaluatorWorkflows(evalFile, client, authHeader, log);
+  const evaluatorResult = await ensureEvaluatorWorkflows(evalFile, client, authHeader, baseUrl, log);
   persist(filePath, evalFile);
 
   const experimentResult = await ensureExperiment(
@@ -162,6 +163,7 @@ async function ensureEvaluatorWorkflows(
   evalFile: EvalFile,
   client: RespanClient,
   Authorization: string,
+  baseUrl: string,
   log: (msg: string) => void,
 ): Promise<{ workflow_ids: string[]; created_count: number }> {
   const experiment = evalFile.experiment ?? (evalFile.experiment = {});
@@ -233,7 +235,7 @@ async function ensureEvaluatorWorkflows(
       ev.workflow_id = workflowId;
 
       log(`workflow: committing draft v1`);
-      await commitWorkflow(Authorization, workflowId);
+      await commitWorkflow(Authorization, baseUrl, workflowId);
 
       log(`workflow: deploying v1`);
       const deployed = (await client.workflows.deployWorkflow({
@@ -251,7 +253,7 @@ async function ensureEvaluatorWorkflows(
 
     if (!ev.workflow_version_id) {
       log(`workflow: looking up deployed version row id for ${ev.workflow_id}`);
-      const versionRowId = await getDeployedWorkflowVersionId(Authorization, ev.workflow_id);
+      const versionRowId = await getDeployedWorkflowVersionId(Authorization, baseUrl, ev.workflow_id);
       if (!versionRowId) {
         throw new Error(
           `workflow ${ev.workflow_id} has no deployed version; rerun after committing/deploying.`,
@@ -333,10 +335,10 @@ function outputFieldForScoreType(scoreValueType: string): string | null {
 
 async function getDeployedWorkflowVersionId(
   Authorization: string,
+  baseUrl: string,
   workflowId: string,
 ): Promise<string | null> {
-  const baseUrl = (process.env.RESPAN_API_BASE_URL || 'https://api.respan.ai').replace(/\/+$/, '');
-  const url = `${baseUrl}/api/workflows/${encodeURIComponent(workflowId)}/versions/`;
+  const url = `${normalizeBaseUrl(baseUrl)}/api/workflows/${encodeURIComponent(workflowId)}/versions/`;
   const response = await fetch(url, { headers: { Authorization } });
   if (!response.ok) return null;
   const body = (await response.json()) as { results?: Array<Record<string, unknown>> };
@@ -346,9 +348,12 @@ async function getDeployedWorkflowVersionId(
   return deployed ? String(deployed.id ?? '') : null;
 }
 
-async function commitWorkflow(Authorization: string, workflowId: string): Promise<void> {
-  const baseUrl = (process.env.RESPAN_API_BASE_URL || 'https://api.respan.ai').replace(/\/+$/, '');
-  const url = `${baseUrl}/api/workflows/${encodeURIComponent(workflowId)}/commits/`;
+function normalizeBaseUrl(baseUrl: string): string {
+  return baseUrl.replace(/\/+$/, '').replace(/\/api$/, '');
+}
+
+async function commitWorkflow(Authorization: string, baseUrl: string, workflowId: string): Promise<void> {
+  const url = `${normalizeBaseUrl(baseUrl)}/api/workflows/${encodeURIComponent(workflowId)}/commits/`;
   const response = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization },

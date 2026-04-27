@@ -60,6 +60,10 @@ export abstract class BaseCommand extends Command {
     return `Bearer ${token}`;
   }
 
+  protected getBaseUrl(): string {
+    return this.getAuth().baseUrl || 'https://api.respan.ai';
+  }
+
   protected getOutputFormat(): 'json' | 'csv' | 'table' {
     if (this.globalFlags.json) return 'json';
     if (this.globalFlags.csv) return 'csv';
