@@ -16,6 +16,7 @@ import {
 import { createSpinner } from '../../lib/spinner.js';
 import {
   TRACING_MD,
+  GATEWAY_MD,
   PROMPTS_MD,
   EVALS_MD,
   MONITORS_MD,
@@ -69,57 +70,6 @@ Full docs index: \`https://www.respan.ai/docs/llms.txt\`
 
 Platform: \`https://platform.respan.ai\`
 `;
-
-const GATEWAY_MD = `# Respan Gateway
-
-Route LLM calls through the Respan proxy for logging, caching, key management, and model switching.
-
-## Setup
-
-Point the LLM client's base URL at the Respan gateway. The API key authenticates both the proxy and tracing.
-
-### TypeScript
-
-\`\`\`typescript
-import OpenAI from "openai";
-
-const client = new OpenAI({
-  apiKey: process.env.RESPAN_API_KEY,
-  baseURL: process.env.RESPAN_BASE_URL || "https://api.respan.ai/api",
-});
-\`\`\`
-
-### Python
-
-\`\`\`python
-import os
-from openai import OpenAI
-
-client = OpenAI(
-    api_key=os.environ["RESPAN_API_KEY"],
-    base_url=os.getenv("RESPAN_BASE_URL", "https://api.respan.ai/api"),
-)
-\`\`\`
-
-## Gateway + Tracing (Both)
-
-Combine SDK tracing and gateway routing — initialize Respan for tracing AND point the LLM client at the gateway.
-
-## Features
-
-- **Unified key management** — one API key for all providers
-- **Caching** — cache repeated LLM calls
-- **Fallbacks** — automatic failover between providers
-- **Cost tracking** — per-request cost logging
-- **Model switching** — swap models without code changes
-
-## Docs
-
-- Quickstart: \`https://respan.ai/docs/documentation/features/gateway/gateway-quickstart.md\`
-- Advanced: \`https://respan.ai/docs/documentation/features/gateway/advanced.md\`
-- Provider setup: \`https://respan.ai/docs/integrations/providers/openai.md\`
-`;
-
 
 const SETUP_MD = `# Respan Setup
 

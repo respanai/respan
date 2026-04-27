@@ -26,11 +26,11 @@ export default class EvaluatorsCreate extends BaseCommand {
       }
       const data = await this.spin('Creating evaluator', () => client.evaluators.createEvaluator({
         Authorization: this.getAuthHeader(),
+        ...extra,
         name: flags.name,
-        type: (flags.type ?? 'llm') as any,
+        type: (flags.type ?? extra.type ?? 'llm') as any,
         score_value_type: (extra.score_value_type ?? 'numerical') as any,
         ...(flags.description ? { description: flags.description } : {}),
-        ...extra,
       } as any));
       this.log(JSON.stringify(data, null, 2));
     } catch (error) {

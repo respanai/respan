@@ -171,7 +171,20 @@ async function ensureEvaluatorWorkflows(
   const explicitWorkflowIds = experiment.evaluator_workflow_ids ?? [];
 
   let createdCount = 0;
-  const workflowIds: string[] = [...explicitWorkflowIds];
+  const workflowIds: string[] = [];
+
+  // Resolve user-supplied workflow IDs to their deployed-version row IDs.
+  // The experiment API expects version IDs (the `evaluator_workflow_ids` field
+  // name is misleading), so we look up each workflow's deployed version.
+  for (const wfId of explicitWorkflowIds) {
+    const versionRowId = await getDeployedWorkflowVersionId(Authorization, baseUrl, wfId);
+    if (!versionRowId) {
+      throw new Error(
+        `workflow ${wfId} (from experiment.evaluator_workflow_ids) has no deployed version.`,
+      );
+    }
+    workflowIds.push(versionRowId);
+  }
 
   for (const ev of evaluators) {
     if (!ev.evaluator_id) {

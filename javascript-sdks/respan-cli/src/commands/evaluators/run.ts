@@ -26,12 +26,12 @@ export default class EvaluatorsRun extends BaseCommand {
       }
       const data = await this.spin('Running evaluator', () => client.evaluators.runEvaluator({
         Authorization: this.getAuthHeader(),
+        ...extra,
         evaluator_id: args.id,
         ...(flags['dataset-id'] ? { dataset_id: flags['dataset-id'] } : {}),
         ...(flags['log-ids']
           ? { log_ids: flags['log-ids'].split(',').map((s) => s.trim()) }
           : {}),
-        ...extra,
       }));
       this.log(JSON.stringify(data, null, 2));
     } catch (error) {

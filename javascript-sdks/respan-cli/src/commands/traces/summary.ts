@@ -2,7 +2,7 @@ import { Flags } from '@oclif/core';
 import { BaseCommand } from '../../lib/base-command.js';
 
 export default class TracesSummary extends BaseCommand {
-  static description = 'Get a summary of traces for a time range';
+  static description = 'Get a span-level summary of activity for a time range (counts, latency, cost, errors aggregated across spans)';
   static flags = {
     ...BaseCommand.baseFlags,
     'start-time': Flags.string({ description: 'Start time (ISO 8601)', required: true }),

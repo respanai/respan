@@ -8,7 +8,7 @@ const REPO_ROOT = resolve(__dirname, '../../..');
 const REFS_DIR = resolve(REPO_ROOT, 'skills/references');
 const OUT_FILE = resolve(__dirname, '../src/lib/skill-refs.generated.ts');
 
-const REFS = ['tracing', 'prompts', 'evals', 'monitors'];
+const REFS = ['tracing', 'gateway', 'prompts', 'evals', 'monitors'];
 
 const escapeTemplate = (s) =>
   s.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$\{/g, '\\${');

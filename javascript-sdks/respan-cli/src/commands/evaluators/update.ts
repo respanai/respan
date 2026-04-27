@@ -26,10 +26,10 @@ export default class EvaluatorsUpdate extends BaseCommand {
       }
       const data = await this.spin('Updating evaluator', () => client.evaluators.updateEvaluator({
         Authorization: this.getAuthHeader(),
+        ...extra,
         evaluator_id: args.id,
         ...(flags.name ? { name: flags.name } : {}),
         ...(flags.description ? { description: flags.description } : {}),
-        ...extra,
       } as any));
       this.log(JSON.stringify(data, null, 2));
     } catch (error) {
