@@ -14,9 +14,11 @@ export default class DatasetsCreate extends BaseCommand {
     this.globalFlags = flags;
     try {
       const client = this.getClient();
-      const body: Record<string, unknown> = { name: flags.name };
-      if (flags.description) body.description = flags.description;
-      const data = await this.spin('Creating dataset', () => client.datasets.createDataset(body as any));
+      const data = await this.spin('Creating dataset', () => client.datasets.createDataset({
+        Authorization: this.getAuthHeader(),
+        name: flags.name,
+        ...(flags.description ? { description: flags.description } : {}),
+      }));
       this.log(JSON.stringify(data, null, 2));
     } catch (error) {
       this.handleError(error);

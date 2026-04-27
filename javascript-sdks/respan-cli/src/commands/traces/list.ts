@@ -31,25 +31,22 @@ ${FILTER_EXAMPLES}`;
     try {
       const client = this.getClient();
 
-      let bodyFilters: Record<string, unknown> = {};
+      let bodyFilters: Record<string, unknown> | undefined;
       if (flags.filter && flags.filter.length > 0) {
         bodyFilters = parseFilters(flags.filter);
       }
 
-      const queryParams: Record<string, unknown> = {
-        page_size: flags.limit,
-        page: flags.page,
-        sort_by: flags['sort-by'],
-      };
-      if (flags['start-time']) queryParams.start_time = flags['start-time'];
-      if (flags['end-time']) queryParams.end_time = flags['end-time'];
-      if (flags.environment) queryParams.environment = flags.environment;
-
       const data = await this.spin('Fetching traces', () =>
-        client.traces.list(
-          { filters: bodyFilters },
-          { queryParams },
-        ),
+        client.traces.listTraces({
+          Authorization: this.getAuthHeader(),
+          page_size: flags.limit,
+          page: flags.page,
+          sort_by: flags['sort-by'],
+          ...(flags['start-time'] ? { start_time: flags['start-time'] } : {}),
+          ...(flags['end-time'] ? { end_time: flags['end-time'] } : {}),
+          ...(flags.environment ? { environment: flags.environment } : {}),
+          ...(bodyFilters ? { filters: bodyFilters as any } : {}),
+        }),
       );
       this.outputResult(data, [
         'trace_unique_id', 'name', 'duration', 'span_count', 'total_cost', 'error_count', 'start_time',

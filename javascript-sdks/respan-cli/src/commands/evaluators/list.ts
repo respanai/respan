@@ -16,7 +16,7 @@ export default class EvaluatorsList extends BaseCommand {
     try {
       const client = this.getClient();
       const data = await this.spin('Fetching evaluators', () =>
-        client.evaluators.listEvaluators(),
+        client.evaluators.listEvaluators({ Authorization: this.getAuthHeader() }),
       );
       this.outputResult(data, ['id', 'name', 'type', 'is_active', 'created_at']);
       const pagination = extractPagination(data, flags.page);

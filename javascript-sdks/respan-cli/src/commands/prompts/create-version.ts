@@ -24,16 +24,18 @@ export default class PromptsCreateVersion extends BaseCommand {
         this.error('Invalid JSON for --messages');
       }
       // createVersion requires prompt_id, messages (string[]), and model (required)
-      const messagesStr = Array.isArray(messages) ? (messages as any[]).map((m: any) => typeof m === 'string' ? m : JSON.stringify(m)) : [String(messages)];
-      const createBody: Record<string, unknown> = {
-        prompt_id: args['prompt-id'],
-        messages: messagesStr,
-        model: flags.model || 'gpt-4o',
-      };
-      if (flags.temperature) createBody.temperature = parseFloat(flags.temperature);
-      if (flags['max-tokens']) createBody.max_tokens = flags['max-tokens'];
+      const messageList = Array.isArray(messages)
+        ? (messages as Record<string, unknown>[])
+        : [{ role: 'user', content: String(messages) }];
 
-      const data = await this.spin('Creating prompt version', () => client.prompts.createVersion(createBody as any));
+      const data = await this.spin('Creating prompt version', () => client.prompts.createPromptVersion({
+        Authorization: this.getAuthHeader(),
+        prompt_id: args['prompt-id'],
+        messages: messageList,
+        model: flags.model || 'gpt-4o',
+        ...(flags.temperature ? { temperature: parseFloat(flags.temperature) } : {}),
+        ...(flags['max-tokens'] !== undefined ? { max_tokens: flags['max-tokens'] } : {}),
+      }));
       this.log(JSON.stringify(data, null, 2));
     } catch (error) {
       this.handleError(error);

@@ -16,19 +16,21 @@ export default class ExperimentsCreate extends BaseCommand {
     this.globalFlags = flags;
     try {
       const client = this.getClient();
-      const body: Record<string, unknown> = {
-        name: flags.name,
-        dataset_id: flags['dataset-id'],
-      };
-      if (flags.description) body.description = flags.description;
+      let workflows: unknown = undefined;
       if (flags.workflows) {
         try {
-          body.workflows = JSON.parse(flags.workflows);
+          workflows = JSON.parse(flags.workflows);
         } catch {
           this.error('Invalid JSON for --workflows');
         }
       }
-      const data = await this.spin('Creating experiment', () => client.experiments.createExperiment(body as any));
+      const data = await this.spin('Creating experiment', () => client.experiments.createExperiment({
+        Authorization: this.getAuthHeader(),
+        name: flags.name,
+        dataset_id: flags['dataset-id'],
+        ...(flags.description ? { description: flags.description } : {}),
+        ...(workflows ? { workflows: workflows as any } : {}),
+      }));
       this.log(JSON.stringify(data, null, 2));
     } catch (error) {
       this.handleError(error);

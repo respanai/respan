@@ -48,9 +48,16 @@ export abstract class BaseCommand extends Command {
     const token = auth.apiKey || auth.accessToken;
     if (!token) throw new Error('No API key or access token available.');
     return new RespanClient({
-      token,
+      headers: { Authorization: `Bearer ${token}` },
       ...(auth.baseUrl ? { environment: auth.baseUrl } : {}),
     });
+  }
+
+  protected getAuthHeader(): string {
+    const auth = this.getAuth();
+    const token = auth.apiKey || auth.accessToken;
+    if (!token) throw new Error('No API key or access token available.');
+    return `Bearer ${token}`;
   }
 
   protected getOutputFormat(): 'json' | 'csv' | 'table' {

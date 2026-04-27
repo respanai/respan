@@ -14,9 +14,11 @@ export default class PromptsCreate extends BaseCommand {
     this.globalFlags = flags;
     try {
       const client = this.getClient();
-      const body: Record<string, unknown> = { name: flags.name };
-      if (flags.description) body.description = flags.description;
-      const data = await this.spin('Creating prompt', () => client.prompts.createPrompt(body as any));
+      const data = await this.spin('Creating prompt', () => client.prompts.createPrompt({
+        Authorization: this.getAuthHeader(),
+        name: flags.name,
+        ...(flags.description ? { description: flags.description } : {}),
+      }));
       this.log(JSON.stringify(data, null, 2));
     } catch (error) {
       this.handleError(error);

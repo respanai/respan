@@ -14,8 +14,9 @@
     "directory": "javascript-sdks/respan-cli"
   },
   "scripts": {
-    "build": "tsc && npm run build:hooks",
+    "build": "npm run generate:skill-refs && tsc && npm run build:hooks",
     "build:hooks": "node -e \"const{build}=require('esbuild');const hooks=['claude-code','codex-cli','gemini-cli'];Promise.all(hooks.map(h=>build({entryPoints:['src/hooks/'+h+'.ts'],bundle:true,platform:'node',target:'node18',format:'cjs',outfile:'dist/hooks/'+h+'.cjs',external:[]}))).then(()=>console.log('Hooks bundled.'))\"",
+    "generate:skill-refs": "node scripts/embed-skill-refs.mjs",
     "clean": "rm -rf dist",
     "dev": "node --loader ts-node/esm bin/dev.js",
     "postpack": "rm -f oclif.manifest.json",
@@ -42,7 +43,7 @@
     "@oclif/plugin-help": "^6",
     "@oclif/plugin-not-found": "^3",
     "@respan/cli": "^0.5.2",
-    "@respan/respan-api": "^0.0.3",
+    "@respan/respan-api": "0.1.16",
     "@respan/respan-sdk": "^1.1.4"
   },
   "devDependencies": {

@@ -17,14 +17,13 @@ export default class UsersList extends BaseCommand {
     this.globalFlags = flags;
     try {
       const client = this.getClient();
-      const params: Record<string, unknown> = {
+      const data = await this.spin('Fetching users', () => client.users.listCustomers({
+        Authorization: this.getAuthHeader(),
         page_size: flags.limit,
         page: flags.page,
-      };
-      if (flags['sort-by']) params.sort_by = flags['sort-by'];
-      if (flags.environment) params.environment = flags.environment;
-
-      const data = await this.spin('Fetching users', () => client.users.list(params as any));
+        ...(flags['sort-by'] ? { sort_by: flags['sort-by'] } : {}),
+        ...(flags.environment ? { environment: flags.environment as any } : {}),
+      }));
       this.outputResult(data, [
         'customer_identifier', 'name', 'email', 'number_of_requests', 'total_cost', 'last_active_timeframe',
       ]);

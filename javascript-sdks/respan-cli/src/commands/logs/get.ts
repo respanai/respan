@@ -11,7 +11,7 @@ export default class LogsGet extends BaseCommand {
     this.globalFlags = flags;
     try {
       const client = this.getClient();
-      const data = await this.spin('Fetching span', () => client.logs.retrieveSpan({ unique_id: args.id }));
+      const data = await this.spin('Fetching span', () => client.spans.retrieveSpan({ Authorization: this.getAuthHeader(), unique_id: args.id }));
       this.log(JSON.stringify(data, null, 2));
     } catch (error) {
       this.handleError(error);

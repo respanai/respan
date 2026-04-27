@@ -15,12 +15,11 @@ export default class PromptsUpdate extends BaseCommand {
     this.globalFlags = flags;
     try {
       const client = this.getClient();
-      const updateBody: Record<string, unknown> = {};
-      if (flags.name) updateBody.name = flags.name;
-      if (flags.description) updateBody.description = flags.description;
       const data = await this.spin('Updating prompt', () => client.prompts.updatePrompt({
+        Authorization: this.getAuthHeader(),
         prompt_id: args.id,
-        body: updateBody,
+        ...(flags.name ? { name: flags.name } : {}),
+        ...(flags.description ? { description: flags.description } : {}),
       }));
       this.log(JSON.stringify(data, null, 2));
     } catch (error) {

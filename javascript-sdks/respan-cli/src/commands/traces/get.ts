@@ -11,7 +11,7 @@ export default class TracesGet extends BaseCommand {
     this.globalFlags = flags;
     try {
       const client = this.getClient();
-      const data = await this.spin('Fetching trace', () => client.traces.retrieveTrace({ trace_unique_id: args.id }));
+      const data = await this.spin('Fetching trace', () => client.traces.retrieveTrace({ Authorization: this.getAuthHeader(), trace_unique_id: args.id }));
       this.log(JSON.stringify(data, null, 2));
     } catch (error) {
       this.handleError(error);

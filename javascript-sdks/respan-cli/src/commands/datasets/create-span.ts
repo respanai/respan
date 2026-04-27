@@ -22,10 +22,12 @@ export default class DatasetsCreateSpan extends BaseCommand {
       }
       const spanData = parsed as Record<string, unknown>;
       const data = await this.spin('Creating dataset span', () =>
-        client.datasets.createDatasetSpan({
+        client.datasets.createDatasetLog({
+          Authorization: this.getAuthHeader(),
           dataset_id: args['dataset-id'],
-          input: String(spanData.input || ''),
-          output: String(spanData.output || ''),
+          input: spanData.input,
+          output: spanData.output,
+          ...(spanData.expected_output !== undefined ? { expected_output: spanData.expected_output } : {}),
           ...(spanData.metadata ? { metadata: spanData.metadata as Record<string, unknown> } : {}),
         }),
       );

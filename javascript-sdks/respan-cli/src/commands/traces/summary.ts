@@ -15,7 +15,11 @@ export default class TracesSummary extends BaseCommand {
     try {
       const client = this.getClient();
       const data = await this.spin('Fetching traces summary', () =>
-        client.traces.retrieveTracesSummary({ start_time: flags['start-time'], end_time: flags['end-time'] }),
+        client.spans.getSpansSummary({
+          Authorization: this.getAuthHeader(),
+          start_time: flags['start-time'],
+          end_time: flags['end-time'],
+        } as any),
       );
       this.log(JSON.stringify(data, null, 2));
     } catch (error) {

@@ -12,7 +12,7 @@ export default class DatasetsGet extends BaseCommand {
     try {
       const client = this.getClient();
       const data = await this.spin('Fetching dataset', () =>
-        client.datasets.retrieveDataset({ dataset_id: args.id }),
+        client.datasets.retrieveDataset({ Authorization: this.getAuthHeader(), dataset_id: args.id }),
       );
       this.log(JSON.stringify(data, null, 2));
     } catch (error) {

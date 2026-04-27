@@ -15,7 +15,11 @@ export default class DatasetsList extends BaseCommand {
     try {
       const client = this.getClient();
       const data = await this.spin('Fetching datasets', () =>
-        client.datasets.listDatasets(),
+        client.datasets.listDatasets({
+          Authorization: this.getAuthHeader(),
+          page: flags.page,
+          page_size: flags.limit,
+        }),
       );
       this.outputResult(data, ['id', 'name', 'description', 'created_at']);
     } catch (error) {

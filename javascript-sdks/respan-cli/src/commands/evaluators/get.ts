@@ -12,7 +12,7 @@ export default class EvaluatorsGet extends BaseCommand {
     try {
       const client = this.getClient();
       const data = await this.spin('Fetching evaluator', () =>
-        client.evaluators.retrieveEvaluator({ evaluator_id: args.id }),
+        client.evaluators.retrieveEvaluator({ Authorization: this.getAuthHeader(), evaluator_id: args.id }),
       );
       this.log(JSON.stringify(data, null, 2));
     } catch (error) {

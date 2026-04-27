@@ -12,7 +12,7 @@ export default class ExperimentsGet extends BaseCommand {
     try {
       const client = this.getClient();
       const data = await this.spin('Fetching experiment', () =>
-        client.experiments.retrieveExperiment({ experiment_id: args.id }),
+        client.experiments.retrieveExperiment({ Authorization: this.getAuthHeader(), experiment_id: args.id }),
       );
       this.log(JSON.stringify(data, null, 2));
     } catch (error) {

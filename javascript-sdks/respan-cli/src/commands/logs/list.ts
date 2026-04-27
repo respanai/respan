@@ -39,18 +39,19 @@ ${FILTER_EXAMPLES}`;
       }
 
       const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-      const data = await this.spin('Fetching logs', () => client.logs.listSpans({
+      const data = await this.spin('Fetching logs', () => client.spans.listSpans({
+        Authorization: this.getAuthHeader(),
         start_time: flags['start-time'] || oneHourAgo,
         end_time: flags['end-time'] || new Date().toISOString(),
         sort_by: flags['sort-by'] || '-id',
-        operator: '',
+        operator: 'AND',
         page_size: flags.limit,
         page: flags.page,
-        is_test: flags['is-test'],
-        all_envs: flags['all-envs'],
-        fetch_filters: 'false',
+        is_test: flags['is-test'] as any,
+        all_envs: flags['all-envs'] as any,
+        fetch_filters: 'false' as any,
         include_fields: flags['include-fields'],
-        filters,
+        filters: filters as any,
       }));
       this.outputResult(data, ['id', 'model', 'prompt_tokens', 'completion_tokens', 'cost', 'latency', 'timestamp']);
       const pagination = extractPagination(data, flags.page);

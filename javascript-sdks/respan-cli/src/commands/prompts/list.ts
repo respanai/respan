@@ -14,7 +14,7 @@ export default class PromptsList extends BaseCommand {
     try {
       const client = this.getClient();
       const data = await this.spin('Fetching prompts', () =>
-        client.prompts.retrievePrompts(),
+        client.prompts.listPrompts({ Authorization: this.getAuthHeader(), page_size: flags.limit }),
       );
       this.outputResult(data, ['id', 'name', 'description', 'is_active', 'current_version', 'updated_at']);
     } catch (error) {

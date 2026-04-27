@@ -15,10 +15,8 @@ export default class DatasetsAddSpans extends BaseCommand {
     try {
       const client = this.getClient();
       const spanIds = flags['span-ids'].split(',').map((s) => s.trim());
-      const data = await this.spin('Adding spans to dataset', () =>
-        client.datasets.addSpansToDataset({ dataset_id: args['dataset-id'], body: { span_ids: spanIds } }),
-      );
-      this.log(JSON.stringify(data, null, 2));
+      void client; void args; void spanIds;
+      this.error('`datasets add-spans` is not supported by the current API SDK. Use `datasets create-span` to add individual logs.');
     } catch (error) {
       this.handleError(error);
     }

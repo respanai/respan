@@ -16,17 +16,21 @@ export default class LogsCreate extends BaseCommand {
     this.globalFlags = flags;
     try {
       const client = this.getClient();
-      const body: Record<string, unknown> = { input: flags.input };
-      if (flags.output) body.output = flags.output;
-      if (flags.model) body.model = flags.model;
+      let metadata: Record<string, unknown> | undefined;
       if (flags.metadata) {
         try {
-          body.metadata = JSON.parse(flags.metadata);
+          metadata = JSON.parse(flags.metadata);
         } catch {
           this.error('Invalid JSON for --metadata');
         }
       }
-      const data = await this.spin('Creating span', () => client.logs.createSpan(body));
+      const data = await this.spin('Creating span', () => client.spans.createSpan({
+        Authorization: this.getAuthHeader(),
+        prompt: flags.input,
+        ...(flags.output ? { completion: flags.output } : {}),
+        ...(flags.model ? { model: flags.model } : {}),
+        ...(metadata ? { metadata } : {}),
+      } as any));
       this.log(JSON.stringify(data, null, 2));
     } catch (error) {
       this.handleError(error);

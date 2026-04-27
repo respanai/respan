@@ -15,7 +15,7 @@ export default class ExperimentsList extends BaseCommand {
     try {
       const client = this.getClient();
       const data = await this.spin('Fetching experiments', () =>
-        client.experiments.listExperiments(),
+        client.experiments.listExperiments({ Authorization: this.getAuthHeader() }),
       );
       this.outputResult(data, ['id', 'name', 'dataset_id', 'status', 'created_at']);
     } catch (error) {

@@ -34,13 +34,14 @@ ${FILTER_EXAMPLES}`;
       }
 
       const data = await this.spin('Fetching summary', () =>
-        client.logs.getSpansSummary({
+        client.spans.getSpansSummary({
+          Authorization: this.getAuthHeader(),
           start_time: flags['start-time'],
           end_time: flags['end-time'],
-          is_test: flags['is-test'],
-          all_envs: flags['all-envs'],
-          filters,
-        }),
+          is_test: flags['is-test'] as any,
+          all_envs: flags['all-envs'] as any,
+          filters: filters as any,
+        } as any),
       );
       this.log(JSON.stringify(data, null, 2));
     } catch (error) {

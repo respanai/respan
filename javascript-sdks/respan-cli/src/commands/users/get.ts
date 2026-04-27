@@ -12,7 +12,7 @@ export default class UsersGet extends BaseCommand {
     try {
       const client = this.getClient();
       const data = await this.spin('Fetching user', () =>
-        client.users.retrieveUser({ customer_identifier: args.id }),
+        client.users.retrieveUser({ Authorization: this.getAuthHeader(), customer_identifier: args.id }),
       );
       this.log(JSON.stringify(data, null, 2));
     } catch (error) {

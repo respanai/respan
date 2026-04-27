@@ -16,17 +16,22 @@ export default class EvaluatorsCreate extends BaseCommand {
     this.globalFlags = flags;
     try {
       const client = this.getClient();
-      const body: Record<string, unknown> = { name: flags.name };
-      if (flags.type) body.type = flags.type;
-      if (flags.description) body.description = flags.description;
+      let extra: Record<string, unknown> = {};
       if (flags.config) {
         try {
-          body.config = JSON.parse(flags.config);
+          extra = JSON.parse(flags.config);
         } catch {
           this.error('Invalid JSON for --config');
         }
       }
-      const data = await this.spin('Creating evaluator', () => client.evaluators.createEvaluator(body));
+      const data = await this.spin('Creating evaluator', () => client.evaluators.createEvaluator({
+        Authorization: this.getAuthHeader(),
+        name: flags.name,
+        type: (flags.type ?? 'llm') as any,
+        score_value_type: (extra.score_value_type ?? 'numerical') as any,
+        ...(flags.description ? { description: flags.description } : {}),
+        ...extra,
+      } as any));
       this.log(JSON.stringify(data, null, 2));
     } catch (error) {
       this.handleError(error);

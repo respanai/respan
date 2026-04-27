@@ -16,19 +16,22 @@ export default class EvaluatorsRun extends BaseCommand {
     this.globalFlags = flags;
     try {
       const client = this.getClient();
-      const runBody: Record<string, unknown> = {};
-      if (flags['dataset-id']) runBody.dataset_id = flags['dataset-id'];
-      if (flags['log-ids']) runBody.log_ids = flags['log-ids'].split(',').map((s) => s.trim());
+      let extra: Record<string, unknown> = {};
       if (flags.params) {
         try {
-          Object.assign(runBody, JSON.parse(flags.params));
+          extra = JSON.parse(flags.params);
         } catch {
           this.error('Invalid JSON for --params');
         }
       }
       const data = await this.spin('Running evaluator', () => client.evaluators.runEvaluator({
+        Authorization: this.getAuthHeader(),
         evaluator_id: args.id,
-        body: runBody,
+        ...(flags['dataset-id'] ? { dataset_id: flags['dataset-id'] } : {}),
+        ...(flags['log-ids']
+          ? { log_ids: flags['log-ids'].split(',').map((s) => s.trim()) }
+          : {}),
+        ...extra,
       }));
       this.log(JSON.stringify(data, null, 2));
     } catch (error) {

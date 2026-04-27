@@ -12,7 +12,7 @@ export default class DatasetsSpans extends BaseCommand {
     try {
       const client = this.getClient();
       const data = await this.spin('Fetching dataset spans', () =>
-        client.datasets.listspans({ dataset_id: args['dataset-id'] }),
+        client.datasets.listDatasetLogs({ Authorization: this.getAuthHeader(), dataset_id: args['dataset-id'] }),
       );
       this.outputResult(data, ['id', 'input', 'output', 'created_at']);
     } catch (error) {

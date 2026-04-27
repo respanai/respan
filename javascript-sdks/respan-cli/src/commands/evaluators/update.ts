@@ -16,20 +16,21 @@ export default class EvaluatorsUpdate extends BaseCommand {
     this.globalFlags = flags;
     try {
       const client = this.getClient();
-      const updateBody: Record<string, unknown> = {};
-      if (flags.name) updateBody.name = flags.name;
-      if (flags.description) updateBody.description = flags.description;
+      let extra: Record<string, unknown> = {};
       if (flags.config) {
         try {
-          Object.assign(updateBody, JSON.parse(flags.config));
+          extra = JSON.parse(flags.config);
         } catch {
           this.error('Invalid JSON for --config');
         }
       }
       const data = await this.spin('Updating evaluator', () => client.evaluators.updateEvaluator({
+        Authorization: this.getAuthHeader(),
         evaluator_id: args.id,
-        body: updateBody,
-      }));
+        ...(flags.name ? { name: flags.name } : {}),
+        ...(flags.description ? { description: flags.description } : {}),
+        ...extra,
+      } as any));
       this.log(JSON.stringify(data, null, 2));
     } catch (error) {
       this.handleError(error);
