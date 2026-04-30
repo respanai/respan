@@ -314,7 +314,7 @@ class RespanClient:
         export_filter: Optional[FilterParamDict] = None,
         links: LinksParam = None,
         version: Optional[int] = None,
-        start_new_trace: bool = False,
+        is_new_trace_root: bool = False,
     ) -> Generator[Span, None, None]:
         """
         Context manager for creating spans with full Respan metadata.
@@ -386,7 +386,7 @@ class RespanClient:
             processors=processors,
             export_filter=export_filter,
             links=links,
-            start_new_trace=start_new_trace,
+            is_new_trace_root=is_new_trace_root,
         )
 
         try:

@@ -41,12 +41,12 @@ def setup_span(
     export_filter: Optional[FilterParamDict] = None,
     links: LinksParam = None,
     sample_rate: Optional[float] = None,
-    start_new_trace: bool = False,
+    is_new_trace_root: bool = False,
 ) -> Tuple[Span, object, Optional[object], Optional[object], Optional[object]]:
     """Create and configure an OpenTelemetry span with Respan metadata.
 
     Args:
-        start_new_trace: When True, detach any inherited OTel context before
+        is_new_trace_root: When True, detach any inherited OTel context before
             creating the span so it starts a fresh root trace (no parent span,
             new trace_id). Use when entering an execution boundary that should
             not be associated with the caller's trace — e.g., a per-message
@@ -56,14 +56,14 @@ def setup_span(
     Returns:
         Tuple of (span, ctx_token, entity_name_token, entity_path_token,
         root_ctx_token). root_ctx_token is non-None only when
-        start_new_trace=True. The caller MUST call cleanup_span() with these
+        is_new_trace_root=True. The caller MUST call cleanup_span() with these
         values in a finally block.
     """
     # Normalize kind to string (accepts enum or str)
     span_kind_str = span_kind.value if hasattr(span_kind, "value") else str(span_kind)
 
     root_ctx_token = None
-    if start_new_trace:
+    if is_new_trace_root:
         # Attach an empty Context so tracer.start_span() finds no active parent
         # and creates a fresh root with a new trace_id. Detached last in
         # cleanup_span() to restore the caller's original context.
@@ -150,7 +150,7 @@ def cleanup_span(
     """End span and detach all context tokens. Must be called in a finally block.
 
     Tokens are detached in reverse-attach order (LIFO) to preserve OTel context
-    invariants. root_ctx_token (from start_new_trace=True) is detached last.
+    invariants. root_ctx_token (from is_new_trace_root=True) is detached last.
     """
     span.end()
     context_api.detach(ctx_token)
