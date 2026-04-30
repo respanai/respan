@@ -44,15 +44,16 @@ def _setup_span(
     export_filter: Optional[FilterParamDict] = None,
     links: LinksParam = None,
     sample_rate: Optional[float] = None,
+    start_new_trace: bool = False,
 ):
     """Setup OpenTelemetry span and context.
 
     Delegates to the shared setup_span() utility.
     Returns (span, ctx_token) for backward compatibility with existing callers.
-    Context tokens for entity_name/entity_path are tracked internally and
+    Context tokens for entity_name/entity_path/root are tracked internally and
     cleaned up in _cleanup_span().
     """
-    span, ctx_token, entity_name_token, entity_path_token = setup_span(
+    span, ctx_token, entity_name_token, entity_path_token, root_ctx_token = setup_span(
         entity_name=entity_name,
         span_kind=span_kind,
         version=version,
@@ -60,10 +61,12 @@ def _setup_span(
         export_filter=export_filter,
         links=links,
         sample_rate=sample_rate,
+        start_new_trace=start_new_trace,
     )
     # Store extra tokens on the span object for _cleanup_span to detach
     span._entity_name_token = entity_name_token
     span._entity_path_token = entity_path_token
+    span._root_ctx_token = root_ctx_token
     return span, ctx_token
 
 
@@ -97,6 +100,7 @@ def _cleanup_span(span, ctx_token):
         ctx_token,
         entity_name_token=getattr(span, '_entity_name_token', None),
         entity_path_token=getattr(span, '_entity_path_token', None),
+        root_ctx_token=getattr(span, '_root_ctx_token', None),
     )
 
 
@@ -135,6 +139,7 @@ def create_entity_method(
     export_filter: Optional[FilterParamDict] = None,
     links: LinksParam = None,
     sample_rate: Optional[float] = None,
+    start_new_trace: bool = False,
 ) -> Callable[[F], F]:
     """Create entity decorator for methods or classes"""
 
@@ -149,6 +154,7 @@ def create_entity_method(
             export_filter=export_filter,
             links=links,
             sample_rate=sample_rate,
+            start_new_trace=start_new_trace,
         )
     else:
         # Method decorator
@@ -160,6 +166,7 @@ def create_entity_method(
             export_filter=export_filter,
             links=links,
             sample_rate=sample_rate,
+            start_new_trace=start_new_trace,
         )
 
 
@@ -171,6 +178,7 @@ def _create_entity_method_decorator(
     export_filter: Optional[FilterParamDict] = None,
     links: LinksParam = None,
     sample_rate: Optional[float] = None,
+    start_new_trace: bool = False,
 ) -> Callable[[F], F]:
     """Create method decorator.
 
@@ -269,6 +277,7 @@ def _create_entity_method_decorator(
                     export_filter=export_filter,
                     links=links,
                     sample_rate=sample_rate,
+                    start_new_trace=start_new_trace,
                 )
                 _handle_span_input(span, args, kwargs)
 
@@ -303,6 +312,7 @@ def _create_entity_class(
     export_filter: Optional[FilterParamDict] = None,
     links: LinksParam = None,
     sample_rate: Optional[float] = None,
+    start_new_trace: bool = False,
 ):
     """Create class decorator"""
 
@@ -321,6 +331,7 @@ def _create_entity_class(
             export_filter=export_filter,
             links=links,
             sample_rate=sample_rate,
+            start_new_trace=start_new_trace,
         )(original_method)
 
         # Replace the method

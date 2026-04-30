@@ -314,6 +314,7 @@ class RespanClient:
         export_filter: Optional[FilterParamDict] = None,
         links: LinksParam = None,
         version: Optional[int] = None,
+        start_new_trace: bool = False,
     ) -> Generator[Span, None, None]:
         """
         Context manager for creating spans with full Respan metadata.
@@ -378,13 +379,14 @@ class RespanClient:
             yield None
             return
 
-        span, ctx_token, entity_name_token, entity_path_token = setup_span(
+        span, ctx_token, entity_name_token, entity_path_token, root_ctx_token = setup_span(
             entity_name=name,
             span_kind=kind,
             version=version,
             processors=processors,
             export_filter=export_filter,
             links=links,
+            start_new_trace=start_new_trace,
         )
 
         try:
@@ -394,7 +396,13 @@ class RespanClient:
             span.record_exception(e)
             raise
         finally:
-            cleanup_span(span, ctx_token, entity_name_token, entity_path_token)
+            cleanup_span(
+                span,
+                ctx_token,
+                entity_name_token,
+                entity_path_token,
+                root_ctx_token=root_ctx_token,
+            )
 
     def get_span_buffer(
         self,

@@ -428,5 +428,98 @@ class TestSetupSpanShared:
         assert name_after is None or name_after != "outer_wf"
 
 
+class TestStartNewTrace:
+    """Tests for the start_new_trace flag — fresh root inside an active trace."""
+
+    def setup_method(self):
+        self.telemetry = RespanTelemetry(
+            app_name="test-start-new-trace",
+            api_key="test-key",
+            is_enabled=True,
+        )
+        self.client = get_client()
+
+    def test_decorator_starts_new_trace_when_flagged(self):
+        """Inner @workflow(start_new_trace=True) gets a fresh trace_id."""
+        from respan_tracing import workflow
+
+        captured = {}
+
+        @workflow(name="inner_wf", start_new_trace=True)
+        def inner():
+            captured["inner_trace_id"] = trace.get_current_span().get_span_context().trace_id
+            captured["inner_parent"] = trace.get_current_span().parent
+
+        @workflow(name="outer_wf")
+        def outer():
+            captured["outer_trace_id"] = trace.get_current_span().get_span_context().trace_id
+            inner()
+
+        outer()
+
+        assert captured["outer_trace_id"] != 0
+        assert captured["inner_trace_id"] != 0
+        assert captured["inner_trace_id"] != captured["outer_trace_id"], (
+            "inner workflow with start_new_trace=True should have a different trace_id "
+            "from the outer workflow"
+        )
+        assert captured["inner_parent"] is None, (
+            "inner workflow with start_new_trace=True should be a root span (no parent)"
+        )
+
+    def test_decorator_default_inherits_trace(self):
+        """Without start_new_trace, inner @workflow shares trace_id with the outer (regression)."""
+        from respan_tracing import workflow
+
+        captured = {}
+
+        @workflow(name="inner_wf_inherits")
+        def inner():
+            captured["inner_trace_id"] = trace.get_current_span().get_span_context().trace_id
+
+        @workflow(name="outer_wf_for_inherit")
+        def outer():
+            captured["outer_trace_id"] = trace.get_current_span().get_span_context().trace_id
+            inner()
+
+        outer()
+
+        assert captured["outer_trace_id"] != 0
+        assert captured["inner_trace_id"] == captured["outer_trace_id"]
+
+    def test_outer_context_restored_after_new_trace_exits(self):
+        """After an inner start_new_trace=True workflow exits, the outer trace is the active context."""
+        from respan_tracing import workflow
+
+        captured = {}
+
+        @workflow(name="inner_wf_restore", start_new_trace=True)
+        def inner():
+            pass
+
+        @workflow(name="outer_wf_restore")
+        def outer():
+            outer_trace = trace.get_current_span().get_span_context().trace_id
+            captured["before"] = outer_trace
+            inner()
+            captured["after"] = trace.get_current_span().get_span_context().trace_id
+
+        outer()
+        assert captured["before"] == captured["after"], (
+            "outer trace_id must be restored after inner start_new_trace exits"
+        )
+
+    def test_imperative_start_span_starts_new_trace_when_flagged(self):
+        """client.start_span(..., start_new_trace=True) creates a fresh root."""
+        with self.client.start_span("outer", kind="workflow") as outer_span:
+            outer_trace = outer_span.get_span_context().trace_id
+            with self.client.start_span(
+                "inner", kind="workflow", start_new_trace=True
+            ) as inner_span:
+                inner_trace = inner_span.get_span_context().trace_id
+                assert inner_trace != outer_trace
+                assert inner_span.parent is None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

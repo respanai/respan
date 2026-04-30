@@ -7,6 +7,7 @@ import json
 from typing import List, Optional, Union, Callable, Tuple
 
 from opentelemetry import trace, context as context_api
+from opentelemetry.context import Context
 from opentelemetry.trace.span import Span
 from opentelemetry.semconv_ai import TraceloopSpanKindValues, SpanAttributes
 from respan_sdk import FilterParamDict
@@ -40,16 +41,36 @@ def setup_span(
     export_filter: Optional[FilterParamDict] = None,
     links: LinksParam = None,
     sample_rate: Optional[float] = None,
-) -> Tuple[Span, object, Optional[object], Optional[object]]:
+    start_new_trace: bool = False,
+) -> Tuple[Span, object, Optional[object], Optional[object], Optional[object]]:
     """Create and configure an OpenTelemetry span with Respan metadata.
 
+    Args:
+        start_new_trace: When True, detach any inherited OTel context before
+            creating the span so it starts a fresh root trace (no parent span,
+            new trace_id). Use when entering an execution boundary that should
+            not be associated with the caller's trace — e.g., a per-message
+            handler invoked from inside a batch-level @workflow span where
+            messages are independent units of work.
+
     Returns:
-        Tuple of (span, ctx_token, entity_name_token, entity_path_token).
-        The caller MUST call cleanup_span() with these values in a finally block.
+        Tuple of (span, ctx_token, entity_name_token, entity_path_token,
+        root_ctx_token). root_ctx_token is non-None only when
+        start_new_trace=True. The caller MUST call cleanup_span() with these
+        values in a finally block.
     """
     # Normalize kind to string (accepts enum or str)
     span_kind_str = span_kind.value if hasattr(span_kind, "value") else str(span_kind)
-    entity_path = context_api.get_value(SpanAttributes.TRACELOOP_ENTITY_PATH) or ""
+
+    root_ctx_token = None
+    if start_new_trace:
+        # Attach an empty Context so tracer.start_span() finds no active parent
+        # and creates a fresh root with a new trace_id. Detached last in
+        # cleanup_span() to restore the caller's original context.
+        root_ctx_token = context_api.attach(Context())
+        entity_path = ""
+    else:
+        entity_path = context_api.get_value(SpanAttributes.TRACELOOP_ENTITY_PATH) or ""
 
     entity_name_token = None
     entity_path_token = None
@@ -116,7 +137,7 @@ def setup_span(
     ctx = trace.set_span_in_context(span)
     ctx_token = context_api.attach(ctx)
 
-    return span, ctx_token, entity_name_token, entity_path_token
+    return span, ctx_token, entity_name_token, entity_path_token, root_ctx_token
 
 
 def cleanup_span(
@@ -124,11 +145,18 @@ def cleanup_span(
     ctx_token: object,
     entity_name_token: Optional[object] = None,
     entity_path_token: Optional[object] = None,
+    root_ctx_token: Optional[object] = None,
 ) -> None:
-    """End span and detach all context tokens. Must be called in a finally block."""
+    """End span and detach all context tokens. Must be called in a finally block.
+
+    Tokens are detached in reverse-attach order (LIFO) to preserve OTel context
+    invariants. root_ctx_token (from start_new_trace=True) is detached last.
+    """
     span.end()
     context_api.detach(ctx_token)
     if entity_path_token is not None:
         context_api.detach(entity_path_token)
     if entity_name_token is not None:
         context_api.detach(entity_name_token)
+    if root_ctx_token is not None:
+        context_api.detach(root_ctx_token)

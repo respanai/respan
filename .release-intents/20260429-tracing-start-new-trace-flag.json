@@ -1,0 +1,6 @@
+{
+  "summary": "Add start_new_trace flag to @workflow decorator and client.start_span(); when True, the span detaches the inherited OTel context and starts a fresh root trace. Use at execution boundaries where the decorated function is one independent unit of work invoked from inside another @workflow span (e.g. per-message Celery tasks fired by a Pulsar consumer batch handler).",
+  "packages": {
+    "respan-tracing": "minor"
+  }
+}

@@ -13,6 +13,7 @@ def workflow(
     export_filter: Optional[FilterParamDict] = None,
     links: LinksParam = None,
     sample_rate: Optional[float] = None,
+    start_new_trace: bool = False,
 ):
     """Respan workflow decorator
 
@@ -31,6 +32,14 @@ def workflow(
         sample_rate: Optional float between 0.0 and 1.0 controlling what fraction of
                     spans are exported. 1.0 = export all (default), 0.01 = export 1%.
                     When None, all spans are exported.
+        start_new_trace: When True, the workflow span starts a fresh root trace
+                    (new trace_id, no parent) instead of inheriting the caller's
+                    OTel context. Use at execution boundaries where the decorated
+                    function processes one independent unit of work but is itself
+                    invoked from inside another @workflow span — e.g., a per-message
+                    Celery task fired by a Pulsar consumer batch handler. Without
+                    this flag, every per-message span inherits the batch's trace_id
+                    and downstream readers see N messages collapsed into 1 trace.
     """
     return create_entity_method(
         name=name,
@@ -41,6 +50,7 @@ def workflow(
         export_filter=export_filter,
         links=links,
         sample_rate=sample_rate,
+        start_new_trace=start_new_trace,
     )
 
 
