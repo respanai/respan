@@ -17,6 +17,7 @@ from respan_sdk.respan_types.span_types import SpanLink
 
 from respan_tracing.contexts.span import span_link_to_otel, consume_span_links
 from respan_tracing.constants.tracing import EXPORT_FILTER_ATTR, PROCESSORS_ATTR, SAMPLE_RATE_ATTR
+from respan_tracing.processors.base import _active_span_buffer
 
 LinksParam = Optional[Union[List[SpanLink], Callable[[], List[SpanLink]]]]
 
@@ -41,20 +42,6 @@ _ROOT_DEFAULT_KINDS = frozenset([
     TraceloopSpanKindValues.WORKFLOW.value,
     TraceloopSpanKindValues.AGENT.value,
 ])
-
-
-def _is_inside_active_span_buffer() -> bool:
-    """SpanBuffer (continuation OR trace_id-injection mode) deliberately
-    sets up a parent OTel context. When a buffer is active, decorators must
-    respect that context — do NOT detach to a fresh root. This is the SDK's
-    single, explicit continuation mechanism. Imported lazily to avoid a
-    circular import with processors.base.
-    """
-    try:
-        from respan_tracing.processors.base import _active_span_buffer
-    except ImportError:
-        return False
-    return _active_span_buffer.get(None) is not None
 
 
 def setup_span(
@@ -97,8 +84,13 @@ def setup_span(
     # Normalize kind to string (accepts enum or str)
     span_kind_str = span_kind.value if hasattr(span_kind, "value") else str(span_kind)
 
+    # SpanBuffer (continuation or trace_id-injection mode) deliberately sets
+    # up a parent OTel context. When a buffer is active, respect it — do not
+    # detach to a fresh root. This is the SDK's single, explicit continuation
+    # mechanism (see RespanClient.get_span_buffer).
     is_root_kind = span_kind_str in _ROOT_DEFAULT_KINDS
-    should_start_fresh_root = is_root_kind and not _is_inside_active_span_buffer()
+    is_inside_span_buffer = _active_span_buffer.get(None) is not None
+    should_start_fresh_root = is_root_kind and not is_inside_span_buffer
 
     root_ctx_token = None
     if should_start_fresh_root:
