@@ -90,10 +90,10 @@ def setup_span(
     # mechanism (see RespanClient.get_span_buffer).
     is_root_kind = span_kind_str in _ROOT_DEFAULT_KINDS
     is_inside_span_buffer = _active_span_buffer.get(None) is not None
-    should_start_fresh_root = is_root_kind and not is_inside_span_buffer
+    is_fresh_root = is_root_kind and not is_inside_span_buffer
 
     root_ctx_token = None
-    if should_start_fresh_root:
+    if is_fresh_root:
         # Attach an empty Context so tracer.start_span() finds no active parent
         # and creates a fresh root with a new trace_id. Detached last in
         # cleanup_span() to restore the caller's original context.
