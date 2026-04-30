@@ -32,6 +32,27 @@ _ENTITY_PATH_KINDS = frozenset([
     TraceloopSpanKindValues.TOOL.value,
 ])
 
+# Span kinds that act as trace entry points. By default they detach any
+# inherited OTel context and start a fresh root trace; opt back into
+# inheritance with has_parent_trace=True.
+_ROOT_DEFAULT_KINDS = frozenset([
+    TraceloopSpanKindValues.WORKFLOW.value,
+    TraceloopSpanKindValues.AGENT.value,
+])
+
+
+def _is_inside_active_span_buffer() -> bool:
+    """SpanBuffer (continuation OR trace_id-injection mode) deliberately
+    sets up a parent OTel context. When a buffer is active, decorators must
+    respect that context — do NOT detach to a fresh root. Imported lazily
+    to avoid a circular import with processors.base.
+    """
+    try:
+        from respan_tracing.processors.base import _active_span_buffer
+    except ImportError:
+        return False
+    return _active_span_buffer.get(None) is not None
+
 
 def setup_span(
     entity_name: str,
@@ -41,29 +62,50 @@ def setup_span(
     export_filter: Optional[FilterParamDict] = None,
     links: LinksParam = None,
     sample_rate: Optional[float] = None,
-    is_new_trace_root: bool = False,
+    has_parent_trace: bool = False,
 ) -> Tuple[Span, object, Optional[object], Optional[object], Optional[object]]:
     """Create and configure an OpenTelemetry span with Respan metadata.
 
-    Args:
-        is_new_trace_root: When True, detach any inherited OTel context before
-            creating the span so it starts a fresh root trace (no parent span,
-            new trace_id). Use when entering an execution boundary that should
-            not be associated with the caller's trace — e.g., a per-message
-            handler invoked from inside a batch-level @workflow span where
-            messages are independent units of work.
+    Trace-root behavior (workflow/agent kinds only):
+
+        Workflow and agent spans default to **fresh root**: the inherited
+        OTel context is detached before span creation so OTel allocates a
+        new trace_id with no parent. This is the right default at every
+        entry point in our system (Celery tasks, Pulsar consumer batch
+        handlers, gunicorn views, signal receivers) — relying on the caller
+        to leave behind no active span is fragile and was the source of
+        the 2026-04-30 "55 runs collapsed into 3 traces" bug.
+
+        To opt back into inheritance, pass has_parent_trace=True. The
+        decorator will then attach as a child of the active OTel span, as
+        plain OTel would. Use this for genuine sub-step decorators inside
+        an outer workflow span where the two pieces of work share a
+        lifecycle.
+
+        Task and tool kinds always inherit (they are sub-steps by definition).
+
+        SpanBuffer continuation/injection mode is detected automatically:
+        when a SpanBuffer is active, the buffer's parent context is always
+        respected — equivalent to has_parent_trace=True.
 
     Returns:
         Tuple of (span, ctx_token, entity_name_token, entity_path_token,
-        root_ctx_token). root_ctx_token is non-None only when
-        is_new_trace_root=True. The caller MUST call cleanup_span() with these
-        values in a finally block.
+        root_ctx_token). root_ctx_token is non-None only when this span
+        attached an empty Context to become a fresh root. The caller MUST
+        call cleanup_span() with these values in a finally block.
     """
     # Normalize kind to string (accepts enum or str)
     span_kind_str = span_kind.value if hasattr(span_kind, "value") else str(span_kind)
 
+    is_root_kind = span_kind_str in _ROOT_DEFAULT_KINDS
+    should_start_fresh_root = (
+        is_root_kind
+        and not has_parent_trace
+        and not _is_inside_active_span_buffer()
+    )
+
     root_ctx_token = None
-    if is_new_trace_root:
+    if should_start_fresh_root:
         # Attach an empty Context so tracer.start_span() finds no active parent
         # and creates a fresh root with a new trace_id. Detached last in
         # cleanup_span() to restore the caller's original context.

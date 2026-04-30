@@ -314,7 +314,7 @@ class RespanClient:
         export_filter: Optional[FilterParamDict] = None,
         links: LinksParam = None,
         version: Optional[int] = None,
-        is_new_trace_root: bool = False,
+        has_parent_trace: bool = False,
     ) -> Generator[Span, None, None]:
         """
         Context manager for creating spans with full Respan metadata.
@@ -330,6 +330,12 @@ class RespanClient:
         - Span links (static list or callable)
         - Error recording and status propagation
 
+        Trace-root behavior matches ``@workflow``: workflow/agent kinds default
+        to fresh root (detach inherited OTel context, allocate new trace_id).
+        Pass ``has_parent_trace=True`` to opt back into inheritance, or
+        use a SpanBuffer (continuation/injection mode is auto-detected and
+        always respected).
+
         Args:
             name: Span name (equivalent to the decorator ``name`` parameter).
             kind: Span kind — ``"workflow"``, ``"task"``, ``"agent"``, or
@@ -341,6 +347,9 @@ class RespanClient:
             links: Span links — a list of ``SpanLink`` objects or a callable
                 returning one.
             version: Optional version number.
+            has_parent_trace: For workflow/agent kinds, opt back into
+                v2 behavior — inherit the active OTel trace_id as a child.
+                No effect for task/tool kinds (always inherit).
 
         Yields:
             The active ``Span`` object.
@@ -386,7 +395,7 @@ class RespanClient:
             processors=processors,
             export_filter=export_filter,
             links=links,
-            is_new_trace_root=is_new_trace_root,
+            has_parent_trace=has_parent_trace,
         )
 
         try:

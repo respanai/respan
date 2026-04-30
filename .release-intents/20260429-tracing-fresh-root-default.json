@@ -1,0 +1,6 @@
+{
+  "summary": "BREAKING: @workflow and @agent now default to fresh root traces — the wrapper detaches inherited OTel context and starts a new trace_id with no parent. Use has_parent_trace=True to opt back into v2 behavior (inherit the active span as a child). @task / @tool kinds always inherit. SpanBuffer continuation/trace-id-injection mode is auto-detected and respected. Driven by 2026-04-30 incident: a 55-run experiment surfaced as 3 traces in the UI because per-row run_workflow_async spans inherited the Pulsar consumer batch handler's trace_id. The new default makes that class of bug architecturally impossible without explicitly typing has_parent_trace=True.",
+  "packages": {
+    "respan-tracing": "major"
+  }
+}

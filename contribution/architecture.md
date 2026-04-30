@@ -107,7 +107,7 @@ Supporting subsystems:
   - filtering, buffering, and span collection behavior
 - `utils/span_setup.py`
   - common span setup/cleanup logic used by decorators and clients
-  - hosts the `is_new_trace_root` boundary control (see "Trace boundaries" below)
+  - hosts the workflow/agent fresh-root default (see "Trace root semantics" below)
 - [instruments.py](../python-sdks/respan-tracing/src/respan_tracing/instruments.py)
   - enum of built-in auto-instrumentable libraries
 
@@ -115,51 +115,63 @@ Design rule:
 
 - all Python instrumentation packages should eventually terminate into this runtime layer
 
-#### Trace boundaries inside batch handlers (`is_new_trace_root`)
+#### Trace root semantics (workflow/agent kinds)
 
-OTel propagates `trace_id` implicitly through the active `Context`. Every span created while another span is active attaches as that span's child and inherits the parent's `trace_id`. This is the right default for request-scoped work, but it is the wrong default at any execution boundary where the inner work is an independent unit.
+The python tracing runtime treats `@workflow` and `@agent` as **trace entry points by default**. When the wrapper opens the span it detaches any inherited OTel context and starts a fresh root trace — new `trace_id`, no parent. Continuation is opt-in. This is a deliberate departure from plain OpenTelemetry, where `tracer.start_span()` always attaches as a child of `context_api.get_current()`.
 
-The canonical case is a batch consumer dispatching per-message work:
+##### Why fresh root is the right default
 
-```python
-@workflow(name="my_consumer_handle_batch")          # 1 span per BATCH
-async def _handle_batch(consumer, messages):
-    for message in messages:
-        # Each per-message Celery task creates its own @workflow.
-        # By default it ATTACHES as a child of _handle_batch and shares
-        # its trace_id, even though the messages are independent.
-        await asyncio.to_thread(per_message_task.run, **message.payload)
-```
+OTel's "current-context-as-implicit-parent" rule is correct for service-tracing — a request enters the system, a propagator decodes the W3C trace headers, and the active context is *deliberately* set up before any span is created. In Respan's deployment shape there is no propagator at most entry points:
 
-If `per_message_task` is decorated `@workflow(name="run_X")`, every message in one batch ends up with the same `trace_id`. Downstream readers that do `count(distinct trace_id)` — per-trace UIs, "how many runs did this experiment produce" aggregations — collapse N messages into ~1 trace per batch.
+- **Celery worker** — the worker process picks up a task message; the active OTel context is whatever happened to be attached during prior unrelated work (or empty by accident).
+- **Pulsar consumer** — the consumer wraps a batch in a `@workflow(name="..._handle_batch")` span for batch-level observability, then iterates through messages calling `task.run(...)` synchronously. With OTel defaults, every per-message `@workflow` becomes a child of the batch handler and inherits its `trace_id`. The "55 runs collapsed into 3 traces" production incident (2026-04-30, experiment `b64a29c7`) hit exactly this.
+- **gunicorn view handler** — Django middleware does not currently inject an OTel context; the caller's context is irrelevant to the request's logical work.
+- **signal receiver** — fired in arbitrary contexts depending on what triggered the signal.
 
-`is_new_trace_root=True` declares the decorated function a fresh trace root: the wrapper attaches an empty `Context()` before creating the span, so OTel sees no active parent and allocates a new `trace_id`. On exit the root context token is detached LIFO-last to restore the caller's original trace.
+In all of these, the right semantic is "this `@workflow` is the start of a logical execution." Inheritance is the exception, not the rule.
+
+##### How to opt back into inheritance
 
 ```python
-@workflow(name="run_X", is_new_trace_root=True)    # FRESH trace per call
-def per_message_task(...):
-    ...
+# Default — fresh trace per call. Use for entry points.
+@workflow(name="run_per_message_task")
+def per_message_task(...): ...
+
+# Opt-in — child of the active span, shares its trace_id.
+@workflow(name="evaluator_step", has_parent_trace=True)
+def evaluator_step(...): ...
 ```
 
-When to set the flag:
+`has_parent_trace=True` is reserved for the rare case where a `@workflow` genuinely models a sub-step of an outer workflow span (e.g. a multi-stage pipeline that wants one logical trace across stages).
 
-- the decorated function is invoked from inside another active `@workflow` span (a batch handler, a request handler, an outer workflow)
-- the work being decorated is conceptually one independent unit — one message, one row, one job — not a sub-step of the caller
-- downstream readers count or aggregate by `trace_id`
+`@task` and `@tool` kinds always inherit. They are sub-steps by definition and exist inside a containing workflow; making one a fresh root would orphan it from its logical parent.
 
-When NOT to set it:
+##### Auto-detected: SpanBuffer continuation
 
-- the decorated function is a request handler, a top-level Celery task, or a CLI entry point — there is no active OTel context to detach from. Harmless but signals the wrong intent.
-- the work IS conceptually a sub-step (a child task within a workflow) and should be queryable as part of the caller's trace
+`SpanBuffer` (continuation mode via `parent_trace_id`/`parent_span_id`, or trace-id injection mode via the `trace_id` kwarg) deliberately sets up a parent OTel context for pause/resume and similar workflows. When a buffer is active, the fresh-root default is **suppressed** — decorators inside the buffer respect the buffer's parent context. No flag needed; `setup_span` checks `_active_span_buffer.get(None)` and acts accordingly.
 
-Design choices:
+##### Cost model
 
-- **Flag, not a separate API.** The alternative was `client.start_root_workflow(...)` as a sibling primitive. Rejected because every existing `@workflow`-decorated function would then have two entry points to maintain, and callers would have to know which one to use. A flag on the existing decorator keeps the surface flat: one decorator, one mental model, one call site to update when a function moves from "child of caller" to "fresh trace root."
-- **Cost.** One extra optional kwarg, one extra context token threaded through `setup_span`/`cleanup_span`, zero runtime overhead when `is_new_trace_root=False` (the default). When `True`, the cost is one `context_api.attach(Context())` and one matching `detach` — a few hundred nanoseconds per call.
-- **Surfaced on `@workflow` and `client.start_span` only.** The flag is conceptually meaningful only for entry-point spans. `task` and `tool` kinds are by definition sub-steps within a containing workflow; making one a fresh root would orphan it from its logical parent. The lower-level `create_entity_method` accepts the kwarg so the imperative `client.start_span(..., is_new_trace_root=True)` works for kinds the caller picks at runtime.
-- **Use span links, not trace inheritance, for cross-trace correlation.** If a fresh-root span needs to be findable from the caller's trace (e.g. "follow the request → kicked-off background job"), use `links=[SpanLink(...)]` on the decorator. Trace inheritance is the wrong tool for cross-trace correlation: it tells readers "these two spans are part of the SAME trace," which is false when the two pieces of work have independent lifecycles.
+| Path | Cost |
+|---|---|
+| `@workflow` (default, fresh root) | one extra `context_api.attach(Context())` + one matching `detach` — a few hundred nanoseconds per call |
+| `@workflow(has_parent_trace=True)` | identical to the v2 path — no extra context manipulation |
+| `@task` / `@tool` | identical to v2 — always inherits |
 
-Production driver: a 55-run experiment showed up as 3 traces in the UI because every per-row `run_automation_workflow` span inherited the `workflow_execution_writer_handle_batch` (Pulsar consumer) trace.
+##### Use span links for cross-trace correlation
+
+If a fresh-root span needs to be findable from another trace (e.g. "this trace was triggered by that one"), use `links=[SpanLink(...)]` on the decorator, not trace inheritance. Links record a typed cross-trace pointer in the OTel data model. Trace inheritance is the wrong tool for cross-trace correlation: it tells readers "these two spans are part of the SAME trace," which is false when the pieces of work have independent lifecycles.
+
+##### Migration from v2
+
+The v2 decorator inherited active context unconditionally. v3 inverts the default for `@workflow`/`@agent` kinds. To preserve v2 behavior on a specific decorator, add `has_parent_trace=True`. To migrate a codebase, audit every `@workflow` site:
+
+- entry points (Celery tasks, view handlers, batch handlers, signal receivers): leave default — they should be roots.
+- sub-step decorators inside an outer workflow span: add `has_parent_trace=True`.
+
+If you cannot determine which a site is, default-fresh-root is safer: a wrong fresh root produces independent traces (recoverable via span links if needed), whereas a wrong inheritance silently collapses N units into 1 trace and corrupts every downstream `count(distinct trace_id)` reader.
+
+Production driver for this design: experiment `0430-1` recorded 55 dispatches in the run ledger but exported only 275 spans across 3 distinct `trace_unique_id`s in CH Cloud. The Pulsar consumer fetched messages in three bursts (sizes 31, 1, 23), and every per-row span inherited its batch handler's `trace_id`. The experiment summary endpoint, which groups by `trace_unique_id`, surfaced three buckets of ~18 runs each instead of 55 individual rows. The fresh-root default makes this class of bug architecturally impossible without explicitly typing `has_parent_trace=True`.
 
 ## JavaScript Runtime
 
