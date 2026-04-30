@@ -117,7 +117,9 @@ Design rule:
 
 #### Trace root semantics (workflow/agent kinds)
 
-The python tracing runtime treats `@workflow` and `@agent` as **trace entry points by default**. When the wrapper opens the span it detaches any inherited OTel context and starts a fresh root trace — new `trace_id`, no parent. Continuation is opt-in. This is a deliberate departure from plain OpenTelemetry, where `tracer.start_span()` always attaches as a child of `context_api.get_current()`.
+The python tracing runtime treats `@workflow` and `@agent` as **trace entry points**: when the wrapper opens the span it detaches any inherited OTel context and starts a fresh root trace — new `trace_id`, no parent. There is no per-decorator continuation flag. The single, explicit continuation mechanism is `SpanBuffer` with `parent_trace_id` + `parent_span_id`.
+
+This is a deliberate departure from plain OpenTelemetry, where `tracer.start_span()` always attaches as a child of `context_api.get_current()`.
 
 ##### Why fresh root is the right default
 
@@ -130,48 +132,59 @@ OTel's "current-context-as-implicit-parent" rule is correct for service-tracing 
 
 In all of these, the right semantic is "this `@workflow` is the start of a logical execution." Inheritance is the exception, not the rule.
 
-##### How to opt back into inheritance
+##### `@task` and `@tool` always inherit
+
+These kinds are sub-steps by definition and exist inside a containing workflow; making one a fresh root would orphan it from its logical parent. They keep the standard OTel inheritance behavior.
+
+##### The single continuation mechanism: SpanBuffer
+
+When a workflow legitimately needs to be part of an existing trace — pause/resume, cross-session continuation, any case where you have a specific `(trace_id, span_id)` pair you want spans to attach under — use `RespanClient.get_span_buffer(trace_id=..., parent_trace_id=..., parent_span_id=...)`. The buffer deliberately sets up a parent OTel context. `setup_span` checks `_active_span_buffer.get(None)` and, when a buffer is active, suppresses the fresh-root default so decorators inside attach as children of the named parent.
 
 ```python
-# Default — fresh trace per call. Use for entry points.
-@workflow(name="run_per_message_task")
-def per_message_task(...): ...
+# Pause: capture the trace
+trace_id = client.get_current_trace_id()
+span_id = client.get_current_span_id()
+save_for_resume(trace_id, span_id)
 
-# Opt-in — child of the active span, shares its trace_id.
-@workflow(name="evaluator_step", has_parent_trace=True)
-def evaluator_step(...): ...
+# Resume: name the parent explicitly
+saved = load_resume_point()
+with client.get_span_buffer(
+    trace_id="resume-run-id",
+    parent_trace_id=saved["trace_id"],
+    parent_span_id=saved["span_id"],
+):
+    @workflow(name="resumed_step")  # inherits parent_trace_id, becomes a child of parent_span_id
+    def resumed_step(): ...
+    resumed_step()
 ```
 
-`has_parent_trace=True` is reserved for the rare case where a `@workflow` genuinely models a sub-step of an outer workflow span (e.g. a multi-stage pipeline that wants one logical trace across stages).
-
-`@task` and `@tool` kinds always inherit. They are sub-steps by definition and exist inside a containing workflow; making one a fresh root would orphan it from its logical parent.
-
-##### Auto-detected: SpanBuffer continuation
-
-`SpanBuffer` (continuation mode via `parent_trace_id`/`parent_span_id`, or trace-id injection mode via the `trace_id` kwarg) deliberately sets up a parent OTel context for pause/resume and similar workflows. When a buffer is active, the fresh-root default is **suppressed** — decorators inside the buffer respect the buffer's parent context. No flag needed; `setup_span` checks `_active_span_buffer.get(None)` and acts accordingly.
+There is no implicit "inherit whatever happens to be in scope" path. If you want a parent, you name it.
 
 ##### Cost model
 
 | Path | Cost |
 |---|---|
-| `@workflow` (default, fresh root) | one extra `context_api.attach(Context())` + one matching `detach` — a few hundred nanoseconds per call |
-| `@workflow(has_parent_trace=True)` | identical to the v2 path — no extra context manipulation |
+| `@workflow` / `@agent` outside a SpanBuffer | one extra `context_api.attach(Context())` + one matching `detach` — a few hundred nanoseconds per call |
+| `@workflow` / `@agent` inside an active SpanBuffer | identical to v2 — no extra context manipulation |
 | `@task` / `@tool` | identical to v2 — always inherits |
 
 ##### Use span links for cross-trace correlation
 
-If a fresh-root span needs to be findable from another trace (e.g. "this trace was triggered by that one"), use `links=[SpanLink(...)]` on the decorator, not trace inheritance. Links record a typed cross-trace pointer in the OTel data model. Trace inheritance is the wrong tool for cross-trace correlation: it tells readers "these two spans are part of the SAME trace," which is false when the pieces of work have independent lifecycles.
+If a fresh-root span needs to be findable from another trace (e.g. "this trace was triggered by that one") but should remain its own trace, use `links=[SpanLink(...)]` on the decorator. Links record a typed cross-trace pointer in the OTel data model without making the span a child of the linked trace.
+
+Trace inheritance is the wrong tool for cross-trace correlation: it tells readers "these two spans are part of the SAME trace," which is false when the pieces of work have independent lifecycles.
 
 ##### Migration from v2
 
-The v2 decorator inherited active context unconditionally. v3 inverts the default for `@workflow`/`@agent` kinds. To preserve v2 behavior on a specific decorator, add `has_parent_trace=True`. To migrate a codebase, audit every `@workflow` site:
+The v2 decorator inherited active context unconditionally. v3 inverts the default for `@workflow`/`@agent` kinds. To migrate a codebase, audit every `@workflow` site:
 
-- entry points (Celery tasks, view handlers, batch handlers, signal receivers): leave default — they should be roots.
-- sub-step decorators inside an outer workflow span: add `has_parent_trace=True`.
+- entry points (Celery tasks, view handlers, batch handlers, signal receivers): leave as-is — they should be roots, and they are now.
+- pause/resume sites: must use `client.get_span_buffer(parent_trace_id=..., parent_span_id=...)`. (This is also what v2 should have used; v2 just got away with implicit inheritance because the call stack happened to carry the right span.)
+- "sub-step" decorators inside an outer workflow span: refactor. Either inline the sub-step logic into the outer workflow (it was never really a separate logical execution), or move the parent into a SpanBuffer so the relationship is explicit.
 
-If you cannot determine which a site is, default-fresh-root is safer: a wrong fresh root produces independent traces (recoverable via span links if needed), whereas a wrong inheritance silently collapses N units into 1 trace and corrupts every downstream `count(distinct trace_id)` reader.
+The migration removes a class of silent bug: implicit inheritance fails the moment the call stack changes (e.g., the Celery→Pulsar migration that triggered this incident). If you cannot make a site work without implicit inheritance, the right answer is almost always "make the parent explicit via SpanBuffer," not "find a way to opt back into the implicit behavior."
 
-Production driver for this design: experiment `0430-1` recorded 55 dispatches in the run ledger but exported only 275 spans across 3 distinct `trace_unique_id`s in CH Cloud. The Pulsar consumer fetched messages in three bursts (sizes 31, 1, 23), and every per-row span inherited its batch handler's `trace_id`. The experiment summary endpoint, which groups by `trace_unique_id`, surfaced three buckets of ~18 runs each instead of 55 individual rows. The fresh-root default makes this class of bug architecturally impossible without explicitly typing `has_parent_trace=True`.
+Production driver for this design: experiment `0430-1` recorded 55 dispatches in the run ledger but exported only 275 spans across 3 distinct `trace_unique_id`s in CH Cloud. The Pulsar consumer fetched messages in three bursts (sizes 31, 1, 23), and every per-row span inherited its batch handler's `trace_id`. The experiment summary endpoint, which groups by `trace_unique_id`, surfaced three buckets of ~18 runs each instead of 55 individual rows. The fresh-root default makes this class of bug architecturally impossible to reintroduce without rewriting the consumer to spawn an explicit SpanBuffer.
 
 ## JavaScript Runtime
 

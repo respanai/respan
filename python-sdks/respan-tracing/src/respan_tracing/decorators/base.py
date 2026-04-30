@@ -44,7 +44,6 @@ def _setup_span(
     export_filter: Optional[FilterParamDict] = None,
     links: LinksParam = None,
     sample_rate: Optional[float] = None,
-    has_parent_trace: bool = False,
 ):
     """Setup OpenTelemetry span and context.
 
@@ -61,7 +60,6 @@ def _setup_span(
         export_filter=export_filter,
         links=links,
         sample_rate=sample_rate,
-        has_parent_trace=has_parent_trace,
     )
     # Store extra tokens on the span object for _cleanup_span to detach
     span._entity_name_token = entity_name_token
@@ -139,7 +137,6 @@ def create_entity_method(
     export_filter: Optional[FilterParamDict] = None,
     links: LinksParam = None,
     sample_rate: Optional[float] = None,
-    has_parent_trace: bool = False,
 ) -> Callable[[F], F]:
     """Create entity decorator for methods or classes"""
 
@@ -154,7 +151,6 @@ def create_entity_method(
             export_filter=export_filter,
             links=links,
             sample_rate=sample_rate,
-            has_parent_trace=has_parent_trace,
         )
     else:
         # Method decorator
@@ -166,7 +162,6 @@ def create_entity_method(
             export_filter=export_filter,
             links=links,
             sample_rate=sample_rate,
-            has_parent_trace=has_parent_trace,
         )
 
 
@@ -178,7 +173,6 @@ def _create_entity_method_decorator(
     export_filter: Optional[FilterParamDict] = None,
     links: LinksParam = None,
     sample_rate: Optional[float] = None,
-    has_parent_trace: bool = False,
 ) -> Callable[[F], F]:
     """Create method decorator.
 
@@ -277,7 +271,6 @@ def _create_entity_method_decorator(
                     export_filter=export_filter,
                     links=links,
                     sample_rate=sample_rate,
-                    has_parent_trace=has_parent_trace,
                 )
                 _handle_span_input(span, args, kwargs)
 
@@ -312,7 +305,6 @@ def _create_entity_class(
     export_filter: Optional[FilterParamDict] = None,
     links: LinksParam = None,
     sample_rate: Optional[float] = None,
-    has_parent_trace: bool = False,
 ):
     """Create class decorator"""
 
@@ -331,7 +323,6 @@ def _create_entity_class(
             export_filter=export_filter,
             links=links,
             sample_rate=sample_rate,
-            has_parent_trace=has_parent_trace,
         )(original_method)
 
         # Replace the method

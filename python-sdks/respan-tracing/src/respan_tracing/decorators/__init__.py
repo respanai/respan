@@ -13,27 +13,25 @@ def workflow(
     export_filter: Optional[FilterParamDict] = None,
     links: LinksParam = None,
     sample_rate: Optional[float] = None,
-    has_parent_trace: bool = False,
 ):
     """Respan workflow decorator.
 
     Trace-root behavior (BREAKING CHANGE in v3.0):
 
-        @workflow spans default to **fresh root**. The decorator detaches
-        any inherited OTel context before creating the span, so OTel
-        allocates a new trace_id with no parent. This matches reality at
-        every entry point in our system (Celery tasks, Pulsar consumer
+        @workflow spans always start a **fresh root** trace. The decorator
+        detaches any inherited OTel context before creating the span, so
+        OTel allocates a new trace_id with no parent. This matches reality
+        at every entry point in our system (Celery tasks, Pulsar consumer
         batch handlers, gunicorn views, signal receivers) — these are
         independent units of work whose lifecycles are not children of
         whatever happened to be the active OTel span when the function ran.
 
-        Pass has_parent_trace=True to opt back into inheritance for
-        the rare case where a @workflow is genuinely a sub-step of an
-        outer workflow span and should share its trace_id.
-
-        SpanBuffer continuation/injection (parent_trace_id / trace_id on
-        client.get_span_buffer) is auto-detected and always respected —
-        no flag needed.
+        There is no per-decorator continuation flag. The single, explicit
+        continuation mechanism is SpanBuffer with parent_trace_id +
+        parent_span_id (RespanClient.get_span_buffer). Decorators inside an
+        active SpanBuffer respect the buffer's parent context — this is
+        auto-detected and is the only path by which a @workflow span can
+        become a child of an existing trace.
 
     Args:
         name: Optional name for the workflow
@@ -52,11 +50,6 @@ def workflow(
         sample_rate: Optional float between 0.0 and 1.0 controlling what fraction of
                     spans are exported. 1.0 = export all (default), 0.01 = export 1%.
                     When None, all spans are exported.
-        has_parent_trace: Opt back into the v2 behavior — inherit the
-                    active OTel trace_id as a child span. Default False.
-                    Use only when the decorated function is conceptually a
-                    sub-step of the active span's workflow; otherwise the
-                    fresh-root default is correct.
     """
     return create_entity_method(
         name=name,
@@ -67,7 +60,6 @@ def workflow(
         export_filter=export_filter,
         links=links,
         sample_rate=sample_rate,
-        has_parent_trace=has_parent_trace,
     )
 
 

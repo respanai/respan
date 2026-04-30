@@ -431,8 +431,9 @@ class TestSetupSpanShared:
 class TestWorkflowFreshRootDefault:
     """Tests for the v3 default: @workflow / @agent kinds start fresh root traces.
 
-    Continuation is opt-in via has_parent_trace=True. SpanBuffer
-    continuation/injection is auto-detected and respected.
+    There is no per-decorator continuation flag. The single, explicit
+    continuation mechanism is SpanBuffer with parent_trace_id +
+    parent_span_id (auto-detected and respected by the decorator).
     """
 
     def setup_method(self):
@@ -444,7 +445,7 @@ class TestWorkflowFreshRootDefault:
         self.client = get_client()
 
     def test_workflow_default_starts_fresh_root_inside_outer_workflow(self):
-        """Inner @workflow (default args) gets a fresh trace_id even when an outer @workflow is active."""
+        """Inner @workflow gets a fresh trace_id even when an outer @workflow is active."""
         from respan_tracing import workflow
 
         captured = {}
@@ -471,33 +472,6 @@ class TestWorkflowFreshRootDefault:
             "v3 default: inner @workflow must be a root span (no parent)."
         )
 
-    def test_workflow_has_parent_trace_opts_back_into_inheritance(self):
-        """has_parent_trace=True restores v2 behavior: inherit the outer trace_id."""
-        from respan_tracing import workflow
-
-        captured = {}
-
-        @workflow(name="inner_wf_continues", has_parent_trace=True)
-        def inner():
-            captured["inner_trace_id"] = trace.get_current_span().get_span_context().trace_id
-            captured["inner_parent_span_id"] = trace.get_current_span().parent.span_id
-
-        @workflow(name="outer_wf_for_continue")
-        def outer():
-            captured["outer_trace_id"] = trace.get_current_span().get_span_context().trace_id
-            captured["outer_span_id"] = trace.get_current_span().get_span_context().span_id
-            inner()
-
-        outer()
-
-        assert captured["outer_trace_id"] != 0
-        assert captured["inner_trace_id"] == captured["outer_trace_id"], (
-            "has_parent_trace=True must inherit the active trace_id."
-        )
-        assert captured["inner_parent_span_id"] == captured["outer_span_id"], (
-            "has_parent_trace=True must attach as a child of the active span."
-        )
-
     def test_outer_context_restored_after_fresh_root_exits(self):
         """After an inner fresh-root @workflow exits, the outer trace is the active context."""
         from respan_tracing import workflow
@@ -519,8 +493,8 @@ class TestWorkflowFreshRootDefault:
             "outer trace_id must be restored after inner fresh-root exits"
         )
 
-    def test_imperative_start_span_default_is_fresh_root(self):
-        """client.start_span(kind='workflow') defaults to fresh root."""
+    def test_imperative_start_span_workflow_kind_is_fresh_root(self):
+        """client.start_span(kind='workflow') always starts a fresh root."""
         with self.client.start_span("outer", kind="workflow") as outer_span:
             outer_trace = outer_span.get_span_context().trace_id
             with self.client.start_span("inner", kind="workflow") as inner_span:
@@ -528,18 +502,9 @@ class TestWorkflowFreshRootDefault:
                 assert inner_trace != outer_trace
                 assert inner_span.parent is None
 
-    def test_imperative_start_span_has_parent_trace_inherits(self):
-        """client.start_span(kind='workflow', has_parent_trace=True) inherits."""
-        with self.client.start_span("outer", kind="workflow") as outer_span:
-            outer_trace = outer_span.get_span_context().trace_id
-            with self.client.start_span(
-                "inner", kind="workflow", has_parent_trace=True
-            ) as inner_span:
-                assert inner_span.get_span_context().trace_id == outer_trace
-
     def test_task_kind_always_inherits(self):
         """task and tool kinds are sub-steps by definition — they always
-        inherit, regardless of has_parent_trace.
+        inherit the active trace_id, regardless of any other config.
         """
         from respan_tracing import workflow, task
 
