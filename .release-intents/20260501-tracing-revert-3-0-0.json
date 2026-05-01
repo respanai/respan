@@ -1,0 +1,6 @@
+{
+  "summary": "Revert respan-tracing 3.0.0 (PR #188 + the auto version-sync chore that followed). Restores v2.16.6 contract exactly. No new release cut from this PR — 2.16.6 stays as the de facto latest until the follow-up feature PR adds suppressed_parent_context() and publishes 2.17.0. After this lands, yank 3.0.0 from PyPI.",
+  "packages": {
+    "respan-tracing": "none"
+  }
+}
