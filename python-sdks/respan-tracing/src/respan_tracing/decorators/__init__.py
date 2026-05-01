@@ -14,24 +14,7 @@ def workflow(
     links: LinksParam = None,
     sample_rate: Optional[float] = None,
 ):
-    """Respan workflow decorator.
-
-    Trace-root behavior (BREAKING CHANGE in v3.0):
-
-        @workflow spans always start a **fresh root** trace. The decorator
-        detaches any inherited OTel context before creating the span, so
-        OTel allocates a new trace_id with no parent. This matches reality
-        at every entry point in our system (Celery tasks, Pulsar consumer
-        batch handlers, gunicorn views, signal receivers) — these are
-        independent units of work whose lifecycles are not children of
-        whatever happened to be the active OTel span when the function ran.
-
-        There is no per-decorator continuation flag. The single, explicit
-        continuation mechanism is SpanBuffer with parent_trace_id +
-        parent_span_id (RespanClient.get_span_buffer). Decorators inside an
-        active SpanBuffer respect the buffer's parent context — this is
-        auto-detected and is the only path by which a @workflow span can
-        become a child of an existing trace.
+    """Respan workflow decorator
 
     Args:
         name: Optional name for the workflow
@@ -45,8 +28,6 @@ def workflow(
                       Example: {"status_code": {"operator": "", "value": "ERROR"}}
         links: Optional span links. Can be a list of SpanLink objects (static) or a
                callable returning a list of SpanLink objects (resolved at call time).
-                Use links for cross-trace correlation (e.g., "this trace was
-                triggered by that one") instead of trace inheritance.
         sample_rate: Optional float between 0.0 and 1.0 controlling what fraction of
                     spans are exported. 1.0 = export all (default), 0.01 = export 1%.
                     When None, all spans are exported.
@@ -72,11 +53,7 @@ def task(
     links: LinksParam = None,
     sample_rate: Optional[float] = None,
 ):
-    """Respan task decorator.
-
-    Trace-root behavior: @task spans ALWAYS inherit the active trace_id —
-    they are sub-steps by definition and exist inside a containing workflow.
-    This is unchanged from v2.
+    """Respan task decorator
 
     Args:
         name: Name for the task. Can be a string (static) or a callable
@@ -117,13 +94,7 @@ def agent(
     links: LinksParam = None,
     sample_rate: Optional[float] = None,
 ):
-    """Respan agent decorator.
-
-    Trace-root behavior (BREAKING CHANGE in v3.0): @agent spans always start
-    a fresh root trace, identical to @workflow. The decorator detaches any
-    inherited OTel context before opening the span so OTel allocates a new
-    trace_id with no parent. The single, explicit continuation mechanism is
-    SpanBuffer with parent_trace_id + parent_span_id (auto-detected).
+    """Respan agent decorator
 
     Args:
         name: Optional name for the agent
@@ -162,10 +133,7 @@ def tool(
     links: LinksParam = None,
     sample_rate: Optional[float] = None,
 ):
-    """Respan tool decorator.
-
-    Trace-root behavior: @tool spans ALWAYS inherit the active trace_id —
-    sub-step semantics, identical to @task. Unchanged from v2.
+    """Respan tool decorator
 
     Args:
         name: Optional name for the tool

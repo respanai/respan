@@ -49,10 +49,10 @@ def _setup_span(
 
     Delegates to the shared setup_span() utility.
     Returns (span, ctx_token) for backward compatibility with existing callers.
-    Context tokens for entity_name/entity_path/root are tracked internally and
+    Context tokens for entity_name/entity_path are tracked internally and
     cleaned up in _cleanup_span().
     """
-    span, ctx_token, entity_name_token, entity_path_token, root_ctx_token = setup_span(
+    span, ctx_token, entity_name_token, entity_path_token = setup_span(
         entity_name=entity_name,
         span_kind=span_kind,
         version=version,
@@ -64,7 +64,6 @@ def _setup_span(
     # Store extra tokens on the span object for _cleanup_span to detach
     span._entity_name_token = entity_name_token
     span._entity_path_token = entity_path_token
-    span._root_ctx_token = root_ctx_token
     return span, ctx_token
 
 
@@ -98,7 +97,6 @@ def _cleanup_span(span, ctx_token):
         ctx_token,
         entity_name_token=getattr(span, '_entity_name_token', None),
         entity_path_token=getattr(span, '_entity_path_token', None),
-        root_ctx_token=getattr(span, '_root_ctx_token', None),
     )
 
 

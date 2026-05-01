@@ -1,6 +1,0 @@
-{
-  "summary": "BREAKING: @workflow and @agent now always start fresh root traces — the wrapper detaches inherited OTel context and allocates a new trace_id with no parent. There is no per-decorator continuation flag. The single, explicit continuation mechanism is SpanBuffer with parent_trace_id+parent_span_id, which is auto-detected and suppresses the fresh-root default for decorators inside the buffer. @task / @tool kinds always inherit. Driven by 2026-04-30 incident: a 55-run experiment surfaced as 3 traces in the UI because per-row run_workflow_async spans inherited the Pulsar consumer batch handler's trace_id. The new default plus SpanBuffer-as-only-continuation makes that class of bug architecturally impossible to reintroduce without rewriting the consumer to spawn an explicit SpanBuffer.",
-  "packages": {
-    "respan-tracing": "major"
-  }
-}

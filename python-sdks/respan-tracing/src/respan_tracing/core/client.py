@@ -329,12 +329,6 @@ class RespanClient:
         - Span links (static list or callable)
         - Error recording and status propagation
 
-        Trace-root behavior matches ``@workflow``: workflow/agent kinds always
-        start a fresh root trace (detach inherited OTel context, allocate
-        new trace_id). The single, explicit continuation mechanism is
-        SpanBuffer with parent_trace_id + parent_span_id — when an active
-        SpanBuffer is detected, the fresh-root default is suppressed.
-
         Args:
             name: Span name (equivalent to the decorator ``name`` parameter).
             kind: Span kind — ``"workflow"``, ``"task"``, ``"agent"``, or
@@ -384,7 +378,7 @@ class RespanClient:
             yield None
             return
 
-        span, ctx_token, entity_name_token, entity_path_token, root_ctx_token = setup_span(
+        span, ctx_token, entity_name_token, entity_path_token = setup_span(
             entity_name=name,
             span_kind=kind,
             version=version,
@@ -400,13 +394,7 @@ class RespanClient:
             span.record_exception(e)
             raise
         finally:
-            cleanup_span(
-                span,
-                ctx_token,
-                entity_name_token,
-                entity_path_token,
-                root_ctx_token=root_ctx_token,
-            )
+            cleanup_span(span, ctx_token, entity_name_token, entity_path_token)
 
     def get_span_buffer(
         self,
