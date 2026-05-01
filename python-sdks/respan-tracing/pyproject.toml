@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "respan-tracing"
-version = "3.0.0"
+version = "2.16.6"
 description = "Respan SDK allows you to interact with the Respan API smoothly"
 authors = ["Respan <team@respan.ai>"]
 license = "MIT"
