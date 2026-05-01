@@ -428,5 +428,252 @@ class TestSetupSpanShared:
         assert name_after is None or name_after != "outer_wf"
 
 
+class TestNestedWorkflowTraceContinuationContract:
+    """The SDK contract for nested @workflow / @agent / @task: when invoked
+    inside an active OTel context, the new span attaches as a child and
+    inherits the parent trace_id. This is the user-facing "sub-workflow
+    composition" pattern — workflow → workflow → workflow appears as one
+    trace in the UI.
+
+    These tests existed implicitly in the SDK's behavior, but had no
+    explicit test asserting them, which is why a 2026-04-30 redesign
+    attempt (3.0.0, since reverted via #189) flipped the @workflow default
+    to "fresh root per call" and shipped before being caught. Locking the
+    contract down so the same redesign can't pass CI again.
+    """
+
+    def setup_method(self):
+        self.telemetry = RespanTelemetry(
+            app_name="test-nested-continuation-contract",
+            api_key="test-key",
+            is_enabled=True,
+        )
+        self.client = get_client()
+
+    def test_nested_workflow_inherits_outer_trace_id(self):
+        """@workflow nested inside another @workflow MUST share the outer's
+        trace_id by default. This is the sub-workflow composition contract.
+        """
+        from respan_tracing import workflow
+
+        captured = {}
+
+        @workflow(name="inner_wf")
+        def inner():
+            captured["inner_trace_id"] = trace.get_current_span().get_span_context().trace_id
+            captured["inner_parent_span_id"] = trace.get_current_span().parent.span_id
+
+        @workflow(name="outer_wf")
+        def outer():
+            captured["outer_trace_id"] = trace.get_current_span().get_span_context().trace_id
+            captured["outer_span_id"] = trace.get_current_span().get_span_context().span_id
+            inner()
+
+        outer()
+
+        assert captured["outer_trace_id"] != 0
+        assert captured["inner_trace_id"] == captured["outer_trace_id"], (
+            "Nested @workflow must inherit the outer @workflow's trace_id. "
+            "If this fails, somebody broke the sub-workflow composition contract."
+        )
+        assert captured["inner_parent_span_id"] == captured["outer_span_id"], (
+            "Nested @workflow must attach as a child of the outer @workflow span."
+        )
+
+    def test_three_level_workflow_nesting_shares_trace_id(self):
+        """workflow → workflow → workflow appears as one trace."""
+        from respan_tracing import workflow
+
+        captured = []
+
+        @workflow(name="level_3")
+        def level_3():
+            captured.append(trace.get_current_span().get_span_context().trace_id)
+
+        @workflow(name="level_2")
+        def level_2():
+            captured.append(trace.get_current_span().get_span_context().trace_id)
+            level_3()
+
+        @workflow(name="level_1")
+        def level_1():
+            captured.append(trace.get_current_span().get_span_context().trace_id)
+            level_2()
+
+        level_1()
+
+        assert len(captured) == 3
+        assert captured[0] != 0
+        assert captured[0] == captured[1] == captured[2], (
+            f"Three-level @workflow nesting must share one trace_id. Got: {captured}"
+        )
+
+    def test_top_level_workflow_no_parent_gets_fresh_trace(self):
+        """@workflow with no active OTel context gets a fresh root trace.
+        The dominant case — Celery worker, gunicorn handler, CLI entry,
+        signal receiver — and unchanged from plain OTel.
+        """
+        from respan_tracing import workflow
+
+        captured = {}
+
+        @workflow(name="standalone_wf")
+        def fn():
+            captured["trace_id"] = trace.get_current_span().get_span_context().trace_id
+            captured["parent"] = trace.get_current_span().parent
+
+        fn()
+        assert captured["trace_id"] != 0
+        assert captured["parent"] is None
+
+    def test_two_top_level_workflow_calls_get_distinct_trace_ids(self):
+        """Each top-level @workflow call gets its own trace. Sanity check
+        that the inheritance contract doesn't leak across independent invocations.
+        """
+        from respan_tracing import workflow
+
+        captured = []
+
+        @workflow(name="standalone")
+        def fn():
+            captured.append(trace.get_current_span().get_span_context().trace_id)
+
+        fn()
+        fn()
+        assert len(captured) == 2
+        assert captured[0] != captured[1]
+
+    def test_imperative_start_span_workflow_kind_inherits_outer(self):
+        """client.start_span(kind='workflow') matches @workflow:
+        inherits the active trace_id when one exists.
+        """
+        with self.client.start_span("outer", kind="workflow") as outer_span:
+            outer_trace = outer_span.get_span_context().trace_id
+            with self.client.start_span("inner", kind="workflow") as inner_span:
+                assert inner_span.get_span_context().trace_id == outer_trace
+                assert inner_span.parent.span_id == outer_span.get_span_context().span_id
+
+
+class TestSuppressedParentContext:
+    """Tests for suppressed_parent_context() — the helper a caller uses to
+    isolate per-iteration work from a wrapping @workflow span (the Pulsar
+    consumer batch-handler pattern).
+    """
+
+    def setup_method(self):
+        self.telemetry = RespanTelemetry(
+            app_name="test-suppressed-parent-context",
+            api_key="test-key",
+            is_enabled=True,
+        )
+        self.client = get_client()
+
+    def test_workflow_inside_suppressed_block_starts_fresh_root(self):
+        """An @workflow called inside `with suppressed_parent_context()`
+        produces a fresh trace_id even when an outer @workflow span is active.
+        """
+        from respan_tracing import suppressed_parent_context, workflow
+
+        captured = {}
+
+        @workflow(name="inner_isolated_wf")
+        def inner():
+            captured["inner_trace_id"] = trace.get_current_span().get_span_context().trace_id
+            captured["inner_parent"] = trace.get_current_span().parent
+
+        @workflow(name="outer_wf")
+        def outer():
+            captured["outer_trace_id"] = trace.get_current_span().get_span_context().trace_id
+            with suppressed_parent_context():
+                inner()
+
+        outer()
+
+        assert captured["outer_trace_id"] != 0
+        assert captured["inner_trace_id"] != 0
+        assert captured["inner_trace_id"] != captured["outer_trace_id"], (
+            "@workflow inside suppressed_parent_context() must start a fresh "
+            "trace, not inherit the outer span's trace_id."
+        )
+        assert captured["inner_parent"] is None, (
+            "@workflow inside suppressed_parent_context() must be a root span (no parent)."
+        )
+
+    def test_outer_trace_restored_after_suppressed_block_exits(self):
+        """After the with-block exits, the outer span's trace_id is the
+        active context again.
+        """
+        from respan_tracing import suppressed_parent_context, workflow
+
+        captured = []
+
+        @workflow(name="outer_wf_restore")
+        def outer():
+            captured.append(trace.get_current_span().get_span_context().trace_id)
+            with suppressed_parent_context():
+                pass
+            captured.append(trace.get_current_span().get_span_context().trace_id)
+
+        outer()
+        assert captured[0] == captured[1], (
+            "Outer trace_id must be restored after suppressed_parent_context exits"
+        )
+
+    def test_multiple_iterations_each_get_distinct_trace_id(self):
+        """The canonical Pulsar-consumer pattern: a loop inside an outer
+        @workflow span, each iteration wraps its dispatch in
+        `with suppressed_parent_context()`. Each iteration must produce a
+        distinct trace_id (none equal to the outer span's).
+        """
+        from respan_tracing import suppressed_parent_context, workflow
+
+        captured: list[int] = []
+        outer_trace_id: dict[str, int] = {}
+        n_iterations = 10
+
+        @workflow(name="per_message_dispatch")
+        def per_message():
+            captured.append(trace.get_current_span().get_span_context().trace_id)
+
+        @workflow(name="batch_handler")
+        def batch_handler():
+            outer_trace_id["value"] = trace.get_current_span().get_span_context().trace_id
+            for _ in range(n_iterations):
+                with suppressed_parent_context():
+                    per_message()
+
+        batch_handler()
+
+        assert len(captured) == n_iterations
+        assert outer_trace_id["value"] not in captured, (
+            "A per-iteration trace_id matched the outer batch span — "
+            "suppressed_parent_context() is not isolating context."
+        )
+        assert len(set(captured)) == n_iterations, (
+            f"Expected {n_iterations} distinct trace_ids, got {len(set(captured))}. "
+            "Per-iteration spans are sharing trace_ids — the bug class this "
+            "helper exists to prevent."
+        )
+
+    def test_helper_is_a_no_op_when_no_active_context(self):
+        """Calling suppressed_parent_context() with no active OTel parent
+        is harmless. @workflow inside still produces a normal fresh trace.
+        """
+        from respan_tracing import suppressed_parent_context, workflow
+
+        captured = {}
+
+        @workflow(name="standalone")
+        def fn():
+            captured["trace_id"] = trace.get_current_span().get_span_context().trace_id
+            captured["parent"] = trace.get_current_span().parent
+
+        with suppressed_parent_context():
+            fn()
+
+        assert captured["trace_id"] != 0
+        assert captured["parent"] is None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

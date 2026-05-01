@@ -1,0 +1,6 @@
+{
+  "summary": "feat(tracing): add suppressed_parent_context() — a top-level context manager that suppresses the active OTel parent for a code block. Spans created inside start fresh root traces; the outer span itself is untouched. For the canonical Pulsar/Kafka/Celery batch consumer pattern: wrap each per-iteration dispatch in `with suppressed_parent_context():` so per-message work is isolated from the batch handler's @workflow span. Lets callers express the boundary explicitly without reaching into raw OTel context APIs. Also adds TestNestedWorkflowTraceContinuationContract — explicit guards for the v2 contract (nested @workflow inherits outer trace_id by default) so the same redesign that produced 3.0.0 cannot pass CI again. Pure addition; no existing behavior changes.",
+  "packages": {
+    "respan-tracing": "minor"
+  }
+}
