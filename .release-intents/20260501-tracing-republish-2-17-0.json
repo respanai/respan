@@ -1,0 +1,6 @@
+{
+  "summary": "Republish respan-tracing as 2.17.0 (continuing the v2 line). The mistakenly-published 3.0.0 (broken, reverted in #189) and 3.1.0 (correctly featured but accidentally published in the v3 line because the publish floor was max(pyproject, pypi)) are being removed from PyPI. This PR rolls pyproject.toml back to 2.16.6 so the publish pipeline computes 2.17.0 from a clean v2 baseline. Pure additive content: suppressed_parent_context() helper + nested-workflow contract guards (already merged via #190).",
+  "packages": {
+    "respan-tracing": "minor"
+  }
+}
