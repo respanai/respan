@@ -1,0 +1,6 @@
+{
+  "summary": "Fix Vercel AI SDK instrumentation span classification and tool capture",
+  "packages": {
+    "@respan/instrumentation-vercel": "patch"
+  }
+}
