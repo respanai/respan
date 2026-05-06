@@ -14,27 +14,34 @@ import type { Context } from "@opentelemetry/api";
 import type { ReadableSpan, Span, SpanProcessor } from "@opentelemetry/sdk-trace-base";
 import { RespanLogType } from "@respan/respan-sdk";
 import { VERCEL_PARENT_SPANS, VERCEL_SPAN_CONFIG } from "./constants/index.js";
-import { formatCompletionOutput, formatPromptInput, formatToolInput, formatToolOutput, parseToolChoice, parseToolsValue } from "./_translator/messages.js";
+import {
+  enrichToolDefinitionAttrs,
+  enrichToolSpanAttrs,
+  formatCompletionOutput,
+  formatPromptInput,
+  formatToolInput,
+  formatToolOutput,
+  parseToolChoice,
+  parseToolsValue,
+} from "./_translator/messages.js";
 import {
   AI_AGENT_ID,
   AI_MODEL_ID,
   AI_PREFIX,
-  GEN_AI_REQUEST_MODEL,
   LLM_REQUEST_TYPE,
   RESPAN_LOG_TYPE,
   RESPAN_METADATA_AGENT_NAME,
-  RESPAN_SPAN_TOOLS,
+  TL_SPAN_KIND,
   TL_ENTITY_INPUT,
   TL_ENTITY_OUTPUT,
   TL_REQUEST_FUNCTIONS,
   isVercelAISpan,
   metadataKey,
-  normalizeModel,
   resolveLogType,
   safeJsonStr,
   setDefault,
 } from "./_translator/shared.js";
-import { enrichMetadata, enrichPerformanceMetrics, enrichTokens, stripRedundantAttrs } from "./_translator/span-enrichment.js";
+import { enrichMetadata, enrichModel, enrichPerformanceMetrics, enrichTokens, stripRedundantAttrs } from "./_translator/span-enrichment.js";
 
 /**
  * SpanProcessor that translates Vercel AI SDK attributes to Traceloop/OpenLLMetry.
@@ -78,6 +85,7 @@ export class VercelAITranslator implements SpanProcessor {
     const logType = resolveLogType(name, attrs);
 
     enrichMetadata(attrs);
+    delete attrs[TL_SPAN_KIND];
 
     if (parentLogType !== undefined && !config) {
       setDefault(attrs, RESPAN_LOG_TYPE, logType);
@@ -102,10 +110,7 @@ export class VercelAITranslator implements SpanProcessor {
       if (config.isLLM) {
         setDefault(attrs, LLM_REQUEST_TYPE, RespanLogType.CHAT);
 
-        const modelId = attrs[AI_MODEL_ID];
-        if (modelId) {
-          setDefault(attrs, GEN_AI_REQUEST_MODEL, normalizeModel(String(modelId)));
-        }
+        enrichModel(attrs, attrs[AI_MODEL_ID]);
 
         const input = formatPromptInput(attrs);
         if (input) {
@@ -121,9 +126,8 @@ export class VercelAITranslator implements SpanProcessor {
 
         const toolsValue = parseToolsValue(attrs);
         if (toolsValue) {
-          const tools = safeJsonStr(toolsValue);
-          attrs[RESPAN_SPAN_TOOLS] = tools;
-          attrs[TL_REQUEST_FUNCTIONS] = tools;
+          enrichToolDefinitionAttrs(attrs, toolsValue);
+          attrs[TL_REQUEST_FUNCTIONS] = safeJsonStr(toolsValue);
         }
 
         const toolChoice = parseToolChoice(attrs);
@@ -134,7 +138,14 @@ export class VercelAITranslator implements SpanProcessor {
         enrichPerformanceMetrics(attrs, name);
       }
 
+      if (config.logType === RespanLogType.EMBEDDING || logType === RespanLogType.EMBEDDING) {
+        setDefault(attrs, LLM_REQUEST_TYPE, RespanLogType.EMBEDDING);
+        enrichModel(attrs, attrs[AI_MODEL_ID]);
+      }
+
       if (config.logType === RespanLogType.TOOL || logType === RespanLogType.TOOL) {
+        enrichToolSpanAttrs(attrs);
+
         const toolInput = formatToolInput(attrs);
         if (toolInput) {
           setDefault(attrs, TL_ENTITY_INPUT, toolInput);
@@ -151,32 +162,34 @@ export class VercelAITranslator implements SpanProcessor {
         setDefault(attrs, RESPAN_METADATA_AGENT_NAME, String(agentName));
       }
     } else {
-      if (logType === RespanLogType.TEXT || logType === RespanLogType.EMBEDDING) {
-        const modelId = attrs[AI_MODEL_ID];
-        if (modelId) {
-          setDefault(attrs, GEN_AI_REQUEST_MODEL, normalizeModel(String(modelId)));
-        }
+      if (logType === RespanLogType.TEXT) {
+        enrichModel(attrs, attrs[AI_MODEL_ID]);
 
         enrichTokens(attrs);
 
-        if (logType === RespanLogType.TEXT) {
-          setDefault(attrs, LLM_REQUEST_TYPE, RespanLogType.CHAT);
+        setDefault(attrs, LLM_REQUEST_TYPE, RespanLogType.CHAT);
 
-          const input = formatPromptInput(attrs);
-          if (input) {
-            setDefault(attrs, TL_ENTITY_INPUT, input);
-          }
-
-          const output = formatCompletionOutput(attrs);
-          if (output) {
-            setDefault(attrs, TL_ENTITY_OUTPUT, output);
-          }
-
-          enrichPerformanceMetrics(attrs, name);
+        const input = formatPromptInput(attrs);
+        if (input) {
+          setDefault(attrs, TL_ENTITY_INPUT, input);
         }
+
+        const output = formatCompletionOutput(attrs);
+        if (output) {
+          setDefault(attrs, TL_ENTITY_OUTPUT, output);
+        }
+
+        enrichPerformanceMetrics(attrs, name);
+      }
+
+      if (logType === RespanLogType.EMBEDDING) {
+        setDefault(attrs, LLM_REQUEST_TYPE, RespanLogType.EMBEDDING);
+        enrichModel(attrs, attrs[AI_MODEL_ID]);
       }
 
       if (logType === RespanLogType.TOOL) {
+        enrichToolSpanAttrs(attrs);
+
         const toolInput = formatToolInput(attrs);
         if (toolInput) {
           setDefault(attrs, TL_ENTITY_INPUT, toolInput);

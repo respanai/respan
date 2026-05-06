@@ -13,6 +13,7 @@ import {
   AI_TOOL_CALL_NAME,
   AI_TOOL_CALL_PREFIX,
   AI_TOOL_CALL_RESULT,
+  RESPAN_SPAN_TOOLS,
   RESPAN_SPAN_TOOL_CALLS,
   isRecord,
   safeJsonParse,
@@ -72,7 +73,25 @@ function normalizeToolCallList(value: unknown): Record<string, any>[] | undefine
   return normalized.length > 0 ? normalized : undefined;
 }
 
-function parseToolCalls(attrs: SpanAttributes): Record<string, any>[] | undefined {
+function mergeToolCallLists(...groups: Array<Record<string, any>[] | undefined>): Record<string, any>[] | undefined {
+  const merged: Record<string, any>[] = [];
+  const seen = new Set<string>();
+
+  for (const group of groups) {
+    for (const call of group ?? []) {
+      const key = safeJsonStr(call);
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      merged.push(call);
+    }
+  }
+
+  return merged.length > 0 ? merged : undefined;
+}
+
+export function parseToolCalls(attrs: SpanAttributes): Record<string, any>[] | undefined {
   for (const key of [AI_RESPONSE_TOOL_CALLS, AI_TOOL_CALL, AI_TOOL_CALLS]) {
     if (!attrs[key]) {
       continue;
@@ -143,6 +162,37 @@ export function parseToolsValue(attrs: SpanAttributes): unknown[] | undefined {
     return parsedTools.length > 0 ? parsedTools : undefined;
   } catch {
     return undefined;
+  }
+}
+
+export function extractToolNames(tools: unknown[] | undefined): string[] | undefined {
+  if (!tools || tools.length === 0) {
+    return undefined;
+  }
+
+  const names = tools
+    .map((tool) => {
+      const parsed = typeof tool === "string" ? safeJsonParse(tool) : tool;
+      if (!isRecord(parsed)) {
+        return undefined;
+      }
+
+      const functionName = isRecord(parsed.function) ? parsed.function.name : undefined;
+      const name = functionName ?? parsed.name ?? parsed.toolName ?? parsed.tool_name;
+      return name === undefined ? undefined : String(name);
+    })
+    .filter((name): name is string => Boolean(name));
+
+  return names.length > 0 ? Array.from(new Set(names)) : undefined;
+}
+
+export function enrichToolDefinitionAttrs(attrs: SpanAttributes, tools: unknown[]): void {
+  attrs[RESPAN_SPAN_TOOLS] = tools;
+  attrs.tools = tools;
+
+  const toolNames = extractToolNames(tools);
+  if (toolNames) {
+    attrs.span_tools = toolNames;
   }
 }
 
@@ -442,28 +492,48 @@ function selectPrimaryAssistantMessage(value: unknown): MessagePayload | undefin
 
 function enrichCompletionAttrs(attrs: SpanAttributes, payload: unknown): void {
   const message = selectPrimaryAssistantMessage(payload);
-  if (!message) {
-    return;
+  const promptToolCalls = extractToolCallsFromMessages(parsePromptInputValue(attrs));
+  const responseToolCalls = message
+    ? normalizeToolCallList(message.tool_calls) ||
+      normalizeToolCallList(message.toolCalls) ||
+      parseToolCalls(attrs)
+    : parseToolCalls(attrs);
+  const toolCalls = mergeToolCallLists(responseToolCalls, promptToolCalls);
+
+  if (message) {
+    attrs["gen_ai.completion.0.role"] = "assistant";
+    attrs["gen_ai.completion.0.content"] =
+      typeof message.content === "string"
+        ? message.content
+        : message.content !== undefined
+          ? safeJsonStr(message.content)
+          : "";
   }
 
-  attrs["gen_ai.completion.0.role"] = "assistant";
-  attrs["gen_ai.completion.0.content"] =
-    typeof message.content === "string"
-      ? message.content
-      : message.content !== undefined
-        ? safeJsonStr(message.content)
-        : "";
-
-  const toolCalls =
-    normalizeToolCallList(message.tool_calls) ||
-    normalizeToolCallList(message.toolCalls) ||
-    parseToolCalls(attrs);
   if (toolCalls && toolCalls.length > 0) {
-    attrs["gen_ai.completion.0.tool_calls"] = toolCalls;
-    attrs[RESPAN_SPAN_TOOL_CALLS] = safeJsonStr(toolCalls);
+    if (responseToolCalls && responseToolCalls.length > 0) {
+      attrs["gen_ai.completion.0.tool_calls"] = responseToolCalls;
+    }
+    attrs[RESPAN_SPAN_TOOL_CALLS] = toolCalls;
+    attrs.tool_calls = toolCalls;
     attrs["has_tool_calls"] = true;
     attrs["parallel_tool_calls"] = toolCalls.length > 1;
   }
+}
+
+function extractToolCallsFromMessages(messages: MessagePayload[] | undefined): Record<string, any>[] | undefined {
+  if (!messages) {
+    return undefined;
+  }
+
+  const calls = messages.flatMap((message) => {
+    const toolCalls =
+      normalizeToolCallList(message.tool_calls) ??
+      normalizeToolCallList(message.toolCalls);
+    return toolCalls ?? [];
+  });
+
+  return calls.length > 0 ? calls : undefined;
 }
 
 function parsePromptInputValue(attrs: SpanAttributes): Record<string, any>[] | undefined {
@@ -546,4 +616,17 @@ export function formatToolOutput(attrs: SpanAttributes): string | undefined {
     return undefined;
   }
   return safeJsonStr(typeof result === "string" ? safeJsonParse(result) : result);
+}
+
+export function enrichToolSpanAttrs(attrs: SpanAttributes): void {
+  const name = attrs[AI_TOOL_CALL_NAME];
+  if (name) {
+    attrs.span_tools = [String(name)];
+  }
+
+  const toolCalls = parseToolCalls(attrs);
+  if (toolCalls) {
+    attrs[RESPAN_SPAN_TOOL_CALLS] = toolCalls;
+    attrs.tool_calls = toolCalls;
+  }
 }

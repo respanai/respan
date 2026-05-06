@@ -22,6 +22,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "test": "tsc -p tsconfig.json && node --test tests/*.test.mjs",
     "publish:package": "yarn npm publish",
     "release": "yarn build && yarn version patch && yarn publish:package"
   },

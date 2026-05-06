@@ -1,6 +1,8 @@
 import {
   AI_MODEL_ID,
   AI_OPERATION_ID,
+  AI_EMBEDDING,
+  AI_EMBEDDINGS,
   AI_PROMPT,
   AI_PROMPT_MESSAGES,
   AI_PROMPT_TOOL_CHOICE,
@@ -24,6 +26,7 @@ import {
   GEN_AI_USAGE_OUTPUT_TOKENS,
   GEN_AI_USAGE_TTFT,
   GEN_AI_USAGE_TYPE,
+  GEN_AI_REQUEST_MODEL,
   GEN_AI_USAGE_WARNINGS,
   GEN_AI_USAGE_COMPLETION_TOKENS,
   GEN_AI_USAGE_PROMPT_TOKENS,
@@ -31,6 +34,7 @@ import {
   THREAD_ID,
   TRACE_GROUP_ID,
   metadataKey,
+  normalizeModel,
   setDefault,
   type SpanAttributes,
 } from "./shared.js";
@@ -96,19 +100,34 @@ export function enrichMetadata(attrs: SpanAttributes): void {
   }
 }
 
+export function enrichModel(attrs: SpanAttributes, modelId: unknown): void {
+  if (!modelId) {
+    return;
+  }
+
+  const model = normalizeModel(String(modelId));
+  setDefault(attrs, GEN_AI_REQUEST_MODEL, model);
+}
+
 export function enrichTokens(attrs: SpanAttributes): void {
   const inputTokens =
     attrs[GEN_AI_USAGE_INPUT_TOKENS] ??
-    attrs["gen_ai.usage.prompt_tokens"];
+    attrs["gen_ai.usage.prompt_tokens"] ??
+    attrs["ai.usage.promptTokens"];
   const outputTokens =
     attrs[GEN_AI_USAGE_OUTPUT_TOKENS] ??
-    attrs["gen_ai.usage.completion_tokens"];
+    attrs["gen_ai.usage.completion_tokens"] ??
+    attrs["ai.usage.completionTokens"];
 
   if (inputTokens !== undefined) {
-    setDefault(attrs, GEN_AI_USAGE_PROMPT_TOKENS, Number(inputTokens));
+    const promptTokens = Number(inputTokens);
+    setDefault(attrs, GEN_AI_USAGE_INPUT_TOKENS, promptTokens);
+    setDefault(attrs, GEN_AI_USAGE_PROMPT_TOKENS, promptTokens);
   }
   if (outputTokens !== undefined) {
-    setDefault(attrs, GEN_AI_USAGE_COMPLETION_TOKENS, Number(outputTokens));
+    const completionTokens = Number(outputTokens);
+    setDefault(attrs, GEN_AI_USAGE_OUTPUT_TOKENS, completionTokens);
+    setDefault(attrs, GEN_AI_USAGE_COMPLETION_TOKENS, completionTokens);
   }
 }
 
@@ -155,6 +174,8 @@ const VERCEL_ATTRS_TO_STRIP = [
   "ai.prompt.format",
   AI_RESPONSE_TEXT,
   AI_RESPONSE_OBJECT,
+  AI_EMBEDDING,
+  AI_EMBEDDINGS,
   "ai.usage.promptTokens",
   "ai.usage.completionTokens",
   "ai.usage.inputTokens",
@@ -162,6 +183,7 @@ const VERCEL_ATTRS_TO_STRIP = [
   "ai.usage.totalTokens",
   "ai.usage.reasoningTokens",
   "ai.usage.cachedInputTokens",
+  "ai.usage.tokens",
   "ai.response.finishReason",
   "ai.response.id",
   "ai.response.timestamp",
@@ -184,8 +206,6 @@ const VERCEL_ATTRS_TO_STRIP = [
   AI_RESPONSE_TOOL_CALLS,
   "gen_ai.response.finish_reasons",
   "gen_ai.response.id",
-  "gen_ai.usage.input_tokens",
-  "gen_ai.usage.output_tokens",
   "gen_ai.system",
   "traceloop.entity.name",
   "traceloop.entity.path",
