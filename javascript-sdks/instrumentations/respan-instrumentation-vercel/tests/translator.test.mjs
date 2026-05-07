@@ -114,7 +114,7 @@ test("LLM spans emit tool definitions and tool calls in canonical fields only", 
     },
   ];
 
-  // Canonical fields only (per contribution/span-contract.md):
+  // Canonical fields only (per docs/SPAN_CONTRACT.md):
   assert.equal(JSON.parse(attrs["llm.request.functions"]).length, 1);
   assert.deepEqual(JSON.parse(attrs["llm.request.functions"]), expectedTools);
   assert.deepEqual(JSON.parse(attrs["gen_ai.completion.0.tool_calls"]), [toolCall]);
