@@ -126,7 +126,7 @@ test("LLM spans promote raw tool definitions and tool calls into backend fields"
   assert.equal(attrs["ai.response.toolCalls"], undefined);
 });
 
-test("final text step keeps tool calls from prompt history", () => {
+test("final text step does not echo prompt-history tool calls into completion", () => {
   const toolCall = {
     id: "call_weather",
     type: "function",
@@ -151,10 +151,13 @@ test("final text step keeps tool calls from prompt history", () => {
     "ai.response.text": "Tokyo is clear.",
   });
 
-  assert.deepEqual(attrs.tool_calls, [toolCall]);
-  assert.deepEqual(attrs["respan.span.tool_calls"], [toolCall]);
+  // This turn emitted plain text, not a new tool call. The assistant's
+  // earlier tool_calls remain in the prompt history (gen_ai.prompt.*),
+  // not on this span's completion / top-level tool_calls fields.
+  assert.equal(attrs.tool_calls, undefined);
+  assert.equal(attrs["respan.span.tool_calls"], undefined);
   assert.equal(attrs["gen_ai.completion.0.tool_calls"], undefined);
-  assert.equal(attrs.has_tool_calls, true);
+  assert.equal(attrs.has_tool_calls, undefined);
   assert.deepEqual(JSON.parse(attrs["traceloop.entity.output"]), {
     role: "assistant",
     content: "Tokyo is clear.",

@@ -137,7 +137,7 @@ jobs:
             done
           fi
           if [ "${{ matrix.has_test }}" = "true" ]; then
-            yarn workspace "${{ matrix.name }}" test
+            (cd "../${{ matrix.path }}" && yarn run test)
           fi
 
       - name: Package smoke check

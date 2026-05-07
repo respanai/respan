@@ -73,24 +73,6 @@ function normalizeToolCallList(value: unknown): Record<string, any>[] | undefine
   return normalized.length > 0 ? normalized : undefined;
 }
 
-function mergeToolCallLists(...groups: Array<Record<string, any>[] | undefined>): Record<string, any>[] | undefined {
-  const merged: Record<string, any>[] = [];
-  const seen = new Set<string>();
-
-  for (const group of groups) {
-    for (const call of group ?? []) {
-      const key = safeJsonStr(call);
-      if (seen.has(key)) {
-        continue;
-      }
-      seen.add(key);
-      merged.push(call);
-    }
-  }
-
-  return merged.length > 0 ? merged : undefined;
-}
-
 export function parseToolCalls(attrs: SpanAttributes): Record<string, any>[] | undefined {
   for (const key of [AI_RESPONSE_TOOL_CALLS, AI_TOOL_CALL, AI_TOOL_CALLS]) {
     if (!attrs[key]) {
@@ -492,13 +474,11 @@ function selectPrimaryAssistantMessage(value: unknown): MessagePayload | undefin
 
 function enrichCompletionAttrs(attrs: SpanAttributes, payload: unknown): void {
   const message = selectPrimaryAssistantMessage(payload);
-  const promptToolCalls = extractToolCallsFromMessages(parsePromptInputValue(attrs));
   const responseToolCalls = message
     ? normalizeToolCallList(message.tool_calls) ||
       normalizeToolCallList(message.toolCalls) ||
       parseToolCalls(attrs)
     : parseToolCalls(attrs);
-  const toolCalls = mergeToolCallLists(responseToolCalls, promptToolCalls);
 
   if (message) {
     attrs["gen_ai.completion.0.role"] = "assistant";
@@ -510,30 +490,13 @@ function enrichCompletionAttrs(attrs: SpanAttributes, payload: unknown): void {
           : "";
   }
 
-  if (toolCalls && toolCalls.length > 0) {
-    if (responseToolCalls && responseToolCalls.length > 0) {
-      attrs["gen_ai.completion.0.tool_calls"] = responseToolCalls;
-    }
-    attrs[RESPAN_SPAN_TOOL_CALLS] = toolCalls;
-    attrs.tool_calls = toolCalls;
+  if (responseToolCalls && responseToolCalls.length > 0) {
+    attrs["gen_ai.completion.0.tool_calls"] = responseToolCalls;
+    attrs[RESPAN_SPAN_TOOL_CALLS] = responseToolCalls;
+    attrs.tool_calls = responseToolCalls;
     attrs["has_tool_calls"] = true;
-    attrs["parallel_tool_calls"] = toolCalls.length > 1;
+    attrs["parallel_tool_calls"] = responseToolCalls.length > 1;
   }
-}
-
-function extractToolCallsFromMessages(messages: MessagePayload[] | undefined): Record<string, any>[] | undefined {
-  if (!messages) {
-    return undefined;
-  }
-
-  const calls = messages.flatMap((message) => {
-    const toolCalls =
-      normalizeToolCallList(message.tool_calls) ??
-      normalizeToolCallList(message.toolCalls);
-    return toolCalls ?? [];
-  });
-
-  return calls.length > 0 ? calls : undefined;
 }
 
 function parsePromptInputValue(attrs: SpanAttributes): Record<string, any>[] | undefined {
