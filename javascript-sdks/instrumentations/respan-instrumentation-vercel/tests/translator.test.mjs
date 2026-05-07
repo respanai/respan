@@ -74,7 +74,7 @@ test("ai.embed.doEmbed is classified as embedding without synthetic usage fields
   assert.equal(attrs["ai.embeddings"], undefined);
 });
 
-test("LLM spans promote raw tool definitions and tool calls into backend fields", () => {
+test("LLM spans emit tool definitions and tool calls in canonical fields only", () => {
   const tool = {
     type: "function",
     name: "weather",
@@ -114,14 +114,21 @@ test("LLM spans promote raw tool definitions and tool calls into backend fields"
     },
   ];
 
-  assert.deepEqual(attrs.tools, expectedTools);
-  assert.deepEqual(attrs["respan.span.tools"], expectedTools);
-  assert.deepEqual(attrs.span_tools, ["weather"]);
-  assert.deepEqual(attrs.tool_calls, [toolCall]);
-  assert.deepEqual(attrs["respan.span.tool_calls"], [toolCall]);
-  assert.deepEqual(attrs["gen_ai.completion.0.tool_calls"], [toolCall]);
-  assert.equal(attrs.has_tool_calls, true);
-  assert.equal(attrs.parallel_tool_calls, false);
+  // Canonical fields only (per docs/SPAN_CONTRACT.md):
+  assert.equal(JSON.parse(attrs["llm.request.functions"]).length, 1);
+  assert.deepEqual(JSON.parse(attrs["llm.request.functions"]), expectedTools);
+  assert.deepEqual(JSON.parse(attrs["gen_ai.completion.0.tool_calls"]), [toolCall]);
+
+  // Off-contract aliases must NOT be set:
+  assert.equal(attrs.tools, undefined);
+  assert.equal(attrs["respan.span.tools"], undefined);
+  assert.equal(attrs.span_tools, undefined);
+  assert.equal(attrs.tool_calls, undefined);
+  assert.equal(attrs["respan.span.tool_calls"], undefined);
+  assert.equal(attrs.has_tool_calls, undefined);
+  assert.equal(attrs.parallel_tool_calls, undefined);
+
+  // Vendor-specific raw attrs stripped:
   assert.equal(attrs["ai.prompt.tools"], undefined);
   assert.equal(attrs["ai.response.toolCalls"], undefined);
 });
@@ -164,7 +171,7 @@ test("final text step does not echo prompt-history tool calls into completion", 
   });
 });
 
-test("ai.toolCall spans expose span_tools and tool call payloads", () => {
+test("ai.toolCall spans carry input/output only — no tool_calls aliases", () => {
   const attrs = runTranslator("ai.toolCall", {
     "ai.toolCall.id": "call_weather",
     "ai.toolCall.name": "weather",
@@ -172,18 +179,8 @@ test("ai.toolCall spans expose span_tools and tool call payloads", () => {
     "ai.toolCall.result": JSON.stringify({ city: "Tokyo", condition: "clear" }),
   });
 
+  // The span's existence + log_type=tool IS the tool call.
   assert.equal(attrs["respan.entity.log_type"], "tool");
-  assert.deepEqual(attrs.span_tools, ["weather"]);
-  assert.deepEqual(attrs.tool_calls, [
-    {
-      id: "call_weather",
-      type: "function",
-      function: {
-        name: "weather",
-        arguments: JSON.stringify({ city: "Tokyo" }),
-      },
-    },
-  ]);
   assert.deepEqual(JSON.parse(attrs["traceloop.entity.input"]), {
     name: "weather",
     args: { city: "Tokyo" },
@@ -192,4 +189,9 @@ test("ai.toolCall spans expose span_tools and tool call payloads", () => {
     city: "Tokyo",
     condition: "clear",
   });
+
+  // Tool execution spans must NOT carry tool_calls aliases:
+  assert.equal(attrs.tool_calls, undefined);
+  assert.equal(attrs["respan.span.tool_calls"], undefined);
+  assert.equal(attrs.span_tools, undefined);
 });

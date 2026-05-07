@@ -15,8 +15,6 @@ import type { ReadableSpan, Span, SpanProcessor } from "@opentelemetry/sdk-trace
 import { RespanLogType } from "@respan/respan-sdk";
 import { VERCEL_PARENT_SPANS, VERCEL_SPAN_CONFIG } from "./constants/index.js";
 import {
-  enrichToolDefinitionAttrs,
-  enrichToolSpanAttrs,
   formatCompletionOutput,
   formatPromptInput,
   formatToolInput,
@@ -126,7 +124,6 @@ export class VercelAITranslator implements SpanProcessor {
 
         const toolsValue = parseToolsValue(attrs);
         if (toolsValue) {
-          enrichToolDefinitionAttrs(attrs, toolsValue);
           attrs[TL_REQUEST_FUNCTIONS] = safeJsonStr(toolsValue);
         }
 
@@ -144,8 +141,6 @@ export class VercelAITranslator implements SpanProcessor {
       }
 
       if (config.logType === RespanLogType.TOOL || logType === RespanLogType.TOOL) {
-        enrichToolSpanAttrs(attrs);
-
         const toolInput = formatToolInput(attrs);
         if (toolInput) {
           setDefault(attrs, TL_ENTITY_INPUT, toolInput);
@@ -188,8 +183,6 @@ export class VercelAITranslator implements SpanProcessor {
       }
 
       if (logType === RespanLogType.TOOL) {
-        enrichToolSpanAttrs(attrs);
-
         const toolInput = formatToolInput(attrs);
         if (toolInput) {
           setDefault(attrs, TL_ENTITY_INPUT, toolInput);

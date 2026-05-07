@@ -13,8 +13,6 @@ import {
   AI_TOOL_CALL_NAME,
   AI_TOOL_CALL_PREFIX,
   AI_TOOL_CALL_RESULT,
-  RESPAN_SPAN_TOOLS,
-  RESPAN_SPAN_TOOL_CALLS,
   isRecord,
   safeJsonParse,
   safeJsonStr,
@@ -147,36 +145,6 @@ export function parseToolsValue(attrs: SpanAttributes): unknown[] | undefined {
   }
 }
 
-export function extractToolNames(tools: unknown[] | undefined): string[] | undefined {
-  if (!tools || tools.length === 0) {
-    return undefined;
-  }
-
-  const names = tools
-    .map((tool) => {
-      const parsed = typeof tool === "string" ? safeJsonParse(tool) : tool;
-      if (!isRecord(parsed)) {
-        return undefined;
-      }
-
-      const functionName = isRecord(parsed.function) ? parsed.function.name : undefined;
-      const name = functionName ?? parsed.name ?? parsed.toolName ?? parsed.tool_name;
-      return name === undefined ? undefined : String(name);
-    })
-    .filter((name): name is string => Boolean(name));
-
-  return names.length > 0 ? Array.from(new Set(names)) : undefined;
-}
-
-export function enrichToolDefinitionAttrs(attrs: SpanAttributes, tools: unknown[]): void {
-  attrs[RESPAN_SPAN_TOOLS] = tools;
-  attrs.tools = tools;
-
-  const toolNames = extractToolNames(tools);
-  if (toolNames) {
-    attrs.span_tools = toolNames;
-  }
-}
 
 export function parseToolChoice(attrs: SpanAttributes): string | undefined {
   try {
@@ -491,11 +459,7 @@ function enrichCompletionAttrs(attrs: SpanAttributes, payload: unknown): void {
   }
 
   if (responseToolCalls && responseToolCalls.length > 0) {
-    attrs["gen_ai.completion.0.tool_calls"] = responseToolCalls;
-    attrs[RESPAN_SPAN_TOOL_CALLS] = responseToolCalls;
-    attrs.tool_calls = responseToolCalls;
-    attrs["has_tool_calls"] = true;
-    attrs["parallel_tool_calls"] = responseToolCalls.length > 1;
+    attrs["gen_ai.completion.0.tool_calls"] = safeJsonStr(responseToolCalls);
   }
 }
 
@@ -581,15 +545,3 @@ export function formatToolOutput(attrs: SpanAttributes): string | undefined {
   return safeJsonStr(typeof result === "string" ? safeJsonParse(result) : result);
 }
 
-export function enrichToolSpanAttrs(attrs: SpanAttributes): void {
-  const name = attrs[AI_TOOL_CALL_NAME];
-  if (name) {
-    attrs.span_tools = [String(name)];
-  }
-
-  const toolCalls = parseToolCalls(attrs);
-  if (toolCalls) {
-    attrs[RESPAN_SPAN_TOOL_CALLS] = toolCalls;
-    attrs.tool_calls = toolCalls;
-  }
-}
