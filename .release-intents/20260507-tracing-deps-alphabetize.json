@@ -1,0 +1,6 @@
+{
+  "summary": "Alphabetize @respan/respan-sdk in respan-tracing package.json (no functional change, no version bump)",
+  "packages": {
+    "@respan/tracing": "none"
+  }
+}
