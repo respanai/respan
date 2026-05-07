@@ -137,7 +137,13 @@ jobs:
             done
           fi
           if [ "${{ matrix.has_test }}" = "true" ]; then
-            (cd "../${{ matrix.path }}" && yarn run test)
+            # Bypass `yarn workspace ... test` and `yarn run test` because
+            # Yarn 4 hardened mode (active on public-fork PRs) doesn't
+            # persist the install-state file that those commands rely on.
+            # `npm test` reads scripts from package.json directly and walks
+            # parents to find node_modules/.bin (populated by yarn install
+            # with nodeLinker: node-modules).
+            (cd "../${{ matrix.path }}" && npm test)
           fi
 
       - name: Package smoke check
