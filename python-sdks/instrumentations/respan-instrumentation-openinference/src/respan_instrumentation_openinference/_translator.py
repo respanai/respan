@@ -615,6 +615,7 @@ class OpenInferenceTranslator(SpanProcessor):
 
         oi_kind_upper = str(oi_kind).upper()
         is_llm_kind = oi_kind_upper in _LLM_KINDS
+        is_llm_only = oi_kind_upper == "LLM"
         logger.debug("[OI→TL] Translating %s span: %s", oi_kind_upper, span.name)
 
         # --- Span kind (reverse of Arize _SPAN_KIND_MAPPING) ---
@@ -693,21 +694,16 @@ class OpenInferenceTranslator(SpanProcessor):
             direct_tools = _extract_tools_from_indexed_attrs(attrs)
         if direct_tools is not None:
             attrs.setdefault(RESPAN_SPAN_TOOLS, _safe_json_str(direct_tools))
-            if is_llm_kind:
+            if is_llm_only:
                 attrs.setdefault(_RESPAN_TOOLS, direct_tools)
 
         direct_tool_calls = _extract_tool_calls(
             attrs=attrs,
             oi_prefixes=[_OI_OUTPUT_MESSAGES_PREFIX],
         )
-        if direct_tool_calls is None and is_llm_kind:
-            direct_tool_calls = _extract_tool_calls(
-                attrs=attrs,
-                oi_prefixes=[_OI_INPUT_MESSAGES_PREFIX],
-            )
         if direct_tool_calls is not None:
             attrs.setdefault(RESPAN_SPAN_TOOL_CALLS, _safe_json_str(direct_tool_calls))
-            if is_llm_kind:
+            if is_llm_only:
                 attrs.setdefault(_RESPAN_TOOL_CALLS, direct_tool_calls)
 
         # --- LLM-specific: messages, invocation params, tools ---

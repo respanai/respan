@@ -4,24 +4,20 @@ import importlib
 import logging
 from typing import Any
 
+from respan_instrumentation_openinference import OpenInferenceInstrumentor
 from respan_tracing.core.tracer import RespanTracer
 
 logger = logging.getLogger(__name__)
 
 CREWAI_INSTRUMENTATION_NAME = "crewai"
 OPENINFERENCE_CREWAI_MODULE = "openinference.instrumentation.crewai"
-RESPAN_OPENINFERENCE_MODULE = "respan_instrumentation_openinference"
 USE_EVENT_LISTENER_KWARG = "use_event_listener"
 CREATE_LLM_SPANS_KWARG = "create_llm_spans"
 
 
-def _load_openinference_crewai() -> tuple[type, type]:
+def _load_openinference_crewai_class() -> type:
     crewai_module = importlib.import_module(OPENINFERENCE_CREWAI_MODULE)
-    openinference_module = importlib.import_module(RESPAN_OPENINFERENCE_MODULE)
-    return (
-        openinference_module.OpenInferenceInstrumentor,
-        crewai_module.CrewAIInstrumentor,
-    )
+    return crewai_module.CrewAIInstrumentor
 
 
 class CrewAIInstrumentor:
@@ -69,9 +65,7 @@ class CrewAIInstrumentor:
             return
 
         try:
-            openinference_instrumentor, crewai_instrumentor = (
-                _load_openinference_crewai()
-            )
+            crewai_instrumentor_class = _load_openinference_crewai_class()
         except ImportError as exc:
             logger.warning(
                 "Failed to activate CrewAI instrumentation — missing dependency: %s",
@@ -80,8 +74,8 @@ class CrewAIInstrumentor:
             return
 
         try:
-            self._delegate = openinference_instrumentor(
-                crewai_instrumentor,
+            self._delegate = OpenInferenceInstrumentor(
+                crewai_instrumentor_class,
                 **self._instrumentor_kwargs,
             )
             self._delegate.activate()

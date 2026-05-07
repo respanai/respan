@@ -3,28 +3,18 @@ import sys
 from types import ModuleType, SimpleNamespace
 
 import pytest
-from opentelemetry.semconv_ai import SpanAttributes
-from openinference.semconv import trace
 
-from respan_instrumentation_crewai import CrewAIInstrumentor, CrewAITranslator
+from respan_instrumentation_crewai import CrewAIInstrumentor
 from respan_instrumentation_crewai import _instrumentation
 from respan_instrumentation_crewai._instrumentation import (
     CREATE_LLM_SPANS_KWARG,
     OPENINFERENCE_CREWAI_MODULE,
-    RESPAN_OPENINFERENCE_MODULE,
     USE_EVENT_LISTENER_KWARG,
-)
-from respan_sdk.constants.llm_logging import LOG_TYPE_AGENT, LOG_TYPE_CHAT
-from respan_sdk.constants.span_attributes import (
-    LLM_REQUEST_MODEL,
-    LLM_USAGE_COMPLETION_TOKENS,
-    LLM_USAGE_PROMPT_TOKENS,
-    RESPAN_LOG_TYPE,
 )
 from respan_tracing.core.tracer import RespanTracer
 
 
-def _install_fake_openinference_modules(monkeypatch):
+def _install_fake_modules(monkeypatch):
     class FakeCrewAIInstrumentor:
         pass
 
@@ -50,9 +40,6 @@ def _install_fake_openinference_modules(monkeypatch):
     openinference_crewai_module.CrewAIInstrumentor = FakeCrewAIInstrumentor
     openinference_instrumentation_module.crewai = openinference_crewai_module
 
-    respan_openinference_module = ModuleType(RESPAN_OPENINFERENCE_MODULE)
-    respan_openinference_module.OpenInferenceInstrumentor = FakeOpenInferenceInstrumentor
-
     monkeypatch.setitem(sys.modules, "openinference", openinference_module)
     monkeypatch.setitem(
         sys.modules,
@@ -64,10 +51,11 @@ def _install_fake_openinference_modules(monkeypatch):
         OPENINFERENCE_CREWAI_MODULE,
         openinference_crewai_module,
     )
-    monkeypatch.setitem(
-        sys.modules,
-        RESPAN_OPENINFERENCE_MODULE,
-        respan_openinference_module,
+
+    monkeypatch.setattr(
+        _instrumentation,
+        "OpenInferenceInstrumentor",
+        FakeOpenInferenceInstrumentor,
     )
 
     return SimpleNamespace(
@@ -84,7 +72,7 @@ def reset_tracer():
 
 
 def test_activate_uses_openinference_crewai_defaults(monkeypatch):
-    fake = _install_fake_openinference_modules(monkeypatch)
+    fake = _install_fake_modules(monkeypatch)
 
     instrumentor = CrewAIInstrumentor()
     instrumentor.activate()
@@ -105,7 +93,7 @@ def test_activate_uses_openinference_crewai_defaults(monkeypatch):
 
 
 def test_activate_passes_custom_openinference_kwargs(monkeypatch):
-    fake = _install_fake_openinference_modules(monkeypatch)
+    fake = _install_fake_modules(monkeypatch)
 
     instrumentor = CrewAIInstrumentor(
         use_event_listener=False,
@@ -123,7 +111,7 @@ def test_activate_passes_custom_openinference_kwargs(monkeypatch):
 
 
 def test_activate_cleans_up_delegate_when_activation_fails(monkeypatch, caplog):
-    fake = _install_fake_openinference_modules(monkeypatch)
+    fake = _install_fake_modules(monkeypatch)
 
     def activate_raises(self):
         self.is_activated = True
@@ -147,7 +135,7 @@ def test_activate_cleans_up_delegate_when_activation_fails(monkeypatch, caplog):
 
 
 def test_activate_skips_when_respan_tracing_is_disabled(monkeypatch, caplog):
-    fake = _install_fake_openinference_modules(monkeypatch)
+    fake = _install_fake_modules(monkeypatch)
     RespanTracer(is_enabled=False)
 
     instrumentor = CrewAIInstrumentor()
@@ -163,12 +151,10 @@ def test_activate_skips_when_respan_tracing_is_disabled(monkeypatch, caplog):
 
 
 def test_activate_logs_warning_when_dependencies_are_missing(monkeypatch, caplog):
-    original_import_module = _instrumentation.importlib.import_module
-
     def import_module_raises(module_name):
         if module_name == OPENINFERENCE_CREWAI_MODULE:
             raise ImportError(module_name)
-        return original_import_module(module_name)
+        raise AssertionError(f"unexpected import: {module_name}")
 
     monkeypatch.setattr(
         _instrumentation.importlib,
@@ -182,51 +168,3 @@ def test_activate_logs_warning_when_dependencies_are_missing(monkeypatch, caplog
 
     assert "Failed to activate CrewAI instrumentation" in caplog.text
     assert instrumentor._is_instrumented is False
-
-
-def test_crewai_translator_maps_openinference_span_to_respan_shape():
-    span = SimpleNamespace(
-        name="Crew.kickoff",
-        _attributes={
-            trace.SpanAttributes.OPENINFERENCE_SPAN_KIND: "AGENT",
-            trace.SpanAttributes.AGENT_NAME: "Research crew",
-            trace.SpanAttributes.INPUT_VALUE: {"topic": "weather"},
-            trace.SpanAttributes.OUTPUT_VALUE: {"result": "done"},
-        },
-    )
-
-    CrewAITranslator().on_end(span)
-
-    assert span._attributes[SpanAttributes.TRACELOOP_SPAN_KIND] == "agent"
-    assert span._attributes[SpanAttributes.TRACELOOP_ENTITY_NAME] == "Research crew"
-    assert (
-        span._attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT]
-        == '{"topic": "weather"}'
-    )
-    assert (
-        span._attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]
-        == '{"result": "done"}'
-    )
-    assert span._attributes[RESPAN_LOG_TYPE] == LOG_TYPE_AGENT
-    assert trace.SpanAttributes.OPENINFERENCE_SPAN_KIND not in span._attributes
-
-
-def test_crewai_translator_maps_llm_model_and_usage():
-    span = SimpleNamespace(
-        name="CrewAI LLM",
-        _attributes={
-            trace.SpanAttributes.OPENINFERENCE_SPAN_KIND: "LLM",
-            trace.SpanAttributes.LLM_MODEL_NAME: "gpt-4o-mini",
-            trace.SpanAttributes.LLM_TOKEN_COUNT_PROMPT: 11,
-            trace.SpanAttributes.LLM_TOKEN_COUNT_COMPLETION: 7,
-            trace.SpanAttributes.LLM_INVOCATION_PARAMETERS: '{"temperature": 0.2}',
-        },
-    )
-
-    CrewAITranslator().on_end(span)
-
-    assert span._attributes[RESPAN_LOG_TYPE] == LOG_TYPE_CHAT
-    assert span._attributes[LLM_REQUEST_MODEL] == "gpt-4o-mini"
-    assert span._attributes[LLM_USAGE_PROMPT_TOKENS] == 11
-    assert span._attributes[LLM_USAGE_COMPLETION_TOKENS] == 7
-    assert span._attributes[SpanAttributes.LLM_REQUEST_TEMPERATURE] == 0.2

@@ -530,7 +530,7 @@ def test_mixed_modern_and_legacy_tool_call_fields_deduplicate(translator):
     assert span._attributes["tool_calls"] == expected_tool_calls
 
 
-def test_input_history_tool_calls_become_backend_tool_call_override(translator):
+def test_input_history_tool_calls_do_not_become_top_level_tool_calls(translator):
     span = _make_span({
         "openinference.span.kind": "LLM",
         "llm.input_messages.0.message.role": "assistant",
@@ -543,18 +543,8 @@ def test_input_history_tool_calls_become_backend_tool_call_override(translator):
 
     translator.on_end(span)
 
-    expected_tool_calls = [
-        {
-            "id": "call_history",
-            "function": {
-                "name": "lookup_weather",
-                "arguments": '{"city":"Tokyo"}',
-            },
-            "type": "function",
-        }
-    ]
-    assert json.loads(span._attributes[RESPAN_SPAN_TOOL_CALLS]) == expected_tool_calls
-    assert span._attributes["tool_calls"] == expected_tool_calls
+    assert RESPAN_SPAN_TOOL_CALLS not in span._attributes
+    assert "tool_calls" not in span._attributes
     assert span._attributes["gen_ai.prompt.0.tool_calls"] == [
         {
             "id": "call_history",
