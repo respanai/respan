@@ -8,6 +8,8 @@ Start here:
   - system layers, package responsibilities, and dependency direction
 - [writing-instrumentations.md](writing-instrumentations.md)
   - how to add a new active instrumentation package
+- [span-contract.md](span-contract.md)
+  - canonical span attribute shape every instrumentation must emit (Python or JS, first-party or OI-delegated)
 - [cicd.md](cicd.md)
   - what CI and publish do, and what the pipeline expects
 - [publish.md](publish.md)
