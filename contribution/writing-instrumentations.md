@@ -112,11 +112,16 @@ If the package is intended to be loaded as a plugin, make the plugin entrypoint 
 
 ## Constant Resolution Order
 
+See [`span-contract.md`](./span-contract.md#source-rules) for the
+canonical source rules — this section is a how-to overlay, that doc is
+the source of truth.
+
 When an instrumentation needs semantic-convention keys or attribute constants, resolve them in this order:
 
 1. Traceloop / GenAI semantic-convention packages already used by that instrumentation
 2. OpenInference semantic-convention packages already used by that instrumentation
 3. `respan-sdk` constants, but only for Respan-owned keys that do not exist upstream
+4. **SDK-specific keys** (e.g. LangChain callback field names, Vercel AI SDK `ai.*`, n8n event keys): keep as local constants inside the instrumentation package that owns the SDK. Do NOT promote them into `respan-sdk` — they are translator-internal, not part of the public span contract.
 
 Rules:
 
@@ -124,6 +129,7 @@ Rules:
 - Do not create local ad hoc string constants in an instrumentation if an upstream constant already exists.
 - Add a new `respan-sdk` constant only when the key is Respan-specific and cannot be sourced from Traceloop or OpenInference.
 - Prefer importing upstream constants directly in the instrumentation package that uses them.
+- SDK-specific input keys (whatever the instrumented library names its fields) stay co-located with the translator that reads them.
 
 Examples of keys that belong upstream rather than in `respan-sdk`:
 
@@ -136,6 +142,12 @@ Examples of keys that may belong in `respan-sdk`:
 - Respan-specific metadata keys
 - Respan-specific log type identifiers
 - Respan-owned plugin or registry keys shared across packages
+
+Examples of keys that stay inside the instrumentation package:
+
+- LangChain callback handler field names
+- Vercel AI SDK `ai.*` raw attribute keys
+- n8n / Langflow / vendor-specific event payload keys
 
 ## JavaScript Guidance
 
