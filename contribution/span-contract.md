@@ -11,19 +11,34 @@ backend is not modified to accommodate translator drift.**
 
 ## Source rules
 
-- **Industry-standard attributes** (`gen_ai.*`, `llm.*`, `traceloop.*`,
-  `openinference.*`): import from upstream packages.
-  - Python: `opentelemetry.semconv_ai.SpanAttributes`,
-    `openinference.semconv.trace.SpanAttributes`
-  - JavaScript: `@traceloop/ai-semantic-conventions`,
-    `@arizeai/openinference-semantic-conventions`,
-    `@opentelemetry/semantic-conventions`
-  - **Never redefine these as local constants in `respan-sdk` or in a
-    translator.**
+Each constant has exactly one home. Import it from there. **Do not
+re-export, re-declare, or shadow it elsewhere** — duplicates drift.
+
+- **Traceloop / GenAI attributes** (`gen_ai.*`, `llm.*`, `traceloop.*`):
+  import directly from the Traceloop semantic-conventions package.
+  - Python: `from opentelemetry.semconv_ai import SpanAttributes`
+  - JavaScript: `from "@traceloop/ai-semantic-conventions"`
+- **OpenInference attributes** (`openinference.*`,
+  `llm.input_messages.*`, `llm.output_messages.*`, and other OI
+  conventions): import directly from the OpenInference constants
+  package.
+  - Python: `from openinference.semconv.trace import SpanAttributes`
+  - JavaScript: `from "@arizeai/openinference-semantic-conventions"`
 - **Respan-specific attributes** (`respan.entity.log_type`,
   `respan.customer_params.*`, `respan.threads.*`, `respan.trace.*`,
-  `respan.metadata`): defined in `respan-sdk`. Use those constants —
-  do not stringify keys inline.
+  `respan.metadata`): import directly from `respan-sdk` (Python:
+  `respan_sdk.constants`; JS: `@respan/respan-sdk`).
+- **SDK-specific keys** (LangChain callback fields, Vercel AI SDK
+  `ai.*`, n8n event keys, etc.): keep them **inside the instrumentation
+  package that owns that SDK**. Do not promote them into `respan-sdk` —
+  they are a translator-internal detail, not part of the public span
+  contract.
+
+**Never invent a duplicate.** If a key already exists in Traceloop,
+OpenInference, or `respan-sdk`, use that constant. Don't create a
+parallel local constant, a re-export, or a renamed alias just because
+the import path is long.
+
 - **OTel attribute spec compliance**: span attribute values are
   primitives or homogeneous primitive arrays. Structured data
   (objects, lists of objects) → JSON-stringify the value. No object
