@@ -40,7 +40,7 @@ JavaScript contract package:
 Responsibilities:
 
 - public parameter types such as `RespanLogParams`, `RespanParams`, filter types, and usage/message models
-- canonical attribute keys such as `RespanSpanAttributes`
+- canonical attribute keys for **Respan-owned** namespaces (`respan.*`) such as `RespanSpanAttributes`. Industry-standard keys (`gen_ai.*`, `llm.*`, `traceloop.*`, `openinference.*`) are imported from upstream semconv packages, not redeclared here. SDK-specific keys (LangChain callback fields, Vercel `ai.*`, n8n events, …) stay inside the instrumentation package that owns the SDK. See [`span-contract.md`](span-contract.md#source-rules).
 - OTLP field names and promotion rules used by exporters and serializers
 - low-level utility code that is safe to reuse from runtime packages
 
