@@ -128,6 +128,12 @@
     },
     {
       "ecosystem": "python",
+      "name": "respan-instrumentation-cohere",
+      "path": "python-sdks/instrumentations/respan-instrumentation-cohere",
+      "registry": "pypi"
+    },
+    {
+      "ecosystem": "python",
       "name": "respan-instrumentation-langfuse",
       "path": "python-sdks/instrumentations/respan-instrumentation-langfuse",
       "registry": "pypi"
