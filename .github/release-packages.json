@@ -116,6 +116,12 @@
     },
     {
       "ecosystem": "python",
+      "name": "respan-instrumentation-aws-bedrock",
+      "path": "python-sdks/instrumentations/respan-instrumentation-aws-bedrock",
+      "registry": "pypi"
+    },
+    {
+      "ecosystem": "python",
       "name": "respan-instrumentation-autogen",
       "path": "python-sdks/instrumentations/respan-instrumentation-autogen",
       "registry": "pypi"
@@ -128,6 +134,12 @@
     },
     {
       "ecosystem": "python",
+      "name": "respan-instrumentation-cohere",
+      "path": "python-sdks/instrumentations/respan-instrumentation-cohere",
+      "registry": "pypi"
+    },
+    {
+      "ecosystem": "python",
       "name": "respan-instrumentation-langfuse",
       "path": "python-sdks/instrumentations/respan-instrumentation-langfuse",
       "registry": "pypi"
@@ -136,6 +148,12 @@
       "ecosystem": "python",
       "name": "respan-instrumentation-langchain",
       "path": "python-sdks/instrumentations/respan-instrumentation-langchain",
+      "registry": "pypi"
+    },
+    {
+      "ecosystem": "python",
+      "name": "respan-instrumentation-litellm",
+      "path": "python-sdks/instrumentations/respan-instrumentation-litellm",
       "registry": "pypi"
     },
     {
@@ -178,6 +196,12 @@
       "ecosystem": "python",
       "name": "respan-instrumentation-google-genai",
       "path": "python-sdks/instrumentations/respan-instrumentation-google-genai",
+      "registry": "pypi"
+    },
+    {
+      "ecosystem": "python",
+      "name": "respan-instrumentation-vertexai",
+      "path": "python-sdks/instrumentations/respan-instrumentation-vertexai",
       "registry": "pypi"
     },
     {
