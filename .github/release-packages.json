@@ -182,6 +182,12 @@
     },
     {
       "ecosystem": "python",
+      "name": "respan-instrumentation-vertexai",
+      "path": "python-sdks/instrumentations/respan-instrumentation-vertexai",
+      "registry": "pypi"
+    },
+    {
+      "ecosystem": "python",
       "name": "respan-instrumentation-haystack",
       "path": "python-sdks/instrumentations/respan-instrumentation-haystack",
       "registry": "pypi"
