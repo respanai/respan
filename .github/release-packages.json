@@ -140,6 +140,12 @@
     },
     {
       "ecosystem": "python",
+      "name": "respan-instrumentation-litellm",
+      "path": "python-sdks/instrumentations/respan-instrumentation-litellm",
+      "registry": "pypi"
+    },
+    {
+      "ecosystem": "python",
       "name": "respan-instrumentation-openinference",
       "path": "python-sdks/instrumentations/respan-instrumentation-openinference",
       "registry": "pypi"
