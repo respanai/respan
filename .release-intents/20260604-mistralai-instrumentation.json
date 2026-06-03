@@ -1,0 +1,6 @@
+{
+  "summary": "Add Mistral AI instrumentation package",
+  "packages": {
+    "respan-instrumentation-mistralai": "new"
+  }
+}
