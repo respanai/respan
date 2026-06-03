@@ -259,6 +259,12 @@
       "registry": "pypi"
     },
     {
+      "ecosystem": "python",
+      "name": "respan-instrumentation-portkey",
+      "path": "python-sdks/instrumentations/respan-instrumentation-portkey",
+      "registry": "pypi"
+    },
+    {
       "ecosystem": "javascript",
       "name": "@respan/instrumentation-mastra",
       "path": "javascript-sdks/instrumentations/respan-instrumentation-mastra",
