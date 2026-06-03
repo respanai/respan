@@ -259,6 +259,12 @@
       "registry": "pypi"
     },
     {
+      "ecosystem": "python",
+      "name": "respan-instrumentation-groq",
+      "path": "python-sdks/instrumentations/respan-instrumentation-groq",
+      "registry": "pypi"
+    },
+    {
       "ecosystem": "javascript",
       "name": "@respan/instrumentation-mastra",
       "path": "javascript-sdks/instrumentations/respan-instrumentation-mastra",
