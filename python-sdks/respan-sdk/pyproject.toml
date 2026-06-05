@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "respan-sdk"
-version = "2.6.27"
+version = "2.6.26"
 description = "Respan SDK allows you to interact with the Respan API smoothly"
 authors = ["Respan <team@respan.ai>"]
 license = "MIT"
