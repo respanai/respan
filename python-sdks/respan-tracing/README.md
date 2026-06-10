@@ -209,6 +209,46 @@ kai.add_processor(
 
 See [Multi-Processor Examples](#multiple-processors) for complete examples.
 
+### ThreadPoolExecutor and Parallel Agent Steps
+
+OpenTelemetry context is thread-local. A plain `ThreadPoolExecutor` can lose
+the active Respan span, processor routing, propagated attributes, and active
+`SpanBuffer`. Use `ContextPropagatingThreadPoolExecutor` when parallel work is
+launched from inside a traced workflow or agent.
+
+```python
+from respan_tracing import ContextPropagatingThreadPoolExecutor, RespanTelemetry, task, workflow
+
+telemetry = RespanTelemetry(app_name="parallel-agent", api_key="respan-xxx")
+
+
+@task(name="score_candidate")
+def score_candidate(candidate: str) -> int:
+    return len(candidate)
+
+
+@workflow(name="rank_candidates", processors="production")
+def rank_candidates(candidates: list[str]) -> list[int]:
+    with ContextPropagatingThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(score_candidate, candidate) for candidate in candidates]
+        return [future.result() for future in futures]
+```
+
+If you already own the executor lifecycle, use `submit_with_current_context`:
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+from respan_tracing import submit_with_current_context
+
+with ThreadPoolExecutor(max_workers=4) as executor:
+    future = submit_with_current_context(executor, score_candidate, "agent-output")
+    result = future.result()
+```
+
+For buffered spans, wait for submitted futures before leaving the
+`client.get_span_buffer(...)` block. The buffer is thread-safe and flushes a
+stable snapshot on exit.
+
 ### Common Configuration Patterns
 
 #### **Development (Full Visibility)**
