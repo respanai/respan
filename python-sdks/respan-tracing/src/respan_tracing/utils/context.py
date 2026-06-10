@@ -1,9 +1,11 @@
 import contextvars
+import asyncio
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
 from threading import Thread
-from typing import Callable, Iterator, Optional, ParamSpec, TypeVar
+from typing import Awaitable, Callable, Iterator, Optional, ParamSpec, TypeVar
 
 from opentelemetry import context as context_api
 from opentelemetry.context import Context
@@ -81,6 +83,38 @@ def submit_with_current_context(
 
     snapshot = capture_context()
     return executor.submit(snapshot.run, fn, *args, **kwargs)
+
+
+def run_in_executor_with_current_context(
+    executor: Executor | None,
+    fn: Callable[P, R],
+    *args: P.args,
+    **kwargs: P.kwargs,
+) -> Awaitable[R]:
+    """Run blocking work through asyncio while preserving tracing context.
+
+    ``asyncio`` tasks preserve contextvars, but many agent workflows still cross
+    into blocking SDK calls through ``loop.run_in_executor``. This helper
+    captures the Respan/OpenTelemetry context before that handoff so spans
+    created inside the executor keep the active parent, entity path, SpanBuffer,
+    and processor routing.
+    """
+
+    loop = asyncio.get_running_loop()
+    snapshot = capture_context()
+    work = partial(snapshot.run, fn, *args, **kwargs)
+    return loop.run_in_executor(executor, work)
+
+
+async def to_thread_with_current_context(
+    fn: Callable[P, R],
+    *args: P.args,
+    **kwargs: P.kwargs,
+) -> R:
+    """Async ``to_thread`` helper that preserves the active tracing context."""
+
+    snapshot = capture_context()
+    return await asyncio.to_thread(snapshot.run, fn, *args, **kwargs)
 
 
 class ContextPropagatingThread(Thread):
