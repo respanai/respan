@@ -11,7 +11,9 @@ from respan_tracing.contexts.span import (
 from respan_tracing.instruments import Instruments
 from respan_tracing.utils.context import (
     ContextPropagatingThreadPoolExecutor,
+    ContextPropagatingThread,
     RespanContextSnapshot,
+    add_done_callback_with_current_context,
     capture_context,
     submit_with_current_context,
     suppressed_parent_context,
@@ -35,7 +37,9 @@ __all__ = [
     "respan_span_attributes",
     "attach_span_links",
     "ContextPropagatingThreadPoolExecutor",
+    "ContextPropagatingThread",
     "RespanContextSnapshot",
+    "add_done_callback_with_current_context",
     "capture_context",
     "submit_with_current_context",
     "suppressed_parent_context",

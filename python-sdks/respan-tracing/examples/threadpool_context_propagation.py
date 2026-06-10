@@ -6,8 +6,11 @@ attached to the parent Respan workflow and inherit processor routing.
 """
 
 from respan_tracing import (
+    ContextPropagatingThread,
     ContextPropagatingThreadPoolExecutor,
     RespanTelemetry,
+    add_done_callback_with_current_context,
+    get_client,
     task,
     workflow,
 )
@@ -25,6 +28,11 @@ def score_context(context: str) -> int:
     return len(context)
 
 
+def record_final_count(_future) -> None:
+    with get_client().start_span("record_final_count", kind="task"):
+        pass
+
+
 @workflow(name="parallel_retrieval_agent", processors="debug")
 def parallel_retrieval_agent(queries: list[str]) -> list[int]:
     with ContextPropagatingThreadPoolExecutor(max_workers=4) as executor:
@@ -32,9 +40,16 @@ def parallel_retrieval_agent(queries: list[str]) -> list[int]:
         contexts = [future.result() for future in retrievals]
 
         scoring = [executor.submit(score_context, context) for context in contexts]
+        add_done_callback_with_current_context(scoring[-1], record_final_count)
         return [future.result() for future in scoring]
 
 
 if __name__ == "__main__":
+    warmup = ContextPropagatingThread(
+        target=lambda: parallel_retrieval_agent(["warmup"])
+    )
+    warmup.start()
+    warmup.join()
+
     print(parallel_retrieval_agent(["pricing", "latency", "tool failures"]))
     telemetry.flush()

@@ -211,13 +211,19 @@ See [Multi-Processor Examples](#multiple-processors) for complete examples.
 
 ### ThreadPoolExecutor and Parallel Agent Steps
 
-OpenTelemetry context is thread-local. A plain `ThreadPoolExecutor` can lose
-the active Respan span, processor routing, propagated attributes, and active
-`SpanBuffer`. Use `ContextPropagatingThreadPoolExecutor` when parallel work is
-launched from inside a traced workflow or agent.
+OpenTelemetry context is thread-local. Plain `ThreadPoolExecutor` workers,
+raw `threading.Thread` targets, and `Future` callbacks can lose the active
+Respan span, processor routing, propagated attributes, and active `SpanBuffer`.
+Use the context propagation helpers when parallel work is launched from inside
+a traced workflow or agent.
 
 ```python
-from respan_tracing import ContextPropagatingThreadPoolExecutor, RespanTelemetry, task, workflow
+from respan_tracing import (
+    ContextPropagatingThreadPoolExecutor,
+    RespanTelemetry,
+    task,
+    workflow,
+)
 
 telemetry = RespanTelemetry(app_name="parallel-agent", api_key="respan-xxx")
 
@@ -234,16 +240,30 @@ def rank_candidates(candidates: list[str]) -> list[int]:
         return [future.result() for future in futures]
 ```
 
-If you already own the executor lifecycle, use `submit_with_current_context`:
+`executor.map(...)` is also context-aware on
+`ContextPropagatingThreadPoolExecutor`.
+
+If you already own the executor lifecycle, use `submit_with_current_context`.
+For callbacks that create spans after a future completes, use
+`add_done_callback_with_current_context`.
 
 ```python
 from concurrent.futures import ThreadPoolExecutor
-from respan_tracing import submit_with_current_context
+from respan_tracing import add_done_callback_with_current_context, submit_with_current_context
+
+
+def on_done(future):
+    with get_client().start_span("post_process_result", kind="task"):
+        consume(future.result())
+
 
 with ThreadPoolExecutor(max_workers=4) as executor:
     future = submit_with_current_context(executor, score_candidate, "agent-output")
+    add_done_callback_with_current_context(future, on_done)
     result = future.result()
 ```
+
+For raw threads, use `ContextPropagatingThread` instead of `threading.Thread`.
 
 For buffered spans, wait for submitted futures before leaving the
 `client.get_span_buffer(...)` block. The buffer is thread-safe and flushes a

@@ -2,6 +2,7 @@ import contextvars
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
+from threading import Thread
 from typing import Callable, Iterator, Optional, ParamSpec, TypeVar
 
 from opentelemetry import context as context_api
@@ -55,6 +56,21 @@ def wrap_with_current_context(fn: Callable[P, R]) -> Callable[P, R]:
     return capture_context().wrap(fn)
 
 
+def add_done_callback_with_current_context(
+    future: Future[R],
+    callback: Callable[[Future[R]], object],
+) -> Future[R]:
+    """Register a Future callback that runs with the current tracing context."""
+
+    snapshot = capture_context()
+
+    def wrapped(done: Future[R]) -> None:
+        snapshot.run(callback, done)
+
+    future.add_done_callback(wrapped)
+    return future
+
+
 def submit_with_current_context(
     executor: Executor,
     fn: Callable[P, R],
@@ -65,6 +81,32 @@ def submit_with_current_context(
 
     snapshot = capture_context()
     return executor.submit(snapshot.run, fn, *args, **kwargs)
+
+
+class ContextPropagatingThread(Thread):
+    """Thread that preserves the Respan and OpenTelemetry context from creation."""
+
+    def __init__(
+        self,
+        group=None,
+        target: Optional[Callable[..., object]] = None,
+        name: Optional[str] = None,
+        args=(),
+        kwargs=None,
+        *,
+        daemon: Optional[bool] = None,
+        context_snapshot: Optional[RespanContextSnapshot] = None,
+    ) -> None:
+        snapshot = context_snapshot or capture_context()
+        wrapped_target = snapshot.wrap(target) if target is not None else None
+        super().__init__(
+            group=group,
+            target=wrapped_target,
+            name=name,
+            args=args,
+            kwargs=kwargs or {},
+            daemon=daemon,
+        )
 
 
 class ContextPropagatingThreadPoolExecutor(ThreadPoolExecutor):
