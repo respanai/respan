@@ -263,6 +263,29 @@ with ThreadPoolExecutor(max_workers=4) as executor:
     result = future.result()
 ```
 
+For async orchestration that hands blocking SDK calls to an executor, use
+`run_in_executor_with_current_context` or `to_thread_with_current_context`.
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+from respan_tracing import run_in_executor_with_current_context, task, workflow
+
+
+@task(name="blocking_retrieval")
+def blocking_retrieval(query: str) -> str:
+    return search_index(query)
+
+
+@workflow(name="async_agent", processors="production")
+async def async_agent(query: str) -> str:
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        return await run_in_executor_with_current_context(
+            executor,
+            blocking_retrieval,
+            query,
+        )
+```
+
 For raw threads, use `ContextPropagatingThread` instead of `threading.Thread`.
 
 For buffered spans, wait for submitted futures before leaving the

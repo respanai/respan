@@ -15,8 +15,10 @@ from respan_tracing.utils.context import (
     RespanContextSnapshot,
     add_done_callback_with_current_context,
     capture_context,
+    run_in_executor_with_current_context,
     submit_with_current_context,
     suppressed_parent_context,
+    to_thread_with_current_context,
     wrap_with_current_context,
 )
 from respan_tracing.utils.logging import get_respan_logger, get_main_logger
@@ -41,8 +43,10 @@ __all__ = [
     "RespanContextSnapshot",
     "add_done_callback_with_current_context",
     "capture_context",
+    "run_in_executor_with_current_context",
     "submit_with_current_context",
     "suppressed_parent_context",
+    "to_thread_with_current_context",
     "wrap_with_current_context",
     "Instruments",
     "RespanParams",

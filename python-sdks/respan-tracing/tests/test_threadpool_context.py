@@ -1,3 +1,7 @@
+import asyncio
+
+import pytest
+
 from concurrent.futures import ThreadPoolExecutor
 
 from respan_tracing import (
@@ -6,8 +10,10 @@ from respan_tracing import (
     RespanTelemetry,
     add_done_callback_with_current_context,
     get_client,
+    run_in_executor_with_current_context,
     submit_with_current_context,
     task,
+    to_thread_with_current_context,
 )
 from respan_tracing.core.tracer import RespanTracer
 from respan_tracing.testing.exporters import InMemorySpanExporter
@@ -213,3 +219,73 @@ class TestThreadPoolContextPropagation:
             worker_span = self.span_by_prefix(f"buffered_worker_{index}")
             assert worker_span.context.trace_id == parent.context.trace_id
             assert worker_span.parent.span_id == parent.context.span_id
+
+    @pytest.mark.asyncio
+    async def test_plain_asyncio_run_in_executor_loses_processor_routing(self):
+        @task(name="async_executor_worker")
+        def worker():
+            return "done"
+
+        with self.client.start_span(
+            "parent_workflow",
+            kind="workflow",
+            processors="dogfood",
+        ):
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                loop = asyncio.get_running_loop()
+                assert await loop.run_in_executor(executor, worker) == "done"
+
+        names = self.exported_names()
+
+        self.assert_exported(names, "parent_workflow")
+        self.assert_not_exported(names, "async_executor_worker")
+
+    @pytest.mark.asyncio
+    async def test_run_in_executor_with_current_context_preserves_routing(self):
+        @task(name="async_executor_worker")
+        def worker(value: int, *, scale: int):
+            return value * scale
+
+        with self.client.start_span(
+            "parent_workflow",
+            kind="workflow",
+            processors="dogfood",
+        ):
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                assert (
+                    await run_in_executor_with_current_context(
+                        executor,
+                        worker,
+                        7,
+                        scale=6,
+                    )
+                    == 42
+                )
+
+        names = self.exported_names()
+
+        self.assert_exported(names, "parent_workflow")
+        self.assert_exported(names, "async_executor_worker")
+
+        parent = self.span_by_prefix("parent_workflow")
+        worker_span = self.span_by_prefix("async_executor_worker")
+        assert worker_span.context.trace_id == parent.context.trace_id
+        assert worker_span.parent.span_id == parent.context.span_id
+
+    @pytest.mark.asyncio
+    async def test_to_thread_with_current_context_preserves_routing(self):
+        @task(name="to_thread_worker")
+        def worker():
+            return "done"
+
+        with self.client.start_span(
+            "parent_workflow",
+            kind="workflow",
+            processors="dogfood",
+        ):
+            assert await to_thread_with_current_context(worker) == "done"
+
+        names = self.exported_names()
+
+        self.assert_exported(names, "parent_workflow")
+        self.assert_exported(names, "to_thread_worker")
