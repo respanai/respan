@@ -1,0 +1,6 @@
+{
+  "summary": "Add thread-pool context propagation helpers for reliable parallel tracing",
+  "packages": {
+    "respan-tracing": "minor"
+  }
+}
