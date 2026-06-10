@@ -1,8 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor
 
 from respan_tracing import (
+    ContextPropagatingThread,
     ContextPropagatingThreadPoolExecutor,
     RespanTelemetry,
+    add_done_callback_with_current_context,
     get_client,
     submit_with_current_context,
     task,
@@ -36,11 +38,22 @@ class TestThreadPoolContextPropagation:
         self.telemetry.flush()
         return [span.name for span in self.exporter.get_finished_spans()]
 
+    def exported_spans(self):
+        self.telemetry.flush()
+        return self.exporter.get_finished_spans()
+
     def assert_exported(self, names: list[str], span_name: str):
         assert any(name.startswith(span_name) for name in names)
 
     def assert_not_exported(self, names: list[str], span_name: str):
         assert not any(name.startswith(span_name) for name in names)
+
+    def span_by_prefix(self, prefix: str):
+        matches = [
+            span for span in self.exported_spans() if span.name.startswith(f"{prefix}.")
+        ]
+        assert len(matches) == 1, [span.name for span in self.exported_spans()]
+        return matches[0]
 
     def test_regular_threadpool_loses_processor_routing(self):
         @task(name="threadpool_worker")
@@ -78,6 +91,29 @@ class TestThreadPoolContextPropagation:
         self.assert_exported(names, "parent_workflow")
         self.assert_exported(names, "threadpool_worker")
 
+        parent = self.span_by_prefix("parent_workflow")
+        worker_span = self.span_by_prefix("threadpool_worker")
+        assert worker_span.context.trace_id == parent.context.trace_id
+        assert worker_span.parent.span_id == parent.context.span_id
+
+    def test_context_propagating_threadpool_map_preserves_routing(self):
+        @task(name="mapped_worker")
+        def worker(index: int):
+            return index * 2
+
+        with self.client.start_span(
+            "parent_workflow",
+            kind="workflow",
+            processors="dogfood",
+        ):
+            with ContextPropagatingThreadPoolExecutor(max_workers=3) as executor:
+                assert list(executor.map(worker, range(6))) == [0, 2, 4, 6, 8, 10]
+
+        names = self.exported_names()
+
+        self.assert_exported(names, "parent_workflow")
+        assert sum(name.startswith("mapped_worker") for name in names) == 6
+
     def test_submit_with_current_context_preserves_routing(self):
         @task(name="submitted_worker")
         def worker():
@@ -95,6 +131,58 @@ class TestThreadPoolContextPropagation:
 
         self.assert_exported(names, "parent_workflow")
         self.assert_exported(names, "submitted_worker")
+
+    def test_context_propagating_thread_preserves_routing(self):
+        @task(name="thread_worker")
+        def worker():
+            return "done"
+
+        with self.client.start_span(
+            "parent_workflow",
+            kind="workflow",
+            processors="dogfood",
+        ):
+            thread = ContextPropagatingThread(target=worker)
+            thread.start()
+            thread.join()
+
+        names = self.exported_names()
+
+        self.assert_exported(names, "parent_workflow")
+        self.assert_exported(names, "thread_worker")
+
+        parent = self.span_by_prefix("parent_workflow")
+        worker_span = self.span_by_prefix("thread_worker")
+        assert worker_span.context.trace_id == parent.context.trace_id
+        assert worker_span.parent.span_id == parent.context.span_id
+
+    def test_future_done_callback_preserves_routing(self):
+        def complete_work():
+            return "done"
+
+        def callback(_future):
+            with self.client.start_span("future_callback", kind="task"):
+                pass
+
+        with self.client.start_span(
+            "parent_workflow",
+            kind="workflow",
+            processors="dogfood",
+        ):
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(complete_work)
+                add_done_callback_with_current_context(future, callback)
+                assert future.result() == "done"
+
+        names = self.exported_names()
+
+        self.assert_exported(names, "parent_workflow")
+        self.assert_exported(names, "future_callback")
+
+        parent = self.span_by_prefix("parent_workflow")
+        callback_span = self.span_by_prefix("future_callback")
+        assert callback_span.context.trace_id == parent.context.trace_id
+        assert callback_span.parent.span_id == parent.context.span_id
 
     def test_threadpool_spans_inside_span_buffer_flush_with_parent_context(self):
         def worker(index: int):
@@ -119,3 +207,9 @@ class TestThreadPoolContextPropagation:
         self.assert_exported(names, "parent_workflow")
         for index in range(12):
             self.assert_exported(names, f"buffered_worker_{index}")
+
+        parent = self.span_by_prefix("parent_workflow")
+        for index in range(12):
+            worker_span = self.span_by_prefix(f"buffered_worker_{index}")
+            assert worker_span.context.trace_id == parent.context.trace_id
+            assert worker_span.parent.span_id == parent.context.span_id
