@@ -1,0 +1,6 @@
+{
+  "summary": "Add LiteLLM instrumentation package",
+  "packages": {
+    "respan-instrumentation-litellm": "new"
+  }
+}

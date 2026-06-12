@@ -1,0 +1,6 @@
+{
+  "summary": "Add Groq instrumentation package",
+  "packages": {
+    "respan-instrumentation-groq": "new"
+  }
+}

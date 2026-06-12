@@ -13,7 +13,6 @@ from .param_types import (
     CacheOptions,
     Customer,
     PromptParam,
-    PostHogIntegration,
 )
 from .services_types.hyperspell_types import (
     HyperspellAddMemoryParams,
@@ -73,7 +72,6 @@ __all__ = [
     "CacheOptions",
     "Customer",
     "PromptParam",
-    "PostHogIntegration",
     "HyperspellAddMemoryParams",
     "HyperspellSearchMemoriesParams",
     "HyperspellParams",

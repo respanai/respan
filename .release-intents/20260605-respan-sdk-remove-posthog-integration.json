@@ -1,0 +1,6 @@
+{
+  "summary": "Remove deprecated posthog_integration field and PostHogIntegration type from respan-sdk; PostHog now uses the stored technical-partnership integration instead of passing credentials in the request payload",
+  "packages": {
+    "respan-sdk": "patch"
+  }
+}

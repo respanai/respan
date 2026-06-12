@@ -1,0 +1,6 @@
+{
+  "summary": "Add first-party Cohere SDK instrumentation with Respan span contract normalization.",
+  "packages": {
+    "respan-instrumentation-cohere": "new"
+  }
+}
