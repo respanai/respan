@@ -12,6 +12,7 @@
     "instrumentations/respan-instrumentation-llama-index",
     "instrumentations/respan-instrumentation-mastra",
     "instrumentations/respan-instrumentation-mcp",
+    "instrumentations/respan-instrumentation-strands-agents",
     "instrumentations/respan-instrumentation-openai",
     "instrumentations/respan-instrumentation-openai-agents",
     "instrumentations/respan-instrumentation-openinference",
