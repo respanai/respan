@@ -1,0 +1,59 @@
+export const PACKAGE_VERSION = "0.1.0";
+export const INSTRUMENTATION_LIBRARY_NAME = "@respan/instrumentation-vertexai";
+export const VERTEXAI_INSTRUMENTATION_NAME = "vertexai";
+export const VERTEXAI_SYSTEM_NAME = "google";
+export const VERTEXAI_GENERATE_CONTENT_SPAN_NAME = "vertexai.generate_content";
+export const VERTEXAI_CHAT_SPAN_NAME = "vertexai.chat.send_message";
+export const RESPAN_LOG_METHOD_TS_TRACING = "ts_tracing";
+
+export const GENERATIVE_MODEL_CLASS_NAME = "GenerativeModel";
+export const CHAT_SESSION_CLASS_NAME = "ChatSession";
+
+export const GENERATE_CONTENT_METHOD_NAME = "generateContent";
+export const GENERATE_CONTENT_STREAM_METHOD_NAME = "generateContentStream";
+export const START_CHAT_METHOD_NAME = "startChat";
+export const SEND_MESSAGE_METHOD_NAME = "sendMessage";
+export const SEND_MESSAGE_STREAM_METHOD_NAME = "sendMessageStream";
+
+export const ARGS_KEY = "args";
+export const CANDIDATES_KEY = "candidates";
+export const CONTENT_KEY = "content";
+export const FUNCTION_CALL_KEY = "functionCall";
+export const FUNCTION_CALL_SNAKE_KEY = "function_call";
+export const FUNCTION_DECLARATIONS_KEY = "functionDeclarations";
+export const FUNCTION_DECLARATIONS_SNAKE_KEY = "function_declarations";
+export const FUNCTION_KEY = "function";
+export const FUNCTION_RESPONSE_KEY = "functionResponse";
+export const FUNCTION_RESPONSE_SNAKE_KEY = "function_response";
+export const FUNCTION_TOOL_TYPE = "function";
+export const GENERATION_CONFIG_KEY = "generationConfig";
+export const GENERATION_CONFIG_SNAKE_KEY = "generation_config";
+export const ID_KEY = "id";
+export const NAME_KEY = "name";
+export const PARAMETERS_KEY = "parameters";
+export const PARTS_KEY = "parts";
+export const RESPONSE_KEY = "response";
+export const ROLE_KEY = "role";
+export const STREAM_KEY = "stream";
+export const SYSTEM_INSTRUCTION_KEY = "systemInstruction";
+export const SYSTEM_INSTRUCTION_SNAKE_KEY = "system_instruction";
+export const TEXT_KEY = "text";
+export const TOOL_CONFIG_KEY = "toolConfig";
+export const TOOL_CONFIG_SNAKE_KEY = "tool_config";
+export const TOOLS_KEY = "tools";
+export const TYPE_KEY = "type";
+export const USAGE_METADATA_KEY = "usageMetadata";
+export const USAGE_METADATA_SNAKE_KEY = "usage_metadata";
+
+export const PROMPT_TOKEN_COUNT_KEY = "promptTokenCount";
+export const PROMPT_TOKEN_COUNT_SNAKE_KEY = "prompt_token_count";
+export const CANDIDATES_TOKEN_COUNT_KEY = "candidatesTokenCount";
+export const CANDIDATES_TOKEN_COUNT_SNAKE_KEY = "candidates_token_count";
+export const TOTAL_TOKEN_COUNT_KEY = "totalTokenCount";
+export const TOTAL_TOKEN_COUNT_SNAKE_KEY = "total_token_count";
+
+export const ASSISTANT_ROLE = "assistant";
+export const MODEL_ROLE = "model";
+export const SYSTEM_ROLE = "system";
+export const TOOL_ROLE = "tool";
+export const USER_ROLE = "user";
