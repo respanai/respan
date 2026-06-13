@@ -308,6 +308,12 @@
     },
     {
       "ecosystem": "javascript",
+      "name": "@respan/instrumentation-google-adk",
+      "path": "javascript-sdks/instrumentations/respan-instrumentation-google-adk",
+      "registry": "npm"
+    },
+    {
+      "ecosystem": "javascript",
       "name": "@respan/instrumentation-mastra",
       "path": "javascript-sdks/instrumentations/respan-instrumentation-mastra",
       "registry": "npm"

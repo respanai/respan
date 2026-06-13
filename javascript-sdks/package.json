@@ -10,6 +10,7 @@
     "instrumentations/respan-instrumentation-claude-agent-sdk",
     "instrumentations/respan-instrumentation-langchain",
     "instrumentations/respan-instrumentation-llama-index",
+    "instrumentations/respan-instrumentation-google-adk",
     "instrumentations/respan-instrumentation-mastra",
     "instrumentations/respan-instrumentation-mcp",
     "instrumentations/respan-instrumentation-openai",
