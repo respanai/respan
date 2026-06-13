@@ -188,6 +188,12 @@
     },
     {
       "ecosystem": "python",
+      "name": "respan-instrumentation-huggingface",
+      "path": "python-sdks/instrumentations/respan-instrumentation-huggingface",
+      "registry": "pypi"
+    },
+    {
+      "ecosystem": "python",
       "name": "respan-instrumentation-braintrust",
       "path": "python-sdks/instrumentations/respan-instrumentation-braintrust",
       "registry": "pypi"
