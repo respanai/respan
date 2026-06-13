@@ -110,6 +110,12 @@
     },
     {
       "ecosystem": "python",
+      "name": "respan-instrumentation-aleph-alpha",
+      "path": "python-sdks/instrumentations/respan-instrumentation-aleph-alpha",
+      "registry": "pypi"
+    },
+    {
+      "ecosystem": "python",
       "name": "respan-instrumentation-anthropic",
       "path": "python-sdks/instrumentations/respan-instrumentation-anthropic",
       "registry": "pypi"
