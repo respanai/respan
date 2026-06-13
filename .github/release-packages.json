@@ -74,6 +74,12 @@
     },
     {
       "ecosystem": "javascript",
+      "name": "@respan/instrumentation-vertexai",
+      "path": "javascript-sdks/instrumentations/respan-instrumentation-vertexai",
+      "registry": "npm"
+    },
+    {
+      "ecosystem": "javascript",
       "name": "@respan/respan-sdk",
       "path": "javascript-sdks/respan-sdk",
       "registry": "npm"
