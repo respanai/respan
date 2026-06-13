@@ -20,6 +20,12 @@
     },
     {
       "ecosystem": "javascript",
+      "name": "@respan/instrumentation-azure-openai",
+      "path": "javascript-sdks/instrumentations/respan-instrumentation-azure-openai",
+      "registry": "npm"
+    },
+    {
+      "ecosystem": "javascript",
       "name": "@respan/instrumentation-beeai",
       "path": "javascript-sdks/instrumentations/respan-instrumentation-beeai",
       "registry": "npm"

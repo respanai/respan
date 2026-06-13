@@ -57,6 +57,7 @@ export class Respan {
     const partialDisabled = [
       "openAI",       // covered by @respan/instrumentation-openai
       "anthropic",    // covered by @respan/instrumentation-anthropic
+      "azureOpenAI",  // covered by @respan/instrumentation-azure-openai
       "langChain",    // framework — would duplicate LLM spans
       "llamaIndex",   // framework — would duplicate LLM spans
       "pinecone",     // vector DB
@@ -117,6 +118,7 @@ export class Respan {
     const discoveries: Array<{ pkg: string; className: string }> = [
       { pkg: "@respan/instrumentation-openai", className: "OpenAIInstrumentor" },
       { pkg: "@respan/instrumentation-anthropic", className: "AnthropicInstrumentor" },
+      { pkg: "@respan/instrumentation-azure-openai", className: "AzureOpenAIInstrumentor" },
     ];
 
     for (const { pkg, className } of discoveries) {
