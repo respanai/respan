@@ -50,6 +50,12 @@
     },
     {
       "ecosystem": "javascript",
+      "name": "@respan/instrumentation-strands-agents",
+      "path": "javascript-sdks/instrumentations/respan-instrumentation-strands-agents",
+      "registry": "npm"
+    },
+    {
+      "ecosystem": "javascript",
       "name": "@respan/instrumentation-openai",
       "path": "javascript-sdks/instrumentations/respan-instrumentation-openai",
       "registry": "npm"

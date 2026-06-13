@@ -1,0 +1,6 @@
+{
+  "summary": "Initial release of the Strands Agents TypeScript instrumentation package",
+  "packages": {
+    "@respan/instrumentation-strands-agents": "new"
+  }
+}
