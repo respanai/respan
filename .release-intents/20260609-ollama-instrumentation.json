@@ -1,0 +1,6 @@
+{
+  "summary": "Add Ollama instrumentation package",
+  "packages": {
+    "respan-instrumentation-ollama": "new"
+  }
+}

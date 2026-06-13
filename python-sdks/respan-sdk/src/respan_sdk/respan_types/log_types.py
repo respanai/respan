@@ -27,7 +27,6 @@ from .param_types import (
     LoadBalanceGroup,
     LoadBalanceModel,
     RetryParams,
-    PostHogIntegration,
 )
 from ..constants.llm_logging import LogType
 from .services_types.linkup_types import LinkupParams
@@ -185,7 +184,6 @@ class RespanLogParams(PreprocessLogDataMixin, RespanBaseModel):
     linkup_params: Optional[LinkupParams] = None
     mem0_params: Optional[Mem0Params] = None
     moda_params: Optional[ModaParams] = None
-    posthog_integration: Optional[PostHogIntegration] = None
     # endregion: technical integrations
 
     # region: tracing

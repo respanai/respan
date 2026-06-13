@@ -1,0 +1,29 @@
+[tool.poetry]
+name = "respan-instrumentation-vertexai"
+version = "0.1.0"
+description = "Respan instrumentation plugin for Google Vertex AI"
+authors = ["Respan <team@respan.ai>"]
+license = "Apache 2.0"
+readme = "README.md"
+packages = [
+    { include = "respan_instrumentation_vertexai", from = "./src" },
+]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.14"
+respan-tracing = "^2.17.0"
+respan-sdk = ">=2.6.1"
+google-cloud-aiplatform = ">=1.71.0"
+opentelemetry-semantic-conventions-ai = ">=0.4.1"
+
+[tool.poetry.plugins."respan.instrumentations"]
+vertexai = "respan_instrumentation_vertexai:VertexAIInstrumentor"
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: live network tests (requires API keys)",
+]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
