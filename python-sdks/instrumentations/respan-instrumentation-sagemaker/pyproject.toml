@@ -1,0 +1,29 @@
+[tool.poetry]
+name = "respan-instrumentation-sagemaker"
+version = "0.1.0"
+description = "Respan instrumentation plugin for AWS SageMaker Runtime"
+authors = ["Respan <team@respan.ai>"]
+license = "Apache 2.0"
+readme = "README.md"
+packages = [
+    { include = "respan_instrumentation_sagemaker", from = "./src" },
+]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.14"
+respan-tracing = "^2.17.0"
+respan-sdk = ">=2.6.1"
+boto3 = ">=1.34.0"
+opentelemetry-semantic-conventions-ai = ">=0.4.1"
+
+[tool.poetry.plugins."respan.instrumentations"]
+sagemaker = "respan_instrumentation_sagemaker:SageMakerInstrumentor"
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: live network tests (requires AWS credentials and a SageMaker endpoint)",
+]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

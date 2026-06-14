@@ -122,6 +122,12 @@
     },
     {
       "ecosystem": "python",
+      "name": "respan-instrumentation-sagemaker",
+      "path": "python-sdks/instrumentations/respan-instrumentation-sagemaker",
+      "registry": "pypi"
+    },
+    {
+      "ecosystem": "python",
       "name": "respan-instrumentation-autogen",
       "path": "python-sdks/instrumentations/respan-instrumentation-autogen",
       "registry": "pypi"
