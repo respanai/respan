@@ -307,6 +307,12 @@
       "registry": "pypi"
     },
     {
+      "ecosystem": "python",
+      "name": "respan-instrumentation-replicate",
+      "path": "python-sdks/instrumentations/respan-instrumentation-replicate",
+      "registry": "pypi"
+    },
+    {
       "ecosystem": "javascript",
       "name": "@respan/instrumentation-mastra",
       "path": "javascript-sdks/instrumentations/respan-instrumentation-mastra",
