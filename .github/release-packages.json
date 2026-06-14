@@ -140,6 +140,12 @@
     },
     {
       "ecosystem": "python",
+      "name": "respan-instrumentation-chroma",
+      "path": "python-sdks/instrumentations/respan-instrumentation-chroma",
+      "registry": "pypi"
+    },
+    {
+      "ecosystem": "python",
       "name": "respan-instrumentation-langfuse",
       "path": "python-sdks/instrumentations/respan-instrumentation-langfuse",
       "registry": "pypi"
