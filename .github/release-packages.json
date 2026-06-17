@@ -164,6 +164,12 @@
     },
     {
       "ecosystem": "python",
+      "name": "respan-instrumentation-openrouter",
+      "path": "python-sdks/instrumentations/respan-instrumentation-openrouter",
+      "registry": "pypi"
+    },
+    {
+      "ecosystem": "python",
       "name": "respan-instrumentation-openai",
       "path": "python-sdks/instrumentations/respan-instrumentation-openai",
       "registry": "pypi"

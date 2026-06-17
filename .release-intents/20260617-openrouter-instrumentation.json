@@ -1,0 +1,6 @@
+{
+  "summary": "Add OpenRouter instrumentation package",
+  "packages": {
+    "respan-instrumentation-openrouter": "new"
+  }
+}
