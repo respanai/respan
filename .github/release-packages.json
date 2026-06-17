@@ -188,6 +188,12 @@
     },
     {
       "ecosystem": "python",
+      "name": "respan-instrumentation-cursor-sdk",
+      "path": "python-sdks/instrumentations/respan-instrumentation-cursor-sdk",
+      "registry": "pypi"
+    },
+    {
+      "ecosystem": "python",
       "name": "respan-instrumentation-google-adk",
       "path": "python-sdks/instrumentations/respan-instrumentation-google-adk",
       "registry": "pypi"
