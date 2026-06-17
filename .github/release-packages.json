@@ -116,6 +116,12 @@
     },
     {
       "ecosystem": "python",
+      "name": "respan-instrumentation-arize",
+      "path": "python-sdks/instrumentations/respan-instrumentation-arize",
+      "registry": "pypi"
+    },
+    {
+      "ecosystem": "python",
       "name": "respan-instrumentation-aws-bedrock",
       "path": "python-sdks/instrumentations/respan-instrumentation-aws-bedrock",
       "registry": "pypi"
