@@ -218,6 +218,12 @@
     },
     {
       "ecosystem": "python",
+      "name": "respan-instrumentation-dify",
+      "path": "python-sdks/instrumentations/respan-instrumentation-dify",
+      "registry": "pypi"
+    },
+    {
+      "ecosystem": "python",
       "name": "respan-instrumentation-dspy",
       "path": "python-sdks/instrumentations/respan-instrumentation-dspy",
       "registry": "pypi"
