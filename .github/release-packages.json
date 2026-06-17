@@ -158,6 +158,12 @@
     },
     {
       "ecosystem": "python",
+      "name": "respan-instrumentation-livekit",
+      "path": "python-sdks/instrumentations/respan-instrumentation-livekit",
+      "registry": "pypi"
+    },
+    {
+      "ecosystem": "python",
       "name": "respan-instrumentation-openinference",
       "path": "python-sdks/instrumentations/respan-instrumentation-openinference",
       "registry": "pypi"
