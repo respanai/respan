@@ -17,6 +17,7 @@
     "instrumentations/respan-instrumentation-openinference",
     "instrumentations/respan-instrumentation-vercel",
     "respan-sdk",
-    "respan-tracing"
+    "respan-tracing",
+    "instrumentations/respan-instrumentation-openrouter"
   ]
 }

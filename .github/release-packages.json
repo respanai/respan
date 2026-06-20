@@ -68,6 +68,12 @@
     },
     {
       "ecosystem": "javascript",
+      "name": "@respan/instrumentation-openrouter",
+      "path": "javascript-sdks/instrumentations/respan-instrumentation-openrouter",
+      "registry": "npm"
+    },
+    {
+      "ecosystem": "javascript",
       "name": "@respan/instrumentation-vercel",
       "path": "javascript-sdks/instrumentations/respan-instrumentation-vercel",
       "registry": "npm"
