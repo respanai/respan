@@ -7,6 +7,7 @@
     "respan-cli",
     "instrumentations/respan-instrumentation-anthropic",
     "instrumentations/respan-instrumentation-beeai",
+    "instrumentations/respan-instrumentation-braintrust",
     "instrumentations/respan-instrumentation-claude-agent-sdk",
     "instrumentations/respan-instrumentation-langchain",
     "instrumentations/respan-instrumentation-llama-index",

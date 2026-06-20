@@ -26,6 +26,12 @@
     },
     {
       "ecosystem": "javascript",
+      "name": "@respan/instrumentation-braintrust",
+      "path": "javascript-sdks/instrumentations/respan-instrumentation-braintrust",
+      "registry": "npm"
+    },
+    {
+      "ecosystem": "javascript",
       "name": "@respan/instrumentation-claude-agent-sdk",
       "path": "javascript-sdks/instrumentations/respan-instrumentation-claude-agent-sdk",
       "registry": "npm"
