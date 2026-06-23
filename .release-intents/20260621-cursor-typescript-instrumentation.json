@@ -1,0 +1,6 @@
+{
+  "summary": "Add Cursor TypeScript SDK instrumentation",
+  "packages": {
+    "@respan/instrumentation-cursor": "new"
+  }
+}
