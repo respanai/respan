@@ -16,6 +16,7 @@
     "instrumentations/respan-instrumentation-openai-agents",
     "instrumentations/respan-instrumentation-openinference",
     "instrumentations/respan-instrumentation-vercel",
+    "instrumentations/respan-instrumentation-together-ai",
     "respan-sdk",
     "respan-tracing"
   ]
