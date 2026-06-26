@@ -20,6 +20,12 @@
     },
     {
       "ecosystem": "javascript",
+      "name": "@respan/instrumentation-aws-bedrock",
+      "path": "javascript-sdks/instrumentations/respan-instrumentation-aws-bedrock",
+      "registry": "npm"
+    },
+    {
+      "ecosystem": "javascript",
       "name": "@respan/instrumentation-beeai",
       "path": "javascript-sdks/instrumentations/respan-instrumentation-beeai",
       "registry": "npm"

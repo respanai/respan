@@ -6,6 +6,7 @@
     "respan",
     "respan-cli",
     "instrumentations/respan-instrumentation-anthropic",
+    "instrumentations/respan-instrumentation-aws-bedrock",
     "instrumentations/respan-instrumentation-beeai",
     "instrumentations/respan-instrumentation-claude-agent-sdk",
     "instrumentations/respan-instrumentation-langchain",
