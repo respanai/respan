@@ -32,6 +32,12 @@
     },
     {
       "ecosystem": "javascript",
+      "name": "@respan/instrumentation-cohere",
+      "path": "javascript-sdks/instrumentations/respan-instrumentation-cohere",
+      "registry": "npm"
+    },
+    {
+      "ecosystem": "javascript",
       "name": "@respan/instrumentation-llama-index",
       "path": "javascript-sdks/instrumentations/respan-instrumentation-llama-index",
       "registry": "npm"

@@ -8,6 +8,7 @@
     "instrumentations/respan-instrumentation-anthropic",
     "instrumentations/respan-instrumentation-beeai",
     "instrumentations/respan-instrumentation-claude-agent-sdk",
+    "instrumentations/respan-instrumentation-cohere",
     "instrumentations/respan-instrumentation-langchain",
     "instrumentations/respan-instrumentation-llama-index",
     "instrumentations/respan-instrumentation-mastra",
