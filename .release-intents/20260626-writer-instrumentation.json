@@ -1,0 +1,6 @@
+{
+  "summary": "Add Writer TypeScript SDK instrumentation",
+  "packages": {
+    "@respan/instrumentation-writer": "new"
+  }
+}
