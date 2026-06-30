@@ -64,12 +64,12 @@ These are **auto-instrumented** — just `Respan()` / `new Respan()`. The instru
 |---------|---------------|---------------|------|
 | OpenAI SDK | `openai` | `openai` | [docs](https://respan.ai/docs/integrations/openai-sdk.md) |
 | Anthropic SDK | `anthropic` | `@anthropic-ai/sdk` | [docs](https://respan.ai/docs/integrations/anthropic.md) |
-| Azure OpenAI | `openai` (azure config) | `openai` | [docs](https://respan.ai/docs/integrations/providers/azure.md) |
+| Azure OpenAI | `openai` (azure config) | `openai` | [docs](https://respan.ai/docs/integrations/openai-sdk.md) |
 | Google Vertex AI | `google-cloud-aiplatform` | — | [docs](https://respan.ai/docs/integrations/vertex-ai.md) |
 | AWS Bedrock | `boto3` | — | [docs](https://respan.ai/docs/integrations/aws-bedrock.md) |
 | Together AI | `together` | — | [docs](https://respan.ai/docs/integrations/together-ai.md) |
 | Ollama | `ollama` | — | [docs](https://respan.ai/docs/integrations/ollama.md) |
-| Cohere | `cohere` | — | [docs](https://respan.ai/docs/integrations/providers/cohere.md) |
+| Cohere | `cohere` | — | [docs](https://respan.ai/docs/integrations/cohere.md) |
 
 **Python — some providers need an explicit instrumentor:** `respan-ai` bundles native instrumentors for **OpenAI/Azure, Anthropic, Vertex AI, AWS Bedrock, Together, and Ollama** — a bare `Respan()` traces these. **Cohere, Mistral, and Groq are not yet bundled** — install the explicit instrumentor and pass it, e.g. `pip install respan-instrumentation-cohere` then `Respan(instrumentations=[CohereInstrumentor()])`. (The JS/TS SDK auto-instruments all of these natively, no extra package.)
 
