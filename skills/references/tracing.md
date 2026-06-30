@@ -58,7 +58,7 @@ If a Priority 1 framework is found, use its instrumentation. Do NOT also add Pri
 
 **Priority 2 — Direct LLM SDKs** (only if no P1 framework covers this provider):
 
-These are **auto-instrumented** — just `Respan()` / `new Respan()`, no extra packages needed:
+These are **auto-instrumented** — just `Respan()` / `new Respan()`. The instrumentors ship with the SDK, so no separate install is needed — **except** for a few Python providers noted below the table.
 
 | Library | Python package | JS/TS package | Docs |
 |---------|---------------|---------------|------|
@@ -67,8 +67,11 @@ These are **auto-instrumented** — just `Respan()` / `new Respan()`, no extra p
 | Azure OpenAI | `openai` (azure config) | `openai` | [docs](https://respan.ai/docs/integrations/providers/azure.md) |
 | Google Vertex AI | `google-cloud-aiplatform` | — | [docs](https://respan.ai/docs/integrations/vertex-ai.md) |
 | AWS Bedrock | `boto3` | — | [docs](https://respan.ai/docs/integrations/aws-bedrock.md) |
-| Cohere | `cohere` | — | [docs](https://respan.ai/docs/integrations/providers/cohere.md) |
 | Together AI | `together` | — | [docs](https://respan.ai/docs/integrations/together-ai.md) |
+| Ollama | `ollama` | — | [docs](https://respan.ai/docs/integrations/ollama.md) |
+| Cohere | `cohere` | — | [docs](https://respan.ai/docs/integrations/providers/cohere.md) |
+
+**Python — some providers need an explicit instrumentor:** `respan-ai` bundles native instrumentors for **OpenAI/Azure, Anthropic, Vertex AI, AWS Bedrock, Together, and Ollama** — a bare `Respan()` traces these. **Cohere, Mistral, and Groq are not yet bundled** — install the explicit instrumentor and pass it, e.g. `pip install respan-instrumentation-cohere` then `Respan(instrumentations=[CohereInstrumentor()])`. (The JS/TS SDK auto-instruments all of these natively, no extra package.)
 
 **Note:** LiteLLM in JS uses the OpenAI-compatible API, so the OpenAI auto-instrument covers it. For Python LiteLLM, see [LiteLLM guide](https://respan.ai/docs/integrations/litellm.md). For Google GenAI (`@google/genai`), see [Google GenAI guide](https://respan.ai/docs/integrations/google-genai.md).
 
@@ -165,6 +168,8 @@ pip install respan-ai
 # TypeScript
 npm install @respan/respan
 ```
+
+In Python, also `pip install respan-instrumentation-<provider>` for **Cohere, Mistral, or Groq** (not yet bundled in `respan-ai`) and pass it via `Respan(instrumentations=[...])` — see the Priority-2 note above. All other listed providers, and all of JS/TS, need no extra package.
 
 For agent frameworks (Priority 1) — also install the instrumentor. Check the docs link in the table above for the exact packages.
 
