@@ -66,14 +66,15 @@ These are **auto-instrumented** — just `Respan()` / `new Respan()`. The instru
 | Anthropic SDK | `anthropic` | `@anthropic-ai/sdk` | [docs](https://respan.ai/docs/integrations/anthropic.md) |
 | Azure OpenAI | `openai` (azure config) | `openai` | [docs](https://respan.ai/docs/integrations/openai-sdk.md) |
 | Google Vertex AI | `google-cloud-aiplatform` | — | [docs](https://respan.ai/docs/integrations/vertex-ai.md) |
+| Google GenAI (Gemini) | `google-genai` | — | [docs](https://respan.ai/docs/integrations/google-genai.md) |
 | AWS Bedrock | `boto3` | — | [docs](https://respan.ai/docs/integrations/aws-bedrock.md) |
 | Together AI | `together` | — | [docs](https://respan.ai/docs/integrations/together-ai.md) |
 | Ollama | `ollama` | — | [docs](https://respan.ai/docs/integrations/ollama.md) |
 | Cohere | `cohere` | — | [docs](https://respan.ai/docs/integrations/cohere.md) |
 
-**Python — some providers need an explicit instrumentor:** `respan-ai` bundles native instrumentors for **OpenAI/Azure, Anthropic, Vertex AI, AWS Bedrock, Together, and Ollama** — a bare `Respan()` traces these. **Cohere, Mistral, and Groq are not yet bundled** — install the explicit instrumentor and pass it, e.g. `pip install respan-instrumentation-cohere` then `Respan(instrumentations=[CohereInstrumentor()])`. (The JS/TS SDK auto-instruments all of these natively, no extra package.)
+**Python — some providers need an explicit instrumentor:** `respan-ai` bundles native instrumentors for **OpenAI/Azure, Anthropic, Vertex AI, Google GenAI, AWS Bedrock, Together, and Ollama** — a bare `Respan()` traces these. **Cohere, Mistral, and Groq are not yet bundled** — install the explicit instrumentor and pass it, e.g. `pip install respan-instrumentation-cohere` then `Respan(instrumentations=[CohereInstrumentor()])`. (The JS/TS SDK auto-instruments Cohere/Mistral/Groq natively with no extra package; note the reverse holds for Google GenAI — Python auto-instruments it, but JS/TS `@google/genai` needs the explicit guide below.)
 
-**Note:** LiteLLM in JS uses the OpenAI-compatible API, so the OpenAI auto-instrument covers it. For Python LiteLLM, see [LiteLLM guide](https://respan.ai/docs/integrations/litellm.md). For Google GenAI (`@google/genai`), see [Google GenAI guide](https://respan.ai/docs/integrations/google-genai.md).
+**Note:** LiteLLM in JS uses the OpenAI-compatible API, so the OpenAI auto-instrument covers it. For Python LiteLLM, see [LiteLLM guide](https://respan.ai/docs/integrations/litellm.md). In **JS/TS**, Google GenAI (`@google/genai`) is not auto-instrumented — see the [Google GenAI guide](https://respan.ai/docs/integrations/google-genai.md). (In Python it's auto-instrumented, per the table above.)
 
 **1c. Read the actual code and understand the workflow:**
 
