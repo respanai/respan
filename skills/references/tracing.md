@@ -175,12 +175,14 @@ Wait for user confirmation before proceeding.
 
 For direct LLM SDKs (Priority 2) — just the core SDK:
 ```bash
-# Python
+# Python (requires Python 3.11 to 3.13)
 pip install respan-ai
 
 # TypeScript
 npm install @respan/respan
 ```
+
+**Python 3.11 to 3.13 required.** On 3.9/3.10 the tracing `respan-ai` (4.x, which needs `respan-tracing >=3.11,<3.14`) is unsatisfiable, so pip silently backslides to an unrelated older `respan-ai` release that has no `Respan()` class: the install succeeds, then `from respan import Respan` fails at runtime with no hint. If that happens, check the Python version first.
 
 In Python, Cohere, Mistral, and Groq additionally need their explicit instrumentor (the `*` rows in the Priority-2 table above). Everything else, and all of JS/TS, needs no extra package.
 
