@@ -58,7 +58,7 @@ If a Priority 1 framework is found, use its instrumentation. Do NOT also add Pri
 
 **Priority 2 — Direct LLM SDKs** (only if no P1 framework covers this provider):
 
-These are **auto-instrumented**: just `Respan()` / `new Respan()`, no separate install needed. Rows marked `*` are the exception: in **Python** those providers need an explicit instrumentor (see the note below the table). JS/TS auto-instruments every provider that lists a JS/TS package.
+These are **auto-instrumented** on a bare `Respan()` / `new Respan()`. In **JS/TS**, every provider with a JS/TS package auto-instruments with no separate install. In **Python**, it depends on `respan-ai` bundling the provider's native instrumentor (see the note below the table); rows marked `*` always need an explicit instrumentor.
 
 | Library | Python package | JS/TS package | Docs |
 |---------|---------------|---------------|------|
@@ -74,7 +74,7 @@ These are **auto-instrumented**: just `Respan()` / `new Respan()`, no separate i
 | Mistral | `mistralai` `*` | n/a | [docs](https://respan.ai/docs/integrations/mistral.md) |
 | Groq | `groq` `*` | n/a | [docs](https://respan.ai/docs/integrations/groq.md) |
 
-**`*` Python only, not yet bundled in `respan-ai`.** On a bare `Respan()`, `respan-ai` auto-instruments OpenAI/Azure, Anthropic, Vertex AI, Google GenAI, AWS Bedrock, Together, and Ollama. Cohere, Mistral, and Groq are not bundled yet; in Python install the instrumentor and pass it:
+**`*` Python needs an explicit instrumentor.** On a `respan-ai` release that bundles the native instrumentors, a bare `Respan()` auto-instruments OpenAI/Azure, Anthropic, Vertex AI, Google GenAI, AWS Bedrock, Together, and Ollama. That bundling is **not in the currently released `respan-ai`** (it depends only on `respan-tracing` and bundles none), so until the bundled release ships those need an explicit instrumentor in Python too. Cohere, Mistral, and Groq are not bundled in any release; in Python install the instrumentor and pass it:
 
 ```bash
 pip install respan-instrumentation-cohere   # or respan-instrumentation-mistralai / respan-instrumentation-groq
@@ -86,7 +86,7 @@ Respan(instrumentations=[CohereInstrumentor()])
 
 In **JS/TS** these three differ: Cohere auto-instruments natively (`cohere-ai`, no extra package), while Mistral and Groq are not supported in JS/TS at all.
 
-**Note:** LiteLLM in JS uses the OpenAI-compatible API, so the OpenAI auto-instrument covers it. For Python LiteLLM, see [LiteLLM guide](https://respan.ai/docs/integrations/litellm.md). In **JS/TS**, Google GenAI (`@google/genai`) and Ollama are not auto-instrumented; for Google GenAI see the [Google GenAI guide](https://respan.ai/docs/integrations/google-genai.md). (Both are auto-instrumented in Python, per the table.)
+**Note:** LiteLLM in JS uses the OpenAI-compatible API, so the OpenAI auto-instrument covers it. For Python LiteLLM, see [LiteLLM guide](https://respan.ai/docs/integrations/litellm.md). In **JS/TS**, Google GenAI (`@google/genai`) and Ollama are not auto-instrumented; for Google GenAI see the [Google GenAI guide](https://respan.ai/docs/integrations/google-genai.md). (In Python both are covered by the bundled `respan-ai`, per the note above.)
 
 **1c. Read the actual code and understand the workflow:**
 
@@ -184,7 +184,7 @@ npm install @respan/respan
 
 **Python 3.11 to 3.13 required.** On 3.9/3.10 the tracing `respan-ai` (4.x, which needs `respan-tracing >=3.11,<3.14`) is unsatisfiable, so pip silently backslides to an unrelated older `respan-ai` release that has no `Respan()` class: the install succeeds, then `from respan import Respan` fails at runtime with no hint. If that happens, check the Python version first.
 
-In Python, Cohere, Mistral, and Groq additionally need their explicit instrumentor (the `*` rows in the Priority-2 table above). Everything else, and all of JS/TS, needs no extra package.
+In Python, the `*` providers (Cohere, Mistral, Groq) always need their explicit instrumentor, and the rest need a `respan-ai` that bundles their native instrumentors (see the Priority-2 note above; not the currently released `respan-ai`). In JS/TS, no listed provider needs an extra package.
 
 For agent frameworks (Priority 1) — also install the instrumentor. Check the docs link in the table above for the exact packages.
 
