@@ -1,0 +1,6 @@
+{
+  "summary": "Initial release of Hugging Face Transformers instrumentation package",
+  "packages": {
+    "respan-instrumentation-huggingface": "new"
+  }
+}

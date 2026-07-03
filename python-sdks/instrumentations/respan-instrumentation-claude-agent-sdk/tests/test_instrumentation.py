@@ -63,6 +63,10 @@ def _install_fake_claude_agent_sdk_modules(
     usage_cache_read_tokens_attr = "gen_ai.usage.cache_read_input_tokens"
 
     class FakeClaudeAgentSdkInstrumentor:
+        # Mirrors upstream's BaseInstrumentor singleton: instrument() applies the
+        # module-level `query` wrap once and a second call is a no-op.
+        _module_query_wrapped = False
+
         def __init__(self):
             self.instrument_kwargs = None
             self.uninstrument_calls = 0
@@ -71,9 +75,26 @@ def _install_fake_claude_agent_sdk_modules(
             self.instrument_kwargs = kwargs
             if instrument_error is not None:
                 raise instrument_error
+            if FakeClaudeAgentSdkInstrumentor._module_query_wrapped:
+                return
+            import wrapt
+
+            wrapt.wrap_function_wrapper("claude_agent_sdk", "query", self._wrap_query)
+            FakeClaudeAgentSdkInstrumentor._module_query_wrapped = True
 
         def uninstrument(self):
             self.uninstrument_calls += 1
+            if not FakeClaudeAgentSdkInstrumentor._module_query_wrapped:
+                return
+            FakeClaudeAgentSdkInstrumentor._module_query_wrapped = False
+            import claude_agent_sdk
+
+            module_query = getattr(claude_agent_sdk, "query", None)
+            if hasattr(module_query, "__wrapped__"):
+                claude_agent_sdk.query = module_query.__wrapped__
+
+        def _wrap_query(self, wrapped, instance, args, kwargs):
+            return wrapped(*args, **kwargs)
 
         def _wrap_client_query(self, wrapped, instance, args, kwargs):
             instance._otel_invocation_ctx = kwargs.get("otel_invocation_ctx")
@@ -124,6 +145,7 @@ def _install_fake_claude_agent_sdk_modules(
     )
     constants_module.GEN_AI_OUTPUT_MESSAGES = output_messages_attr
     constants_module.GEN_AI_USAGE_INPUT_TOKENS = usage_input_tokens_attr
+    constants_module.GEN_AI_USAGE_OUTPUT_TOKENS = usage_output_tokens_attr
     constants_module.GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS = (
         usage_cache_creation_tokens_attr
     )
@@ -160,6 +182,15 @@ def _install_fake_claude_agent_sdk_modules(
 
     claude_sdk_module = ModuleType("claude_agent_sdk")
     claude_sdk_module.__path__ = []
+
+    # Standalone `query()` module attribute — what upstream wraps and what
+    # `from claude_agent_sdk import query` binds. The A6 seam covers it via
+    # InternalClient.process_query below.
+    def _standalone_query(*args, **kwargs):
+        return "standalone-query-result"
+
+    claude_sdk_module.query = _standalone_query
+
     internal_module = ModuleType("claude_agent_sdk._internal")
     internal_module.__path__ = []
     query_module = ModuleType("claude_agent_sdk._internal.query")
@@ -172,6 +203,16 @@ def _install_fake_claude_agent_sdk_modules(
             return context_module.get_invocation_context()
 
     query_module.Query = FakeQuery
+
+    # Internal seam that the standalone query() delegates to (A6). Wrapping this
+    # is how respan traces `from claude_agent_sdk import query`.
+    client_module = ModuleType("claude_agent_sdk._internal.client")
+
+    class FakeInternalClient:
+        def process_query(self, *args, **kwargs):
+            return "process-query-result"
+
+    client_module.InternalClient = FakeInternalClient
 
     monkeypatch.setitem(
         sys.modules,
@@ -205,6 +246,11 @@ def _install_fake_claude_agent_sdk_modules(
         "claude_agent_sdk._internal.query",
         query_module,
     )
+    monkeypatch.setitem(
+        sys.modules,
+        "claude_agent_sdk._internal.client",
+        client_module,
+    )
 
     return SimpleNamespace(
         instrumentor_class=FakeClaudeAgentSdkInstrumentor,
@@ -214,6 +260,9 @@ def _install_fake_claude_agent_sdk_modules(
         instrumentor_module=instrumentor_module,
         original_set_response_content=_original_set_response_content,
         original_set_result_attributes=_original_set_result_attributes,
+        claude_sdk_module=claude_sdk_module,
+        standalone_query=_standalone_query,
+        internal_client=FakeInternalClient,
     )
 
 
@@ -368,7 +417,14 @@ def test_activate_patches_helpers_and_restores_originals(monkeypatch):
         },
     ]
     assert span.attributes["gen_ai.usage.input_tokens"] == 4
-    assert span.attributes["cost"] == 0.04241955
+    assert span.attributes["gen_ai.usage.output_tokens"] == 121
+    # Cost is emitted as respan.metadata.response_cost (string), matching the
+    # LiteLLM/OpenAI instrumentors, not a bare "cost" attribute (A7).
+    assert span.attributes["respan.metadata.response_cost"] == "0.04241955"
+    assert "cost" not in span.attributes
+    # The helper writes only raw input/output; the span processor owns
+    # prompt/completion/total, so the helper must not pre-empt them here.
+    assert "gen_ai.usage.total_tokens" not in span.attributes
 
     instrumentor.deactivate()
 
@@ -378,6 +434,54 @@ def test_activate_patches_helpers_and_restores_originals(monkeypatch):
     assert fake.spans_module.set_result_attributes is fake.original_set_result_attributes
     restored_ctx = asyncio.run(fake_query._handle_control_request({"request": {}}))
     assert restored_ctx is None
+
+
+def test_activate_traces_standalone_query_via_internal_seam(monkeypatch):
+    """A6: the from-import query() path is instrumented at InternalClient.process_query."""
+    tracer_provider = _make_fake_tracer_provider()
+    monkeypatch.setattr(trace, "get_tracer_provider", lambda: tracer_provider)
+    fake = _install_fake_claude_agent_sdk_modules(monkeypatch)
+
+    instrumentor = ClaudeAgentSDKInstrumentor()
+    instrumentor.activate()
+
+    # The internal seam is wrapped, so `from claude_agent_sdk import query` traces...
+    assert hasattr(fake.internal_client.process_query, "__wrapped__")
+    # ...and the bypassable module-level `query` wrap is dropped, so module-qualified
+    # and from-imported calls both hit exactly the seam (one span, no double-count).
+    assert fake.claude_sdk_module.query is fake.standalone_query
+    assert not hasattr(fake.claude_sdk_module.query, "__wrapped__")
+
+
+def test_double_activation_does_not_stack_the_query_seam(monkeypatch):
+    """A second instrumentor must not wrap the seam twice (would emit two spans)."""
+    tracer_provider = _make_fake_tracer_provider()
+    monkeypatch.setattr(trace, "get_tracer_provider", lambda: tracer_provider)
+    fake = _install_fake_claude_agent_sdk_modules(monkeypatch)
+
+    ClaudeAgentSDKInstrumentor().activate()
+    ClaudeAgentSDKInstrumentor().activate()
+
+    wrapped = fake.internal_client.process_query
+    assert hasattr(wrapped, "__wrapped__")
+    # Exactly one wrapper layer: __wrapped__ is the pristine original, not a second wrapper.
+    assert not hasattr(wrapped.__wrapped__, "__wrapped__")
+
+
+def test_deactivate_restores_the_query_seam_and_module_query(monkeypatch):
+    tracer_provider = _make_fake_tracer_provider()
+    monkeypatch.setattr(trace, "get_tracer_provider", lambda: tracer_provider)
+    fake = _install_fake_claude_agent_sdk_modules(monkeypatch)
+
+    original_process_query = fake.internal_client.process_query
+
+    instrumentor = ClaudeAgentSDKInstrumentor()
+    instrumentor.activate()
+    instrumentor.deactivate()
+
+    assert fake.internal_client.process_query is original_process_query
+    assert not hasattr(fake.internal_client.process_query, "__wrapped__")
+    assert fake.claude_sdk_module.query is fake.standalone_query
 
 
 def test_activate_logs_warning_when_dependency_missing(monkeypatch, caplog):

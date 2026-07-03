@@ -1,0 +1,6 @@
+{
+  "summary": "Add Braintrust TypeScript instrumentation package",
+  "packages": {
+    "@respan/instrumentation-braintrust": "new"
+  }
+}

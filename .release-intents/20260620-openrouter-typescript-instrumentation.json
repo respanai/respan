@@ -1,0 +1,6 @@
+{
+  "summary": "Add OpenRouter TypeScript instrumentation package",
+  "packages": {
+    "@respan/instrumentation-openrouter": "new"
+  }
+}

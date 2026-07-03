@@ -193,9 +193,19 @@ class AWSBedrockInstrumentor:
 
         try:
             base_client = _load_base_client_class()
-        except (AttributeError, ImportError) as exc:
+        except ImportError as exc:
+            # SDK genuinely absent - expected when the app doesn't use Bedrock
+            # (boto3 is an optional extra).
+            logger.debug(
+                "AWS Bedrock instrumentation inactive - missing dependency: %s",
+                exc,
+            )
+            return
+        except AttributeError as exc:
+            # boto3 installed but incompatible (a class moved/renamed) - surface it
+            # so a broken install isn't silently left untraced.
             logger.warning(
-                "Failed to activate AWS Bedrock instrumentation - missing dependency: %s",
+                "boto3 is installed but incompatible - AWS Bedrock instrumentation inactive: %s",
                 exc,
             )
             return

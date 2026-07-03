@@ -1,0 +1,8 @@
+{
+  "summary": "Fix LLM response span classification for OpenAI Agents SDK, Vercel AI SDK, and Pydantic AI instrumentations",
+  "packages": {
+    "@respan/instrumentation-openai-agents": "patch",
+    "@respan/instrumentation-vercel": "patch",
+    "respan-instrumentation-pydantic-ai": "patch"
+  }
+}

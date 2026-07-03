@@ -1,0 +1,6 @@
+{
+  "summary": "respan-instrumentation-claude-agent-sdk: trace `from claude_agent_sdk import query` by instrumenting the InternalClient.process_query seam (resolved at call time) instead of the bypassable module-level `query` attribute, and drop the now-redundant module wrap so each call yields exactly one span (A6).",
+  "packages": {
+    "respan-instrumentation-claude-agent-sdk": "patch"
+  }
+}

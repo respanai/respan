@@ -1,0 +1,6 @@
+{
+  "summary": "Add `respan demo` command that seeds sample prompts, datasets, evaluators, and traces into an account.",
+  "packages": {
+    "@respan/cli": "minor"
+  }
+}

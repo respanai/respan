@@ -191,6 +191,31 @@ def test_enrich_pydantic_ai_chat_span_maps_messages():
 
     assert span._attributes["respan.entity.log_type"] == "chat"
     assert span._attributes[SpanAttributes.TRACELOOP_SPAN_KIND] == "chat"
+    assert span._attributes[SpanAttributes.LLM_REQUEST_TYPE] == "chat"
+    assert span._attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT] == (
+        '[{"role": "user", "content": "hi"}]'
+    )
+    assert span._attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] == (
+        '[{"role": "assistant", "content": "hello"}]'
+    )
+
+
+def test_enrich_pydantic_ai_response_operation_maps_as_chat_span():
+    span = SimpleNamespace(
+        name="openai.responses.create",
+        _attributes={
+            "gen_ai.system": "openai",
+            "gen_ai.operation.name": "response",
+            "gen_ai.input.messages": '[{"role":"user","content":"hi"}]',
+            "gen_ai.output.messages": '[{"role":"assistant","content":"hello"}]',
+        },
+    )
+
+    enrich_pydantic_ai_span(span)
+
+    assert span._attributes["respan.entity.log_type"] == "chat"
+    assert span._attributes[SpanAttributes.TRACELOOP_SPAN_KIND] == "chat"
+    assert span._attributes[SpanAttributes.LLM_REQUEST_TYPE] == "chat"
     assert span._attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT] == (
         '[{"role": "user", "content": "hi"}]'
     )

@@ -1,0 +1,30 @@
+[tool.poetry]
+name = "respan-instrumentation-chroma"
+version = "0.1.0"
+description = "Respan instrumentation plugin for Chroma"
+authors = ["Respan <team@respan.ai>"]
+license = "Apache 2.0"
+readme = "README.md"
+packages = [
+    { include = "respan_instrumentation_chroma", from = "./src" },
+]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.14"
+respan-tracing = "^2.17.0"
+respan-sdk = ">=2.6.1"
+chromadb = ">=0.5.0,<2.0.0"
+opentelemetry-semantic-conventions-ai = ">=0.4.1"
+wrapt = ">=1.16.0"
+
+[tool.poetry.plugins."respan.instrumentations"]
+chroma = "respan_instrumentation_chroma:ChromaInstrumentor"
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: live network tests (requires API keys)",
+]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

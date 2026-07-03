@@ -1,0 +1,14 @@
+{
+  "summary": "respan-ai bundles the native (Traceloop-free) respan-instrumentation-* plugins for OpenAI/Anthropic/Bedrock/VertexAI/Google-GenAI/Together/Ollama and auto-activates them on a bare Respan(), so direct LLM SDKs are traced with correct llm.request.type/tokens/cost out of the box (A1). This covers Gemini both via Vertex AI and via the Google GenAI SDK. The native packages mark their provider SDK optional (the app brings it) so respan-ai pulls only the instrumentors, not boto3/google-cloud-aiplatform/google-genai/openai/etc. cohere/mistral/groq are excluded until rewritten native (mistral/groq's openinference deps cap at Python <3.13). respan-tracing gets a patch: its enum->entry-point map now resolves BEDROCK/VERTEXAI to Traceloop's actual entry-point names (boto3/google_cloud_aiplatform) so the auto-mode OTEL-twin dedup actually blocks those two providers; respan-ai raises its respan-tracing floor to the release containing this fix.",
+  "packages": {
+    "respan-ai": "minor",
+    "respan-tracing": "patch",
+    "respan-instrumentation-openai": "patch",
+    "respan-instrumentation-anthropic": "patch",
+    "respan-instrumentation-aws-bedrock": "patch",
+    "respan-instrumentation-vertexai": "patch",
+    "respan-instrumentation-google-genai": "patch",
+    "respan-instrumentation-together": "patch",
+    "respan-instrumentation-ollama": "patch"
+  }
+}

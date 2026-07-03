@@ -1,0 +1,6 @@
+{
+  "summary": "Add Aleph Alpha Python instrumentation",
+  "packages": {
+    "respan-instrumentation-aleph-alpha": "new"
+  }
+}

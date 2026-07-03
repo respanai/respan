@@ -1,0 +1,6 @@
+{
+  "summary": "Add IBM watsonx.ai Python instrumentation",
+  "packages": {
+    "respan-instrumentation-watsonx": "new"
+  }
+}

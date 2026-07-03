@@ -1,0 +1,6 @@
+{
+  "summary": "Add Together AI instrumentation package",
+  "packages": {
+    "respan-instrumentation-together": "new"
+  }
+}

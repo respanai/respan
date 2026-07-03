@@ -1,0 +1,6 @@
+{
+  "summary": "Add Cursor SDK instrumentation package",
+  "packages": {
+    "respan-instrumentation-cursor-sdk": "new"
+  }
+}

@@ -192,3 +192,92 @@ jobs:
               raise ModuleNotFoundError(os.environ["IMPORT_NAME"])
           importlib.metadata.version(os.environ["DIST_NAME"])
           PY
+
+      # A1: respan-ai bundles the native respan-instrumentation-* plugins so a bare
+      # Respan() auto-traces the direct LLM SDKs. The provider SDKs are optional
+      # (the app brings them), so this asserts the instrumentors are bundled with no
+      # SDK leakage, then installs openai and asserts that instrumentor actually traces.
+      - name: respan-ai auto-instrument smoke check
+        if: ${{ matrix.name == 'respan-ai' }}
+        working-directory: ${{ matrix.path }}
+        env:
+          RESPAN_API_KEY: ci-test-key
+        run: |
+          python3 -m venv .ci-autoinstrument-venv
+          . .ci-autoinstrument-venv/bin/activate
+          python -m pip install --upgrade pip
+          # Install the bundled native instrumentors from local source (this PR makes
+          # their provider SDKs optional; the published versions don't yet). Installed
+          # with deps, so respan-tracing + OTEL come along but the provider SDKs
+          # (openai, boto3, ...) must NOT.
+          python -m pip install \
+            ../instrumentations/respan-instrumentation-openai \
+            ../instrumentations/respan-instrumentation-anthropic \
+            ../instrumentations/respan-instrumentation-aws-bedrock \
+            ../instrumentations/respan-instrumentation-vertexai \
+            ../instrumentations/respan-instrumentation-google-genai \
+            ../instrumentations/respan-instrumentation-together \
+            ../instrumentations/respan-instrumentation-ollama
+          # respan-ai's floors point at the first optional-SDK releases (e.g.
+          # anthropic >=1.0.2), which aren't published yet and are newer than the
+          # local source installed above, so a normal resolve of respan-ai's deps
+          # would fail (ResolutionImpossible). Install it --no-deps: the instrumentors
+          # it bundles are already present from source, and the floors are validated
+          # against real releases post-publish, not against local working copies.
+          python -m pip install --no-deps dist/*.whl
+          python - <<'PY'
+          import importlib.metadata as md
+          import importlib.util
+
+          # 1. All native instrumentors are bundled / discoverable.
+          expected = {"openai", "anthropic", "aws-bedrock", "vertexai", "google-genai", "together", "ollama"}
+          discovered = {ep.name for ep in md.entry_points(group="respan.instrumentations")}
+          missing = expected - discovered
+          assert not missing, f"native instrumentors not bundled: {sorted(missing)}"
+
+          # 2. No provider SDK leaked in (they are optional, brought by the app).
+          def _installed(module):
+              try:
+                  return importlib.util.find_spec(module) is not None
+              except Exception:
+                  return False
+          leaked = [
+              m for m in ("openai", "anthropic", "botocore", "vertexai", "google.genai", "together", "ollama")
+              if _installed(m)
+          ]
+          assert not leaked, f"provider SDKs must not be installed by respan-ai: {leaked}"
+          print("OK: instrumentors bundled, no provider SDK leaked")
+          PY
+          # 3. Install one provider SDK and assert that instrumentor actually traces.
+          python -m pip install openai
+          python - <<'PY'
+          import os
+          os.environ.setdefault("RESPAN_API_KEY", "ci-test-key")
+
+          from respan import Respan
+          from opentelemetry import trace
+          from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+          from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+              InMemorySpanExporter,
+          )
+
+          Respan(is_batching_enabled=False)
+          mem = InMemorySpanExporter()
+          trace.get_tracer_provider().add_span_processor(SimpleSpanProcessor(mem))
+
+          import openai
+          try:
+              openai.OpenAI(
+                  api_key="x", base_url="http://127.0.0.1:1/v1", max_retries=0
+              ).chat.completions.create(
+                  model="gpt-4o-mini", messages=[{"role": "user", "content": "hi"}]
+              )
+          except Exception:
+              pass
+
+          names = [s.name for s in mem.get_finished_spans()]
+          assert any("openai" in n or "chat" in n.lower() for n in names), (
+              f"openai not instrumented after install; spans={names}"
+          )
+          print("OK: openai instrumented after install ->", names)
+          PY

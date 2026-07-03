@@ -1,6 +1,6 @@
 # respan-instrumentation-openai
 
-Respan instrumentation plugin for direct OpenAI SDK usage. Wraps `opentelemetry-instrumentation-openai` with Respan-specific prompt capture and trace export.
+Respan instrumentation plugin for direct OpenAI SDK usage. A native, Traceloop-free instrumentation: it patches the OpenAI SDK directly and emits Respan's own LLM span conventions (`llm.request.type`, `gen_ai.*`, `traceloop.entity.*`, `respan.entity.log_type`), so chat, responses, completions, and embeddings calls are traced as real LLM calls with token/cost roll-up. Covers sync, async, and streaming.
 
 ## Configuration
 

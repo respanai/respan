@@ -50,6 +50,15 @@ test("ai.streamText.doStream is classified as LLM text, not task", () => {
   assert.equal(attrs["traceloop.span.kind"], undefined);
 });
 
+test("ai.response is classified as LLM text, not response", () => {
+  const attrs = runTranslator("ai.response", baseLLMSpan);
+
+  assert.equal(attrs["respan.entity.log_type"], "text");
+  assert.equal(attrs["llm.request.type"], "chat");
+  assert.equal(attrs["gen_ai.request.model"], "gpt-4o-mini");
+  assert.equal(attrs["traceloop.span.kind"], undefined);
+});
+
 test("ai.embed.doEmbed is classified as embedding without synthetic usage fields", () => {
   const attrs = runTranslator("ai.embed.doEmbed", {
     "ai.model.id": "text-embedding-3-small",

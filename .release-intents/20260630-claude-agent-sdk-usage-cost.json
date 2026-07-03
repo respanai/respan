@@ -1,0 +1,6 @@
+{
+  "summary": "respan-instrumentation-claude-agent-sdk: fix zero usage/cost on the invoke_agent span (A7). Tokens were previously set only as gen_ai.usage.input_tokens (output missing) and cost as a bare 'cost' attribute, so the backend rolled up total_request_tokens=0 and total_cost=0. Now also emit gen_ai.usage.output_tokens so the span processor derives prompt/completion/total (with cache-token normalization and the total-request-tokens rollup), and set cost as respan.metadata.response_cost (from total_cost_usd), matching the LiteLLM/OpenAI instrumentors.",
+  "packages": {
+    "respan-instrumentation-claude-agent-sdk": "patch"
+  }
+}

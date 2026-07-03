@@ -1,0 +1,6 @@
+{
+  "summary": "Add Replicate Python SDK instrumentation",
+  "packages": {
+    "respan-instrumentation-replicate": "new"
+  }
+}
