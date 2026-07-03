@@ -1,5 +1,7 @@
 """Respan — unified entry point for tracing and instrumentation plugins."""
 
+import importlib.metadata
+import importlib.util
 import json
 import logging
 import os
@@ -9,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
 from respan_tracing import RespanTelemetry
+from respan_tracing.instruments import Instruments
 from respan_tracing.utils.span_factory import (
     _PROPAGATED_ATTRIBUTES,
     build_readable_span,
@@ -19,6 +22,96 @@ from respan_tracing.utils.span_factory import (
 from ._types import Instrumentation
 
 logger = logging.getLogger(__name__)
+
+# Entry-point group that native Respan instrumentation plugins register under.
+_NATIVE_INSTRUMENTATION_GROUP = "respan.instrumentations"
+
+# Only the instrumentations bundled as ``respan-ai`` dependencies auto-activate
+# on a bare ``Respan()``.  Every other plugin registered under
+# ``respan.instrumentations`` (litellm, langchain, crewai, cohere, mistralai,
+# groq, ...) must be passed explicitly via ``Respan(instrumentations=[...])`` —
+# without this allowlist a bare ``Respan()`` would silently activate whatever
+# happens to be installed.
+#
+# Each entry maps its entry-point name to the Traceloop OTEL ``Instruments`` it
+# supersedes, so auto mode can block those in the ``RespanTelemetry`` pipeline
+# and never wrap a provider twice (native plugin + OTEL instrumentor = two spans
+# and doubled token/cost).  To add a provider later: add its
+# ``respan-instrumentation-*`` dependency in ``pyproject.toml`` and one row here.
+_BUNDLED_NATIVE_INSTRUMENTATIONS: Dict[str, tuple] = {
+    "openai": (Instruments.OPENAI,),  # covers OpenAI + Azure OpenAI
+    "anthropic": (Instruments.ANTHROPIC,),
+    "aws-bedrock": (Instruments.BEDROCK,),
+    "vertexai": (Instruments.VERTEXAI,),
+    "google-genai": (Instruments.GOOGLE_GENERATIVEAI,),
+    "together": (Instruments.TOGETHER,),
+    "ollama": (Instruments.OLLAMA,),
+}
+
+# Top-level provider SDK package for each bundled native. Used only to detect the
+# "provider SDK is installed but its native instrumentor never activated" case and
+# warn about it — the safety net for the allowlist/dedup logic above, so a
+# bundling gap or a failed load doesn't leave an installed SDK silently untraced.
+# Probed with find_spec (not import), so checking a provider the app doesn't use
+# has no side effects.
+_PROVIDER_SDK_MODULES: Dict[str, tuple] = {
+    "openai": ("openai",),
+    "anthropic": ("anthropic",),
+    "aws-bedrock": ("botocore",),  # boto3's client layer
+    "vertexai": ("vertexai",),
+    "google-genai": ("google.genai",),
+    "together": ("together",),
+    "ollama": ("ollama",),
+}
+
+
+def _provider_sdk_installed(modules: tuple) -> bool:
+    """True if any of ``modules`` is importable (installed), without importing it."""
+    for name in modules:
+        try:
+            if importlib.util.find_spec(name) is not None:
+                return True
+        except (ImportError, ModuleNotFoundError, ValueError):
+            # Parent package absent, name isn't a package, etc. — treat as absent.
+            continue
+    return False
+
+
+def _discover_native_instrumentations() -> List[tuple]:
+    """Instantiate the bundled native ``respan.instrumentations`` plugins.
+
+    Only plugins in :data:`_BUNDLED_NATIVE_INSTRUMENTATIONS` are considered; any
+    other plugin registered under the group must be activated explicitly via
+    ``Respan(instrumentations=[...])``.  Provider SDKs are optional extras, so a
+    bundled plugin whose SDK can't be imported is skipped quietly (DEBUG) rather
+    than erroring — a bare ``Respan()`` never spams about providers the app
+    doesn't use.
+
+    Returns a list of ``(entry_point_name, instrumentor_instance)`` tuples.
+    """
+    plugins: List[tuple] = []
+    try:
+        entry_points = importlib.metadata.entry_points(
+            group=_NATIVE_INSTRUMENTATION_GROUP
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Failed to discover native instrumentations: %s", exc)
+        return plugins
+
+    for ep in entry_points:
+        if ep.name not in _BUNDLED_NATIVE_INSTRUMENTATIONS:
+            # Not bundled — only auto-activates when passed explicitly.
+            continue
+        try:
+            plugins.append((ep.name, ep.load()()))
+        except (ImportError, ModuleNotFoundError) as exc:
+            # Target SDK not importable — expected when that SDK isn't installed.
+            logger.debug(
+                "Skipping %s instrumentation (SDK not available): %s", ep.name, exc
+            )
+        except Exception as exc:
+            logger.warning("Failed to load %s instrumentation: %s", ep.name, exc)
+    return plugins
 
 
 class Respan:
@@ -98,12 +191,27 @@ class Respan:
         if is_auto_instrument is None:
             is_auto_instrument = instrumentations is None
 
+        # In auto mode, discover the bundled native plugins *before* building
+        # RespanTelemetry so we can tell its OTEL (Traceloop) pipeline to skip
+        # the providers those natives already cover.  Otherwise a provider that
+        # has both an installed native plugin and an OTEL instrumentor gets
+        # wrapped twice — two spans and doubled token/cost per LLM call.
+        # Instantiating a plugin only constructs it; patching happens later in
+        # _activate(), after the tracer provider exists.
+        native_instrumentations = (
+            _discover_native_instrumentations() if instrumentations is None else []
+        )
+        blocked = set(telemetry_kwargs.pop("block_instruments", None) or set())
+        for ep_name, _inst in native_instrumentations:
+            blocked.update(_BUNDLED_NATIVE_INSTRUMENTATIONS[ep_name])
+
         # 1. OTEL TracerProvider + optional auto-instrumentation
         self.telemetry = RespanTelemetry(
             app_name=app_name,
             api_key=api_key,
             base_url=base_url,
             is_auto_instrument=is_auto_instrument,
+            block_instruments=blocked or None,
             **telemetry_kwargs,
         )
 
@@ -114,18 +222,53 @@ class Respan:
 
         # 3. Activate instrumentations
         self._instrumentations: Dict[str, object] = {}
+
+        # 3a. Auto mode (no explicit plugins): activate the bundled native
+        #     respan-instrumentation-* plugins discovered above so a bare
+        #     Respan() traces the direct LLM SDKs out of the box.  Their OTEL
+        #     counterparts were blocked above, so each provider is traced once.
+        activated_native_names = set()
+        for ep_name, inst in native_instrumentations:
+            name = getattr(inst, "name", type(inst).__name__)
+            if self._activate(name, inst):
+                activated_native_names.add(ep_name)
+
+        # 3a-safety. Warn when a bundled provider's SDK is installed but its native
+        #     instrumentor never activated (bundling gap, missing entry point, or a
+        #     load failure).  Without this, an installed SDK that isn't covered by a
+        #     native plugin — and whose OTEL twin may have been blocked above — would
+        #     produce no LLM spans with no signal.  (A plugin that ran but found its
+        #     SDK absent or incompatible already logs for itself, so it is not
+        #     re-flagged here.)
+        if instrumentations is None:
+            for ep_name, sdk_modules in _PROVIDER_SDK_MODULES.items():
+                if ep_name in activated_native_names:
+                    continue
+                if _provider_sdk_installed(sdk_modules):
+                    logger.warning(
+                        "%s SDK is installed but its Respan instrumentation did not "
+                        "activate; its LLM calls will not be traced. Reinstall "
+                        "respan-instrumentation-%s, or pass the instrumentor via "
+                        "Respan(instrumentations=[...]).",
+                        ep_name,
+                        ep_name,
+                    )
+
+        # 3b. Explicitly-passed instrumentations.
         for inst in instrumentations or []:
             name = getattr(inst, "name", type(inst).__name__)
             self._activate(name, inst)
 
-    def _activate(self, name: str, inst: object) -> None:
-        """Activate a single instrumentor."""
+    def _activate(self, name: str, inst: object) -> bool:
+        """Activate a single instrumentor. Returns False if activation raised."""
         try:
             inst.activate()  # type: ignore[union-attr]
             self._instrumentations[name] = inst
             logger.info("Activated instrumentation: %s", name)
+            return True
         except Exception as exc:
             logger.warning("Failed to activate instrumentation %s: %s", name, exc)
+            return False
 
     @staticmethod
     @contextmanager

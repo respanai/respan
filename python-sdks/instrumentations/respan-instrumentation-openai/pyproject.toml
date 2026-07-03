@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "respan-instrumentation-openai"
-version = "1.0.0"
-description = "Respan instrumentation plugin for direct OpenAI SDK usage"
+version = "1.2.0"
+description = "Respan instrumentation plugin for direct OpenAI SDK usage (native, Traceloop-free)"
 authors = ["Respan <team@respan.ai>"]
 license = "Apache 2.0"
 readme = "README.md"
@@ -12,8 +12,13 @@ packages = [
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
 respan-tracing = "^2.3.0"
-openai = ">=1.0.0"
-opentelemetry-instrumentation-openai = ">=0.48.0"
+respan-sdk = ">=2.6.0"
+# Optional: the instrumentor lazy-imports openai and no-ops when it is absent, so
+# the app brings its own openai. Install with the SDK via the `instruments` extra.
+openai = { version = ">=1.0.0", optional = true }
+
+[tool.poetry.extras]
+instruments = ["openai"]
 
 [tool.poetry.plugins."respan.instrumentations"]
 openai = "respan_instrumentation_openai:OpenAIInstrumentor"

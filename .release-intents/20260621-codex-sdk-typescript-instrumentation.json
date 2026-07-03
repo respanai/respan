@@ -1,0 +1,6 @@
+{
+  "summary": "Add Codex SDK TypeScript instrumentation package",
+  "packages": {
+    "@respan/instrumentation-codex-sdk": "new"
+  }
+}

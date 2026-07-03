@@ -1,0 +1,6 @@
+{
+  "summary": "Fix flat traces and $0 cost for the OpenAI Agents SDK by emitting Task/Turn structural spans and not mislabeling the LLM span as a task",
+  "packages": {
+    "respan-instrumentation-openai-agents": "patch"
+  }
+}

@@ -13,8 +13,13 @@ packages = [
 python = ">=3.11,<3.14"
 respan-tracing = "^2.17.0"
 respan-sdk = ">=2.6.1"
-boto3 = ">=1.34.0"
+# Optional: the instrumentor lazy-imports boto3 and no-ops when it is absent, so
+# the app brings its own boto3. Install with the SDK via the `instruments` extra.
+boto3 = { version = ">=1.34.0", optional = true }
 opentelemetry-semantic-conventions-ai = ">=0.4.1"
+
+[tool.poetry.extras]
+instruments = ["boto3"]
 
 [tool.poetry.plugins."respan.instrumentations"]
 aws-bedrock = "respan_instrumentation_aws_bedrock:AWSBedrockInstrumentor"

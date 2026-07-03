@@ -1,0 +1,29 @@
+[tool.poetry]
+name = "respan-instrumentation-dify"
+version = "0.1.0"
+description = "Respan instrumentation plugin for Dify"
+authors = ["Respan <team@respan.ai>"]
+license = "Apache 2.0"
+readme = "README.md"
+packages = [
+    { include = "respan_instrumentation_dify", from = "./src" },
+]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.14"
+respan-tracing = "^2.17.0"
+respan-sdk = ">=2.6.1"
+dify-client = ">=0.1.10"
+opentelemetry-semantic-conventions-ai = ">=0.4.1"
+
+[tool.poetry.plugins."respan.instrumentations"]
+dify = "respan_instrumentation_dify:DifyInstrumentor"
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: live network tests (requires API keys)",
+]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

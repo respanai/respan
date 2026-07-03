@@ -1,0 +1,6 @@
+{
+  "summary": "Add Flue TypeScript instrumentation",
+  "packages": {
+    "@respan/instrumentation-flue": "new"
+  }
+}

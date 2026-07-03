@@ -1,0 +1,43 @@
+{
+  "name": "@respan/instrumentation-arize",
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Respan instrumentation plugin for Arize Phoenix TypeScript OpenInference helpers",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "author": "Respan <team@respan.ai>",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/respanai/respan",
+    "directory": "javascript-sdks/instrumentations/respan-instrumentation-arize"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "yarn build && node --test tests/*.test.mjs",
+    "publish:package": "yarn npm publish",
+    "release": "yarn build && yarn version patch && yarn publish:package"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/sdk-trace-base": "^1.29.0",
+    "@respan/instrumentation-openinference": "^1.1.3",
+    "@traceloop/ai-semantic-conventions": "^0.13.0"
+  },
+  "peerDependencies": {
+    "@arizeai/phoenix-otel": "^1.0.0"
+  },
+  "devDependencies": {
+    "@arizeai/phoenix-otel": "^1.0.2",
+    "@types/node": "^22.15.29",
+    "typescript": "^5.7.3"
+  }
+}

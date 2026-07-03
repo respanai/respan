@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "respan-instrumentation-openai-agents"
-version = "1.1.0"
+version = "1.1.1"
 description = "Respan instrumentation plugin for the OpenAI Agents SDK"
 authors = ["Respan <team@respan.ai>"]
 license = "Apache 2.0"

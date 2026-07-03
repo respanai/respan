@@ -1,185 +1,271 @@
-"""OpenAI SDK instrumentation plugin for Respan.
+"""Native OpenAI SDK instrumentation for Respan.
 
-Self-contained plugin that enables ``opentelemetry-instrumentation-openai``
-and applies a sync prompt-capture patch. Spans carry proper GenAI semantic
-conventions and pass ``is_processable_span()`` natively — no conversion needed.
+Monkey-patches the ``create`` method of the OpenAI SDK's chat-completions,
+completions, responses, and embeddings resources (sync + async) and emits a
+Respan span per call via ``_otel_emitter``. No Traceloop dependency: spans are
+built directly with Respan's documented LLM conventions, so the backend
+classifies them as real LLM calls (``llm.request.type``) with token/cost
+roll-up — not generic "task" spans.
 """
 
-import copy
-import json
+from __future__ import annotations
+
+import importlib
 import logging
-import traceback
+import time
+from typing import Any, Callable
+
+from respan_instrumentation_openai._constants import (
+    ASYNC_CHAT_CLASS,
+    ASYNC_COMPLETIONS_CLASS,
+    ASYNC_EMBEDDINGS_CLASS,
+    ASYNC_RESPONSES_CLASS,
+    CHAT_MODULE,
+    COMPLETIONS_MODULE,
+    CREATE_METHOD,
+    EMBEDDINGS_MODULE,
+    RESPONSES_MODULE,
+    SYNC_CHAT_CLASS,
+    SYNC_COMPLETIONS_CLASS,
+    SYNC_EMBEDDINGS_CLASS,
+    SYNC_RESPONSES_CLASS,
+)
+from respan_instrumentation_openai import _otel_emitter as emitter
 
 logger = logging.getLogger(__name__)
 
+_original_methods: dict[tuple[type[Any], str], Any] = {}
+
 
 # ---------------------------------------------------------------------------
-# Sync prompt-capture patch
+# Stream aggregation (best-effort; never breaks the caller's stream)
 # ---------------------------------------------------------------------------
 
 
-def _patch_chat_prompt_capture():
-    """Replace the async chat _handle_request with a sync version.
+def _aggregate_chat(chunks: list[Any]) -> dict[str, Any]:
+    parts: list[str] = []
+    tool_calls: dict[int, dict[str, Any]] = {}
+    usage = model = rid = None
+    for ch in chunks:
+        model = getattr(ch, "model", None) or model
+        rid = getattr(ch, "id", None) or rid
+        u = getattr(ch, "usage", None)
+        if u is not None:
+            usage = u
+        choices = getattr(ch, "choices", None) or []
+        if not choices:
+            continue
+        delta = getattr(choices[0], "delta", None)
+        if delta is None:
+            continue
+        content = getattr(delta, "content", None)
+        if content:
+            parts.append(content)
+        # Accumulate streamed tool-call deltas by index (name once, args in fragments).
+        for tcd in getattr(delta, "tool_calls", None) or []:
+            idx = getattr(tcd, "index", 0) or 0
+            slot = tool_calls.setdefault(
+                idx, {"id": None, "type": "function", "function": {"name": "", "arguments": ""}}
+            )
+            if getattr(tcd, "id", None):
+                slot["id"] = tcd.id
+            fn = getattr(tcd, "function", None)
+            if fn is not None:
+                if getattr(fn, "name", None):
+                    slot["function"]["name"] = fn.name
+                if getattr(fn, "arguments", None):
+                    slot["function"]["arguments"] += fn.arguments
+    message: dict[str, Any] = {"role": "assistant", "content": "".join(parts) or None}
+    if tool_calls:
+        message["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
+    return {"model": model, "id": rid, "usage": usage, "choices": [{"message": message}]}
 
-    Root cause: opentelemetry-instrumentation-openai v0.52+ has _handle_request
-    as async def (for optional base64 image upload). In sync contexts, it runs
-    through run_async() which either calls asyncio.run() or spawns a thread.
-    Both paths can silently lose prompt attributes when:
-      - _set_request_attributes (NOT @dont_throw) raises on response_format
-        handling, killing the entire _handle_request before _set_prompts runs
-      - asyncio.run() / thread path has environment-specific issues (Lambda, etc.)
 
-    The embeddings wrapper is fully sync and works correctly. This patch makes
-    the chat path match the embeddings path: fully synchronous with fault
-    isolation between each section.
+def _aggregate_completion(chunks: list[Any]) -> dict[str, Any]:
+    parts: list[str] = []
+    usage = model = rid = None
+    for ch in chunks:
+        model = getattr(ch, "model", None) or model
+        rid = getattr(ch, "id", None) or rid
+        u = getattr(ch, "usage", None)
+        if u is not None:
+            usage = u
+        choices = getattr(ch, "choices", None) or []
+        if choices:
+            text = getattr(choices[0], "text", None)
+            if text:
+                parts.append(text)
+    return {"model": model, "id": rid, "usage": usage, "choices": [{"text": "".join(parts)}]}
 
-    The only async code in _set_prompts was for Config.upload_base64_image
-    (rarely used). For list content (multimodal), we json.dumps as-is — the
-    base64 data stays inline, which is the default behavior anyway.
+
+def _aggregate_response(events: list[Any]) -> Any:
+    """Responses-API streaming: the final event carries the full ``response``."""
+    final = None
+    for ev in events:
+        r = getattr(ev, "response", None)
+        if r is not None:
+            final = r
+    return final
+
+
+# kind -> (emit_fn, aggregator | None)
+_KINDS: dict[str, tuple[Callable[..., None], Callable[[list[Any]], Any] | None]] = {
+    "chat": (emitter.emit_chat_span, _aggregate_chat),
+    "completion": (emitter.emit_completion_span, _aggregate_completion),
+    "response": (emitter.emit_response_span, _aggregate_response),
+    "embedding": (emitter.emit_embedding_span, None),
+}
+
+
+def _is_stream(obj: Any) -> bool:
+    """Detect an OpenAI streaming response.
+
+    Note: Pydantic v2 models define ``__iter__``, so a plain ``hasattr`` check
+    would misfire on every non-streaming response. We match OpenAI's real
+    ``Stream``/``AsyncStream`` types, plus ``__aiter__`` (which pydantic models
+    do *not* have) as a fallback for async streams.
     """
     try:
-        from opentelemetry.instrumentation.openai.shared import chat_wrappers as cw
-        from opentelemetry.instrumentation.openai.shared import (
-            _set_request_attributes,
-            _set_client_attributes,
-            _set_functions_attributes,
-            _set_span_attribute,
-            set_tools_attributes,
-            model_as_dict,
-            propagate_trace_context,
-        )
-        from opentelemetry.instrumentation.openai.shared.config import Config
-        from opentelemetry.instrumentation.openai.utils import (
-            should_send_prompts,
-            should_emit_events,
-            is_openai_v1,
-        )
-        from opentelemetry.semconv._incubating.attributes import (
-            gen_ai_attributes as GenAIAttributes,
-        )
-        from opentelemetry.semconv_ai import SpanAttributes
+        from openai import AsyncStream, Stream
 
-        def _set_prompts_sync(span, messages):
-            if not span.is_recording() or messages is None:
-                return
-
-            for i, msg in enumerate(messages):
-                prefix = f"{GenAIAttributes.GEN_AI_PROMPT}.{i}"
-                msg = msg if isinstance(msg, dict) else model_as_dict(msg)
-
-                _set_span_attribute(span, f"{prefix}.role", msg.get("role"))
-                if msg.get("content"):
-                    content = copy.deepcopy(msg.get("content"))
-                    if isinstance(content, list):
-                        content = json.dumps(content)
-                    _set_span_attribute(span, f"{prefix}.content", content)
-                if msg.get("tool_call_id"):
-                    _set_span_attribute(
-                        span, f"{prefix}.tool_call_id", msg.get("tool_call_id")
-                    )
-                tool_calls = msg.get("tool_calls")
-                if tool_calls:
-                    for j, tool_call in enumerate(tool_calls):
-                        if is_openai_v1():
-                            tool_call = model_as_dict(tool_call)
-                        function = tool_call.get("function")
-                        _set_span_attribute(
-                            span, f"{prefix}.tool_calls.{j}.id", tool_call.get("id")
-                        )
-                        _set_span_attribute(
-                            span, f"{prefix}.tool_calls.{j}.name", function.get("name")
-                        )
-                        _set_span_attribute(
-                            span,
-                            f"{prefix}.tool_calls.{j}.arguments",
-                            function.get("arguments"),
-                        )
-
-        def _handle_request_sync(span, kwargs, instance):
-            # Section 1: Request attributes (fault-isolated from prompts)
-            try:
-                _set_request_attributes(span, kwargs, instance)
-            except Exception:
-                logging.warning(
-                    "respan: _set_request_attributes failed (response_format may be incompatible). "
-                    "Request attributes like model/temperature may be incomplete on this span. "
-                    "Error: %s",
-                    traceback.format_exc(),
-                )
-
-            try:
-                _set_client_attributes(span, instance)
-            except Exception:
-                pass
-
-            # Section 2: Prompt/event capture
-            try:
-                if should_emit_events():
-                    from opentelemetry.instrumentation.openai.shared.event_emitter import emit_event
-                    from opentelemetry.instrumentation.openai.shared.event_models import MessageEvent
-                    for message in kwargs.get("messages", []):
-                        emit_event(
-                            MessageEvent(
-                                content=message.get("content"),
-                                role=message.get("role"),
-                                tool_calls=cw._parse_tool_calls(
-                                    message.get("tool_calls", None)
-                                ),
-                            )
-                        )
-                else:
-                    if should_send_prompts():
-                        _set_prompts_sync(span, kwargs.get("messages"))
-                        if kwargs.get("functions"):
-                            _set_functions_attributes(span, kwargs.get("functions"))
-                        elif kwargs.get("tools"):
-                            set_tools_attributes(span, kwargs.get("tools"))
-            except Exception:
-                logging.warning(
-                    "respan: chat prompt capture failed. "
-                    "Input messages may not appear on the dashboard for this span. "
-                    "Error: %s",
-                    traceback.format_exc(),
-                )
-
-            # Section 3: Trace propagation + reasoning
-            try:
-                if Config.enable_trace_context_propagation:
-                    propagate_trace_context(span, kwargs)
-                reasoning_effort = kwargs.get("reasoning_effort")
-                _set_span_attribute(
-                    span,
-                    SpanAttributes.LLM_REQUEST_REASONING_EFFORT,
-                    reasoning_effort or (),
-                )
-            except Exception:
-                pass
-
-        async def _noop():
-            pass
-
-        def _patched_handle_request(span, kwargs, instance):
-            _handle_request_sync(span, kwargs, instance)
-            return _noop()
-
-        cw._handle_request = _patched_handle_request
-        logger.debug("Patched chat prompt capture to sync path")
-
-    except Exception as e:
-        logger.warning("Failed to patch chat prompt capture: %s", e)
+        if isinstance(obj, (Stream, AsyncStream)):
+            return True
+    except Exception:
+        pass
+    return hasattr(obj, "__aiter__")
 
 
 # ---------------------------------------------------------------------------
-# Instrumentor
+# Iterator wrappers
 # ---------------------------------------------------------------------------
+
+
+def _wrap_sync_stream(iterator, *, kind, request_kwargs, start_ns):
+    emit_fn, aggregate = _KINDS[kind]
+    chunks: list[Any] = []
+    try:
+        for chunk in iterator:
+            chunks.append(chunk)
+            yield chunk
+    except Exception as exc:
+        response = aggregate(chunks) if aggregate else None
+        emit_fn(request_kwargs=request_kwargs, start_ns=start_ns, response=response,
+                error_message=str(exc), status_code=500)
+        raise
+    else:
+        response = aggregate(chunks) if aggregate else None
+        emit_fn(request_kwargs=request_kwargs, start_ns=start_ns, response=response)
+
+
+async def _wrap_async_stream(aiterator, *, kind, request_kwargs, start_ns):
+    emit_fn, aggregate = _KINDS[kind]
+    chunks: list[Any] = []
+    try:
+        async for chunk in aiterator:
+            chunks.append(chunk)
+            yield chunk
+    except Exception as exc:
+        response = aggregate(chunks) if aggregate else None
+        emit_fn(request_kwargs=request_kwargs, start_ns=start_ns, response=response,
+                error_message=str(exc), status_code=500)
+        raise
+    else:
+        response = aggregate(chunks) if aggregate else None
+        emit_fn(request_kwargs=request_kwargs, start_ns=start_ns, response=response)
+
+
+# ---------------------------------------------------------------------------
+# Method wrappers
+# ---------------------------------------------------------------------------
+
+
+def _make_sync_wrapper(original: Any, *, kind: str) -> Any:
+    emit_fn, _ = _KINDS[kind]
+
+    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+        start_ns = time.time_ns()
+        try:
+            response = original(self, *args, **kwargs)
+        except Exception as exc:
+            emit_fn(request_kwargs=kwargs, start_ns=start_ns, error_message=str(exc), status_code=500)
+            raise
+        if kind != "embedding" and _is_stream(response):
+            return _wrap_sync_stream(response, kind=kind, request_kwargs=kwargs, start_ns=start_ns)
+        emit_fn(request_kwargs=kwargs, start_ns=start_ns, response=response)
+        return response
+
+    return wrapper
+
+
+def _make_async_wrapper(original: Any, *, kind: str) -> Any:
+    emit_fn, _ = _KINDS[kind]
+
+    async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+        start_ns = time.time_ns()
+        try:
+            pending = original(self, *args, **kwargs)
+            response = pending if hasattr(pending, "__aiter__") else await pending
+        except Exception as exc:
+            emit_fn(request_kwargs=kwargs, start_ns=start_ns, error_message=str(exc), status_code=500)
+            raise
+        if kind != "embedding" and _is_stream(response):
+            return _wrap_async_stream(response, kind=kind, request_kwargs=kwargs, start_ns=start_ns)
+        emit_fn(request_kwargs=kwargs, start_ns=start_ns, response=response)
+        return response
+
+    return wrapper
+
+
+# ---------------------------------------------------------------------------
+# Patch plumbing
+# ---------------------------------------------------------------------------
+
+
+def _load_class(module_path: str, class_name: str) -> type[Any] | None:
+    try:
+        module = importlib.import_module(module_path)
+    except Exception as exc:
+        logger.debug("OpenAI module %s unavailable: %s", module_path, exc)
+        return None
+    return getattr(module, class_name, None)
+
+
+def _patch(target_class: type[Any] | None, *, kind: str, is_async: bool) -> bool:
+    """Patch one target class's create method.
+
+    Returns True when the target's API surface is present (patched now or already
+    patched), False when the class or method is missing. The caller treats an
+    all-False result as an installed-but-incompatible openai SDK.
+    """
+    if target_class is None:
+        return False
+    original = getattr(target_class, CREATE_METHOD, None)
+    if original is None:
+        return False
+    key = (target_class, CREATE_METHOD)
+    if key in _original_methods:
+        return True
+    _original_methods[key] = original
+    factory = _make_async_wrapper if is_async else _make_sync_wrapper
+    setattr(target_class, CREATE_METHOD, factory(original, kind=kind))
+    return True
+
+
+# (module, class, kind, is_async)
+_TARGETS = [
+    (CHAT_MODULE, SYNC_CHAT_CLASS, "chat", False),
+    (CHAT_MODULE, ASYNC_CHAT_CLASS, "chat", True),
+    (COMPLETIONS_MODULE, SYNC_COMPLETIONS_CLASS, "completion", False),
+    (COMPLETIONS_MODULE, ASYNC_COMPLETIONS_CLASS, "completion", True),
+    (RESPONSES_MODULE, SYNC_RESPONSES_CLASS, "response", False),
+    (RESPONSES_MODULE, ASYNC_RESPONSES_CLASS, "response", True),
+    (EMBEDDINGS_MODULE, SYNC_EMBEDDINGS_CLASS, "embedding", False),
+    (EMBEDDINGS_MODULE, ASYNC_EMBEDDINGS_CLASS, "embedding", True),
+]
 
 
 class OpenAIInstrumentor:
     """Respan instrumentor for direct OpenAI SDK usage.
-
-    Activates OTEL auto-instrumentation for the ``openai`` package so
-    that all ``ChatCompletion``, ``Completion``, and ``Embedding`` calls
-    are traced automatically.
 
     Usage::
 
@@ -195,34 +281,44 @@ class OpenAIInstrumentor:
         self._is_instrumented = False
 
     def activate(self) -> None:
-        """Instrument the OpenAI SDK via OTEL and patch prompt capture."""
+        if self._is_instrumented:
+            return
         try:
-            from opentelemetry.instrumentation.openai import OpenAIInstrumentor as OTELOpenAI
-
-            instrumentor = OTELOpenAI()
-            if not instrumentor.is_instrumented_by_opentelemetry:
-                instrumentor.instrument()
-            self._is_instrumented = True
-
-            # Apply sync prompt-capture patch
-            try:
-                _patch_chat_prompt_capture()
-            except Exception as exc:
-                logger.debug("Prompt capture patch not applied: %s", exc)
-
-            logger.info("OpenAI SDK instrumentation activated")
+            import openai  # noqa: F401
         except ImportError as exc:
-            logger.warning(
-                "Failed to activate OpenAI instrumentation — missing dependency: %s", exc
-            )
+            # SDK genuinely absent — expected when the app doesn't use OpenAI
+            # (the openai SDK is an optional extra).
+            logger.debug("OpenAI instrumentation inactive — openai not installed: %s", exc)
+            return
+        try:
+            patched_any = False
+            for module_path, class_name, kind, is_async in _TARGETS:
+                if _patch(
+                    _load_class(module_path, class_name), kind=kind, is_async=is_async
+                ):
+                    patched_any = True
+            if not patched_any:
+                # openai imports but none of its known API surfaces are present:
+                # installed but incompatible — the silent-failure class this bundling
+                # is meant to fix, so warn instead of leaving it quietly untraced.
+                logger.warning(
+                    "openai is installed but no known API surface could be "
+                    "instrumented — incompatible version? OpenAI instrumentation inactive."
+                )
+        except Exception as exc:
+            logger.warning("Failed to activate OpenAI instrumentation: %s", exc)
+            self.deactivate()
+            return
+        self._is_instrumented = True
+        logger.info("OpenAI SDK instrumentation activated")
 
     def deactivate(self) -> None:
-        """Deactivate the instrumentation."""
-        if self._is_instrumented:
+        for (target_class, method_name), original in list(_original_methods.items()):
             try:
-                from opentelemetry.instrumentation.openai import OpenAIInstrumentor as OTELOpenAI
-                OTELOpenAI().uninstrument()
+                setattr(target_class, method_name, original)
             except Exception:
-                pass
-            self._is_instrumented = False
+                logger.debug("Failed to restore %s.%s", target_class, method_name, exc_info=True)
+            finally:
+                _original_methods.pop((target_class, method_name), None)
+        self._is_instrumented = False
         logger.info("OpenAI SDK instrumentation deactivated")

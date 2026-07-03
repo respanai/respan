@@ -1,0 +1,6 @@
+{
+  "summary": "Add LiveKit TypeScript instrumentation package",
+  "packages": {
+    "@respan/instrumentation-livekit": "new"
+  }
+}

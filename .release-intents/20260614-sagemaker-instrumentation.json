@@ -1,0 +1,6 @@
+{
+  "summary": "Add AWS SageMaker Runtime instrumentation",
+  "packages": {
+    "respan-instrumentation-sagemaker": "new"
+  }
+}

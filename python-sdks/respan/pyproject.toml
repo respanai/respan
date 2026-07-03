@@ -10,8 +10,36 @@ packages = [
 ]
 
 [tool.poetry.dependencies]
-python = ">=3.9,<4.0"
-respan-tracing = ">=2.3.0"
+python = ">=3.11,<3.14"
+# Floor is the release that resolves BEDROCK/VERTEXAI block_instruments to
+# Traceloop's real entry-point names (boto3 / google_cloud_aiplatform). Below
+# it, auto mode can't dedup those two providers' OTEL twins and Bedrock/Vertex
+# calls get traced twice (native plugin + OTEL instrumentor).
+respan-tracing = ">=2.17.1"
+
+# Native (Traceloop-free) instrumentors for the direct LLM SDKs, bundled so a
+# bare `Respan()` auto-traces them with no extra packages. They are discovered
+# at startup via the `respan.instrumentations` entry-point group and emit proper
+# llm.request.type / tokens / cost (unlike the Traceloop opentelemetry-* ones,
+# which mislabel calls as generic tasks with $0 cost).
+#
+# NOTE: only the providers whose instrumentor is native today are bundled. cohere
+# (still wraps Traceloop) and mistral/groq (wrap openinference, which caps at
+# Python <3.13 and breaks resolution) are intentionally excluded until they are
+# rewritten native. To add a provider later: add its respan-instrumentation-*
+# package here; discovery + activation are automatic.
+#
+# Floors are the first releases in which each instrumentor marks its provider SDK
+# optional (the patch bumps in this PR's release intent). The prior versions
+# hard-require the SDK, so a lower floor would let a resolver drag in
+# openai/boto3/google-cloud-aiplatform/etc. — the exact bloat this bundling avoids.
+respan-instrumentation-openai = ">=1.2.1,<2.0.0"       # OpenAI + Azure OpenAI
+respan-instrumentation-anthropic = ">=1.0.2,<2.0.0"
+respan-instrumentation-aws-bedrock = ">=0.1.1,<1.0.0"
+respan-instrumentation-vertexai = ">=0.1.1,<1.0.0"     # Gemini via Vertex AI
+respan-instrumentation-google-genai = ">=0.1.1,<1.0.0" # Gemini via the Google GenAI SDK
+respan-instrumentation-together = ">=0.1.1,<1.0.0"
+respan-instrumentation-ollama = ">=0.1.1,<1.0.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.4.1"

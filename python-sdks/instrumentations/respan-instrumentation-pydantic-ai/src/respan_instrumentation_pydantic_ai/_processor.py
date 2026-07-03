@@ -44,7 +44,6 @@ from respan_sdk.constants.llm_logging import (
     LOG_TYPE_AGENT,
     LOG_TYPE_CHAT,
     LOG_TYPE_EMBEDDING,
-    LOG_TYPE_RESPONSE,
     LOG_TYPE_SPEECH,
     LOG_TYPE_TASK,
     LOG_TYPE_TOOL,
@@ -58,6 +57,7 @@ from respan_sdk.constants.span_attributes import (
     GEN_AI_TOOL_CALL_RESULT,
     GEN_AI_TOOL_NAME,
     LLM_REQUEST_MODEL,
+    LLM_REQUEST_TYPE,
     LLM_USAGE_COMPLETION_TOKENS,
     LLM_USAGE_PROMPT_TOKENS,
     RESPAN_LOG_METHOD,
@@ -70,7 +70,7 @@ logger = logging.getLogger(__name__)
 _PYDANTIC_AI_OPERATION_TO_LOG_TYPE = {
     "chat": LOG_TYPE_CHAT,
     "embedding": LOG_TYPE_EMBEDDING,
-    "response": LOG_TYPE_RESPONSE,
+    "response": LOG_TYPE_CHAT,
     "speech": LOG_TYPE_SPEECH,
     "transcription": LOG_TYPE_TRANSCRIPTION,
 }
@@ -78,7 +78,6 @@ _USAGE_LOG_TYPES = frozenset(
     {
         LOG_TYPE_CHAT,
         LOG_TYPE_EMBEDDING,
-        LOG_TYPE_RESPONSE,
         LOG_TYPE_SPEECH,
         LOG_TYPE_TOOL,
         LOG_TYPE_TRANSCRIPTION,
@@ -468,6 +467,7 @@ def enrich_pydantic_ai_span(
 
     if log_type == LOG_TYPE_CHAT:
         _set_if_missing(attrs, SpanAttributes.TRACELOOP_SPAN_KIND, LLMRequestTypeValues.CHAT.value)
+        _set_if_missing(attrs, LLM_REQUEST_TYPE, LLMRequestTypeValues.CHAT.value)
         input_messages = _extract_messages(attrs, PYDANTIC_AI_INPUT_MESSAGES_ATTR)
         output_messages = _extract_messages(attrs, PYDANTIC_AI_OUTPUT_MESSAGES_ATTR)
         if input_messages is not None:

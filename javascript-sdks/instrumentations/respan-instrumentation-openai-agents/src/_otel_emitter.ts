@@ -642,7 +642,7 @@ function emitResponse(item: Span<any>): void {
   const data = item.spanData as any;
   const { startTimeHr, endTimeHr } = resolveSpanTimes(item);
 
-  const attrs = baseAttrs("response", "response", RespanLogType.RESPONSE);
+  const attrs = baseAttrs("chat", "chat", RespanLogType.CHAT);
   attrs[RespanSpanAttributes.LLM_REQUEST_TYPE] = RespanLogType.CHAT;
   attrs[RespanSpanAttributes.LLM_SYSTEM] = "openai";
 
@@ -728,7 +728,7 @@ function emitGeneration(item: Span<any>): void {
   const data = item.spanData as any;
   const { startTimeHr, endTimeHr } = resolveSpanTimes(item);
 
-  const attrs = baseAttrs("generation", "generation", RespanLogType.GENERATION);
+  const attrs = baseAttrs("chat", "chat", RespanLogType.CHAT);
   attrs[RespanSpanAttributes.LLM_REQUEST_TYPE] = RespanLogType.CHAT;
 
   if (data.model) attrs[RespanSpanAttributes.GEN_AI_REQUEST_MODEL] = data.model;

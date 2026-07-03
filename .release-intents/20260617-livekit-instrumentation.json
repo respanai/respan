@@ -1,0 +1,6 @@
+{
+  "summary": "Add LiveKit Agents Python instrumentation",
+  "packages": {
+    "respan-instrumentation-livekit": "new"
+  }
+}
