@@ -1,0 +1,6 @@
+{
+  "summary": "Add Together AI TypeScript instrumentation.",
+  "packages": {
+    "@respan/instrumentation-together-ai": "new"
+  }
+}

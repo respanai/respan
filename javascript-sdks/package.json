@@ -32,6 +32,7 @@
     "instrumentations/respan-instrumentation-writer",
     "respan-sdk",
     "respan-tracing",
-    "instrumentations/respan-instrumentation-openrouter"
+    "instrumentations/respan-instrumentation-openrouter",
+    "instrumentations/respan-instrumentation-together-ai"
   ]
 }

@@ -99,7 +99,7 @@
     {
       "ecosystem": "javascript",
       "name": "@respan/instrumentation-livekit",
-      "path": "javascript-sdks/instrumentations/respan-instrumentation-livekit",      
+      "path": "javascript-sdks/instrumentations/respan-instrumentation-livekit",
       "registry": "npm"
     },
     {
@@ -478,6 +478,12 @@
       "ecosystem": "javascript",
       "name": "@respan/instrumentation-mastra",
       "path": "javascript-sdks/instrumentations/respan-instrumentation-mastra",
+      "registry": "npm"
+    },
+    {
+      "ecosystem": "javascript",
+      "name": "@respan/instrumentation-together-ai",
+      "path": "javascript-sdks/instrumentations/respan-instrumentation-together-ai",
       "registry": "npm"
     }
   ]
