@@ -48,7 +48,7 @@ export const VERCEL_SPAN_CONFIG: Record<string, VercelSpanConfig> = {
   "ai.speech":     { kind: RespanLogType.TASK, logType: RespanLogType.SPEECH,        isLLM: false },
 
   // Other
-  "ai.response":          { kind: RespanLogType.TASK, logType: RespanLogType.RESPONSE, isLLM: false },
+  "ai.response":          { kind: RespanLogType.TASK, logType: RespanLogType.TEXT,     isLLM: true },
   "ai.stream.firstChunk": { kind: RespanLogType.TASK, logType: RespanLogType.TEXT,     isLLM: false },
 };
 

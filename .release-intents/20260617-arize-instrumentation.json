@@ -1,0 +1,6 @@
+{
+  "summary": "Add Arize Python SDK instrumentation",
+  "packages": {
+    "respan-instrumentation-arize": "new"
+  }
+}

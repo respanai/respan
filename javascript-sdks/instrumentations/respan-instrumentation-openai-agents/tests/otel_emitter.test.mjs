@@ -134,6 +134,8 @@ test("emit response stores plain-text output and namespaced tool attrs", () => {
       tool_call_id: "call_weather",
     },
   ]);
+  assert.equal(attrs[RespanSpanAttributes.RESPAN_LOG_TYPE], "chat");
+  assert.equal(attrs[RespanSpanAttributes.LLM_REQUEST_TYPE], "chat");
   assert.equal(attrs["traceloop.entity.output"], "Here is Tokyo info");
   assert.deepEqual(JSON.parse(attrs[RespanSpanAttributes.RESPAN_SPAN_TOOL_CALLS]), [
     {
@@ -188,6 +190,8 @@ test("emit generation extracts namespaced tool calls", () => {
     }),
   );
 
+  assert.equal(attrs[RespanSpanAttributes.RESPAN_LOG_TYPE], "chat");
+  assert.equal(attrs[RespanSpanAttributes.LLM_REQUEST_TYPE], "chat");
   assert.deepEqual(JSON.parse(attrs["traceloop.entity.input"]), [
     { role: "user", content: "Use the tool" },
   ]);
@@ -238,6 +242,8 @@ test("emit generation preserves boolean false output", () => {
     }),
   );
 
+  assert.equal(attrs[RespanSpanAttributes.RESPAN_LOG_TYPE], "chat");
+  assert.equal(attrs[RespanSpanAttributes.LLM_REQUEST_TYPE], "chat");
   assert.equal(attrs["traceloop.entity.output"], "false");
   assert.equal(attrs["traceloop.span.kind"], undefined);
 });

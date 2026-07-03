@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "respan-instrumentation-claude-agent-sdk"
-version = "0.1.0"
+version = "0.1.2"
 description = "Respan instrumentation plugin for the Claude Agent SDK"
 authors = ["Respan <team@respan.ai>"]
 license = "Apache 2.0"
@@ -16,6 +16,7 @@ respan-sdk = ">=2.5.0"
 claude-agent-sdk = ">=0.1.58"
 opentelemetry-claude-agent-sdk = ">=0.1.4"
 opentelemetry-semantic-conventions-ai = ">=0.4.1"
+wrapt = ">=1.16.0"
 
 [tool.poetry.plugins."respan.instrumentations"]
 claude-agent-sdk = "respan_instrumentation_claude_agent_sdk:ClaudeAgentSDKInstrumentor"

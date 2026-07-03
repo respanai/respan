@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Autonomous Support Desk - Respan × OpenAI Agents SDK</title>
+<style>
+  :root{
+    --black:#0a0a0a; --gray:#6b7280; --line:#e5e7eb; --bg:#ffffff;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --blue:#2563eb; --blue-bg:#eff6ff; --blue-bd:#bfdbfe;
+    --emerald:#059669; --emerald-bg:#ecfdf5; --emerald-bd:#a7f3d0;
+    --amber:#b45309; --amber-bg:#fffbeb; --amber-bd:#fde68a;
+    --indigo:#4f46e5; --indigo-bg:#eef2ff; --indigo-bd:#c7d2fe;
+    --red:#dc2626;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--black);font-family:var(--sans);}
+  .wrap{max-width:1040px;margin:0 auto;padding:40px 24px;}
+  a{color:inherit}
+  .top{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:18px}
+  h1{font-size:24px;font-weight:700;letter-spacing:-.02em;margin:0}
+  .sub{font-size:12px;color:var(--gray);margin-top:8px;max-width:640px;line-height:1.5}
+  .sub code{font-family:var(--mono);background:#f3f4f6;padding:1px 4px}
+  .btn{font-family:var(--mono);font-size:12px;border:1px solid var(--black);background:var(--black);
+       color:#fff;padding:9px 16px;cursor:pointer}
+  .btn:disabled{opacity:.4;cursor:default}
+  .link{font-family:var(--mono);font-size:12px;border:1px solid var(--line);background:#fff;
+        padding:8px 12px;text-decoration:none}
+  .link:hover{border-color:var(--black)}
+  .services{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 6px}
+  .svclink{font-family:var(--mono);font-size:10px;color:#374151;border:1px solid var(--line);
+           padding:4px 9px;background:#fafafa;text-decoration:none}
+  .svclink:hover{border-color:var(--black);background:#fff}
+  .svclink .arrow{color:var(--gray)}
+  /* highlighted when you hover the matching per-step tag */
+  .svclink.hl{background:var(--black);color:#fff;border-color:var(--black)}
+  .svclink.hl .arrow{color:#fff}
+  .svchint{font-size:10px;color:var(--gray);margin:0 0 22px;font-family:var(--mono)}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:720px){.grid{grid-template-columns:1fr}}
+  .card{border:1px solid var(--line);background:#fff;padding:16px;animation:in .25s ease}
+  .card.running{border-color:var(--black);box-shadow:0 1px 0 var(--black)}
+  .card .hd{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+  .dot{width:8px;height:8px;border-radius:9px;flex:none}
+  .tenant{font-weight:600;font-size:13px}
+  .tid{font-family:var(--mono);font-size:10px;color:var(--gray);margin-left:auto}
+  .ticket{font-size:12px;color:#374151;line-height:1.45;margin:2px 0 12px;border-left:2px solid var(--line);padding-left:10px}
+  .steps{display:flex;flex-direction:column;gap:7px}
+  .step{display:flex;align-items:center;gap:8px;font-size:12px;animation:in .2s ease}
+  .step .g{font-family:var(--mono);width:13px;text-align:center;flex:none;color:var(--gray)}
+  .step .t{line-height:1.35;flex:1}
+  .step .t .k{font-family:var(--mono)}
+  .svc{font-family:var(--mono);font-size:9px;color:var(--gray);border:1px solid var(--line);
+       padding:2px 6px;white-space:nowrap;flex:none;cursor:default}
+  .svc:hover{border-color:var(--black);color:var(--black)}
+  .muted{color:var(--gray)}
+  .result{font-family:var(--mono);font-size:11px;color:#374151;background:#fafafa;border:1px solid var(--line);
+          padding:6px 8px;margin-top:1px;white-space:pre-wrap;word-break:break-word;max-height:84px;overflow:auto}
+  .msg{font-size:12px;color:#111;background:#fbfbfb;border:1px solid var(--line);padding:8px 10px;line-height:1.45}
+  .ft{display:flex;align-items:center;gap:8px;margin-top:14px;padding-top:12px;border-top:1px solid var(--line);flex-wrap:wrap}
+  .badge{font-family:var(--mono);font-size:11px;padding:3px 9px;border:1px solid}
+  .copy{font-family:var(--mono);font-size:10px;color:#374151;border:1px solid var(--line);background:#fff;
+        padding:3px 8px;cursor:pointer;margin-left:auto}
+  .copy:hover{border-color:var(--black)}
+  .spin{animation:pulse 1s infinite}
+  @keyframes pulse{50%{opacity:.35}}
+  @keyframes in{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
+  .empty{color:var(--gray);font-size:12px;font-family:var(--mono);padding:40px 0;text-align:center}
+  .foot{margin-top:26px;font-size:11px;color:var(--gray);line-height:1.5}
+  .foot code{font-family:var(--mono)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div>
+      <h1>Autonomous Support Desk</h1>
+      <p class="sub">
+        One agent platform, two tenants, run concurrently. Each ticket is handled by a single
+        <b>autonomous</b> agent on the OpenAI Agents SDK - it decides per ticket whether to search the
+        KB, look up an order, refund, resolve, or hand off to a billing specialist. Every decision is a
+        tool call, every call routes through the Respan <code>gateway</code>, and each ticket becomes one
+        nested <code>trace</code>. Each step below is tagged with the Respan service it uses.
+      </p>
+    </div>
+    <div style="display:flex;gap:8px;flex:none">
+      <button class="btn" id="run">▶ Run tickets</button>
+      <a class="link" href="https://platform.respan.ai/platform/dashboard" target="_blank" rel="noreferrer">Dashboard ↗</a>
+    </div>
+  </div>
+
+  <!-- Service links: jump straight to the platform page for each service this demo uses -->
+  <div class="services" id="services"></div>
+  <div class="svchint">↑ open the Respan page for each service this demo exercises</div>
+
+  <div class="grid" id="lanes"></div>
+  <div class="empty" id="empty">Press <b>Run tickets</b> to fire the desk.</div>
+
+  <div class="foot">
+    Each card = one ticket = one nested trace in Respan (<code>workflow → agent → turn → openai.chat / tool</code>).
+    Copy a card's <code>trace_id</code> to find it instantly in Traces; filter by tenant, outcome, or cost in the Views catalog.
+  </div>
+</div>
+
+<script>
+const P = "https://platform.respan.ai/platform";
+// The five services, with the platform page each one maps to.
+const SERVICES = {
+  trace:   {n:"①", label:"Tracing",     url:P+"/traces"},
+  gateway: {n:"②", label:"Gateway",     url:P+"/logs"},
+  embed:   {n:"③", label:"Embeddings",  url:P+"/logs"},
+  prompt:  {n:"④", label:"Prompt mgmt", url:P+"/prompts"},
+  dataset: {n:"⑤", label:"Datasets",    url:P+"/datasets"},
+};
+
+const ACCENT = {
+  blue:    {dot:"var(--blue)"},
+  emerald: {dot:"var(--emerald)"},
+};
+const RES = {
+  refunded:     {fg:"var(--indigo)",  bg:"var(--indigo-bg)",  bd:"var(--indigo-bd)"},
+  self_resolved:{fg:"var(--emerald)", bg:"var(--emerald-bg)", bd:"var(--emerald-bd)"},
+  escalated:    {fg:"var(--amber)",   bg:"var(--amber-bg)",   bd:"var(--amber-bd)"},
+};
+const accentFor = t => /globex/i.test(t) ? ACCENT.emerald : ACCENT.blue;
+
+const lanes = document.getElementById("lanes");
+const empty = document.getElementById("empty");
+const runBtn = document.getElementById("run");
+const cards = {};
+let es = null;
+
+// Render the service links at the top (these are the clickable ones).
+document.getElementById("services").innerHTML = Object.entries(SERVICES).map(([k,s]) =>
+  `<a class="svclink" data-svc="${k}" href="${s.url}" target="_blank" rel="noreferrer">${s.n} ${s.label} <span class="arrow">↗</span></a>`
+).join("");
+
+function esc(s){const d=document.createElement("div");d.textContent=s==null?"":String(s);return d.innerHTML;}
+
+// Per-step tag - NOT a link; hovering it highlights the matching top link.
+function svcChip(key){
+  const s = SERVICES[key]; if(!s) return "";
+  return `<span class="svc" data-svc="${key}" title="${esc(s.label)} - see the link up top">${s.n} ${esc(s.label)}</span>`;
+}
+
+// Hover a step's service tag → highlight the matching top service link.
+function hl(key, on){
+  const a = document.querySelector('.svclink[data-svc="'+key+'"]');
+  if(a) a.classList.toggle("hl", on);
+}
+lanes.addEventListener("mouseover", e => { const s = e.target.closest(".svc"); if(s) hl(s.dataset.svc, true); });
+lanes.addEventListener("mouseout",  e => { const s = e.target.closest(".svc"); if(s) hl(s.dataset.svc, false); });
+
+function makeCard(ev){
+  const a = accentFor(ev.tenant);
+  const el = document.createElement("div");
+  el.className = "card running";
+  el.innerHTML = `
+    <div class="hd">
+      <span class="dot" style="background:${a.dot}"></span>
+      <span class="tenant">${esc(ev.tenant)}</span>
+      <span class="tid">${esc(ev.ticket_id)}</span>
+    </div>
+    <div class="ticket">${esc(ev.ticket)}</div>
+    <div class="steps"></div>
+    <div class="ft" style="display:none"></div>`;
+  lanes.appendChild(el);
+  cards[ev.ticket_id] = {el, steps: el.querySelector(".steps"), ft: el.querySelector(".ft"), n:0};
+}
+
+// A numbered step row, tagged with the service it uses.
+function addStep(tid, glyph, html, svcKey, cls){
+  const c = cards[tid]; if(!c) return null;
+  const row = document.createElement("div");
+  row.className = "step";
+  row.innerHTML = `<span class="g ${cls||""}">${glyph}</span>`+
+                  `<span class="t">${html}</span>${svcChip(svcKey)}`;
+  c.steps.appendChild(row);
+  c.el.scrollIntoView({block:"nearest"});
+  return row;
+}
+
+function handle(ev){
+  if(ev.type === "ticket_start"){
+    empty.style.display="none";
+    makeCard(ev);
+    const v = ev.prompt === "managed" ? `managed prompt v${ev.prompt_version}` : "inline prompt";
+    addStep(ev.ticket_id, "▣", `<span class="muted">instructions ·</span> <span class="k">${esc(v)}</span>`, "prompt");
+    return;
+  }
+  const c = cards[ev.ticket_id];
+  if(ev.type === "agent"){
+    addStep(ev.ticket_id, "◆", `<span class="muted">agent ·</span> <span class="k">${esc(ev.agent)}</span>`, "gateway");
+  } else if(ev.type === "tool_call"){
+    const isKb = ev.tool === "search_kb";
+    c.lastTool = addStep(ev.ticket_id, "●", `<span class="k">${esc(ev.tool)}()</span>`, isKb ? "embed" : "trace", "spin");
+  } else if(ev.type === "tool_output"){
+    if(c && c.lastTool) c.lastTool.querySelector(".g").classList.remove("spin");
+    if(c){ const r=document.createElement("div"); r.className="result"; r.textContent=ev.output; c.steps.appendChild(r); }
+  } else if(ev.type === "handoff"){
+    addStep(ev.ticket_id, "→", `<span class="muted">handoff to billing specialist</span>`, "trace");
+  } else if(ev.type === "message"){
+    if(c){ const m=document.createElement("div"); m.className="msg"; m.textContent=ev.text; c.steps.appendChild(m); }
+  } else if(ev.type === "ticket_done"){
+    finishCard(ev);
+  } else if(ev.type === "all_done"){
+    stop();
+  } else if(ev.type === "error"){
+    addStep(ev.ticket_id || Object.keys(cards)[0], "✕", `<span style="color:var(--red)">${esc(ev.error)}</span>`, "trace");
+  }
+}
+
+function finishCard(ev){
+  const c = cards[ev.ticket_id]; if(!c) return;
+  c.el.classList.remove("running");
+  const r = RES[ev.resolution] || {fg:"var(--gray)",bg:"#fafafa",bd:"var(--line)"};
+  const tools = (ev.tools_used||[]).join(", ") || "-";
+  c.ft.style.display = "flex";
+  c.ft.innerHTML =
+    `<span class="badge" style="color:${r.fg};background:${r.bg};border-color:${r.bd}">${esc(ev.resolution)}</span>`+
+    `<span class="muted" style="font-size:11px;font-family:var(--mono)">tools: ${esc(tools)}</span>`+
+    (ev.trace_id ? `<button class="copy" title="Copy trace_id (${esc(ev.trace_id)})">trace_id ⧉</button>` : "");
+  if(ev.trace_id){
+    const btn = c.ft.querySelector(".copy");
+    btn.onclick = async () => {
+      try{ await navigator.clipboard.writeText(ev.trace_id); }
+      catch(e){ const ta=document.createElement("textarea"); ta.value=ev.trace_id; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); }
+      btn.textContent = "copied ✓";
+      setTimeout(()=>{ btn.textContent = "trace_id ⧉"; }, 1300);
+    };
+  }
+}
+
+function stop(){
+  if(es){ es.close(); es=null; }
+  runBtn.disabled = false; runBtn.textContent = "▶ Run again";
+}
+
+runBtn.onclick = () => {
+  stop();
+  lanes.innerHTML = ""; for(const k in cards) delete cards[k];
+  empty.style.display = "block"; empty.textContent = "Connecting…";
+  runBtn.disabled = true; runBtn.textContent = "● Running…";
+  es = new EventSource("/stream");
+  es.onmessage = (e) => { try{ handle(JSON.parse(e.data)); }catch(err){} };
+  es.onerror = () => { stop(); };
+};
+</script>
+</body>
+</html>

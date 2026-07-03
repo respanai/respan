@@ -1,0 +1,7 @@
+{
+  "summary": "Add first-party Azure OpenAI TypeScript instrumentation",
+  "packages": {
+    "@respan/instrumentation-azure-openai": "new",
+    "@respan/respan": "patch"
+  }
+}

@@ -25,6 +25,8 @@ from agents.tracing.span_data import (
     GuardrailSpanData,
     HandoffSpanData,
     ResponseSpanData,
+    TaskSpanData,
+    TurnSpanData,
 )
 from agents.tracing.spans import Span, SpanImpl
 from agents.tracing.traces import Trace
@@ -38,6 +40,7 @@ from respan_sdk.constants.llm_logging import (
     LOG_TYPE_GUARDRAIL,
     LOG_TYPE_HANDOFF,
     LOG_TYPE_RESPONSE,
+    LOG_TYPE_TASK,
     LOG_TYPE_TOOL,
     LOG_TYPE_WORKFLOW,
 )
@@ -99,6 +102,26 @@ def _base_attrs(
     """Build the common attribute dict shared by all emitters."""
     return {
         SpanAttributes.TRACELOOP_SPAN_KIND: span_kind,
+        SpanAttributes.TRACELOOP_ENTITY_NAME: entity_name,
+        SpanAttributes.TRACELOOP_ENTITY_PATH: entity_path,
+        RESPAN_LOG_TYPE: log_type,
+    }
+
+
+def _llm_base_attrs(
+    entity_name: str,
+    entity_path: str,
+    log_type: str,
+) -> Dict[str, Any]:
+    """Common attrs for an LLM span — deliberately WITHOUT a span kind.
+
+    Stamping ``traceloop.span.kind="task"`` on the LLM span makes the
+    backend file it as a generic task, so ``total_cost``/``total_tokens``
+    never roll up ($0). Omitting the kind (the span stays processable via
+    its ``traceloop.entity.path``) lets the backend classify it as a
+    ``chat`` LLM call off ``llm.request.type``/``gen_ai.system``.
+    """
+    return {
         SpanAttributes.TRACELOOP_ENTITY_NAME: entity_name,
         SpanAttributes.TRACELOOP_ENTITY_PATH: entity_path,
         RESPAN_LOG_TYPE: log_type,
@@ -218,8 +241,7 @@ def emit_agent(item: SpanImpl, span_data: AgentSpanData) -> None:
 def emit_response(item: SpanImpl, span_data: ResponseSpanData) -> None:
     """Emit a ResponseSpanData span (the actual LLM call)."""
     start_ns, end_ns = _resolve_timestamps(item)
-    attrs = _base_attrs(
-        span_kind="task",
+    attrs = _llm_base_attrs(
         entity_name="response",
         entity_path="response",
         log_type=LOG_TYPE_RESPONSE,
@@ -307,13 +329,13 @@ def emit_function(item: SpanImpl, span_data: FunctionSpanData) -> None:
 def emit_generation(item: SpanImpl, span_data: GenerationSpanData) -> None:
     """Emit a GenerationSpanData span."""
     start_ns, end_ns = _resolve_timestamps(item)
-    attrs = _base_attrs(
-        span_kind="task",
+    attrs = _llm_base_attrs(
         entity_name="generation",
         entity_path="generation",
         log_type=LOG_TYPE_GENERATION,
     )
     attrs[LLM_REQUEST_TYPE] = LLMRequestTypeValues.CHAT.value
+    attrs[GEN_AI_SYSTEM] = "openai"
 
     if span_data.model:
         attrs[LLM_REQUEST_MODEL] = span_data.model
@@ -445,6 +467,72 @@ def emit_custom(item: SpanImpl, span_data: CustomSpanData) -> None:
     inject_span(span)
 
 
+def _emit_structural(
+    item: SpanImpl,
+    span_data: Any,
+    name: str,
+    log_type: str,
+    agent_name: str = None,
+) -> None:
+    """Emit a structural parent span (Task/Turn).
+
+    These are the SDK's tree scaffolding — one ``TaskSpanData`` per
+    ``Runner.run`` and one ``TurnSpanData`` per agent-loop turn. Without
+    them the agent/LLM/tool children orphan onto the trace root and the
+    backend renders the trace **flat**. Emitting them with the SDK's real
+    ``span_id``/``parent_id`` re-nests the tree.
+    """
+    start_ns, end_ns = _resolve_timestamps(item)
+    attrs = _base_attrs(
+        span_kind="task",
+        entity_name=name,
+        entity_path=name,
+        log_type=log_type,
+    )
+    if agent_name:
+        attrs[RESPAN_METADATA_AGENT_NAME] = agent_name
+
+    usage = getattr(span_data, "usage", None) or {}
+    if usage:
+        attrs[LLM_USAGE_PROMPT_TOKENS] = (
+            usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+        )
+        attrs[LLM_USAGE_COMPLETION_TOKENS] = (
+            usage.get("completion_tokens") or usage.get("output_tokens") or 0
+        )
+
+    span = build_readable_span(
+        name=f"{name}.task",
+        trace_id=item.trace_id,
+        span_id=item.span_id,
+        parent_id=item.parent_id or item.trace_id,
+        start_time_ns=start_ns,
+        end_time_ns=end_ns,
+        attributes=attrs,
+        status_code=400 if item.error else 200,
+        error_message=str(item.error) if item.error else None,
+    )
+    inject_span(span)
+
+
+def emit_task(item: SpanImpl, span_data: TaskSpanData) -> None:
+    """Emit a TaskSpanData span (one top-level Runner run)."""
+    _emit_structural(
+        item, span_data, span_data.name or "agent-run", LOG_TYPE_WORKFLOW
+    )
+
+
+def emit_turn(item: SpanImpl, span_data: TurnSpanData) -> None:
+    """Emit a TurnSpanData span (one agent-loop turn)."""
+    _emit_structural(
+        item,
+        span_data,
+        f"turn-{span_data.turn}",
+        LOG_TYPE_TASK,
+        span_data.agent_name,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
@@ -457,6 +545,8 @@ _EMITTERS = {
     HandoffSpanData: emit_handoff,
     GuardrailSpanData: emit_guardrail,
     CustomSpanData: emit_custom,
+    TaskSpanData: emit_task,
+    TurnSpanData: emit_turn,
 }
 
 

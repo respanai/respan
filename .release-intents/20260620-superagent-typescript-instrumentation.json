@@ -1,0 +1,6 @@
+{
+  "summary": "Add Superagent TypeScript instrumentation package",
+  "packages": {
+    "@respan/instrumentation-superagent": "new"
+  }
+}

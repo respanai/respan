@@ -1,0 +1,6 @@
+{
+  "summary": "Add TypeScript Vertex AI instrumentation package",
+  "packages": {
+    "@respan/instrumentation-vertexai": "new"
+  }
+}

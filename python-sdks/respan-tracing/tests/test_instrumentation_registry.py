@@ -68,6 +68,21 @@ class TestEnumToEntryPoint:
         """GRPC maps to grpc_client entry point."""
         assert _enum_to_entry_point_name(Instruments.GRPC) == "grpc_client"
 
+    def test_bedrock_and_vertexai_map_to_sdk_entry_points(self):
+        """Bedrock/Vertex AI register under their SDK package name in Traceloop,
+        so block_instruments must resolve to boto3 / google_cloud_aiplatform to
+        dedup the native plugins' OTEL twins (respan-ai auto-instrument path)."""
+        assert _enum_to_entry_point_name(Instruments.BEDROCK) == "boto3"
+        assert (
+            _enum_to_entry_point_name(Instruments.VERTEXAI)
+            == "google_cloud_aiplatform"
+        )
+        # Google GenAI already matches by convention — must stay a direct match.
+        assert (
+            _enum_to_entry_point_name(Instruments.GOOGLE_GENERATIVEAI)
+            == "google_generativeai"
+        )
+
     def test_aiohttp_direct_match(self):
         """AIOHTTP_CLIENT maps directly — enum value equals entry point name."""
         assert _enum_to_entry_point_name(Instruments.AIOHTTP_CLIENT) == "aiohttp_client"

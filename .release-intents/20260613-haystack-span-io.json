@@ -1,0 +1,6 @@
+{
+  "summary": "Fix Haystack instrumentation span input and output normalization",
+  "packages": {
+    "respan-instrumentation-haystack": "patch"
+  }
+}

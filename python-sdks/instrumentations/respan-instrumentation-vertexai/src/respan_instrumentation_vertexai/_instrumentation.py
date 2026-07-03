@@ -271,9 +271,19 @@ class VertexAIInstrumentor:
 
         try:
             GenerativeModel, ChatSession = _load_vertexai_classes()
-        except (AttributeError, ImportError) as exc:
+        except ImportError as exc:
+            # SDK genuinely absent - expected when the app doesn't use Vertex AI
+            # (the google-cloud-aiplatform SDK is an optional extra).
+            logger.debug(
+                "Vertex AI instrumentation inactive - missing dependency: %s",
+                exc,
+            )
+            return
+        except AttributeError as exc:
+            # SDK installed but incompatible (a class moved/renamed) - surface it
+            # so a broken install isn't silently left untraced.
             logger.warning(
-                "Failed to activate Vertex AI instrumentation - missing dependency: %s",
+                "google-cloud-aiplatform is installed but incompatible - Vertex AI instrumentation inactive: %s",
                 exc,
             )
             return

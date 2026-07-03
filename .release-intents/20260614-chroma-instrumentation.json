@@ -1,0 +1,6 @@
+{
+  "summary": "Add Chroma instrumentation",
+  "packages": {
+    "respan-instrumentation-chroma": "new"
+  }
+}
