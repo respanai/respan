@@ -1,7 +1,10 @@
 {
   "mcpServers": {
     "respan": {
-      "url": "https://mcp.respan.ai/mcp"
+      "url": "https://mcp.respan.ai/mcp",
+      "auth": {
+        "CLIENT_ID": "enc_mQcqjLKvweUikLjRuWfTCem2CVwhJl39wSNfEOmSpuW7Pd02UtUaoL4vR5JdIwXelPmuap6S6Bmow7L3MY4Z_vbKz375X6T71R7sRdTBxPoDrYsCepi-7kqNGwPLwx9a9ucFaqAff1hPF4lNfXj6oeHSKspd8ci7TgU-Y813M_ZZ2P7qcKpjcsWuv2vZJsiZUyNL5rTIDdwbKGQXCCM7f8P_EPuhE5HC6yJ_O0rDy4Y1572C0eECAQusDgBoV5p7HG3LNhGkqsph2-APkgnU9IMgUNrFxofF"
+      }
     }
   }
 }

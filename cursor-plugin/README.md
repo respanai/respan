@@ -63,24 +63,38 @@ node scripts/build-plugins.mjs
 
 ## Authentication
 
-`mcp.json` points at the hosted server and carries no credentials at all:
+Sign-in is OAuth. There is no API key to paste, and no secret in this repo.
 
-```json
-{ "mcpServers": { "respan": { "url": "https://mcp.respan.ai/mcp" } } }
-```
+`mcp.respan.ai` is a spec-compliant OAuth 2.1 resource server: an unauthenticated
+request returns `401` with a `WWW-Authenticate` header pointing at
+`/.well-known/oauth-protected-resource`, and the authorization-server metadata
+advertises `/authorize`, `/token`, and `/register` with PKCE (`S256`) against
+public clients (`token_endpoint_auth_methods_supported: ["none"]`).
 
-That is the whole config. `mcp.respan.ai` is a spec-compliant OAuth 2.1 resource
-server: an unauthenticated request returns `401` with a `WWW-Authenticate` header
-pointing at `/.well-known/oauth-protected-resource`, and the authorization-server
-metadata advertises `/authorize`, `/token`, and `/register` with PKCE (`S256`).
-Because it supports Dynamic Client Registration and public clients
-(`token_endpoint_auth_methods_supported: ["none"]`), Cursor registers itself on
-the fly and runs a browser consent flow.
+`mcp.json` therefore declares an `auth` block with a pre-registered `CLIENT_ID`
+and nothing else — no `CLIENT_SECRET` (Respan is a public client; the flow is
+PKCE-protected) and no `scopes` (the server advertises no `scopes_supported`, so
+there is nothing for Cursor to request).
 
-The upshot: **no API key in the manifest, no client secret, nothing for the user
-to paste.** The Claude Code plugin still ships the API-key path
-(`userConfig.api_key`) because Claude Code prompts for secrets at install time;
-Cursor has no equivalent, and OAuth is the better flow anyway.
+> **Why the `auth` block, given the server supports Dynamic Client Registration?**
+> Cursor's docs imply DCR is automatic and an `auth` block is only needed when the
+> provider lacks it. In practice that is not true for **plugin-supplied** MCP
+> servers: with a bare `{ "url": ... }` config, Cursor never initiates OAuth off
+> the `401` + `WWW-Authenticate` challenge, exposes no login affordance in MCP
+> settings, and every tool call 401s. Adding the `auth` block is what surfaces the
+> login flow. Don't "simplify" this back down to a bare URL — it silently breaks
+> authentication.
+
+The `CLIENT_ID` is a public-client identifier, not a credential, so committing it
+is safe. It was minted once against the server's `/register` endpoint with
+Cursor's two redirect URIs baked in
+(`https://www.cursor.com/agents/mcp/oauth/callback` for web,
+`http://localhost:8787/callback` for desktop). The server validates redirect URIs
+against the ones sealed into the ID and rejects anything else.
+
+The Claude Code plugin still ships the API-key path (`userConfig.api_key`)
+because Claude Code prompts for secrets at install time; Cursor has no
+equivalent, and OAuth is the better flow anyway.
 
 ## Test locally
 
