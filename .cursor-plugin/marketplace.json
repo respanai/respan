@@ -1,0 +1,17 @@
+{
+  "name": "respan",
+  "owner": {
+    "name": "Respan"
+  },
+  "metadata": {
+    "description": "The Respan plugin for Cursor.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "respan",
+      "source": "./cursor-plugin",
+      "description": "Respan for Cursor: tracing, evals, prompts, datasets, and gateway routing."
+    }
+  ]
+}

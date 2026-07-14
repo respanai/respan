@@ -31,31 +31,36 @@ directory, so `respanai/respan` resolves as a marketplace on its own:
 ```
 <repo root>/
 ├── .claude-plugin/
-│   └── marketplace.json    # marketplace entry → source: "./plugin"
-└── plugin/
+│   └── marketplace.json    # marketplace entry → source: "./claude-plugin"
+├── scripts/
+│   └── build-plugins.mjs   # copies the shared skill into each plugin (see below)
+└── claude-plugin/
     ├── .claude-plugin/
     │   └── plugin.json     # plugin manifest: name, version, api_key user config
     ├── .mcp.json           # connects the hosted MCP server at mcp.respan.ai
-    ├── scripts/
-    │   └── build-plugin.mjs  # copies the shared skill into skills/ (see below)
     └── skills/
         └── respan/         # GENERATED — do not hand-edit
             ├── SKILL.md
             └── references/*.md
 ```
 
+> The sibling `cursor-plugin/` packages the same skill for Cursor. Both are
+> generated from `respan/skills/` by the same build script.
+
 ## Single source of truth
 
 The skill lives in exactly one place: `respan/skills/` at the monorepo root.
-`scripts/build-plugin.mjs` copies it into `plugin/skills/respan/` at build time
-and prepends the YAML frontmatter a plugin skill needs. This mirrors the CLI's
-`generate:skill-refs` step — one skill, assembled into each distribution (CLI
-bundle and this plugin). **Never edit `plugin/skills/` by hand**; edit
-`respan/skills/` and re-run the build. The generated files are committed so the
-published plugin is self-contained (marketplaces copy the plugin directory).
+`scripts/build-plugins.mjs` copies it into each plugin's `skills/respan/` at
+build time and prepends the YAML frontmatter a plugin skill needs. This mirrors
+the CLI's `generate:skill-refs` step — one skill, assembled into each
+distribution (CLI bundle, this plugin, and the Cursor plugin in
+`../cursor-plugin/`, which uses the identical skill format). **Never edit
+`claude-plugin/skills/` by hand**; edit `respan/skills/` and re-run the build.
+The generated files are committed so the published plugin is self-contained
+(marketplaces copy the plugin directory).
 
 ```bash
-node plugin/scripts/build-plugin.mjs
+node scripts/build-plugins.mjs
 ```
 
 Wire this into the release process so the plugin skill can never drift from the
@@ -66,7 +71,7 @@ CLI's copy.
 From the monorepo root, load the plugin directly without a marketplace:
 
 ```bash
-claude --plugin-dir ./plugin
+claude --plugin-dir ./claude-plugin
 ```
 
 You'll be prompted for a Respan API key (create one at https://platform.respan.ai).
@@ -97,7 +102,7 @@ sign-in; API-key config is what this plugin ships with first.
 ## Distribution
 
 The repo root ships a `.claude-plugin/marketplace.json` that references this
-plugin via `source: "./plugin"`, so `respanai/respan` resolves as a marketplace
+plugin via `source: "./claude-plugin"`, so `respanai/respan` resolves as a marketplace
 directly — that's the self-hosted install path shown under [Install](#install)
 above, and it's the canonical way to get the plugin. It needs no Anthropic review
 and updates the moment you push.
@@ -105,7 +110,7 @@ and updates the moment you push.
 To also list it in Anthropic's community catalog for discoverability at
 https://claude.com/plugins:
 
-1. `node plugin/scripts/build-plugin.mjs` and commit the result.
+1. `node scripts/build-plugins.mjs` and commit the result.
 2. `claude plugin validate . --strict` (from the repo root).
 3. Submit at https://platform.claude.com/plugins/submit, pointing at
    `respanai/respan`. Anthropic runs automated validation + safety screening,

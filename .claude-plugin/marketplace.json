@@ -6,7 +6,7 @@
   "plugins": [
     {
       "name": "respan",
-      "source": "./plugin",
+      "source": "./claude-plugin",
       "description": "Respan for Claude Code: tracing, evals, prompts, datasets, and gateway routing."
     }
   ]

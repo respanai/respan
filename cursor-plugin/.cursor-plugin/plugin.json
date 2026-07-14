@@ -1,0 +1,22 @@
+{
+  "name": "respan",
+  "displayName": "Respan",
+  "version": "0.1.0",
+  "description": "Respan for Cursor: tracing, evals, prompts, datasets, and gateway routing, backed by the hosted Respan MCP server.",
+  "author": {
+    "name": "Respan"
+  },
+  "homepage": "https://respan.ai",
+  "repository": "https://github.com/respanai/respan",
+  "license": "Apache-2.0",
+  "keywords": [
+    "llm",
+    "observability",
+    "tracing",
+    "evals",
+    "prompts",
+    "gateway",
+    "mcp"
+  ],
+  "logo": "assets/logo.svg"
+}
