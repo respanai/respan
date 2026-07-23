@@ -1,0 +1,8 @@
+{
+  "summary": "Disable npm lifecycle scripts for lockfile-based installs",
+  "packages": {
+    "@respan/respan": "none",
+    "@respan/respan-sdk": "none",
+    "@respan/tracing": "none"
+  }
+}
