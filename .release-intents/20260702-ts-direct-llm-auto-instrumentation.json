@@ -1,0 +1,10 @@
+{
+  "summary": "Expand the TypeScript Respan facade auto-discovery path to use a direct LLM instrumentation registry, report known non-direct TypeScript instrumentations as disabled-by-default, include Vertex AI and OpenRouter direct-provider instrumentors, resolve auto-discovered instrumentation and mutable SDK modules from the application runtime, prevent duplicate OpenAI and Azure OpenAI spans when both instrumentors are active, and make OpenRouter installable outside the workspace",
+  "packages": {
+    "@respan/respan": "minor",
+    "@respan/instrumentation-openai": "patch",
+    "@respan/instrumentation-azure-openai": "patch",
+    "@respan/instrumentation-vertexai": "patch",
+    "@respan/instrumentation-openrouter": "patch"
+  }
+}

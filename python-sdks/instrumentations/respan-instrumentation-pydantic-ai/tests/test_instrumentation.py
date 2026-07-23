@@ -1,3 +1,5 @@
+import builtins
+import json
 import logging
 import sys
 from types import ModuleType, SimpleNamespace
@@ -5,11 +7,46 @@ from types import ModuleType, SimpleNamespace
 from opentelemetry import trace
 from opentelemetry.semconv_ai import SpanAttributes
 
-from respan_instrumentation_pydantic_ai import PydanticAIInstrumentor
+from respan_instrumentation_pydantic_ai import PydanticAIInstrumentor, _processor
 from respan_instrumentation_pydantic_ai._processor import (
     PydanticAISpanProcessor,
     enrich_pydantic_ai_span,
 )
+
+_BANNED_ALIASES = {
+    SpanAttributes.TRACELOOP_SPAN_KIND,
+    "respan.span.tools",
+    "respan.span.tool_calls",
+    "respan.span.handoffs",
+    "tools",
+    "tool_calls",
+    "model",
+    "prompt_tokens",
+    "completion_tokens",
+    "total_request_tokens",
+    "span_tools",
+    "span_workflow_name",
+    "input",
+    "output",
+    "has_tool_calls",
+    "parallel_tool_calls",
+}
+
+
+def _assert_otel_safe_attrs(attrs):
+    for key, value in attrs.items():
+        assert value is not None, key
+        if isinstance(value, (list, tuple)):
+            assert all(
+                isinstance(item, (str, bool, int, float, bytes)) for item in value
+            ), key
+            continue
+        assert isinstance(value, (str, bool, int, float, bytes)), key
+
+
+def _assert_no_banned_aliases(attrs):
+    assert _BANNED_ALIASES.isdisjoint(attrs)
+    _assert_otel_safe_attrs(attrs)
 
 
 def _make_fake_tracer_provider():
@@ -68,7 +105,6 @@ def test_activate_instruments_all_agents_and_restores_previous_global(monkeypatc
     instrumentor = PydanticAIInstrumentor(
         include_content=False,
         include_binary_content=False,
-        version=4,
     )
     instrumentor.activate()
 
@@ -78,7 +114,7 @@ def test_activate_instruments_all_agents_and_restores_previous_global(monkeypatc
     assert settings.kwargs["tracer_provider"] is tracer_provider
     assert settings.kwargs["include_content"] is False
     assert settings.kwargs["include_binary_content"] is False
-    assert settings.kwargs["version"] == 4
+    assert settings.kwargs["version"] == 5
 
     active_processors = getattr(
         tracer_provider._active_span_processor, "_span_processors", ()
@@ -131,19 +167,16 @@ def test_enrich_pydantic_ai_tool_span_maps_tool_fields():
 
     assert span._attributes["respan.entity.log_type"] == "tool"
     assert span._attributes["respan.entity.log_method"] == "tracing_integration"
-    assert span._attributes[SpanAttributes.TRACELOOP_SPAN_KIND] == "tool"
     assert span._attributes[SpanAttributes.TRACELOOP_ENTITY_NAME] == "add"
     assert span._attributes[SpanAttributes.TRACELOOP_ENTITY_PATH] == "add"
     assert span._attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT] == '{"a":1,"b":2}'
     assert span._attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] == "3"
-    assert span._attributes["span_tools"] == ["add"]
-    assert span._attributes["input"] == '{"a":1,"b":2}'
-    assert span._attributes["output"] == "3"
-    assert span._attributes["model"] == "gpt-4o-mini"
-    assert span._attributes["prompt_tokens"] == 11
-    assert span._attributes["completion_tokens"] == 7
-    assert span._attributes["total_request_tokens"] == 18
+    assert span._attributes[SpanAttributes.LLM_REQUEST_MODEL] == "gpt-4o-mini"
+    assert span._attributes[SpanAttributes.LLM_USAGE_PROMPT_TOKENS] == 11
+    assert span._attributes[SpanAttributes.LLM_USAGE_COMPLETION_TOKENS] == 7
+    assert span._attributes[SpanAttributes.LLM_USAGE_TOTAL_TOKENS] == 18
     assert "gen_ai.tool.name" not in span._attributes
+    _assert_no_banned_aliases(span._attributes)
 
 
 def test_enrich_pydantic_ai_agent_span_sets_workflow_name_and_response_format():
@@ -152,7 +185,22 @@ def test_enrich_pydantic_ai_agent_span_sets_workflow_name_and_response_format():
         _attributes={
             "gen_ai.system": "openai",
             "gen_ai.agent.name": "weather",
-            "model_request_parameters": '{"output_mode":"native","output_object":{"name":"WeatherAnswer","json_schema":{"type":"object"}}}',
+            "model_request_parameters": json.dumps(
+                {
+                    "output_mode": "native",
+                    "output_object": {
+                        "name": "WeatherAnswer",
+                        "json_schema": {"type": "object"},
+                    },
+                    "function_tools": [
+                        {
+                            "name": "lookup_weather",
+                            "description": "Look up the weather.",
+                            "parameters_json_schema": {"type": "object"},
+                        }
+                    ],
+                }
+            ),
             "gen_ai.request.model": "gpt-4o-mini",
         },
     )
@@ -160,13 +208,21 @@ def test_enrich_pydantic_ai_agent_span_sets_workflow_name_and_response_format():
     enrich_pydantic_ai_span(span)
 
     assert span._attributes["respan.entity.log_type"] == "agent"
-    assert span._attributes[SpanAttributes.TRACELOOP_SPAN_KIND] == "agent"
     assert span._attributes[SpanAttributes.TRACELOOP_ENTITY_NAME] == "weather"
     assert span._attributes[SpanAttributes.TRACELOOP_ENTITY_PATH] == "weather"
     assert span._attributes[SpanAttributes.TRACELOOP_WORKFLOW_NAME] == "weather"
-    assert span._attributes["span_workflow_name"] == "weather"
-    assert span._attributes["model"] == "gpt-4o-mini"
-    assert span._attributes["response_format"] == {
+    assert span._attributes[SpanAttributes.LLM_REQUEST_MODEL] == "gpt-4o-mini"
+    assert json.loads(span._attributes[SpanAttributes.LLM_REQUEST_FUNCTIONS]) == [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup_weather",
+                "description": "Look up the weather.",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+    assert json.loads(span._attributes["response_format"]) == {
         "type": "json_schema",
         "json_schema": {
             "schema": {"type": "object"},
@@ -174,6 +230,7 @@ def test_enrich_pydantic_ai_agent_span_sets_workflow_name_and_response_format():
         },
     }
     assert "gen_ai.agent.name" not in span._attributes
+    _assert_no_banned_aliases(span._attributes)
 
 
 def test_enrich_pydantic_ai_chat_span_maps_messages():
@@ -190,13 +247,113 @@ def test_enrich_pydantic_ai_chat_span_maps_messages():
     enrich_pydantic_ai_span(span)
 
     assert span._attributes["respan.entity.log_type"] == "chat"
-    assert span._attributes[SpanAttributes.TRACELOOP_SPAN_KIND] == "chat"
+    assert span._attributes[SpanAttributes.LLM_REQUEST_TYPE] == "chat"
     assert span._attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT] == (
         '[{"role": "user", "content": "hi"}]'
     )
     assert span._attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] == (
-        '[{"role": "assistant", "content": "hello"}]'
+        '{"role": "assistant", "content": "hello"}'
     )
+    assert span._attributes[f"{SpanAttributes.LLM_PROMPTS}.0.role"] == "user"
+    assert span._attributes[f"{SpanAttributes.LLM_PROMPTS}.0.content"] == "hi"
+    assert span._attributes[f"{SpanAttributes.LLM_COMPLETIONS}.0.role"] == "assistant"
+    assert span._attributes[f"{SpanAttributes.LLM_COMPLETIONS}.0.content"] == "hello"
+    _assert_no_banned_aliases(span._attributes)
+
+
+def test_enrich_pydantic_ai_chat_span_flattens_structured_message_parts():
+    span = SimpleNamespace(
+        name="chat gemini/gemini-2.5-flash",
+        _attributes={
+            "gen_ai.system": "openai",
+            "gen_ai.operation.name": "chat",
+            "model_request_parameters": json.dumps({"output_mode": "text"}),
+            "gen_ai.input.messages": json.dumps(
+                [
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "text",
+                                "content": "You are a helpful assistant.",
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "content": "What is the capital of France?",
+                            }
+                        ],
+                    },
+                ]
+            ),
+            "gen_ai.output.messages": json.dumps(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "content": "The capital of France is Paris.",
+                        }
+                    ],
+                }
+            ),
+        },
+    )
+
+    enrich_pydantic_ai_span(span)
+
+    assert json.loads(span._attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT]) == [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "What is the capital of France?"},
+    ]
+    assert json.loads(span._attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]) == {
+        "role": "assistant",
+        "content": "The capital of France is Paris.",
+    }
+    assert span._attributes[f"{SpanAttributes.LLM_PROMPTS}.0.role"] == "system"
+    assert span._attributes[f"{SpanAttributes.LLM_PROMPTS}.0.content"] == (
+        "You are a helpful assistant."
+    )
+    assert span._attributes[f"{SpanAttributes.LLM_PROMPTS}.1.role"] == "user"
+    assert span._attributes[f"{SpanAttributes.LLM_PROMPTS}.1.content"] == (
+        "What is the capital of France?"
+    )
+    assert span._attributes[f"{SpanAttributes.LLM_COMPLETIONS}.0.role"] == (
+        "assistant"
+    )
+    assert span._attributes[f"{SpanAttributes.LLM_COMPLETIONS}.0.content"] == (
+        "The capital of France is Paris."
+    )
+    assert json.loads(span._attributes["response_format"]) == {"type": "text"}
+    _assert_no_banned_aliases(span._attributes)
+
+
+def test_enrich_pydantic_ai_response_operation_maps_as_chat_span():
+    span = SimpleNamespace(
+        name="openai.responses.create",
+        _attributes={
+            "gen_ai.system": "openai",
+            "gen_ai.operation.name": "response",
+            "gen_ai.input.messages": '[{"role":"user","content":"hi"}]',
+            "gen_ai.output.messages": '[{"role":"assistant","content":"hello"}]',
+        },
+    )
+
+    enrich_pydantic_ai_span(span)
+
+    assert span._attributes["respan.entity.log_type"] == "chat"
+    assert span._attributes[SpanAttributes.LLM_REQUEST_TYPE] == "chat"
+    assert span._attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT] == (
+        '[{"role": "user", "content": "hi"}]'
+    )
+    assert span._attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] == (
+        '{"role": "assistant", "content": "hello"}'
+    )
+    _assert_no_banned_aliases(span._attributes)
 
 
 def test_enrich_pydantic_ai_running_tools_span_maps_task_fields():
@@ -211,13 +368,31 @@ def test_enrich_pydantic_ai_running_tools_span_maps_task_fields():
     enrich_pydantic_ai_span(span)
 
     assert span._attributes["respan.entity.log_type"] == "task"
-    assert span._attributes[SpanAttributes.TRACELOOP_SPAN_KIND] == "task"
     assert span._attributes[SpanAttributes.TRACELOOP_ENTITY_NAME] == "running_tools"
     assert span._attributes[SpanAttributes.TRACELOOP_ENTITY_PATH] == "running_tools"
-    assert span._attributes["span_tools"] == ["add", "multiply"]
+    _assert_no_banned_aliases(span._attributes)
 
 
-def test_activate_logs_warning_when_dependencies_are_missing(caplog):
+def test_extract_usage_ignores_non_usage_agent_name():
+    assert _processor._extract_usage(
+        {
+            "gen_ai.agent.name": 999,
+            "gen_ai.usage.input_tokens": 2,
+            "gen_ai.usage.output_tokens": 3,
+        }
+    ) == (2, 3, 5)
+
+
+def test_activate_logs_warning_when_dependencies_are_missing(monkeypatch, caplog):
+    real_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name in {"pydantic_ai.agent", "pydantic_ai.models.instrumented"}:
+            raise ImportError("missing pydantic ai")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
     instrumentor = PydanticAIInstrumentor()
 
     with caplog.at_level(logging.WARNING):

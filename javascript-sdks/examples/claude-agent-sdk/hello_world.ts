@@ -30,5 +30,3 @@ for await (const event of result) {
     console.log(event.result);
   }
 }
-
-await respan.flush();

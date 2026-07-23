@@ -1,0 +1,7 @@
+{
+  "summary": "Keep JS instrumentations compatible with latest Traceloop semantic conventions",
+  "packages": {
+    "@respan/instrumentation-azure-openai": "patch",
+    "@respan/instrumentation-llama-index": "patch"
+  }
+}

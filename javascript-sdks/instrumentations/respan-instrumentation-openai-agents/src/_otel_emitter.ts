@@ -9,11 +9,25 @@
 import { trace, SpanKind, SpanStatusCode } from "@opentelemetry/api";
 import { hrTime, hrTimeDuration } from "@opentelemetry/core";
 import { ReadableSpan } from "@opentelemetry/sdk-trace-base";
-import { SpanAttributes } from "@traceloop/ai-semantic-conventions";
+import {
+  ATTR_GEN_AI_USAGE_INPUT_TOKENS,
+  ATTR_GEN_AI_USAGE_OUTPUT_TOKENS,
+} from "@opentelemetry/semantic-conventions/incubating";
+import {
+  LLMRequestTypeValues,
+  SpanAttributes,
+} from "@traceloop/ai-semantic-conventions";
 import { RespanLogType, RespanSpanAttributes } from "@respan/respan-sdk";
 import type { Span, Trace } from "@openai/agents";
 
-const PACKAGE_VERSION = "1.0.3";
+const PACKAGE_VERSION = "1.0.6";
+const GEN_AI_USAGE_INPUT_TOKENS = ATTR_GEN_AI_USAGE_INPUT_TOKENS;
+const GEN_AI_USAGE_OUTPUT_TOKENS = ATTR_GEN_AI_USAGE_OUTPUT_TOKENS;
+const LLM_USAGE_CACHE_READ_INPUT_TOKENS = "llm.usage.cache_read_input_tokens";
+const GEN_AI_COMPLETION_PREFIX = `${SpanAttributes.LLM_COMPLETIONS}.0`;
+const GEN_AI_COMPLETION_ROLE = `${GEN_AI_COMPLETION_PREFIX}.role`;
+const GEN_AI_COMPLETION_CONTENT = `${GEN_AI_COMPLETION_PREFIX}.content`;
+const GEN_AI_COMPLETION_TOOL_CALLS = `${GEN_AI_COMPLETION_PREFIX}.tool_calls`;
 
 function safeJson(obj: any): string {
   try {
@@ -104,12 +118,20 @@ function contentBlocksToText(contentBlocks: any): string {
     }
 
     const blockType = (block as any).type ?? "";
-    if (blockType === "input_image") {
+    if (blockType === "input_image" || blockType === "image") {
       textParts.push("[image]");
       continue;
     }
-    if (blockType === "input_file") {
+    if (blockType === "input_file" || blockType === "file") {
       textParts.push("[file]");
+      continue;
+    }
+    if (blockType === "audio" || blockType === "input_audio") {
+      textParts.push("[audio]");
+      continue;
+    }
+    if (blockType === "refusal" && typeof (block as any).refusal === "string") {
+      textParts.push((block as any).refusal);
       continue;
     }
     if (typeof (block as any).text === "string") {
@@ -168,6 +190,42 @@ function stringifyToolResult(value: any): string {
   return stringifyStructured(serialized);
 }
 
+function normalizeToolSpanOutput(value: any): any {
+  const serialized = toSerializableValue(value);
+  if (serialized === undefined || serialized === null) {
+    return "";
+  }
+  if (typeof serialized === "string") {
+    return serialized;
+  }
+  if (Array.isArray(serialized)) {
+    const text = contentBlocksToText(serialized);
+    return text || serialized;
+  }
+  if (typeof serialized === "object") {
+    const blockType = (serialized as any).type ?? "";
+    if (
+      (blockType === "text" ||
+        blockType === "output_text" ||
+        blockType === "input_text") &&
+      typeof (serialized as any).text === "string"
+    ) {
+      return (serialized as any).text;
+    }
+    if (blockType === "image") return "[image]";
+    if (blockType === "file") return "[file]";
+    if (
+      (serialized as any).output !== undefined ||
+      (serialized as any).result !== undefined
+    ) {
+      return normalizeToolSpanOutput(
+        (serialized as any).output ?? (serialized as any).result,
+      );
+    }
+  }
+  return serialized;
+}
+
 function setJsonStructuredAttr(
   attrs: Record<string, any>,
   key: string,
@@ -185,20 +243,32 @@ function normalizeToolCall(rawToolCall: any): Record<string, any> | null {
     return null;
   }
 
+  const toolCallType = String((toolCall as any).type ?? "");
   const functionName =
     (toolCall as any).name ??
     (toolCall as any).function?.name ??
+    (toolCall as any).functionName ??
+    (toolCall as any).toolName ??
+    (toolCallType.endsWith("_call") ? toolCallType : "") ??
     "";
   const functionArguments =
     (toolCall as any).arguments ??
     (toolCall as any).function?.arguments ??
+    (toolCall as any).action ??
+    (toolCall as any).actions ??
+    (toolCall as any).operation ??
     "";
 
-  if (!functionName && !(toolCall as any).function && (toolCall as any).type !== "function_call") {
+  if (
+    !functionName &&
+    !(toolCall as any).function &&
+    toolCallType !== "function_call" &&
+    !toolCallType.endsWith("_call")
+  ) {
     return null;
   }
 
-  return {
+  const normalized: Record<string, any> = {
     id:
       (toolCall as any).call_id ??
       (toolCall as any).callId ??
@@ -211,6 +281,16 @@ function normalizeToolCall(rawToolCall: any): Record<string, any> | null {
       arguments: stringifyStructured(functionArguments),
     },
   };
+  if ((toolCall as any).namespace !== undefined) {
+    normalized.function.namespace = (toolCall as any).namespace;
+  }
+  if ((toolCall as any).status !== undefined) {
+    normalized.status = (toolCall as any).status;
+  }
+  if (toolCallType && toolCallType !== "function_call" && toolCallType !== "function") {
+    normalized.openai_agents_type = toolCallType;
+  }
+  return normalized;
 }
 
 function extractToolCalls(output: any): Record<string, any>[] {
@@ -225,8 +305,27 @@ function extractToolCalls(output: any): Record<string, any>[] {
       continue;
     }
 
+    if (Array.isArray((item as any).choices)) {
+      for (const choice of (item as any).choices) {
+        if ((choice as any)?.message?.tool_calls) {
+          for (const toolCall of (choice as any).message.tool_calls) {
+            const normalized = normalizeToolCall(toolCall);
+            if (normalized) result.push(normalized);
+          }
+        }
+      }
+    }
+
     const itemType = (item as any).type ?? "";
-    if (itemType === "function_call" || itemType === "function") {
+    if (
+      itemType === "function_call" ||
+      itemType === "function" ||
+      itemType === "hosted_tool_call" ||
+      itemType === "tool_search_call" ||
+      itemType === "computer_call" ||
+      itemType === "shell_call" ||
+      itemType === "apply_patch_call"
+    ) {
       const toolCall = normalizeToolCall(item);
       if (toolCall) result.push(toolCall);
       continue;
@@ -254,6 +353,14 @@ function extractTools(tools: any): Record<string, any>[] {
     }
 
     const toolType = (tool as any).type ?? "";
+    if (toolType === "namespace" && Array.isArray((tool as any).tools)) {
+      result.push({
+        ...tool,
+        tools: extractTools((tool as any).tools),
+      } as Record<string, any>);
+      continue;
+    }
+
     if (toolType === "function") {
       const func: Record<string, any> = {
         name: (tool as any).name ?? (tool as any).function?.name ?? "",
@@ -289,16 +396,22 @@ function normalizeChatMessage(rawMessage: any): Record<string, any> {
     content: normalizeMessageContent((message as any).content),
   };
 
-  if (Array.isArray((message as any).tool_calls)) {
-    const toolCalls = extractToolCalls((message as any).tool_calls);
+  const rawToolCalls = (message as any).tool_calls ?? (message as any).toolCalls;
+  if (Array.isArray(rawToolCalls)) {
+    const toolCalls = extractToolCalls(rawToolCalls);
     if (toolCalls.length) {
       normalized.tool_calls = toolCalls;
       if (!normalized.content) normalized.content = "";
     }
   }
 
-  if ((message as any).tool_call_id) {
-    normalized.tool_call_id = (message as any).tool_call_id;
+  const toolCallId =
+    (message as any).tool_call_id ??
+    (message as any).toolCallId ??
+    (message as any).call_id ??
+    (message as any).callId;
+  if (toolCallId) {
+    normalized.tool_call_id = toolCallId;
   }
 
   return normalized;
@@ -318,7 +431,14 @@ function responsesApiItemToMessage(rawItem: any): Record<string, any> | null {
     };
   }
 
-  if (itemType === "function_call") {
+  if (
+    itemType === "function_call" ||
+    itemType === "hosted_tool_call" ||
+    itemType === "tool_search_call" ||
+    itemType === "computer_call" ||
+    itemType === "shell_call" ||
+    itemType === "apply_patch_call"
+  ) {
     const toolCall = normalizeToolCall(item);
     if (!toolCall) return null;
     return {
@@ -328,11 +448,18 @@ function responsesApiItemToMessage(rawItem: any): Record<string, any> | null {
     };
   }
 
-  if (itemType === "function_call_output" || itemType === "function_call_result") {
+  if (
+    itemType === "function_call_output" ||
+    itemType === "function_call_result" ||
+    itemType === "tool_search_output" ||
+    itemType === "computer_call_result" ||
+    itemType === "shell_call_output" ||
+    itemType === "apply_patch_call_output"
+  ) {
     return {
       role: "tool",
       content: stringifyToolResult(
-        (item as any).output ?? (item as any).result ?? "",
+        (item as any).output ?? (item as any).result ?? (item as any).tools ?? "",
       ),
       tool_call_id:
         (item as any).call_id ??
@@ -346,6 +473,13 @@ function responsesApiItemToMessage(rawItem: any): Record<string, any> | null {
     return normalizeChatMessage(item);
   }
 
+  if (itemType === "reasoning") {
+    return {
+      role: "assistant",
+      content: normalizeMessageContent((item as any).content ?? item),
+    };
+  }
+
   return null;
 }
 
@@ -357,6 +491,155 @@ function parseISOToHrTime(iso: string | undefined): [number, number] | null {
   const secs = Math.floor(ms / 1000);
   const nanos = (ms % 1000) * 1_000_000;
   return [secs, nanos];
+}
+
+function numberFromUsage(value: any): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
+
+function usageCandidateFrom(value: any): Record<string, any> | null {
+  const serialized = toSerializableValue(value);
+  if (!serialized || typeof serialized !== "object") return null;
+  if (Array.isArray(serialized)) {
+    for (const item of serialized) {
+      const usage = usageCandidateFrom(item);
+      if (usage) return usage;
+    }
+    return null;
+  }
+
+  const direct = serialized as Record<string, any>;
+  if (direct.usage && typeof direct.usage === "object") {
+    return direct.usage as Record<string, any>;
+  }
+
+  if (
+    direct.input_tokens !== undefined ||
+    direct.output_tokens !== undefined ||
+    direct.prompt_tokens !== undefined ||
+    direct.completion_tokens !== undefined ||
+    direct.inputTokens !== undefined ||
+    direct.outputTokens !== undefined ||
+    direct.promptTokens !== undefined ||
+    direct.completionTokens !== undefined
+  ) {
+    return direct;
+  }
+
+  return null;
+}
+
+function setUsageAttrs(attrs: Record<string, any>, ...sources: any[]): void {
+  const usage = sources.map(usageCandidateFrom).find(Boolean);
+  if (!usage) return;
+
+  const inputTokens = numberFromUsage(
+    usage.input_tokens ??
+      usage.prompt_tokens ??
+      usage.inputTokens ??
+      usage.promptTokens,
+  );
+  const outputTokens = numberFromUsage(
+    usage.output_tokens ??
+      usage.completion_tokens ??
+      usage.outputTokens ??
+      usage.completionTokens,
+  );
+  const totalTokens = numberFromUsage(
+    usage.total_tokens ??
+      usage.totalTokens ??
+      (inputTokens !== undefined && outputTokens !== undefined
+        ? inputTokens + outputTokens
+        : undefined),
+  );
+  const cacheReadInputTokens = numberFromUsage(
+    usage.cache_read_input_tokens ??
+      usage.cacheReadInputTokens ??
+      usage.input_tokens_details?.cached_tokens ??
+      usage.prompt_tokens_details?.cached_tokens ??
+      usage.details?.cache_read_input_tokens ??
+      usage.details?.cached_tokens,
+  );
+
+  if (inputTokens !== undefined) {
+    attrs[GEN_AI_USAGE_INPUT_TOKENS] = inputTokens;
+    attrs[SpanAttributes.LLM_USAGE_PROMPT_TOKENS] = inputTokens;
+  }
+  if (outputTokens !== undefined) {
+    attrs[GEN_AI_USAGE_OUTPUT_TOKENS] = outputTokens;
+    attrs[SpanAttributes.LLM_USAGE_COMPLETION_TOKENS] = outputTokens;
+  }
+  if (totalTokens !== undefined) {
+    attrs[SpanAttributes.LLM_USAGE_TOTAL_TOKENS] = totalTokens;
+  }
+  if (cacheReadInputTokens !== undefined) {
+    attrs[LLM_USAGE_CACHE_READ_INPUT_TOKENS] = cacheReadInputTokens;
+  }
+}
+
+function setPromptAttrs(
+  attrs: Record<string, any>,
+  messages: Record<string, any>[],
+): void {
+  for (const [index, message] of messages.entries()) {
+    const prefix = `${SpanAttributes.LLM_PROMPTS}.${index}`;
+    attrs[`${prefix}.role`] = String(message.role ?? "user");
+    attrs[`${prefix}.content`] = normalizeMessageContent(message.content);
+    if (message.tool_calls !== undefined) {
+      attrs[`${prefix}.tool_calls`] = safeJson(message.tool_calls);
+    }
+  }
+}
+
+function setCompletionAttrs(
+  attrs: Record<string, any>,
+  content: string,
+  toolCalls: Record<string, any>[],
+): void {
+  attrs[GEN_AI_COMPLETION_ROLE] = "assistant";
+  attrs[GEN_AI_COMPLETION_CONTENT] = content;
+  if (toolCalls.length) {
+    attrs[GEN_AI_COMPLETION_TOOL_CALLS] = safeJson(toolCalls);
+  }
+}
+
+function firstModelFromOutput(output: any): string | undefined {
+  const serialized = toSerializableValue(output);
+  const items = Array.isArray(serialized) ? serialized : [serialized];
+  for (const item of items) {
+    if (item && typeof item === "object" && !Array.isArray(item)) {
+      const model = (item as any).model ?? (item as any)._response?.model;
+      if (typeof model === "string" && model) return model;
+    }
+  }
+  return undefined;
+}
+
+function formatChatCompletionOutput(rawResponse: any): string {
+  const response = toSerializableValue(rawResponse);
+  if (!response || typeof response !== "object" || Array.isArray(response)) {
+    return "";
+  }
+
+  const choices = (response as any).choices;
+  if (!Array.isArray(choices)) return "";
+
+  const textParts: string[] = [];
+  for (const choice of choices) {
+    const message = (choice as any)?.message ?? (choice as any)?.delta;
+    if (!message || typeof message !== "object") continue;
+    const content = normalizeMessageContent((message as any).content);
+    if (content) textParts.push(content);
+    if (typeof (message as any).refusal === "string" && (message as any).refusal) {
+      textParts.push((message as any).refusal);
+    }
+  }
+  return textParts.join("\n");
 }
 
 function hashStringToHexId(s: string, length: number): string {
@@ -384,8 +667,12 @@ function resolveSpanTimes(item: Span<any>): {
 } {
   const serialized = toSerializableValue(item) as Record<string, any> | undefined;
   return {
-    startTimeHr: parseISOToHrTime(serialized?.started_at),
-    endTimeHr: parseISOToHrTime(serialized?.ended_at),
+    startTimeHr: parseISOToHrTime(
+      serialized?.started_at ?? serialized?.startedAt ?? (item as any).startedAt,
+    ),
+    endTimeHr: parseISOToHrTime(
+      serialized?.ended_at ?? serialized?.endedAt ?? (item as any).endedAt,
+    ),
   };
 }
 
@@ -537,6 +824,10 @@ function formatOutput(output: any): string {
   }
 
   if (typeof serialized === "object" && !Array.isArray(serialized)) {
+    const chatCompletionText = formatChatCompletionOutput(serialized);
+    if (chatCompletionText) {
+      return chatCompletionText;
+    }
     if ((serialized as any).content === undefined) {
       return safeJson(serialized);
     }
@@ -551,11 +842,27 @@ function formatOutput(output: any): string {
         continue;
       }
 
+      const chatCompletionText = formatChatCompletionOutput(item);
+      if (chatCompletionText) {
+        textParts.push(chatCompletionText);
+        continue;
+      }
+
       const itemType = (item as any).type ?? "";
       if (
         itemType === "function_call" ||
+        itemType === "hosted_tool_call" ||
+        itemType === "tool_search_call" ||
+        itemType === "computer_call" ||
+        itemType === "shell_call" ||
+        itemType === "apply_patch_call" ||
         itemType === "function_call_output" ||
-        itemType === "function_call_result"
+        itemType === "function_call_result" ||
+        itemType === "tool_search_output" ||
+        itemType === "computer_call_result" ||
+        itemType === "shell_call_output" ||
+        itemType === "apply_patch_call_output" ||
+        itemType === "reasoning"
       ) {
         continue;
       }
@@ -595,6 +902,22 @@ function emitTrace(traceObj: Trace): void {
   const traceName = traceObj.name || "trace";
   const attrs = baseAttrs(traceName, "", RespanLogType.WORKFLOW);
   attrs[SpanAttributes.TRACELOOP_WORKFLOW_NAME] = traceName;
+  const metadata: Record<string, any> = {};
+  if (traceObj.groupId) {
+    attrs[RespanSpanAttributes.RESPAN_TRACE_GROUP_ID] = traceObj.groupId;
+    metadata.group_id = traceObj.groupId;
+  }
+  const traceMetadata = toSerializableValue(traceObj.metadata);
+  if (
+    traceMetadata &&
+    typeof traceMetadata === "object" &&
+    !Array.isArray(traceMetadata)
+  ) {
+    Object.assign(metadata, traceMetadata);
+  }
+  if (Object.keys(metadata).length > 0) {
+    attrs[RespanSpanAttributes.RESPAN_METADATA] = safeJson(metadata);
+  }
 
   const span = buildReadableSpan({
     name: `${traceName}.workflow`,
@@ -613,16 +936,6 @@ function emitAgent(item: Span<any>): void {
   const attrs = baseAttrs(name, name, RespanLogType.AGENT);
   attrs[SpanAttributes.TRACELOOP_WORKFLOW_NAME] = name;
   attrs[RespanSpanAttributes.RESPAN_METADATA_AGENT_NAME] = name;
-  setJsonStructuredAttr(
-    attrs,
-    RespanSpanAttributes.RESPAN_SPAN_TOOLS,
-    extractTools(data.tools),
-  );
-  setJsonStructuredAttr(
-    attrs,
-    RespanSpanAttributes.RESPAN_SPAN_HANDOFFS,
-    toSerializableValue(data.handoffs),
-  );
 
   const span = buildReadableSpan({
     name: `${name}.agent`,
@@ -642,44 +955,38 @@ function emitResponse(item: Span<any>): void {
   const data = item.spanData as any;
   const { startTimeHr, endTimeHr } = resolveSpanTimes(item);
 
-  const attrs = baseAttrs("response", "response", RespanLogType.RESPONSE);
-  attrs[RespanSpanAttributes.LLM_REQUEST_TYPE] = RespanLogType.CHAT;
-  attrs[RespanSpanAttributes.LLM_SYSTEM] = "openai";
+  const attrs = baseAttrs("chat", "chat", RespanLogType.CHAT);
+  attrs[SpanAttributes.LLM_REQUEST_TYPE] = LLMRequestTypeValues.CHAT;
+  attrs[SpanAttributes.LLM_SYSTEM] = "openai";
 
   const inputMsgs = formatInputMessages(data._input);
   if (inputMsgs) {
     attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safeJson(inputMsgs);
+    setPromptAttrs(attrs, inputMsgs);
   }
 
   const resp = toSerializableValue(data._response);
   if (resp && typeof resp === "object" && !Array.isArray(resp)) {
     if ((resp as any).model) {
-      attrs[RespanSpanAttributes.GEN_AI_REQUEST_MODEL] = (resp as any).model;
+      attrs[SpanAttributes.LLM_REQUEST_MODEL] = (resp as any).model;
     }
 
     if ("output" in resp) {
-      attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = formatOutput((resp as any).output);
-      setJsonStructuredAttr(
-        attrs,
-        RespanSpanAttributes.RESPAN_SPAN_TOOL_CALLS,
-        extractToolCalls((resp as any).output),
-      );
+      const outputText = formatOutput((resp as any).output);
+      const toolCalls = extractToolCalls((resp as any).output);
+      attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = outputText;
+      setCompletionAttrs(attrs, outputText, toolCalls);
     }
 
     if ("tools" in resp) {
       setJsonStructuredAttr(
         attrs,
-        RespanSpanAttributes.RESPAN_SPAN_TOOLS,
+        SpanAttributes.LLM_REQUEST_FUNCTIONS,
         extractTools((resp as any).tools),
       );
     }
 
-    if ((resp as any).usage) {
-      attrs[RespanSpanAttributes.GEN_AI_USAGE_PROMPT_TOKENS] =
-        (resp as any).usage.input_tokens ?? 0;
-      attrs[RespanSpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS] =
-        (resp as any).usage.output_tokens ?? 0;
-    }
+    setUsageAttrs(attrs, (resp as any).usage);
   }
 
   const span = buildReadableSpan({
@@ -702,13 +1009,18 @@ function emitFunction(item: Span<any>): void {
   const name = data.name || "function";
 
   const attrs = baseAttrs(name, name, RespanLogType.TOOL);
-  attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safeJson([
-    { role: "tool", content: stringifyStructured(data.input) },
-  ]);
-  attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safeJson({
-    role: "tool",
-    content: stringifyToolResult(data.output),
+  attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safeJson({
+    name,
+    arguments: toSerializableValue(data.input) ?? "",
   });
+  attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safeJson(
+    normalizeToolSpanOutput(data.output),
+  );
+  if (data.mcp_data !== undefined) {
+    attrs[RespanSpanAttributes.RESPAN_METADATA] = safeJson({
+      mcp_data: toSerializableValue(data.mcp_data),
+    });
+  }
 
   const span = buildReadableSpan({
     name: `${name}.tool`,
@@ -728,29 +1040,25 @@ function emitGeneration(item: Span<any>): void {
   const data = item.spanData as any;
   const { startTimeHr, endTimeHr } = resolveSpanTimes(item);
 
-  const attrs = baseAttrs("generation", "generation", RespanLogType.GENERATION);
-  attrs[RespanSpanAttributes.LLM_REQUEST_TYPE] = RespanLogType.CHAT;
+  const attrs = baseAttrs("chat", "chat", RespanLogType.CHAT);
+  attrs[SpanAttributes.LLM_REQUEST_TYPE] = LLMRequestTypeValues.CHAT;
+  attrs[SpanAttributes.LLM_SYSTEM] = "openai";
 
-  if (data.model) attrs[RespanSpanAttributes.GEN_AI_REQUEST_MODEL] = data.model;
+  const model = data.model ?? firstModelFromOutput(data.output);
+  if (model) attrs[SpanAttributes.LLM_REQUEST_MODEL] = model;
 
   const inputMsgs = formatInputMessages(data.input);
   if (inputMsgs) {
     attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safeJson(inputMsgs);
+    setPromptAttrs(attrs, inputMsgs);
   }
 
-  attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = formatOutput(data.output);
-  setJsonStructuredAttr(
-    attrs,
-    RespanSpanAttributes.RESPAN_SPAN_TOOL_CALLS,
-    extractToolCalls(data.output),
-  );
+  const outputText = formatOutput(data.output);
+  const toolCalls = extractToolCalls(data.output);
+  attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = outputText;
+  setCompletionAttrs(attrs, outputText, toolCalls);
 
-  if (data.usage) {
-    attrs[RespanSpanAttributes.GEN_AI_USAGE_PROMPT_TOKENS] =
-      data.usage.prompt_tokens ?? data.usage.input_tokens ?? 0;
-    attrs[RespanSpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS] =
-      data.usage.completion_tokens ?? data.usage.output_tokens ?? 0;
-  }
+  setUsageAttrs(attrs, data.usage, data.output);
 
   const span = buildReadableSpan({
     name: "openai.chat",
@@ -773,9 +1081,9 @@ function emitHandoff(item: Span<any>): void {
   const fromAgent = data.from_agent || "";
   const toAgent = data.to_agent || "";
 
-  const attrs = baseAttrs("handoff", "handoff", RespanLogType.HANDOFF);
-  attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safeJson(fromAgent);
-  attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safeJson(toAgent);
+  const attrs = baseAttrs("handoff", "handoff", RespanLogType.TASK);
+  attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safeJson({ from_agent: fromAgent });
+  attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safeJson({ to_agent: toAgent });
   attrs[RespanSpanAttributes.RESPAN_METADATA_FROM_AGENT] = fromAgent;
   attrs[RespanSpanAttributes.RESPAN_METADATA_TO_AGENT] = toAgent;
 
@@ -799,6 +1107,10 @@ function emitGuardrail(item: Span<any>): void {
   const name = `guardrail:${data.name}`;
 
   const attrs = baseAttrs(name, name, RespanLogType.GUARDRAIL);
+  attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safeJson({ name: data.name });
+  attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safeJson({
+    triggered: Boolean(data.triggered),
+  });
   attrs[RespanSpanAttributes.RESPAN_METADATA_GUARDRAIL_NAME] = data.name;
   attrs[RespanSpanAttributes.RESPAN_METADATA_TRIGGERED] = String(data.triggered);
 
@@ -821,15 +1133,18 @@ function emitCustom(item: Span<any>): void {
   const { startTimeHr, endTimeHr } = resolveSpanTimes(item);
   const name = data.name || data.data?.name || "custom";
 
-  const attrs = baseAttrs(name, name, RespanLogType.CUSTOM);
+  const attrs = baseAttrs(name, name, RespanLogType.TASK);
   const customData = data.data || {};
+  const metadata: Record<string, any> = {};
   for (const [key, value] of Object.entries(customData)) {
     if (key === "model") {
-      attrs[RespanSpanAttributes.GEN_AI_REQUEST_MODEL] = value;
+      attrs[SpanAttributes.LLM_REQUEST_MODEL] = value;
     } else if (key === "prompt_tokens") {
-      attrs[RespanSpanAttributes.GEN_AI_USAGE_PROMPT_TOKENS] = value;
+      attrs[GEN_AI_USAGE_INPUT_TOKENS] = value;
+      attrs[SpanAttributes.LLM_USAGE_PROMPT_TOKENS] = value;
     } else if (key === "completion_tokens") {
-      attrs[RespanSpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS] = value;
+      attrs[GEN_AI_USAGE_OUTPUT_TOKENS] = value;
+      attrs[SpanAttributes.LLM_USAGE_COMPLETION_TOKENS] = value;
     } else if (key === "name") {
       continue;
     } else if (key === "input") {
@@ -837,12 +1152,41 @@ function emitCustom(item: Span<any>): void {
     } else if (key === "output") {
       attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safeJson(value);
     } else {
-      attrs[`respan.metadata.${key}`] = String(value);
+      metadata[key] = toSerializableValue(value);
     }
+  }
+  if (Object.keys(metadata).length > 0) {
+    attrs[RespanSpanAttributes.RESPAN_METADATA] = safeJson(metadata);
   }
 
   const span = buildReadableSpan({
     name: `${name}.task`,
+    traceId: item.traceId,
+    spanId: item.spanId,
+    parentId: item.parentId || item.traceId,
+    startTimeHr,
+    endTimeHr,
+    attributes: attrs,
+    statusCode: item.error ? 400 : 200,
+    errorMessage: item.error ? String(item.error) : undefined,
+  });
+  injectSpan(span);
+}
+
+function emitMcpTools(item: Span<any>): void {
+  const data = item.spanData as any;
+  const { startTimeHr, endTimeHr } = resolveSpanTimes(item);
+  const server = data.server || "mcp";
+  const name = `${server}.list_tools`;
+
+  const attrs = baseAttrs(name, name, RespanLogType.TOOL);
+  attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safeJson({ server });
+  attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safeJson(
+    toSerializableValue(data.result ?? []),
+  );
+
+  const span = buildReadableSpan({
+    name: `${name}.tool`,
     traceId: item.traceId,
     spanId: item.spanId,
     parentId: item.parentId || item.traceId,
@@ -873,6 +1217,7 @@ export function emitSdkItem(item: Trace | Span<any>): void {
     else if (type === "agent") emitAgent(item);
     else if (type === "handoff") emitHandoff(item);
     else if (type === "custom") emitCustom(item);
+    else if (type === "mcp_tools") emitMcpTools(item);
     else if (typeof spanData?.triggered === "boolean") emitGuardrail(item);
     else if (spanData?.name && spanData?.data) emitCustom(item);
     else {

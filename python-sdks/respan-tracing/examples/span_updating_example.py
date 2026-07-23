@@ -202,7 +202,6 @@ def main():
     print("  • Automatic Respan parameter handling")
     
     # Flush any remaining spans
-    telemetry.flush()
 
 
 if __name__ == "__main__":

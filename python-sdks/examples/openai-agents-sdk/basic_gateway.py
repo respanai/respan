@@ -28,7 +28,6 @@ agent = Agent(
 async def main():
     result = await Runner.run(agent, "What are the benefits of using an API gateway?")
     print(result.final_output)
-    respan.flush()
 
 
 if __name__ == "__main__":

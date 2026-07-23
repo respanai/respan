@@ -121,11 +121,9 @@ def retrieve_and_log(saved: dict):
 
 # Phase 1: submit
 saved = submit()
-respan.flush()
 print(f"\n--- Batch submitted. Waiting for results... ---\n")
 
 # Phase 2: come back later and retrieve
 # (In production, this would be a completely separate process/job)
 retrieve_and_log(saved)
-respan.flush()
 print("\nDone — check the trace in Respan!")

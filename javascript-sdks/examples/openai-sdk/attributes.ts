@@ -39,4 +39,3 @@ async function handleRequest(userId: string, question: string) {
 
 await handleRequest("user_alice", "What is an API gateway?");
 await handleRequest("user_bob", "Explain rate limiting.");
-await respan.flush();

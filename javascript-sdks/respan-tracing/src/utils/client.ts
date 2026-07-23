@@ -238,9 +238,8 @@ class RespanClientImpl implements RespanClient {
   }
 
   async flush(): Promise<void> {
-    // Import forceFlush from tracing utils
-    const { forceFlush } = await import("./tracing.js");
-    await forceFlush();
+    const { flush } = await import("./tracing.js");
+    await flush();
   }
 }
 

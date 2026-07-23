@@ -1,0 +1,50 @@
+{
+  "name": "@respan/instrumentation-livekit",
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Respan instrumentation plugin for LiveKit Agents TypeScript",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "author": "Respan <team@respan.ai>",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/respanai/respan",
+    "directory": "javascript-sdks/instrumentations/respan-instrumentation-livekit"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "yarn build && node --test tests/*.test.mjs",
+    "publish:package": "yarn npm publish",
+    "release": "yarn build && yarn version patch && yarn publish:package"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/semantic-conventions": "^1.40.0",
+    "@respan/respan-sdk": "^1.1.7",
+    "@traceloop/ai-semantic-conventions": "^0.13.0"
+  },
+  "peerDependencies": {
+    "@livekit/agents": ">=1.4.0"
+  },
+  "peerDependenciesMeta": {
+    "@livekit/agents": {
+      "optional": false
+    }
+  },
+  "devDependencies": {
+    "@livekit/agents": "^1.4.8",
+    "@livekit/rtc-node": "^0.13.29",
+    "@types/node": "^22.15.29",
+    "typescript": "^5.7.3",
+    "zod": "^4.1.12"
+  }
+}

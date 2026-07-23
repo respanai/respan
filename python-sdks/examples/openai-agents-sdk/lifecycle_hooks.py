@@ -48,7 +48,6 @@ async def main():
             hooks=LoggingHooks(),
         )
         print(f"\nFinal: {result.final_output}")
-    respan.flush()
 
 
 if __name__ == "__main__":

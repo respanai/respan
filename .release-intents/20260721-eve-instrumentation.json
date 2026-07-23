@@ -1,0 +1,6 @@
+{
+  "summary": "Add Eve instrumentation",
+  "packages": {
+    "@respan/instrumentation-eve": "new"
+  }
+}

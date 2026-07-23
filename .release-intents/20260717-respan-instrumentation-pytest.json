@@ -1,0 +1,6 @@
+{
+  "summary": "Add Pytest instrumentation",
+  "packages": {
+    "respan-instrumentation-pytest": "new"
+  }
+}

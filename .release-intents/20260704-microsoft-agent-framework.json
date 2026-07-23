@@ -1,0 +1,6 @@
+{
+  "summary": "Add Microsoft Agent Framework Python instrumentation",
+  "packages": {
+    "respan-instrumentation-microsoft-agent-framework": "new"
+  }
+}

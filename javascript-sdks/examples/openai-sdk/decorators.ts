@@ -55,4 +55,3 @@ async function run(topic: string) {
 }
 
 await run("Benefits of open-source software");
-await respan.flush();

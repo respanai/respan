@@ -1,0 +1,9 @@
+{
+  "summary": "Update Python agent-framework instrumentations for current OpenAI Agents, Claude Agent SDK, and Pydantic AI behavior while keeping span attributes on the canonical Respan contract",
+  "packages": {
+    "respan-instrumentation-openai-agents": "patch",
+    "respan-instrumentation-claude-agent-sdk": "patch",
+    "respan-instrumentation-pydantic-ai": "patch",
+    "respan-tracing": "patch"
+  }
+}

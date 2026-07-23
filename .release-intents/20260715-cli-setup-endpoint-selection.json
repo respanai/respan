@@ -1,0 +1,6 @@
+{
+  "summary": "CLI: `respan setup` now prompts for the target endpoint (Respan Platform / Enterprise) like `respan auth login`, persists the choice, and confirms it on later runs",
+  "packages": {
+    "@respan/cli": "minor"
+  }
+}

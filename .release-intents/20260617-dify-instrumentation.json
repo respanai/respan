@@ -1,0 +1,6 @@
+{
+  "summary": "Add Dify Python instrumentation",
+  "packages": {
+    "respan-instrumentation-dify": "new"
+  }
+}

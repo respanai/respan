@@ -1,0 +1,6 @@
+{
+  "summary": "Add Semantic Kernel Python instrumentation",
+  "packages": {
+    "respan-instrumentation-semantic-kernel": "new"
+  }
+}

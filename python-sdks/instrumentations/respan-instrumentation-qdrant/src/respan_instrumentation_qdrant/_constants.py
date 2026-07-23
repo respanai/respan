@@ -1,0 +1,78 @@
+"""Qdrant SDK-specific instrumentation constants."""
+
+QDRANT_INSTRUMENTATION_NAME = "qdrant"
+
+# Public operations that issue work against Qdrant. Local model-selection and
+# introspection helpers are intentionally excluded because they do not perform
+# vector-store work.
+QDRANT_OPERATIONS = (
+    "add",
+    "batch_update_points",
+    "clear_payload",
+    "cluster_collection_update",
+    "cluster_status",
+    "cluster_telemetry",
+    "collection_cluster_info",
+    "collection_exists",
+    "count",
+    "create_collection",
+    "create_full_snapshot",
+    "create_payload_index",
+    "create_shard_key",
+    "create_shard_snapshot",
+    "create_snapshot",
+    "create_vector_name",
+    "delete",
+    "delete_collection",
+    "delete_full_snapshot",
+    "delete_payload",
+    "delete_payload_index",
+    "delete_shard_key",
+    "delete_shard_snapshot",
+    "delete_snapshot",
+    "delete_vector_name",
+    "delete_vectors",
+    "facet",
+    "get_aliases",
+    "get_collection",
+    "get_collection_aliases",
+    "get_collections",
+    "get_optimizations",
+    "info",
+    "list_full_snapshots",
+    "list_shard_keys",
+    "list_shard_snapshots",
+    "list_snapshots",
+    "overwrite_payload",
+    "query",
+    "query_batch",
+    "query_batch_points",
+    "query_points",
+    "query_points_groups",
+    "recover_current_peer",
+    "recover_shard_snapshot",
+    "recover_snapshot",
+    "recreate_collection",
+    "remove_peer",
+    "retrieve",
+    "scroll",
+    "search_matrix_offsets",
+    "search_matrix_pairs",
+    "set_payload",
+    "update_collection",
+    "update_collection_aliases",
+    "update_vectors",
+    "upload_collection",
+    "upload_points",
+    "upsert",
+)
+
+MAX_ATTRIBUTE_CHARS = 16_000
+MAX_PREVIEW_ITEMS = 64
+SENSITIVE_KEY_PARTS = (
+    "api_key",
+    "authorization",
+    "password",
+    "secret",
+    "token",
+)

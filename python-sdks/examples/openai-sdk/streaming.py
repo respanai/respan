@@ -28,5 +28,3 @@ for chunk in stream:
     if content:
         print(content, end="", flush=True)
 print()
-
-respan.flush()

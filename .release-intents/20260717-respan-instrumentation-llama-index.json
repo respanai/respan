@@ -1,0 +1,6 @@
+{
+  "summary": "Enhance LlamaIndex Core and Workflows tracing",
+  "packages": {
+    "respan-instrumentation-llama-index": "patch"
+  }
+}

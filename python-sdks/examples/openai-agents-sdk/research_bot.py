@@ -171,7 +171,6 @@ class ResearchManager:
 async def main():
     query = "What are the latest developments in quantum computing?"
     await ResearchManager().run(query)
-    respan.flush()
 
 
 if __name__ == "__main__":

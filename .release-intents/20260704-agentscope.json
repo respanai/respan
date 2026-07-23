@@ -1,0 +1,6 @@
+{
+  "summary": "Add AgentScope Python instrumentation",
+  "packages": {
+    "respan-instrumentation-agentscope": "new"
+  }
+}

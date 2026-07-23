@@ -1,148 +1,91 @@
 import logging
-import sys
-from types import ModuleType, SimpleNamespace
+import threading
 
 import pytest
 
 from respan_instrumentation_crewai import CrewAIInstrumentor
-from respan_instrumentation_crewai import _instrumentation
-from respan_instrumentation_crewai._instrumentation import (
-    CREATE_LLM_SPANS_KWARG,
-    OPENINFERENCE_CREWAI_MODULE,
-    USE_EVENT_LISTENER_KWARG,
-)
+from respan_instrumentation_crewai import _event_listener
 from respan_tracing.core.tracer import RespanTracer
 
 
-def _install_fake_modules(monkeypatch):
-    class FakeCrewAIInstrumentor:
-        pass
-
-    class FakeOpenInferenceInstrumentor:
-        created = []
-
-        def __init__(self, instrumentor_class, **kwargs):
-            self.instrumentor_class = instrumentor_class
-            self.kwargs = kwargs
-            self.is_activated = False
-            self.is_deactivated = False
-            self.__class__.created.append(self)
-
-        def activate(self):
-            self.is_activated = True
-
-        def deactivate(self):
-            self.is_deactivated = True
-
-    openinference_module = ModuleType("openinference")
-    openinference_instrumentation_module = ModuleType("openinference.instrumentation")
-    openinference_crewai_module = ModuleType(OPENINFERENCE_CREWAI_MODULE)
-    openinference_crewai_module.CrewAIInstrumentor = FakeCrewAIInstrumentor
-    openinference_instrumentation_module.crewai = openinference_crewai_module
-
-    monkeypatch.setitem(sys.modules, "openinference", openinference_module)
-    monkeypatch.setitem(
-        sys.modules,
-        "openinference.instrumentation",
-        openinference_instrumentation_module,
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        OPENINFERENCE_CREWAI_MODULE,
-        openinference_crewai_module,
-    )
-
-    monkeypatch.setattr(
-        _instrumentation,
-        "OpenInferenceInstrumentor",
-        FakeOpenInferenceInstrumentor,
-    )
-
-    return SimpleNamespace(
-        crewai_instrumentor_class=FakeCrewAIInstrumentor,
-        openinference_instrumentor_class=FakeOpenInferenceInstrumentor,
-    )
-
-
 @pytest.fixture(autouse=True)
-def reset_tracer():
+def reset_instrumentation():
+    active_owner = CrewAIInstrumentor._active_owner
+    if active_owner is not None:
+        active_owner.deactivate()
+    CrewAIInstrumentor._active_owner = None
     RespanTracer.reset_instance()
     yield
+    active_owner = CrewAIInstrumentor._active_owner
+    if active_owner is not None:
+        active_owner.deactivate()
+    CrewAIInstrumentor._active_owner = None
     RespanTracer.reset_instance()
 
 
-def test_activate_uses_openinference_crewai_defaults(monkeypatch):
-    fake = _install_fake_modules(monkeypatch)
+def test_activate_and_deactivate_are_idempotent(monkeypatch):
+    created = []
+
+    class FakeListener:
+        def __init__(self):
+            self.shutdown_count = 0
+            created.append(self)
+
+        def shutdown(self):
+            self.shutdown_count += 1
+
+    monkeypatch.setattr(_event_listener, "CrewAIEventListener", FakeListener)
 
     instrumentor = CrewAIInstrumentor()
     instrumentor.activate()
+    instrumentor.activate()
 
-    delegate = fake.openinference_instrumentor_class.created[0]
-    assert delegate.instrumentor_class is fake.crewai_instrumentor_class
-    assert delegate.kwargs == {
-        USE_EVENT_LISTENER_KWARG: True,
-        CREATE_LLM_SPANS_KWARG: True,
-    }
-    assert delegate.is_activated is True
+    assert len(created) == 1
     assert instrumentor._is_instrumented is True
+    assert CrewAIInstrumentor._active_owner is instrumentor
 
     instrumentor.deactivate()
+    instrumentor.deactivate()
 
-    assert delegate.is_deactivated is True
+    assert created[0].shutdown_count == 1
     assert instrumentor._is_instrumented is False
+    assert CrewAIInstrumentor._active_owner is None
 
 
-def test_activate_passes_custom_openinference_kwargs(monkeypatch):
-    fake = _install_fake_modules(monkeypatch)
+def test_only_one_instrumentor_instance_can_subscribe(monkeypatch):
+    created = []
 
-    instrumentor = CrewAIInstrumentor(
-        use_event_listener=False,
-        create_llm_spans=False,
-        trace_content=False,
-    )
-    instrumentor.activate()
+    class FakeListener:
+        def __init__(self):
+            created.append(self)
 
-    delegate = fake.openinference_instrumentor_class.created[0]
-    assert delegate.kwargs == {
-        USE_EVENT_LISTENER_KWARG: False,
-        CREATE_LLM_SPANS_KWARG: False,
-        "trace_content": False,
-    }
+        def shutdown(self):
+            return None
 
+    monkeypatch.setattr(_event_listener, "CrewAIEventListener", FakeListener)
 
-def test_activate_cleans_up_delegate_when_activation_fails(monkeypatch, caplog):
-    fake = _install_fake_modules(monkeypatch)
+    first = CrewAIInstrumentor()
+    second = CrewAIInstrumentor()
+    first.activate()
+    second.activate()
 
-    def activate_raises(self):
-        self.is_activated = True
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(
-        fake.openinference_instrumentor_class,
-        "activate",
-        activate_raises,
-    )
-
-    instrumentor = CrewAIInstrumentor()
-    with caplog.at_level(logging.ERROR):
-        instrumentor.activate()
-
-    delegate = fake.openinference_instrumentor_class.created[0]
-    assert delegate.is_deactivated is True
-    assert instrumentor._delegate is None
-    assert instrumentor._is_instrumented is False
-    assert "Failed to activate CrewAI instrumentation" in caplog.text
+    assert len(created) == 1
+    assert first._is_instrumented is True
+    assert second._is_instrumented is False
 
 
 def test_activate_skips_when_respan_tracing_is_disabled(monkeypatch, caplog):
-    fake = _install_fake_modules(monkeypatch)
+    class UnexpectedListener:
+        def __init__(self):
+            raise AssertionError("listener must not be created")
+
+    monkeypatch.setattr(_event_listener, "CrewAIEventListener", UnexpectedListener)
     RespanTracer(is_enabled=False)
 
     instrumentor = CrewAIInstrumentor()
     with caplog.at_level(logging.INFO):
         instrumentor.activate()
 
-    assert fake.openinference_instrumentor_class.created == []
     assert instrumentor._is_instrumented is False
     assert (
         "CrewAI instrumentation skipped because Respan tracing is disabled"
@@ -150,21 +93,67 @@ def test_activate_skips_when_respan_tracing_is_disabled(monkeypatch, caplog):
     )
 
 
-def test_activate_logs_warning_when_dependencies_are_missing(monkeypatch, caplog):
-    def import_module_raises(module_name):
-        if module_name == OPENINFERENCE_CREWAI_MODULE:
-            raise ImportError(module_name)
-        raise AssertionError(f"unexpected import: {module_name}")
+def test_activate_leaves_clean_state_when_listener_creation_fails(
+    monkeypatch,
+    caplog,
+):
+    class FailingListener:
+        def __init__(self):
+            raise RuntimeError("boom")
 
-    monkeypatch.setattr(
-        _instrumentation.importlib,
-        "import_module",
-        import_module_raises,
-    )
+    monkeypatch.setattr(_event_listener, "CrewAIEventListener", FailingListener)
+
     instrumentor = CrewAIInstrumentor()
-
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.ERROR):
         instrumentor.activate()
 
-    assert "Failed to activate CrewAI instrumentation" in caplog.text
+    assert instrumentor._listener is None
     assert instrumentor._is_instrumented is False
+    assert CrewAIInstrumentor._active_owner is None
+    assert "Failed to activate CrewAI instrumentation" in caplog.text
+
+
+def test_deactivate_blocks_reactivation_until_shutdown_finishes(monkeypatch):
+    shutdown_started = threading.Event()
+    allow_shutdown = threading.Event()
+    activation_finished = threading.Event()
+    created = []
+
+    class BlockingListener:
+        def __init__(self):
+            created.append(self)
+
+        def shutdown(self):
+            if self is created[0]:
+                shutdown_started.set()
+                assert allow_shutdown.wait(timeout=2)
+
+    monkeypatch.setattr(_event_listener, "CrewAIEventListener", BlockingListener)
+
+    first = CrewAIInstrumentor()
+    first.activate()
+    deactivate_thread = threading.Thread(target=first.deactivate)
+    deactivate_thread.start()
+    assert shutdown_started.wait(timeout=1)
+
+    second = CrewAIInstrumentor()
+
+    def activate_second():
+        second.activate()
+        activation_finished.set()
+
+    activate_thread = threading.Thread(target=activate_second)
+    activate_thread.start()
+    try:
+        assert not activation_finished.wait(timeout=0.1)
+    finally:
+        allow_shutdown.set()
+        deactivate_thread.join(timeout=2)
+        activate_thread.join(timeout=2)
+
+    assert not deactivate_thread.is_alive()
+    assert not activate_thread.is_alive()
+    assert activation_finished.is_set()
+    assert len(created) == 2
+    assert second._is_instrumented is True
+    second.deactivate()

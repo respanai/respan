@@ -1,14 +1,25 @@
-"""Unit tests for OpenAI Agents OTEL emitter tool attributes."""
+"""Unit tests for OpenAI Agents OTEL emitter contract attrs."""
 
 import json
 from types import SimpleNamespace
 
-from respan_sdk.constants.span_attributes import (
-    RESPAN_SPAN_TOOL_CALLS,
-    RESPAN_SPAN_TOOLS,
-)
+from opentelemetry.semconv_ai import SpanAttributes
+
+from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
 
 from respan_instrumentation_openai_agents import _otel_emitter
+
+
+_BANNED_ALIASES = {
+    "respan.span.tool_calls",
+    "respan.span.tools",
+    "respan.span.handoffs",
+    "tool_calls",
+    "tools",
+    "span_tools",
+    "has_tool_calls",
+    "parallel_tool_calls",
+}
 
 
 def _make_span_item() -> SimpleNamespace:
@@ -34,7 +45,7 @@ def _capture_attrs(monkeypatch):
     return captured
 
 
-def test_emit_response_serializes_namespaced_tool_attrs(monkeypatch):
+def test_emit_response_uses_chat_contract_tool_attrs(monkeypatch):
     captured = _capture_attrs(monkeypatch)
     response = SimpleNamespace(
         model="gpt-4o",
@@ -61,34 +72,30 @@ def test_emit_response_serializes_namespaced_tool_attrs(monkeypatch):
     _otel_emitter.emit_response(_make_span_item(), span_data)
 
     attrs = captured["attributes"]
-    assert attrs[RESPAN_SPAN_TOOL_CALLS] == json.dumps(
-        [
-            {
-                "id": "call_1",
-                "type": "function",
-                "function": {
-                    "name": "lookup_weather",
-                    "arguments": '{"city":"NYC"}',
-                },
-            }
-        ],
-        default=str,
-    )
-    assert attrs[RESPAN_SPAN_TOOLS] == json.dumps(
-        [
-            {
-                "type": "function",
-                "function": {
-                    "name": "lookup_weather",
-                    "description": "Look up the weather.",
-                    "parameters": {"type": "object"},
-                },
-            }
-        ],
-        default=str,
-    )
-    assert "tool_calls" not in attrs
-    assert "tools" not in attrs
+    assert attrs[RESPAN_LOG_TYPE] == "chat"
+    assert attrs[SpanAttributes.LLM_REQUEST_TYPE] == "chat"
+    assert json.loads(attrs[f"{SpanAttributes.LLM_COMPLETIONS}.0.tool_calls"]) == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "lookup_weather",
+                "arguments": '{"city":"NYC"}',
+            },
+        }
+    ]
+    assert json.loads(attrs[SpanAttributes.LLM_REQUEST_FUNCTIONS]) == [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup_weather",
+                "description": "Look up the weather.",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+    assert attrs[f"{SpanAttributes.LLM_COMPLETIONS}.0.role"] == "assistant"
+    assert _BANNED_ALIASES.isdisjoint(attrs)
 
 
 def test_emit_generation_extracts_tool_calls(monkeypatch):
@@ -110,17 +117,16 @@ def test_emit_generation_extracts_tool_calls(monkeypatch):
     _otel_emitter.emit_generation(_make_span_item(), span_data)
 
     attrs = captured["attributes"]
-    assert attrs[RESPAN_SPAN_TOOL_CALLS] == json.dumps(
-        [
-            {
-                "id": "call_2",
-                "type": "function",
-                "function": {
-                    "name": "search_docs",
-                    "arguments": '{"query":"otel"}',
-                },
-            }
-        ],
-        default=str,
-    )
-    assert "tool_calls" not in attrs
+    assert attrs[RESPAN_LOG_TYPE] == "chat"
+    assert attrs[SpanAttributes.LLM_REQUEST_TYPE] == "chat"
+    assert json.loads(attrs[f"{SpanAttributes.LLM_COMPLETIONS}.0.tool_calls"]) == [
+        {
+            "id": "call_2",
+            "type": "function",
+            "function": {
+                "name": "search_docs",
+                "arguments": '{"query":"otel"}',
+            },
+        }
+    ]
+    assert _BANNED_ALIASES.isdisjoint(attrs)

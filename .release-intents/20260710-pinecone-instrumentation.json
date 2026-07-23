@@ -1,0 +1,6 @@
+{
+  "summary": "Add Pinecone Python instrumentation",
+  "packages": {
+    "respan-instrumentation-pinecone": "new"
+  }
+}

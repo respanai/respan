@@ -1,0 +1,6 @@
+{
+  "summary": "@respan/instrumentation-openai-agents: restore tracing.ts to upstream main behavior",
+  "packages": {
+    "@respan/instrumentation-openai-agents": "patch"
+  }
+}

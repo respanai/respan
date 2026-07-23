@@ -36,7 +36,6 @@ async def main():
         result = await Runner.run(triage_agent, "Hola, necesito ayuda con mi cuenta.")
         print(f"Handled by: {result.last_agent.name}")
         print(f"Response: {result.final_output}")
-    respan.flush()
 
 
 if __name__ == "__main__":

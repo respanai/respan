@@ -2,32 +2,30 @@
 
 This module separates:
 - native PydanticAI/vendor attributes that we consume as input
-- Respan backend override keys that this instrumentation emits
+- legacy/off-contract Respan override keys that are stripped when present
 """
 
-from respan_sdk.constants.span_attributes import (
-    GEN_AI_AGENT_NAME,
-    GEN_AI_OPERATION_NAME,
-    GEN_AI_TOOL_CALL_ARGUMENTS,
-    GEN_AI_TOOL_CALL_RESULT,
-    GEN_AI_TOOL_NAME,
-    LLM_REQUEST_MODEL,
-)
+from opentelemetry.semconv_ai import SpanAttributes
 
 
 # PydanticAI native / vendor attributes
+PYDANTIC_AI_AGENT_NAME_ATTR = "gen_ai.agent.name"
+PYDANTIC_AI_OPERATION_NAME_ATTR = "gen_ai.operation.name"
+PYDANTIC_AI_TOOL_NAME_ATTR = "gen_ai.tool.name"
+PYDANTIC_AI_TOOL_CALL_ARGUMENTS_ATTR = "gen_ai.tool.call.arguments"
+PYDANTIC_AI_TOOL_CALL_RESULT_ATTR = "gen_ai.tool.call.result"
 PYDANTIC_AI_REQUEST_PARAMETERS_ATTR = "model_request_parameters"
 PYDANTIC_AI_TOOL_DEFINITIONS_ATTR = "gen_ai.tool.definitions"
 PYDANTIC_AI_INPUT_MESSAGES_ATTR = "gen_ai.input.messages"
 PYDANTIC_AI_OUTPUT_MESSAGES_ATTR = "gen_ai.output.messages"
-PYDANTIC_AI_SYSTEM_ATTR = "gen_ai.system"
 PYDANTIC_AI_PROVIDER_NAME_ATTR = "gen_ai.provider.name"
 PYDANTIC_AI_RESPONSE_ID_ATTR = "gen_ai.response.id"
 PYDANTIC_AI_RESPONSE_FINISH_REASONS_ATTR = "gen_ai.response.finish_reasons"
-PYDANTIC_AI_OPENAI_API_BASE_ATTR = "gen_ai.openai.api_base"
 PYDANTIC_AI_USAGE_INPUT_TOKENS_ATTR = "gen_ai.usage.input_tokens"
 PYDANTIC_AI_USAGE_OUTPUT_TOKENS_ATTR = "gen_ai.usage.output_tokens"
-PYDANTIC_AI_USAGE_TOTAL_TOKENS_ATTR = "gen_ai.usage.total_tokens"
+PYDANTIC_AI_AGGREGATED_USAGE_INPUT_TOKENS_ATTR = "gen_ai.aggregated_usage.input_tokens"
+PYDANTIC_AI_AGGREGATED_USAGE_OUTPUT_TOKENS_ATTR = "gen_ai.aggregated_usage.output_tokens"
+PYDANTIC_AI_AGGREGATED_USAGE_TOTAL_TOKENS_ATTR = "gen_ai.aggregated_usage.total_tokens"
 PYDANTIC_AI_USAGE_DETAILS_INPUT_TOKENS_ATTR = "gen_ai.usage.details.input_tokens"
 PYDANTIC_AI_USAGE_DETAILS_OUTPUT_TOKENS_ATTR = "gen_ai.usage.details.output_tokens"
 PYDANTIC_AI_OPERATION_COST_ATTR = "operation.cost"
@@ -43,12 +41,7 @@ LOGFIRE_MESSAGE_ATTR = "logfire.msg"
 MODEL_NAME_ATTR = "model_name"
 FINAL_RESULT_ATTR = "final_result"
 PYDANTIC_ALL_MESSAGES_ATTR = "pydantic_ai.all_messages"
-OPENAI_LLM_HEADERS_ATTR = "llm.headers"
-OPENAI_LLM_REQUEST_REASONING_EFFORT_ATTR = "llm.request.reasoning_effort"
-OPENAI_SYSTEM_FINGERPRINT_ATTR = "gen_ai.openai.system_fingerprint"
 OPENAI_RESPONSE_SERVICE_TIER_ATTR = "openai.response.service_tier"
-OPENAI_CACHE_READ_INPUT_TOKENS_ATTR = "gen_ai.usage.cache_read_input_tokens"
-OPENAI_REASONING_TOKENS_ATTR = "llm.usage.reasoning_tokens"
 OTEL_SERVER_ADDRESS_ATTR = "server.address"
 OTEL_SERVER_PORT_ATTR = "server.port"
 OTEL_SERVICE_NAME_ATTR = "service.name"
@@ -71,6 +64,11 @@ PYDANTIC_AI_RUNNING_TOOLS_SPAN_NAME = "running tools"
 
 PYDANTIC_AI_STRIP_ATTRS = frozenset(
     {
+        PYDANTIC_AI_AGENT_NAME_ATTR,
+        PYDANTIC_AI_OPERATION_NAME_ATTR,
+        PYDANTIC_AI_TOOL_NAME_ATTR,
+        PYDANTIC_AI_TOOL_CALL_ARGUMENTS_ATTR,
+        PYDANTIC_AI_TOOL_CALL_RESULT_ATTR,
         PYDANTIC_AI_REQUEST_PARAMETERS_ATTR,
         PYDANTIC_AI_TOOL_DEFINITIONS_ATTR,
         PYDANTIC_AI_INPUT_MESSAGES_ATTR,
@@ -81,9 +79,13 @@ PYDANTIC_AI_STRIP_ATTRS = frozenset(
         PYDANTIC_AI_PROVIDER_NAME_ATTR,
         PYDANTIC_AI_RESPONSE_ID_ATTR,
         PYDANTIC_AI_RESPONSE_FINISH_REASONS_ATTR,
-        PYDANTIC_AI_OPENAI_API_BASE_ATTR,
+        SpanAttributes.GEN_AI_OPENAI_API_BASE,
         PYDANTIC_AI_USAGE_INPUT_TOKENS_ATTR,
         PYDANTIC_AI_USAGE_OUTPUT_TOKENS_ATTR,
+        SpanAttributes.GEN_AI_USAGE_TOTAL_TOKENS,
+        PYDANTIC_AI_AGGREGATED_USAGE_INPUT_TOKENS_ATTR,
+        PYDANTIC_AI_AGGREGATED_USAGE_OUTPUT_TOKENS_ATTR,
+        PYDANTIC_AI_AGGREGATED_USAGE_TOTAL_TOKENS_ATTR,
         PYDANTIC_AI_USAGE_DETAILS_INPUT_TOKENS_ATTR,
         PYDANTIC_AI_USAGE_DETAILS_OUTPUT_TOKENS_ATTR,
         PYDANTIC_AI_OPERATION_COST_ATTR,
@@ -92,22 +94,31 @@ PYDANTIC_AI_STRIP_ATTRS = frozenset(
         MODEL_NAME_ATTR,
         FINAL_RESULT_ATTR,
         PYDANTIC_ALL_MESSAGES_ATTR,
-        OPENAI_LLM_HEADERS_ATTR,
-        OPENAI_LLM_REQUEST_REASONING_EFFORT_ATTR,
-        OPENAI_SYSTEM_FINGERPRINT_ATTR,
+        SpanAttributes.LLM_HEADERS,
+        SpanAttributes.LLM_REQUEST_REASONING_EFFORT,
+        SpanAttributes.LLM_OPENAI_RESPONSE_SYSTEM_FINGERPRINT,
         OPENAI_RESPONSE_SERVICE_TIER_ATTR,
-        OPENAI_CACHE_READ_INPUT_TOKENS_ATTR,
-        OPENAI_REASONING_TOKENS_ATTR,
+        SpanAttributes.LLM_USAGE_CACHE_READ_INPUT_TOKENS,
+        SpanAttributes.LLM_USAGE_REASONING_TOKENS,
         OTEL_SERVER_ADDRESS_ATTR,
         OTEL_SERVER_PORT_ATTR,
         OTEL_SERVICE_NAME_ATTR,
         OTEL_SCOPE_NAME_ATTR,
         OTEL_SCOPE_VERSION_ATTR,
-        GEN_AI_AGENT_NAME,
-        GEN_AI_OPERATION_NAME,
-        GEN_AI_TOOL_NAME,
-        GEN_AI_TOOL_CALL_ARGUMENTS,
-        GEN_AI_TOOL_CALL_RESULT,
-        LLM_REQUEST_MODEL,
+        RESPAN_OVERRIDE_MODEL_ATTR,
+        RESPAN_OVERRIDE_INPUT_ATTR,
+        RESPAN_OVERRIDE_OUTPUT_ATTR,
+        RESPAN_OVERRIDE_SPAN_TOOLS_ATTR,
+        RESPAN_OVERRIDE_SPAN_WORKFLOW_NAME_ATTR,
+        RESPAN_OVERRIDE_PROMPT_TOKENS_ATTR,
+        RESPAN_OVERRIDE_COMPLETION_TOKENS_ATTR,
+        RESPAN_OVERRIDE_TOTAL_REQUEST_TOKENS_ATTR,
+        SpanAttributes.TRACELOOP_SPAN_KIND,
+        "respan.span.tools",
+        "respan.span.tool_calls",
+        "respan.span.handoffs",
+        "tool_calls",
+        "has_tool_calls",
+        "parallel_tool_calls",
     }
 )

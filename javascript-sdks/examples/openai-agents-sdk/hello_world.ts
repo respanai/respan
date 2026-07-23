@@ -19,5 +19,3 @@ const agent = new Agent({
 
 const result = await run(agent, "Tell me about recursion in programming.");
 console.log(result.finalOutput);
-
-await respan.flush();

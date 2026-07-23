@@ -13,9 +13,15 @@ logger = logging.getLogger(__name__)
 ENTRY_POINT_GROUP = "opentelemetry_instrumentor"
 
 # Map Instruments enum values to entry point names.
-# Only needed when they differ (most match by convention).
+# Only needed when they differ (most match by convention). Traceloop registers
+# the Bedrock and Vertex AI instrumentors under their underlying SDK package
+# names (boto3 / google_cloud_aiplatform), not the provider name — so without
+# these, block_instruments={BEDROCK, VERTEXAI} resolves to names that match no
+# entry point and silently fails to dedup the native plugins' OTEL twins.
 _ENUM_TO_ENTRY_POINT: dict[str, str] = {
     "grpc": "grpc_client",
+    "bedrock": "boto3",
+    "vertexai": "google_cloud_aiplatform",
 }
 
 # Post-init hooks keyed by entry point name.

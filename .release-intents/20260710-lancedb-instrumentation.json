@@ -1,0 +1,6 @@
+{
+  "summary": "Add LanceDB Python instrumentation",
+  "packages": {
+    "respan-instrumentation-lancedb": "new"
+  }
+}

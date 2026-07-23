@@ -57,8 +57,3 @@ def run_tracing_test():
     for topic in topics:
         print(f"Input: Please explain to me {topic.lower()}")
         print(f"Answer: {explain_concept(topic)} \n")
-
-    # Ensure all spans are flushed before exit
-    k_tl.flush()
-
-

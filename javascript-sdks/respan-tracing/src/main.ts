@@ -2,7 +2,7 @@ import { withTask, withWorkflow, withAgent, withTool } from "./decorators/index.
 import { WithFunctionType } from "./types/decoratorTypes.js";
 import { RespanOptions, ProcessorConfig } from "./types/clientTypes.js";
 import { withRespanSpanAttributes } from "./contexts/span.js";
-import { startTracing, forceFlush, addProcessorToSDK, injectSpan } from "./utils/tracing.js";
+import { startTracing, flush, shutdownTracing, addProcessorToSDK, injectSpan } from "./utils/tracing.js";
 import { enableInstrumentation } from "./instrumentation/index.js";
 import { getClient as getClientAPI } from "./utils/client.js";
 import { getSpanBufferManager } from "./utils/spanBuffer.js";
@@ -75,6 +75,7 @@ export class RespanTelemetry {
 
     constructor(options: RespanOptions) {
         this.options = {
+            ...options,
             appName: options.appName || process.env.RESPAN_APP_NAME || "default",
             disableBatch: options.disableBatch || false,
             baseURL: options.baseURL || process.env.RESPAN_BASE_URL || "https://api.respan.ai",
@@ -82,6 +83,9 @@ export class RespanTelemetry {
             instrumentModules: options.instrumentModules || {},
             disabledInstrumentations: options.disabledInstrumentations || [],
             tracingEnabled: options.tracingEnabled !== false,
+            spanNameStyle: (options.spanNameStyle ||
+                process.env.RESPAN_SPAN_NAME_STYLE ||
+                "semantic") as RespanOptions["spanNameStyle"],
             traceContent: options.traceContent !== false,
             logLevel: options.logLevel || "error",
             silenceInitializationMessage: options.silenceInitializationMessage || false,
@@ -149,10 +153,18 @@ export class RespanTelemetry {
     }
 
     /**
-     * Flush and shutdown tracing
+     * Flush pending spans without shutting down tracing.
+     */
+    public async flush(): Promise<void> {
+        await flush();
+    }
+
+    /**
+     * Flush pending spans and shutdown tracing.
      */
     public async shutdown(): Promise<void> {
-        await forceFlush();
+        await shutdownTracing();
+        this.initialized = false;
     }
 
     /**

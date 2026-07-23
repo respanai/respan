@@ -112,15 +112,28 @@ across spans.
 |---|---|---|
 | `gen_ai.request.model` | string | embedding model |
 | `llm.request.type` | string | `embedding` |
-| `gen_ai.usage.input_tokens` | int | input token count |
+| `gen_ai.usage.input_tokens` | int | input token count, **only from a real provider usage field** |
+| `traceloop.entity.input` | string (JSON) | the embedded text/value(s) |
+| `traceloop.entity.output` | string (JSON) | the embedding vector(s) |
 
-**Strip** before export:
+**Capture the vector.** We are an observability platform — the embedding
+vector is the customer's data and is debuggable (RAG similarity, drift,
+degenerate/zero-vector detection, dimension/model mismatch). Map it into
+`traceloop.entity.output` rather than dropping it. Vector *size* is a
+storage concern handled at ingest by tiering the full span body to the
+storage object (the queryable column may be truncated for display) — and,
+for very high-volume pipelines, by sampling / an opt-out flag. It is **not**
+solved by deleting the data in the translator.
 
-- The embedding vectors themselves (`ai.embedding`, `ai.embeddings`,
-  vendor-specific arrays) — they bloat span size and aren't useful at
-  trace level.
-- Vendor-specific synthetic token fields (e.g., Vercel's
-  `ai.usage.tokens`) once the canonical fields above are populated.
+**Remap, then strip** the vendor-specific keys once the canonical fields are
+populated (so they don't also linger in passthrough metadata): `ai.value` /
+`ai.values` → `traceloop.entity.input`, `ai.embedding` / `ai.embeddings` →
+`traceloop.entity.output`.
+
+**Do not** surface vendor *synthetic* token fields as a usage count (e.g.,
+Vercel's `ai.usage.tokens` is not a trustworthy provider token count) — strip
+them. `gen_ai.usage.input_tokens` is populated only when the provider returns a
+real usage field.
 
 ## Workflow / Agent / Task spans
 
@@ -134,7 +147,9 @@ canonical contract**. It is not to invent new Respan-prefixed fields.
 Vendor-specific shapes a translator must handle today:
 
 - Vercel AI SDK: `ai.*` → canonical
-- OpenInference (CrewAI, Haystack, Google ADK, LangChain, …):
+- CrewAI official lifecycle events: the first-party CrewAI listener emits the
+  canonical contract directly (no OpenInference runtime translation)
+- OpenInference (Haystack, Google ADK, LangChain, …):
   `openinference.*`, indexed `llm.input_messages.N.*` /
   `llm.output_messages.N.*` → canonical
 

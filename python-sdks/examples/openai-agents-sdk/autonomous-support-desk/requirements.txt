@@ -1,0 +1,15 @@
+# Autonomous Support Desk demo - dependencies.
+# Requires Python 3.11-3.13 (respan-tracing needs >=3.11,<3.14).
+
+respan-ai>=4.1.0                                # the `respan` facade (Respan, propagate_attributes)
+respan-sdk>=2.6.0                               # ensure_trace_id + shared types
+respan-instrumentation-openai-agents>=1.1.1     # Agents SDK tracing - MUST include the nested-trace/cost fix
+openai-agents>=0.17.6                           # the `agents` package
+openai>=2.0.0
+python-dotenv>=1.0.0
+httpx>=0.27.0
+
+# Web UI (web/app.py). Also pulled in transitively by openai-agents; pinned here for clarity.
+uvicorn
+starlette
+sse-starlette

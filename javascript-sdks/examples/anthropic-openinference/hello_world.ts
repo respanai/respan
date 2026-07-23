@@ -29,5 +29,3 @@ const text = message.content[0];
 if (text.type === "text") {
   console.log(text.text);
 }
-
-await respan.flush();

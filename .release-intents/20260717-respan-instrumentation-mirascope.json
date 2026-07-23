@@ -1,0 +1,6 @@
+{
+  "summary": "Add Mirascope instrumentation",
+  "packages": {
+    "respan-instrumentation-mirascope": "new"
+  }
+}

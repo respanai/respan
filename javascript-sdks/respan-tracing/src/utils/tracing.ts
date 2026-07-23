@@ -16,9 +16,23 @@ import {
 import { shouldSendTraces } from "./context.js";
 
 // Global SDK instance (singleton)
-let _sdk: NodeSDK;
+let _sdk: NodeSDK | undefined;
 let _initialized: boolean = false;
 let _compositeProcessor: RespanCompositeProcessor | undefined;
+let _flushPromise: Promise<void> | undefined;
+let _shutdownPromise: Promise<void> | undefined;
+let _beforeExitFlushRegistered = false;
+
+const registerBeforeExitFlush = () => {
+  if (_beforeExitFlushRegistered || typeof process === "undefined") {
+    return;
+  }
+
+  _beforeExitFlushRegistered = true;
+  process.once("beforeExit", () => {
+    void flush();
+  });
+};
 
 /**
  * Helper function to resolve and clean up the base URL
@@ -71,11 +85,13 @@ export const startTracing = async (options: RespanOptions) => {
     contextManager,
     silenceInitializationMessage = false,
     tracingEnabled = true,
+    spanNameStyle = process.env.RESPAN_SPAN_NAME_STYLE,
     instrumentModules,
     traceContent = true,
     disabledInstrumentations = [],
     resourceAttributes = {},
     spanPostprocessCallback,
+    disableBatch = false,
   } = options;
 
   // Debug logging for configuration
@@ -84,6 +100,7 @@ export const startTracing = async (options: RespanOptions) => {
     baseURL,
     logLevel,
     tracingEnabled,
+    spanNameStyle,
     traceContent,
     hasApiKey: !!apiKey,
     apiKeyLength: apiKey?.length || 0,
@@ -95,6 +112,7 @@ export const startTracing = async (options: RespanOptions) => {
       : [],
     customHeaders: Object.keys(headers),
     disabledInstrumentations: disabledInstrumentations || [],
+    disableBatch,
   });
 
   if (!tracingEnabled) {
@@ -210,7 +228,7 @@ export const startTracing = async (options: RespanOptions) => {
   console.debug("[Respan Debug] Created OTLP trace exporter");
 
   // Initialize multi-processor manager
-  const processorManager = new MultiProcessorManager();
+  const processorManager = new MultiProcessorManager({ disableBatch, spanNameStyle });
   
   // Add default Respan processor to the manager
   // This ensures backward compatibility: spans without a `processors` attribute
@@ -255,6 +273,7 @@ export const startTracing = async (options: RespanOptions) => {
   try {
     console.debug("[Respan Debug] Starting OpenTelemetry SDK...");
     _sdk.start();
+    registerBeforeExitFlush();
 
     // Strip noisy resource attributes that NodeSDK adds automatically.
     // These pollute span metadata on the backend with no user value.
@@ -300,26 +319,74 @@ export const startTracing = async (options: RespanOptions) => {
 };
 
 /**
- * Enhanced error logging for forceFlush
+ * Flush pending spans without shutting down the SDK.
  */
-export const forceFlush = async (): Promise<void> => {
-  if (_sdk) {
-    try {
-      console.debug(
-        "[Respan Debug] Shutting down SDK and flushing traces..."
-      );
-      await _sdk.shutdown();
-      console.debug("[Respan Debug] SDK shutdown completed");
-    } catch (error) {
-      console.error("[Respan Debug] Error during SDK shutdown:", error);
-      console.error("[Respan Debug] Shutdown error details:", {
-        message: (error as Error).message,
-        stack: (error as Error).stack,
-      });
-    }
-  } else {
-    console.debug("[Respan Debug] No SDK to shutdown");
+export const flush = async (): Promise<void> => {
+  if (!_compositeProcessor) {
+    console.debug("[Respan Debug] No SDK to flush");
+    return;
   }
+
+
+  if (!_flushPromise) {
+    _flushPromise = (async () => {
+      try {
+        console.debug("[Respan Debug] Flushing traces...");
+        await _compositeProcessor?.forceFlush();
+        console.debug("[Respan Debug] Trace flush completed");
+      } catch (error) {
+        console.error("[Respan Debug] Error during trace flush:", error);
+        console.error("[Respan Debug] Flush error details:", {
+          message: (error as Error).message,
+          stack: (error as Error).stack,
+        });
+      }
+    })().finally(() => {
+      _flushPromise = undefined;
+    });
+  }
+
+  await _flushPromise;
+};
+
+/**
+ * Backward-compatible alias for flushing pending spans.
+ */
+export const forceFlush = flush;
+
+/**
+ * Flush pending spans and shut down the SDK.
+ */
+export const shutdownTracing = async (): Promise<void> => {
+  if (!_sdk) {
+    console.debug("[Respan Debug] No SDK to shutdown");
+    return;
+  }
+
+  if (!_shutdownPromise) {
+    _shutdownPromise = (async () => {
+      try {
+        console.debug("[Respan Debug] Shutting down SDK...");
+        await flush();
+        await _sdk?.shutdown();
+        console.debug("[Respan Debug] SDK shutdown completed");
+      } catch (error) {
+        console.error("[Respan Debug] Error during SDK shutdown:", error);
+        console.error("[Respan Debug] Shutdown error details:", {
+          message: (error as Error).message,
+          stack: (error as Error).stack,
+        });
+      } finally {
+        _initialized = false;
+        _compositeProcessor = undefined;
+        _sdk = undefined;
+      }
+    })().finally(() => {
+      _shutdownPromise = undefined;
+    });
+  }
+
+  await _shutdownPromise;
 };
 
 /**

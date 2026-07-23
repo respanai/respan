@@ -72,4 +72,3 @@ def run(question: str):
 
 
 run("What's the weather in Paris?")
-respan.flush()

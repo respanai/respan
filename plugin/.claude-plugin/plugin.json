@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "respan",
+  "displayName": "Respan",
+  "version": "0.1.0",
+  "description": "Respan for Claude Code: tracing, evals, prompts, datasets, and gateway routing, backed by the hosted Respan MCP server.",
+  "author": { "name": "Respan", "url": "https://respan.ai" },
+  "homepage": "https://respan.ai",
+  "repository": "https://github.com/respanai/respan",
+  "license": "Apache-2.0",
+  "keywords": ["llm", "observability", "tracing", "evals", "prompts", "gateway", "mcp"],
+  "mcpServers": "./.mcp.json",
+  "userConfig": {
+    "api_key": {
+      "type": "string",
+      "title": "Respan API Key",
+      "description": "Create one at https://platform.respan.ai. Stored securely in your OS keychain, never written to settings files.",
+      "sensitive": true,
+      "required": true
+    }
+  }
+}

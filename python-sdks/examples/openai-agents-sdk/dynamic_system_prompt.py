@@ -32,7 +32,6 @@ async def main():
         with trace(f"Dynamic prompt ({style})"):
             result = await Runner.run(agent, "Tell me about the ocean.", context=style)
             print(f"[{style}] {result.final_output}\n")
-    respan.flush()
 
 
 if __name__ == "__main__":

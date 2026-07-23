@@ -1,0 +1,6 @@
+{
+  "summary": "CLI: split `respan setup` into tracing and gateway modes — add `respan setup tracing` and `respan setup gateway` subcommands, gateway-mode key verification via a real gateway completion, and a new gateway-setup skill reference",
+  "packages": {
+    "@respan/cli": "minor"
+  }
+}

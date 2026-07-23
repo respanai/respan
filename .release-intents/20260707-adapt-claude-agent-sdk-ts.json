@@ -1,0 +1,6 @@
+{
+  "summary": "@respan/instrumentation-claude-agent-sdk: update instrumentation for latest Claude Agent SDK",
+  "packages": {
+    "@respan/instrumentation-claude-agent-sdk": "patch"
+  }
+}

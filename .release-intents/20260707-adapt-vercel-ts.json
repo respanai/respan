@@ -1,0 +1,6 @@
+{
+  "summary": "@respan/instrumentation-vercel: update instrumentation for latest tracing model",
+  "packages": {
+    "@respan/instrumentation-vercel": "patch"
+  }
+}

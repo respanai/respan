@@ -1,0 +1,6 @@
+{
+  "summary": "Replace the CrewAI OpenInference wrapper with first-party lifecycle and LLM usage instrumentation",
+  "packages": {
+    "respan-instrumentation-crewai": "minor"
+  }
+}

@@ -54,4 +54,3 @@ def run(topic: str) -> str:
 
 
 run("Benefits of open-source software")
-respan.flush()

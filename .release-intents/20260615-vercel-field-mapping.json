@@ -1,0 +1,6 @@
+{
+  "summary": "Map Vercel streaming + embedding input/output to promoted span fields instead of passthrough metadata",
+  "packages": {
+    "@respan/instrumentation-vercel": "patch"
+  }
+}

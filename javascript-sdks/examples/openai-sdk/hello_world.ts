@@ -22,4 +22,3 @@ const response = await client.chat.completions.create({
   messages: [{ role: "user", content: "Say hello in three languages." }],
 });
 console.log(response.choices[0].message.content);
-await respan.flush();

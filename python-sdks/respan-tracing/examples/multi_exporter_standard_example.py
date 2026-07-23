@@ -162,7 +162,6 @@ def main():
     
     # Flush to ensure all spans are exported
     print("\n💾 Flushing spans...")
-    kai.flush()
     time.sleep(1)  # Give time for async export
     
     print("\n" + "=" * 60)

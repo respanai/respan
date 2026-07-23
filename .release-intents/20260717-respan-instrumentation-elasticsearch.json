@@ -1,0 +1,6 @@
+{
+  "summary": "Add Elasticsearch instrumentation",
+  "packages": {
+    "respan-instrumentation-elasticsearch": "new"
+  }
+}

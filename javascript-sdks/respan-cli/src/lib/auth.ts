@@ -1,4 +1,6 @@
+import * as path from 'node:path';
 import { getCredential, Credential } from './config.js';
+import { findProjectRoot, readTextFile, extractEnvVar } from './integrate.js';
 
 export const DEFAULT_BASE_URL = 'https://api.respan.ai';
 export const ENTERPRISE_BASE_URL = 'https://endpoint.respan.ai';
@@ -22,6 +24,19 @@ function resolveConfiguredBaseUrl(credential?: Credential, flagBaseUrl?: string)
   );
 }
 
+/**
+ * Read RESPAN_API_KEY from the project's `.env`. setup writes it there as the
+ * project source of truth, so in-project commands (e.g. `respan logs list`)
+ * work right after setup without a separate `respan auth login`.
+ */
+function readProjectEnvKey(): string | undefined {
+  try {
+    return extractEnvVar(readTextFile(path.join(findProjectRoot(), '.env')), 'RESPAN_API_KEY');
+  } catch {
+    return undefined;
+  }
+}
+
 export function resolveAuth(flags: { 'api-key'?: string; 'base-url'?: string; profile?: string }): AuthConfig {
   const credential = getCredential(flags.profile);
   const baseUrl = resolveConfiguredBaseUrl(credential, flags['base-url']);
@@ -34,6 +49,15 @@ export function resolveAuth(flags: { 'api-key'?: string; 'base-url'?: string; pr
       apiKey: process.env.RESPAN_API_KEY,
       baseUrl,
     };
+  }
+  // The project .env key wins over a saved credential — but an explicit
+  // --profile selects a specific credential (and its base URL), so don't let
+  // an ambient .env key override that choice and break enterprise setups.
+  if (!flags.profile) {
+    const projectEnvKey = readProjectEnvKey();
+    if (projectEnvKey) {
+      return { apiKey: projectEnvKey, baseUrl };
+    }
   }
   if (credential) {
     return credentialToAuth(credential, baseUrl);

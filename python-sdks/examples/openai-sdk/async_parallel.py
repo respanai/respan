@@ -40,4 +40,3 @@ async def run():
 
 
 asyncio.run(run())
-respan.flush()

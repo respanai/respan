@@ -42,4 +42,3 @@ def chat():
 
 
 chat()
-respan.flush()

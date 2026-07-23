@@ -1,0 +1,6 @@
+{
+  "summary": "Add AWS Bedrock Runtime instrumentation",
+  "packages": {
+    "respan-instrumentation-aws-bedrock": "new"
+  }
+}

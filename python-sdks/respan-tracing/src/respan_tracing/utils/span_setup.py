@@ -54,6 +54,15 @@ def setup_span(
     entity_name_token = None
     entity_path_token = None
 
+    # Resolve span links before attaching entity context. consume_span_links()
+    # clears the pending-link context; if we clear it after entity context is
+    # attached, cleanup detaches can restore the older pending-link value.
+    otel_links: List[trace.Link] = []
+    explicit_links = links() if callable(links) else (links or [])
+    for link in explicit_links:
+        otel_links.append(span_link_to_otel(link))
+    otel_links.extend(consume_span_links())
+
     # Propagate entity name for workflow/agent spans (children inherit it
     # as TRACELOOP_WORKFLOW_NAME via RespanSpanProcessor.on_start)
     if span_kind_str in _ENTITY_NAME_KINDS:
@@ -67,13 +76,6 @@ def setup_span(
         entity_path_token = context_api.attach(
             context_api.set_value(SpanAttributes.TRACELOOP_ENTITY_PATH, entity_path)
         )
-
-    # Resolve span links: explicit param + context-attached
-    otel_links: List[trace.Link] = []
-    explicit_links = links() if callable(links) else (links or [])
-    for link in explicit_links:
-        otel_links.append(span_link_to_otel(link))
-    otel_links.extend(consume_span_links())
 
     # Build initial attributes — processors must be set BEFORE start_span()
     # so that on_start's inheritance guard can distinguish explicit processors

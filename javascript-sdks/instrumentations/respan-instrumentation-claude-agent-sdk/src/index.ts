@@ -50,6 +50,7 @@ const HOOK_EVENT_USER_PROMPT_SUBMIT = "UserPromptSubmit";
 const HOOK_EVENT_PRE_TOOL_USE = "PreToolUse";
 const HOOK_EVENT_POST_TOOL_USE = "PostToolUse";
 const HOOK_EVENT_POST_TOOL_USE_FAILURE = "PostToolUseFailure";
+const HOOK_EVENT_POST_TOOL_BATCH = "PostToolBatch";
 const INSTRUMENTOR_LOG_PREFIX = "[respan] ClaudeAgentSDKInstrumentor";
 
 export class ClaudeAgentSDKInstrumentor {
@@ -203,6 +204,39 @@ export class ClaudeAgentSDKInstrumentor {
       } catch (error) {
         console.warn(
           `${INSTRUMENTOR_LOG_PREFIX} ${HOOK_EVENT_POST_TOOL_USE_FAILURE} hook failed:`,
+          error,
+        );
+      }
+      return {};
+    });
+
+    appendHook(HOOK_EVENT_POST_TOOL_BATCH, async (input) => {
+      try {
+        const toolCalls = Array.isArray(input.tool_calls) ? input.tool_calls : [];
+        for (const toolCall of toolCalls) {
+          if (!toolCall || typeof toolCall !== "object" || Array.isArray(toolCall)) {
+            continue;
+          }
+          const toolCallRecord = toolCall as Record<string, unknown>;
+          const toolUseId =
+            typeof toolCallRecord.tool_use_id === "string"
+              ? toolCallRecord.tool_use_id
+              : undefined;
+          if (toolUseId && !state.pendingTools.has(toolUseId)) {
+            continue;
+          }
+          emitCompletedTool(
+            state,
+            {
+              session_id: input.session_id,
+              ...toolCallRecord,
+            },
+            toolUseId,
+          );
+        }
+      } catch (error) {
+        console.warn(
+          `${INSTRUMENTOR_LOG_PREFIX} ${HOOK_EVENT_POST_TOOL_BATCH} hook failed:`,
           error,
         );
       }

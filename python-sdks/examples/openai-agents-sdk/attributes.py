@@ -46,7 +46,6 @@ async def main():
     # Simulate two different users making requests
     await handle_request("user_alice", "What's the weather in Tokyo?")
     await handle_request("user_bob", "What's the weather in London?")
-    respan.flush()
 
 
 if __name__ == "__main__":

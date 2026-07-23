@@ -146,6 +146,16 @@ RESPAN_SPAN_TOOL_CALLS = "respan.span.tool_calls"
 RESPAN_SPAN_HANDOFFS = "respan.span.handoffs"
 
 # ---------------------------------------------------------------------------
+# Internal exporter hints (shared contract with the JS SDK)
+# Instrumentations may set these to steer semantic span naming; the exporter
+# strips them before export — they must never appear in exported attributes.
+# ---------------------------------------------------------------------------
+RESPAN_INTERNAL_SPAN_NAME_KIND = "respan.internal.span_name.kind"
+RESPAN_INTERNAL_SPAN_NAME_DETAIL = "respan.internal.span_name.detail"
+RESPAN_INTERNAL_DROP_SPAN = "respan.internal.drop_span"
+RESPAN_INTERNAL_EXPORT_PARENT = "respan.internal.export_parent_span_id"
+
+# ---------------------------------------------------------------------------
 # LLM attributes (removed from opentelemetry-semantic-conventions-ai 0.5.0)
 # Defined locally for backward compatibility with the Respan pipeline.
 # ---------------------------------------------------------------------------

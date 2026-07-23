@@ -1,0 +1,11 @@
+{
+  "summary": "Unify semantic span naming across JS and Python: semantic is the default in both SDKs with RESPAN_SPAN_NAME_STYLE=legacy opt-out, shared internal naming-hint attributes, batch-safe wrapper drop/reparenting, handoff from/to names, and suffix sanitization",
+  "packages": {
+    "@respan/respan-sdk": "minor",
+    "@respan/tracing": "minor",
+    "@respan/respan": "minor",
+    "@respan/instrumentation-vercel": "minor",
+    "respan-sdk": "minor",
+    "respan-tracing": "minor"
+  }
+}

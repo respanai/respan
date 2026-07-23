@@ -22,4 +22,3 @@ response = client.responses.create(
     input="Say hello in three languages.",
 )
 print(response.output_text)
-respan.flush()

@@ -98,17 +98,35 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@opentelemetry/semantic-conventions@npm:^1.40.0":
+  version: 1.40.0
+  resolution: "@opentelemetry/semantic-conventions@npm:1.40.0"
+  checksum: 10c0/3259de0ea11b52eb70e44c12eba21448392baf9cb74c37b62071c4a5ed7fb89b61e194f3898d40ac6bfa7293617a0e132876cb6e355472b66de0cdb13c50b529
+  languageName: node
+  linkType: hard
+
 "@respan/instrumentation-vercel@workspace:.":
   version: 0.0.0-use.local
   resolution: "@respan/instrumentation-vercel@workspace:."
   dependencies:
     "@opentelemetry/api": "npm:^1.9.0"
     "@opentelemetry/sdk-trace-base": "npm:^1.29.0"
+    "@opentelemetry/semantic-conventions": "npm:^1.40.0"
     "@respan/respan-sdk": "npm:^1.0.0"
+    "@traceloop/ai-semantic-conventions": "npm:^0.13.0"
     "@types/node": "npm:^22.15.29"
     typescript: "npm:^5.7.3"
   languageName: unknown
   linkType: soft
+
+"@traceloop/ai-semantic-conventions@npm:^0.13.0":
+  version: 0.13.0
+  resolution: "@traceloop/ai-semantic-conventions@npm:0.13.0"
+  dependencies:
+    "@opentelemetry/api": "npm:^1.9.0"
+  checksum: 10c0/f5d20dabb3b7be5cf539550727e67c90ebe317a910a846cee26d1ba87f2c4ffcccff1aca395b5f5c815cfa72d2a4fa7943341d487f972deb04a5039e43e1aea3
+  languageName: node
+  linkType: hard
 
 "@respan/respan-sdk@npm:^1.0.0":
   version: 1.1.6

@@ -1,0 +1,6 @@
+{
+  "summary": "Add Writer Python SDK instrumentation",
+  "packages": {
+    "respan-instrumentation-writer": "new"
+  }
+}

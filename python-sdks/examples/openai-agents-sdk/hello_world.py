@@ -21,7 +21,6 @@ async def main():
     with trace("Hello world"):
         result = await Runner.run(agent, "Tell me about recursion in programming.")
         print(result.final_output)
-    respan.flush()
 
 
 if __name__ == "__main__":

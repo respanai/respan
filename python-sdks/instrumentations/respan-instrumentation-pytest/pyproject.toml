@@ -1,0 +1,28 @@
+[tool.poetry]
+name = "respan-instrumentation-pytest"
+version = "0.1.0"
+description = "Respan tracing plugin for Pytest sessions and tests"
+authors = ["Respan <team@respan.ai>"]
+license = "Apache 2.0"
+readme = "README.md"
+classifiers = ["Framework :: Pytest"]
+packages = [
+    { include = "respan_instrumentation_pytest", from = "./src" },
+]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.14"
+respan-tracing = "^2.17.0"
+respan-sdk = ">=2.6.1"
+pytest = ">=7.4.0,<10.0.0"
+opentelemetry-semantic-conventions-ai = ">=0.4.1"
+
+[tool.poetry.plugins."respan.instrumentations"]
+pytest = "respan_instrumentation_pytest:PytestInstrumentor"
+
+[tool.poetry.plugins.pytest11]
+respan = "respan_instrumentation_pytest.plugin"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

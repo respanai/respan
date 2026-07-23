@@ -1,3 +1,5 @@
+import type { RespanSpanNameStyle } from "./spanTypes.js";
+
 export interface TracingDecoratorConfig {
   name: string;
   version?: number;
@@ -55,6 +57,14 @@ export interface TracingOptions {
    * Defaults to true.
    */
   tracingEnabled?: boolean;
+
+  /**
+   * Controls exported span.name formatting.
+   * - semantic: use operation-prefixed names like agent.triage or llm.gpt-4o
+   * - legacy: preserve instrumentation span names
+   * Defaults to semantic. Can also be set with RESPAN_SPAN_NAME_STYLE=legacy.
+   */
+  spanNameStyle?: RespanSpanNameStyle;
 
   /**
    * Explicitly specify modules to instrument. Optional.

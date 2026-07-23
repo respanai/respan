@@ -26,7 +26,6 @@ async def main():
                 if isinstance(event.data, ResponseTextDeltaEvent):
                     print(event.data.delta, end="", flush=True)
         print()
-    respan.flush()
 
 
 if __name__ == "__main__":

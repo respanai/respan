@@ -1,0 +1,6 @@
+{
+  "summary": "Add Temporal instrumentation",
+  "packages": {
+    "respan-instrumentation-temporal": "new"
+  }
+}

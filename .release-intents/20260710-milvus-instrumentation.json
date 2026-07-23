@@ -1,0 +1,6 @@
+{
+  "summary": "Add Milvus Python instrumentation",
+  "packages": {
+    "respan-instrumentation-milvus": "new"
+  }
+}

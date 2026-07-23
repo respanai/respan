@@ -46,7 +46,6 @@ async def main():
     )
     print(f"Handled by: {result.last_agent.name}")
     print(f"Response: {result.final_output}")
-    respan.flush()
 
 
 if __name__ == "__main__":

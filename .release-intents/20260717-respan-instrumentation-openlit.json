@@ -1,0 +1,6 @@
+{
+  "summary": "Add OpenLIT instrumentation",
+  "packages": {
+    "respan-instrumentation-openlit": "new"
+  }
+}

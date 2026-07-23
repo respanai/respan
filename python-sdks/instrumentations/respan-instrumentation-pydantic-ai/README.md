@@ -42,5 +42,5 @@ respan.flush()
 
 - By default the instrumentor enables global PydanticAI instrumentation via `Agent.instrument_all(...)`.
 - Pass `agent=...` to `PydanticAIInstrumentor(...)` if you only want to instrument one agent instance.
-- The plugin uses explicit `InstrumentationSettings(version=4)` to keep emitted spans on the current GenAI semantic conventions used elsewhere in this repo.
+- The plugin uses explicit `InstrumentationSettings(version=5)` to keep emitted spans on the current Pydantic AI v2 GenAI semantic conventions.
 - This package does not depend on OpenInference at runtime; it consumes native PydanticAI telemetry directly.

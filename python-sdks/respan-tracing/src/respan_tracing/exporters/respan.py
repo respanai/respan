@@ -2,6 +2,8 @@ import base64
 import hashlib
 import importlib.metadata
 import json
+import os
+import re
 from collections.abc import Mapping
 from types import SimpleNamespace
 from typing import Dict, Optional, Sequence, List, Any
@@ -58,13 +60,37 @@ from respan_sdk.constants.otlp_constants import (
 
 from opentelemetry.semconv_ai import SpanAttributes, LLMRequestTypeValues
 
-from respan_sdk.constants.llm_logging import LOG_TYPE_CHAT
+from respan_sdk.constants.llm_logging import (
+    LOG_TYPE_AGENT,
+    LOG_TYPE_CHAT,
+    LOG_TYPE_COMPLETION,
+    LOG_TYPE_EMBEDDING,
+    LOG_TYPE_FUNCTION,
+    LOG_TYPE_GENERATION,
+    LOG_TYPE_GUARDRAIL,
+    LOG_TYPE_HANDOFF,
+    LOG_TYPE_RESPONSE,
+    LOG_TYPE_TASK,
+    LOG_TYPE_TEXT,
+    LOG_TYPE_TOOL,
+    LOG_TYPE_WORKFLOW,
+)
 from respan_sdk.constants.span_attributes import (
+    GEN_AI_AGENT_NAME,
+    GEN_AI_OPERATION_NAME,
     GEN_AI_SYSTEM,
+    GEN_AI_TOOL_NAME,
     LLM_REQUEST_MODEL,
     LLM_REQUEST_TYPE,
+    RESPAN_INTERNAL_DROP_SPAN,
+    RESPAN_INTERNAL_EXPORT_PARENT,
+    RESPAN_INTERNAL_SPAN_NAME_DETAIL,
+    RESPAN_INTERNAL_SPAN_NAME_KIND,
     RESPAN_LOG_TYPE,
+    RESPAN_METADATA_FROM_AGENT,
+    RESPAN_METADATA_GUARDRAIL_NAME,
     RESPAN_METADATA_INTERNAL_TRACING_SDK_VERSION,
+    RESPAN_METADATA_TO_AGENT,
     RESPAN_SPAN_TOOL_CALLS,
     RESPAN_SPAN_TOOLS,
 )
@@ -147,8 +173,9 @@ _CLAUDE_AGENT_RESPONSE_SPAN_NAMES = frozenset({
     "ClaudeAgentSDK.ClaudeSDKClient.receive_response",
 })
 _ASSISTANT_MESSAGE_SPAN_NAME = "assistant_message"
-_GEN_AI_PROMPT_PREFIX = "gen_ai.prompt."
-_GEN_AI_COMPLETION_PREFIX = "gen_ai.completion."
+_GEN_AI_PROMPT_PREFIX = f"{SpanAttributes.LLM_PROMPTS}."
+_GEN_AI_COMPLETION_PREFIX = f"{SpanAttributes.LLM_COMPLETIONS}."
+_COMPLETION_TOOL_CALLS_ATTR = f"{SpanAttributes.LLM_COMPLETIONS}.0.tool_calls"
 
 
 def _derive_synthetic_span_id(*parts: Any) -> int:
@@ -180,7 +207,9 @@ def _build_claude_agent_final_chat_span(
         return None
 
     attrs = span.attributes or {}
-    tool_calls = _parse_structured_json_attr(attrs.get(RESPAN_SPAN_TOOL_CALLS))
+    tool_calls = _parse_structured_json_attr(attrs.get(_COMPLETION_TOOL_CALLS_ATTR))
+    if not isinstance(tool_calls, list) or not tool_calls:
+        tool_calls = _parse_structured_json_attr(attrs.get(RESPAN_SPAN_TOOL_CALLS))
     if not isinstance(tool_calls, list) or not tool_calls:
         return None
 
@@ -195,10 +224,11 @@ def _build_claude_agent_final_chat_span(
 
     child_attributes: Dict[str, Any] = {
         RESPAN_LOG_TYPE: LOG_TYPE_CHAT,
-        LLM_REQUEST_TYPE: LLMRequestTypeValues.CHAT.value,
-        "traceloop.entity.name": _ASSISTANT_MESSAGE_SPAN_NAME,
-        "gen_ai.completion.0.role": "assistant",
-        "gen_ai.completion.0.content": completion_text,
+        SpanAttributes.LLM_REQUEST_TYPE: LLMRequestTypeValues.CHAT.value,
+        SpanAttributes.TRACELOOP_ENTITY_NAME: _ASSISTANT_MESSAGE_SPAN_NAME,
+        f"{SpanAttributes.LLM_COMPLETIONS}.0.role": "assistant",
+        f"{SpanAttributes.LLM_COMPLETIONS}.0.content": completion_text,
+        _COMPLETION_TOOL_CALLS_ATTR: tool_calls,
         SpanAttributes.TRACELOOP_ENTITY_OUTPUT: json.dumps(
             primary_completion_message,
             default=str,
@@ -209,13 +239,13 @@ def _build_claude_agent_final_chat_span(
     if input_value is not None:
         child_attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT] = input_value
 
-    model = attrs.get(LLM_REQUEST_MODEL)
+    model = attrs.get(SpanAttributes.LLM_REQUEST_MODEL)
     if model is not None:
-        child_attributes[LLM_REQUEST_MODEL] = model
+        child_attributes[SpanAttributes.LLM_REQUEST_MODEL] = model
 
-    system = attrs.get(GEN_AI_SYSTEM)
+    system = attrs.get(SpanAttributes.LLM_SYSTEM)
     if system is not None:
-        child_attributes[GEN_AI_SYSTEM] = system
+        child_attributes[SpanAttributes.LLM_SYSTEM] = system
 
     child_attributes.update({
         key: value
@@ -322,7 +352,357 @@ _STRIPPED_ATTRIBUTES = frozenset({
     "logfire.json_schema",
     RESPAN_SPAN_TOOL_CALLS,
     RESPAN_SPAN_TOOLS,
+    # Internal naming hints — exporter-only, never part of the export contract.
+    RESPAN_INTERNAL_SPAN_NAME_KIND,
+    RESPAN_INTERNAL_SPAN_NAME_DETAIL,
+    RESPAN_INTERNAL_DROP_SPAN,
+    RESPAN_INTERNAL_EXPORT_PARENT,
 })
+
+_LLM_SPAN_NAME_PREFIX = "llm"
+_SPAN_NAME_PREFIXES = frozenset({
+    LOG_TYPE_AGENT,
+    LOG_TYPE_EMBEDDING,
+    LOG_TYPE_GUARDRAIL,
+    LOG_TYPE_HANDOFF,
+    _LLM_SPAN_NAME_PREFIX,
+    LOG_TYPE_TASK,
+    LOG_TYPE_TOOL,
+    LOG_TYPE_WORKFLOW,
+})
+_LEGACY_SPAN_NAME_PREFIX_ALIASES = {
+    LOG_TYPE_CHAT: _LLM_SPAN_NAME_PREFIX,
+    LOG_TYPE_COMPLETION: _LLM_SPAN_NAME_PREFIX,
+    "generate": _LLM_SPAN_NAME_PREFIX,
+    LOG_TYPE_GENERATION: _LLM_SPAN_NAME_PREFIX,
+    LOG_TYPE_RESPONSE: _LLM_SPAN_NAME_PREFIX,
+    "responses": _LLM_SPAN_NAME_PREFIX,
+    LOG_TYPE_TEXT: _LLM_SPAN_NAME_PREFIX,
+}
+_SPAN_NAME_PREFIX_ALIASES = {
+    **{prefix: prefix for prefix in _SPAN_NAME_PREFIXES},
+    **_LEGACY_SPAN_NAME_PREFIX_ALIASES,
+}
+_SUFFIXED_SPAN_NAME_PREFIXES = frozenset({
+    LOG_TYPE_AGENT,
+    LOG_TYPE_HANDOFF,
+    _LLM_SPAN_NAME_PREFIX,
+    LOG_TYPE_TOOL,
+})
+_LOG_TYPE_TO_SPAN_NAME_PREFIX = {
+    LOG_TYPE_AGENT: LOG_TYPE_AGENT,
+    LOG_TYPE_CHAT: _LLM_SPAN_NAME_PREFIX,
+    LOG_TYPE_COMPLETION: _LLM_SPAN_NAME_PREFIX,
+    LOG_TYPE_EMBEDDING: LOG_TYPE_EMBEDDING,
+    LOG_TYPE_FUNCTION: LOG_TYPE_TOOL,
+    LOG_TYPE_GENERATION: _LLM_SPAN_NAME_PREFIX,
+    LOG_TYPE_GUARDRAIL: LOG_TYPE_GUARDRAIL,
+    LOG_TYPE_HANDOFF: LOG_TYPE_HANDOFF,
+    LOG_TYPE_RESPONSE: _LLM_SPAN_NAME_PREFIX,
+    LOG_TYPE_TASK: LOG_TYPE_TASK,
+    LOG_TYPE_TEXT: _LLM_SPAN_NAME_PREFIX,
+    LOG_TYPE_TOOL: LOG_TYPE_TOOL,
+    LOG_TYPE_WORKFLOW: LOG_TYPE_WORKFLOW,
+}
+_REQUEST_TYPE_TO_SPAN_NAME_PREFIX = {
+    "chat": _LLM_SPAN_NAME_PREFIX,
+    "completion": _LLM_SPAN_NAME_PREFIX,
+    "embedding": LOG_TYPE_EMBEDDING,
+}
+_ENTITY_DETAIL_ATTRS_BY_PREFIX = {
+    LOG_TYPE_AGENT: (GEN_AI_AGENT_NAME, SpanAttributes.TRACELOOP_ENTITY_NAME),
+    LOG_TYPE_GUARDRAIL: (
+        RESPAN_METADATA_GUARDRAIL_NAME,
+        SpanAttributes.TRACELOOP_ENTITY_NAME,
+    ),
+    LOG_TYPE_HANDOFF: (SpanAttributes.TRACELOOP_ENTITY_NAME,),
+    LOG_TYPE_TASK: (SpanAttributes.TRACELOOP_ENTITY_NAME, GEN_AI_OPERATION_NAME),
+    LOG_TYPE_TOOL: (
+        GEN_AI_TOOL_NAME,
+        SpanAttributes.TRACELOOP_ENTITY_NAME,
+        GEN_AI_OPERATION_NAME,
+    ),
+    LOG_TYPE_WORKFLOW: (SpanAttributes.TRACELOOP_ENTITY_NAME,),
+}
+_LLM_DETAIL_ATTRS = (
+    LLM_REQUEST_MODEL,
+    "llm.model_name",
+    "model",
+    "ai.model.id",
+    "ai.response.model",
+    SpanAttributes.LLM_REQUEST_MODEL,
+)
+_CHAT_NAME_MARKERS = ("chat", "response", "responses")
+_GENERATION_NAME_MARKERS = ("generate", "generation", "completion")
+_EMBEDDING_NAME_MARKERS = ("embedding", "embeddings", "embed")
+
+# Operation/structural tokens that must not survive as a semantic-name suffix
+# (e.g. "handoff.task" or "llm.doGenerate" — the suffix carries no identity).
+_GENERIC_SPAN_NAME_DETAILS = frozenset(
+    set(_SPAN_NAME_PREFIX_ALIASES)
+    | {"completions", "dogenerate", "dostream", "doembed"}
+)
+
+_SPAN_NAME_STYLE_ENV_VAR = "RESPAN_SPAN_NAME_STYLE"
+_SPAN_NAME_STYLE_LEGACY = "legacy"
+_SPAN_NAME_STYLE_SEMANTIC = "semantic"
+
+_SPAN_NAME_ARROW_RE = re.compile(r"\s*(?:→|->)\s*")
+_SPAN_NAME_INVALID_CHARS_RE = re.compile(r"[^\w.-]+")
+_SPAN_NAME_EDGE_PUNCT_RE = re.compile(r"^[_\-.]+|[_\-.]+$")
+
+
+def _resolve_span_name_style() -> str:
+    """Resolve the export span-name style.
+
+    Semantic renaming is the default (matching released behavior);
+    RESPAN_SPAN_NAME_STYLE=legacy preserves original instrumentation names.
+    """
+    value = (os.environ.get(_SPAN_NAME_STYLE_ENV_VAR) or "").strip().lower()
+    if value == _SPAN_NAME_STYLE_LEGACY:
+        return _SPAN_NAME_STYLE_LEGACY
+    return _SPAN_NAME_STYLE_SEMANTIC
+
+
+def _sanitize_span_name_part(value: str) -> str:
+    """Mirror the JS SDK sanitizer: arrows/whitespace/punctuation → underscores."""
+    sanitized = _SPAN_NAME_ARROW_RE.sub("_", value.strip())
+    sanitized = _SPAN_NAME_INVALID_CHARS_RE.sub("_", sanitized)
+    return _SPAN_NAME_EDGE_PUNCT_RE.sub("", sanitized)
+
+
+def _clean_span_name_part(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _first_present_attr(attrs: Mapping[str, Any], keys: Sequence[str]) -> Optional[str]:
+    for key in keys:
+        value = _clean_span_name_part(attrs.get(key))
+        if value:
+            return value
+    return None
+
+
+def _display_span_name_prefix(prefix: str) -> str:
+    return prefix.lower()
+
+
+def _normalize_existing_semantic_span_name(name: str) -> Optional[str]:
+    lower_name = name.lower()
+    for candidate, prefix in _SPAN_NAME_PREFIX_ALIASES.items():
+        display_prefix = _display_span_name_prefix(prefix)
+        if lower_name == candidate:
+            return display_prefix
+        if lower_name.startswith(f"{candidate}."):
+            if prefix not in _SUFFIXED_SPAN_NAME_PREFIXES:
+                return display_prefix
+            detail = _sanitize_span_name_part(name[len(candidate) + 1 :])
+            return f"{display_prefix}.{detail}" if detail else display_prefix
+    return None
+
+
+def _strip_token_from_span_name(name: str, tokens: Sequence[str]) -> Optional[str]:
+    normalized = name.strip()
+    lower_name = normalized.lower()
+
+    for token in tokens:
+        lower_token = token.lower()
+        dotted_prefix = f"{lower_token}."
+        if lower_name.startswith(dotted_prefix):
+            return normalized[len(dotted_prefix):].strip() or None
+
+        spaced_prefix = f"{lower_token} "
+        if lower_name.startswith(spaced_prefix):
+            return normalized[len(spaced_prefix):].strip() or None
+
+        dotted_suffix = f".{lower_token}"
+        if lower_name.endswith(dotted_suffix):
+            return normalized[: -len(dotted_suffix)].strip() or None
+
+        spaced_suffix = f" {lower_token}"
+        if lower_name.endswith(spaced_suffix):
+            return normalized[: -len(spaced_suffix)].strip() or None
+
+    return None
+
+
+def _resolve_hinted_span_name_prefix(hinted_kind: str) -> Optional[str]:
+    """Map an instrumentation-provided kind hint to a semantic prefix."""
+    normalized = hinted_kind.lower()
+    prefix = (
+        _LOG_TYPE_TO_SPAN_NAME_PREFIX.get(normalized)
+        or _SPAN_NAME_PREFIX_ALIASES.get(normalized)
+    )
+    if prefix:
+        return prefix
+    return _sanitize_span_name_part(normalized) or None
+
+
+def _infer_span_name_prefix(name: str, attrs: Mapping[str, Any]) -> Optional[str]:
+    hinted_kind = _clean_span_name_part(attrs.get(RESPAN_INTERNAL_SPAN_NAME_KIND))
+    if hinted_kind:
+        prefix = _resolve_hinted_span_name_prefix(hinted_kind)
+        if prefix:
+            return prefix
+
+    log_type = _clean_span_name_part(attrs.get(RESPAN_LOG_TYPE))
+    if log_type:
+        prefix = _LOG_TYPE_TO_SPAN_NAME_PREFIX.get(log_type.lower())
+        if prefix:
+            return prefix
+
+    span_kind = _clean_span_name_part(attrs.get(SpanAttributes.TRACELOOP_SPAN_KIND))
+    if span_kind:
+        prefix = _LOG_TYPE_TO_SPAN_NAME_PREFIX.get(span_kind.lower())
+        if prefix:
+            return prefix
+
+    request_type = _clean_span_name_part(attrs.get(LLM_REQUEST_TYPE))
+    if request_type:
+        prefix = _REQUEST_TYPE_TO_SPAN_NAME_PREFIX.get(request_type.lower())
+        if prefix:
+            return prefix
+
+    operation_name = _clean_span_name_part(attrs.get(GEN_AI_OPERATION_NAME))
+    if operation_name:
+        lower_operation = operation_name.lower()
+        if any(marker in lower_operation for marker in _EMBEDDING_NAME_MARKERS):
+            return LOG_TYPE_EMBEDDING
+        if any(marker in lower_operation for marker in _CHAT_NAME_MARKERS):
+            return _LLM_SPAN_NAME_PREFIX
+        if any(marker in lower_operation for marker in _GENERATION_NAME_MARKERS):
+            return _LLM_SPAN_NAME_PREFIX
+
+    if attrs.get(GEN_AI_SYSTEM):
+        return _LLM_SPAN_NAME_PREFIX
+
+    if _first_present_attr(attrs, _LLM_DETAIL_ATTRS):
+        return _LLM_SPAN_NAME_PREFIX
+
+    lower_name = name.lower()
+    for candidate, prefix in _SPAN_NAME_PREFIX_ALIASES.items():
+        if lower_name.startswith(f"{candidate} ") or lower_name.endswith(f".{candidate}"):
+            return prefix
+        if lower_name.endswith(f" {candidate}"):
+            return prefix
+
+    if any(marker in lower_name for marker in _EMBEDDING_NAME_MARKERS):
+        return LOG_TYPE_EMBEDDING
+    if any(marker in lower_name for marker in _CHAT_NAME_MARKERS):
+        return _LLM_SPAN_NAME_PREFIX
+    if any(marker in lower_name for marker in _GENERATION_NAME_MARKERS):
+        return _LLM_SPAN_NAME_PREFIX
+
+    return None
+
+
+def _detail_tokens_for_prefix(prefix: str) -> Sequence[str]:
+    if prefix == _LLM_SPAN_NAME_PREFIX:
+        return (
+            _LLM_SPAN_NAME_PREFIX,
+            LOG_TYPE_CHAT,
+            LOG_TYPE_COMPLETION,
+            "completion",
+            "generate",
+            LOG_TYPE_GENERATION,
+            LOG_TYPE_RESPONSE,
+            "responses",
+            LOG_TYPE_TEXT,
+        )
+    if prefix == LOG_TYPE_EMBEDDING:
+        return (LOG_TYPE_EMBEDDING, "embeddings", "embed")
+    return (prefix,)
+
+
+def _span_name_detail(prefix: str, name: str, attrs: Mapping[str, Any]) -> Optional[str]:
+    if prefix == _LLM_SPAN_NAME_PREFIX:
+        return _first_present_attr(attrs, _LLM_DETAIL_ATTRS)
+
+    hinted_detail = _clean_span_name_part(attrs.get(RESPAN_INTERNAL_SPAN_NAME_DETAIL))
+    if hinted_detail:
+        return hinted_detail
+
+    if prefix == LOG_TYPE_HANDOFF:
+        from_agent = _clean_span_name_part(attrs.get(RESPAN_METADATA_FROM_AGENT))
+        to_agent = _clean_span_name_part(attrs.get(RESPAN_METADATA_TO_AGENT))
+        if from_agent and to_agent:
+            return f"{from_agent}_to_{to_agent}"
+
+    attr_detail = _first_present_attr(
+        attrs,
+        _ENTITY_DETAIL_ATTRS_BY_PREFIX.get(prefix, ()),
+    )
+    if attr_detail:
+        return attr_detail
+
+    stripped_detail = _strip_token_from_span_name(
+        name,
+        _detail_tokens_for_prefix(prefix),
+    )
+    if stripped_detail and stripped_detail.lower() not in _GENERIC_SPAN_NAME_DETAILS:
+        return stripped_detail
+
+    if prefix == LOG_TYPE_EMBEDDING:
+        llm_detail = _first_present_attr(attrs, _LLM_DETAIL_ATTRS)
+        if llm_detail:
+            return llm_detail
+
+    fallback = _clean_span_name_part(name)
+    if fallback and fallback.lower() in _GENERIC_SPAN_NAME_DETAILS:
+        return None
+    return fallback
+
+
+def _export_span_name(span: ReadableSpan) -> str:
+    if _resolve_span_name_style() == _SPAN_NAME_STYLE_LEGACY:
+        return getattr(span, "name", "")
+
+    original_name = _clean_span_name_part(getattr(span, "name", None))
+    if not original_name:
+        return getattr(span, "name", "")
+
+    attrs = span.attributes or {}
+    has_name_hints = (
+        _clean_span_name_part(attrs.get(RESPAN_INTERNAL_SPAN_NAME_KIND)) is not None
+        or _clean_span_name_part(attrs.get(RESPAN_INTERNAL_SPAN_NAME_DETAIL)) is not None
+    )
+
+    # Names that already look semantic pass through — unless an instrumentation
+    # hint overrides them, or the suffix is a structural token ("handoff.task",
+    # "llm.doGenerate") that must be recomputed from attributes.
+    if not has_name_hints:
+        existing_semantic_name = _normalize_existing_semantic_span_name(original_name)
+        if existing_semantic_name:
+            prefix_part, _, detail_part = existing_semantic_name.partition(".")
+            has_generic_detail = (
+                bool(detail_part) and detail_part.lower() in _GENERIC_SPAN_NAME_DETAILS
+            )
+            if prefix_part == _LLM_SPAN_NAME_PREFIX:
+                if not _first_present_attr(attrs, _LLM_DETAIL_ATTRS):
+                    if has_generic_detail:
+                        return _LLM_SPAN_NAME_PREFIX
+                    return existing_semantic_name
+            elif not has_generic_detail:
+                return existing_semantic_name
+
+    prefix = _infer_span_name_prefix(original_name, attrs)
+    if not prefix:
+        return original_name
+
+    display_prefix = _display_span_name_prefix(prefix)
+    if prefix not in _SUFFIXED_SPAN_NAME_PREFIXES:
+        return display_prefix
+
+    detail = _span_name_detail(prefix, original_name, attrs)
+    if detail:
+        detail = _sanitize_span_name_part(detail)
+    if not detail or detail.lower() == display_prefix:
+        return display_prefix
+
+    return f"{display_prefix}.{detail}"
 
 
 def _parse_structured_json_attr(value: Any) -> Any:
@@ -607,7 +987,7 @@ def _span_to_otlp_json(span: ReadableSpan) -> Dict[str, Any]:
     result = {
         OTLP_TRACE_ID_KEY: trace_id,
         OTLP_SPAN_ID_KEY: span_id,
-        OTLP_NAME_KEY: span.name,
+        OTLP_NAME_KEY: _export_span_name(span),
         OTLP_KIND_KEY: kind_value,
         OTLP_START_TIME_KEY: start_time_ns,
         OTLP_END_TIME_KEY: end_time_ns,
@@ -716,8 +1096,8 @@ def _get_enrichment_attrs(span: ReadableSpan) -> Dict[str, Any]:
             _RESPAN_TRACING_SDK_VERSION
         )
 
-    if attrs.get(GEN_AI_SYSTEM) and not attrs.get(LLM_REQUEST_TYPE):
-        extra[LLM_REQUEST_TYPE] = LLMRequestTypeValues.CHAT.value
+    if attrs.get(SpanAttributes.LLM_SYSTEM) and not attrs.get(SpanAttributes.LLM_REQUEST_TYPE):
+        extra[SpanAttributes.LLM_REQUEST_TYPE] = LLMRequestTypeValues.CHAT.value
 
     cache_read = attrs.get(SpanAttributes.LLM_USAGE_CACHE_READ_INPUT_TOKENS)
     if cache_read not in {None, ""} and "prompt_cache_hit_tokens" not in attrs:
@@ -730,20 +1110,22 @@ def _get_enrichment_attrs(span: ReadableSpan) -> Dict[str, Any]:
     ):
         extra["prompt_cache_creation_tokens"] = cache_creation
 
-    tool_calls = _parse_structured_json_attr(attrs.get(RESPAN_SPAN_TOOL_CALLS))
+    tool_calls = _parse_structured_json_attr(attrs.get(_COMPLETION_TOOL_CALLS_ATTR))
+    if not isinstance(tool_calls, list) or not tool_calls:
+        tool_calls = _parse_structured_json_attr(attrs.get(RESPAN_SPAN_TOOL_CALLS))
     if isinstance(tool_calls, list) and tool_calls:
-        if "gen_ai.completion.0.tool_calls" not in attrs:
-            extra["gen_ai.completion.0.tool_calls"] = tool_calls
-        if "gen_ai.completion.0.role" not in attrs:
-            extra["gen_ai.completion.0.role"] = "assistant"
-        existing_completion_content = attrs.get("gen_ai.completion.0.content")
+        if _COMPLETION_TOOL_CALLS_ATTR not in attrs:
+            extra[_COMPLETION_TOOL_CALLS_ATTR] = tool_calls
+        if f"{SpanAttributes.LLM_COMPLETIONS}.0.role" not in attrs:
+            extra[f"{SpanAttributes.LLM_COMPLETIONS}.0.role"] = "assistant"
+        existing_completion_content = attrs.get(f"{SpanAttributes.LLM_COMPLETIONS}.0.content")
         if existing_completion_content in {None, ""}:
             primary_completion_message = _select_primary_completion_from_attrs(attrs)
             completion_text = _extract_text_from_message(primary_completion_message)
             if completion_text not in {None, ""}:
-                extra["gen_ai.completion.0.content"] = completion_text
-            elif "gen_ai.completion.0.content" not in attrs:
-                extra["gen_ai.completion.0.content"] = ""
+                extra[f"{SpanAttributes.LLM_COMPLETIONS}.0.content"] = completion_text
+            elif f"{SpanAttributes.LLM_COMPLETIONS}.0.content" not in attrs:
+                extra[f"{SpanAttributes.LLM_COMPLETIONS}.0.content"] = ""
 
     return extra
 

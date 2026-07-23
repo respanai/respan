@@ -7,14 +7,16 @@ import logging
 import re
 from typing import Any
 
-from llama_index.core.instrumentation.event_handlers import BaseEventHandler
-from llama_index.core.instrumentation.span.base import BaseSpan
-from llama_index.core.instrumentation.span_handlers import BaseSpanHandler
+from llama_index_instrumentation.dispatcher import active_instrument_tags
+from llama_index_instrumentation.event_handlers import BaseEventHandler
+from llama_index_instrumentation.span import BaseSpan
+from llama_index_instrumentation.span_handlers import BaseSpanHandler
 from opentelemetry import context
 from opentelemetry import trace
 from opentelemetry.semconv_ai import LLMRequestTypeValues, SpanAttributes
 from opentelemetry.trace import Status, StatusCode
 from pydantic import ConfigDict, PrivateAttr
+from respan_sdk.constants import ERROR_MESSAGE_ATTR
 from respan_sdk.constants.llm_logging import (
     LOG_TYPE_AGENT,
     LOG_TYPE_CHAT,
@@ -42,17 +44,14 @@ from respan_instrumentation_llama_index._constants import (
     LLAMA_INDEX_EMBEDDING_SPAN_NAME,
     LLAMA_INDEX_USAGE_INPUT_TOKENS,
     LLAMA_INDEX_USAGE_OUTPUT_TOKENS,
-    LLAMA_INDEX_PARENT_SPAN_ID_ATTR,
-    LLAMA_INDEX_SPAN_ID_ATTR,
-    LLAMA_INDEX_SYNTHETIC_PARENT_ATTR,
-    LLAMA_INDEX_TAGS_ATTR,
+    LLAMA_INDEX_RUN_ID_TAG,
+    LLAMA_INDEX_START_EVENT_TAG,
+    LLAMA_INDEX_STEP_INPUT_EVENT_TAG,
+    LLAMA_INDEX_STEP_INPUT_SUMMARY_TAG,
     LLAMA_INDEX_TOOL_SPAN_PREFIX,
-    LLM_EMBEDDINGS_0,
     MESSAGE_ROLE_ASSISTANT,
     MESSAGE_ROLE_USER,
-    RESPAN_OVERRIDE_COMPLETION_TOKENS_ATTR,
-    RESPAN_OVERRIDE_PROMPT_TOKENS_ATTR,
-    RESPAN_OVERRIDE_TOTAL_REQUEST_TOKENS_ATTR,
+    STATUS_CODE_ATTR,
 )
 from respan_instrumentation_llama_index._serialization import (
     chat_messages_to_dicts,
@@ -115,6 +114,7 @@ class RespanLlamaIndexSpanHandler(BaseSpanHandler[RespanLlamaIndexSpan]):
         tags: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> RespanLlamaIndexSpan:
+        tags = tags or active_instrument_tags.get()
         entity_name = _span_entity_name(span_id=id_)
         log_type = _span_log_type(
             entity_name=entity_name,
@@ -126,17 +126,9 @@ class RespanLlamaIndexSpanHandler(BaseSpanHandler[RespanLlamaIndexSpan]):
             log_type=log_type,
             entity_path=entity_name,
         )
-        attributes[LLAMA_INDEX_SPAN_ID_ATTR] = id_
-        if parent_span_id:
-            attributes[LLAMA_INDEX_PARENT_SPAN_ID_ATTR] = parent_span_id
-        if tags:
-            attributes[LLAMA_INDEX_TAGS_ATTR] = safe_json(tags)
         if self.capture_content:
             attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safe_json(
-                {
-                    "args": to_jsonable(bound_args.args),
-                    "kwargs": to_jsonable(bound_args.kwargs),
-                }
+                _span_input_payload(bound_args=bound_args, tags=tags)
             )
 
         otel_span, context_token, span_context = _start_otel_span(
@@ -184,9 +176,6 @@ class RespanLlamaIndexSpanHandler(BaseSpanHandler[RespanLlamaIndexSpan]):
             ),
             entity_path=entity_name,
         )
-        attributes[LLAMA_INDEX_SPAN_ID_ATTR] = parent_span_id
-        attributes[LLAMA_INDEX_SYNTHETIC_PARENT_ATTR] = True
-
         parent_context = context.get_current()
         otel_span = _start_detached_otel_span(
             span_name=entity_name,
@@ -236,13 +225,20 @@ class RespanLlamaIndexSpanHandler(BaseSpanHandler[RespanLlamaIndexSpan]):
         if active_span is None:
             return None
         if err is not None:
-            active_span.otel_span.record_exception(err)
+            error_message = str(err) if self.capture_content else type(err).__name__
+            if self.capture_content and isinstance(err, Exception):
+                active_span.otel_span.record_exception(err)
             active_span.otel_span.set_status(
-                Status(status_code=StatusCode.ERROR, description=str(err))
+                Status(status_code=StatusCode.ERROR, description=error_message)
             )
+            active_span.otel_span.set_attribute(ERROR_MESSAGE_ATTR, error_message)
+            active_span.otel_span.set_attribute(STATUS_CODE_ATTR, 500)
+            error_output = {"status": "error", "error": type(err).__name__}
+            if self.capture_content:
+                error_output["message"] = error_message
             active_span.otel_span.set_attribute(
                 SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
-                safe_json({"error": str(err)}),
+                safe_json(error_output),
             )
         _end_otel_span(active_span=active_span)
         with self.lock:
@@ -294,14 +290,14 @@ class RespanLlamaIndexEventHandler(BaseEventHandler):
             request_type=LLMRequestTypeValues.CHAT.value,
             model_dict=model_dict,
         )
-        for message_index, message in enumerate(messages):
-            attributes[f"{SpanAttributes.LLM_PROMPTS}.{message_index}.role"] = (
-                message.get("role", "")
-            )
-            attributes[f"{SpanAttributes.LLM_PROMPTS}.{message_index}.content"] = (
-                _content_attribute(value=message.get("content"))
-            )
         if self.capture_content:
+            for message_index, message in enumerate(messages):
+                attributes[f"{SpanAttributes.LLM_PROMPTS}.{message_index}.role"] = (
+                    message.get("role", "")
+                )
+                attributes[f"{SpanAttributes.LLM_PROMPTS}.{message_index}.content"] = (
+                    _content_attribute(value=message.get("content"))
+                )
             attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safe_json(messages)
         self._push_event_span(
             span_id=getattr(event, "span_id", None),
@@ -320,15 +316,14 @@ class RespanLlamaIndexEventHandler(BaseEventHandler):
         response_message = chat_response_to_message_dict(
             getattr(event, "response", None)
         )
-        attributes = {
-            f"{SpanAttributes.LLM_COMPLETIONS}.0.role": response_message.get(
-                "role", MESSAGE_ROLE_ASSISTANT
-            ),
-            f"{SpanAttributes.LLM_COMPLETIONS}.0.content": _content_attribute(
-                value=response_message.get("content")
-            ),
-        }
+        attributes: dict[str, Any] = {}
         if self.capture_content:
+            attributes[f"{SpanAttributes.LLM_COMPLETIONS}.0.role"] = (
+                response_message.get("role", MESSAGE_ROLE_ASSISTANT)
+            )
+            attributes[f"{SpanAttributes.LLM_COMPLETIONS}.0.content"] = (
+                _content_attribute(value=response_message.get("content"))
+            )
             attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safe_json(
                 response_message
             )
@@ -350,9 +345,9 @@ class RespanLlamaIndexEventHandler(BaseEventHandler):
             request_type=LLMRequestTypeValues.COMPLETION.value,
             model_dict=model_dict,
         )
-        attributes[f"{SpanAttributes.LLM_PROMPTS}.0.role"] = MESSAGE_ROLE_USER
-        attributes[f"{SpanAttributes.LLM_PROMPTS}.0.content"] = str(prompt)
         if self.capture_content:
+            attributes[f"{SpanAttributes.LLM_PROMPTS}.0.role"] = MESSAGE_ROLE_USER
+            attributes[f"{SpanAttributes.LLM_PROMPTS}.0.content"] = str(prompt)
             attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safe_json(
                 [{"role": MESSAGE_ROLE_USER, "content": prompt}]
             )
@@ -371,11 +366,12 @@ class RespanLlamaIndexEventHandler(BaseEventHandler):
         if active_event_span is None:
             return
         completion_text = completion_response_to_text(getattr(event, "response", None))
-        attributes = {
-            f"{SpanAttributes.LLM_COMPLETIONS}.0.role": MESSAGE_ROLE_ASSISTANT,
-            f"{SpanAttributes.LLM_COMPLETIONS}.0.content": completion_text,
-        }
+        attributes: dict[str, Any] = {}
         if self.capture_content:
+            attributes[f"{SpanAttributes.LLM_COMPLETIONS}.0.role"] = (
+                MESSAGE_ROLE_ASSISTANT
+            )
+            attributes[f"{SpanAttributes.LLM_COMPLETIONS}.0.content"] = completion_text
             attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safe_json(
                 {"role": MESSAGE_ROLE_ASSISTANT, "content": completion_text}
             )
@@ -411,19 +407,15 @@ class RespanLlamaIndexEventHandler(BaseEventHandler):
         if active_event_span is None:
             return
         chunks = getattr(event, "chunks", [])
-        embedding_summary = _embedding_summary(
-            embeddings=getattr(event, "embeddings", []) or []
-        )
-        attributes: dict[str, Any] = {
-            SpanAttributes.TRACELOOP_ENTITY_OUTPUT: safe_json(embedding_summary),
-            LLM_EMBEDDINGS_0: safe_json(embedding_summary),
-        }
-        if chunks:
-            attributes[f"{SpanAttributes.LLM_PROMPTS}.0.content"] = _embedding_input(
-                chunks=chunks
-            )
+        embeddings = getattr(event, "embeddings", []) or []
+        attributes: dict[str, Any] = {}
         if self.capture_content:
             attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safe_json(chunks)
+            attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safe_json(embeddings)
+            if chunks:
+                attributes[f"{SpanAttributes.LLM_PROMPTS}.0.content"] = (
+                    _embedding_input(chunks=chunks)
+                )
         _finish_event_span(
             active_event_span=active_event_span,
             attributes=attributes,
@@ -453,18 +445,36 @@ class RespanLlamaIndexEventHandler(BaseEventHandler):
     def _handle_exception(self, *, event: Any) -> None:
         span_id = getattr(event, "span_id", None)
         exception = getattr(event, "exception", None)
-        for (open_span_id, _), active_event_spans in self._open_event_spans.items():
-            if open_span_id != span_id:
-                continue
-            for active_event_span in active_event_spans:
-                if exception is not None:
+        if exception is None:
+            return
+        error_message = (
+            str(exception) if self.capture_content else type(exception).__name__
+        )
+        error_output = {"status": "error", "error": type(exception).__name__}
+        if self.capture_content:
+            error_output["message"] = error_message
+        matching_keys = [key for key in self._open_event_spans if key[0] == span_id]
+        for key in matching_keys:
+            active_event_spans = self._open_event_spans.pop(key)
+            for active_event_span in reversed(active_event_spans):
+                if self.capture_content and isinstance(exception, Exception):
                     active_event_span.otel_span.record_exception(exception)
-                    active_event_span.otel_span.set_status(
-                        Status(
-                            status_code=StatusCode.ERROR,
-                            description=str(exception),
-                        )
+                active_event_span.otel_span.set_status(
+                    Status(
+                        status_code=StatusCode.ERROR,
+                        description=error_message,
                     )
+                )
+                active_event_span.otel_span.set_attribute(
+                    ERROR_MESSAGE_ATTR, error_message
+                )
+                active_event_span.otel_span.set_attribute(STATUS_CODE_ATTR, 500)
+                _finish_event_span(
+                    active_event_span=active_event_span,
+                    attributes={
+                        SpanAttributes.TRACELOOP_ENTITY_OUTPUT: safe_json(error_output)
+                    },
+                )
 
     def _push_event_span(
         self,
@@ -604,14 +614,11 @@ def _set_usage_attributes(*, attributes: dict[str, Any], response: Any) -> None:
     if prompt_tokens is not None:
         attributes[SpanAttributes.LLM_USAGE_PROMPT_TOKENS] = prompt_tokens
         attributes[LLAMA_INDEX_USAGE_INPUT_TOKENS] = prompt_tokens
-        attributes[RESPAN_OVERRIDE_PROMPT_TOKENS_ATTR] = prompt_tokens
     if completion_tokens is not None:
         attributes[SpanAttributes.LLM_USAGE_COMPLETION_TOKENS] = completion_tokens
         attributes[LLAMA_INDEX_USAGE_OUTPUT_TOKENS] = completion_tokens
-        attributes[RESPAN_OVERRIDE_COMPLETION_TOKENS_ATTR] = completion_tokens
     if total_tokens is not None:
         attributes[SpanAttributes.LLM_USAGE_TOTAL_TOKENS] = total_tokens
-        attributes[RESPAN_OVERRIDE_TOTAL_REQUEST_TOKENS_ATTR] = total_tokens
 
 
 def _clean_attributes(*, attributes: dict[str, Any]) -> dict[str, Any]:
@@ -634,27 +641,46 @@ def _content_attribute(*, value: Any) -> str:
 
 
 def _span_output_payload(*, entity_name: str, result: Any) -> Any:
-    if "embedding" in entity_name.lower():
-        return _embedding_summary(embeddings=result)
     return result
 
 
-def _embedding_summary(*, embeddings: Any) -> dict[str, Any]:
-    if _is_number_sequence(embeddings):
-        return {
-            "embedding_count": 1,
-            "embedding_dimensions": len(embeddings),
+def _span_input_payload(
+    *,
+    bound_args: inspect.BoundArguments,
+    tags: dict[str, Any] | None,
+) -> Any:
+    """Prefer public Workflows event summaries over internal runtime state.
+
+    Current llama-index-workflows run spans bind a recursive broker state
+    object. Serializing that object can fail before the root span is created.
+    The SDK emits stable input summaries in instrumentation tags specifically
+    for integrations, so consume those and keep the raw vendor tags off the
+    exported span.
+    """
+
+    tags = tags or {}
+    if LLAMA_INDEX_START_EVENT_TAG in tags:
+        payload: dict[str, Any] = {
+            "event": tags[LLAMA_INDEX_START_EVENT_TAG],
         }
-    if isinstance(embeddings, list):
-        first_embedding = next(
-            (embedding for embedding in embeddings if _is_number_sequence(embedding)),
-            None,
-        )
-        summary: dict[str, Any] = {"embedding_count": len(embeddings)}
-        if first_embedding is not None:
-            summary["embedding_dimensions"] = len(first_embedding)
-        return summary
-    return {"embedding_count": 0}
+        if LLAMA_INDEX_RUN_ID_TAG in tags:
+            payload["run_id"] = tags[LLAMA_INDEX_RUN_ID_TAG]
+        return payload
+    if LLAMA_INDEX_STEP_INPUT_SUMMARY_TAG in tags:
+        payload = {
+            "event": tags[LLAMA_INDEX_STEP_INPUT_SUMMARY_TAG],
+        }
+        if LLAMA_INDEX_STEP_INPUT_EVENT_TAG in tags:
+            payload["event_type"] = tags[LLAMA_INDEX_STEP_INPUT_EVENT_TAG]
+        if LLAMA_INDEX_RUN_ID_TAG in tags:
+            payload["run_id"] = tags[LLAMA_INDEX_RUN_ID_TAG]
+        return payload
+    if LLAMA_INDEX_RUN_ID_TAG in tags:
+        return {"run_id": tags[LLAMA_INDEX_RUN_ID_TAG]}
+    return {
+        "args": to_jsonable(bound_args.args),
+        "kwargs": to_jsonable(bound_args.kwargs),
+    }
 
 
 def _embedding_input(*, chunks: Any) -> str:
@@ -663,19 +689,10 @@ def _embedding_input(*, chunks: Any) -> str:
     return safe_json(chunks)
 
 
-def _is_number_sequence(value: Any) -> bool:
-    return (
-        isinstance(value, list)
-        and bool(value)
-        and all(
-            isinstance(item, (int, float)) and not isinstance(item, bool)
-            for item in value
-        )
-    )
-
-
 def _span_entity_name(*, span_id: str) -> str:
     entity_name = _UUID_SUFFIX_RE.sub(repl="", string=span_id)
+    if ".<locals>." in entity_name:
+        entity_name = entity_name.rsplit(".<locals>.", maxsplit=1)[-1]
     return entity_name or span_id
 
 

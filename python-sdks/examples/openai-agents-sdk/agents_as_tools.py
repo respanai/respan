@@ -37,7 +37,6 @@ async def main():
     with trace("Agents as tools"):
         result = await Runner.run(orchestrator, "Good morning, have a wonderful day!")
         print(result.final_output)
-    respan.flush()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,6 @@
+{
+  "summary": "Add Cohere TypeScript instrumentation",
+  "packages": {
+    "@respan/instrumentation-cohere": "new"
+  }
+}

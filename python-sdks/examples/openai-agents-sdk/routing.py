@@ -48,7 +48,6 @@ async def main():
             agent = result.current_agent
             print()
 
-    respan.flush()
 
 
 if __name__ == "__main__":

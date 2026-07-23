@@ -36,6 +36,7 @@ from respan_sdk.utils.data_processing.id_processing import (
     ensure_span_id,
 )
 from respan_sdk.utils.time import iso_to_ns
+from respan_tracing.utils.auto_flush import flush_after_injected_span
 
 logger = logging.getLogger(__name__)
 
@@ -263,6 +264,7 @@ def inject_span(span: ReadableSpan) -> bool:
         return False
     try:
         processor.on_end(span)
+        flush_after_injected_span()
         return True
     except Exception:
         logger.exception("Failed to inject span %r", span.name)

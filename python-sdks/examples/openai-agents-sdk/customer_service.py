@@ -109,7 +109,6 @@ async def main():
             input_items = result.to_input_list()
             current_agent = result.last_agent
 
-    respan.flush()
 
 
 if __name__ == "__main__":

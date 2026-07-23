@@ -1,49 +1,28 @@
-"""CrewAI instrumentation plugin for Respan."""
+"""Native CrewAI instrumentation plugin for Respan."""
 
-import importlib
+from __future__ import annotations
+
 import logging
-from typing import Any
+import threading
+from typing import Any, ClassVar
 
-from respan_instrumentation_openinference import OpenInferenceInstrumentor
 from respan_tracing.core.tracer import RespanTracer
+
+from respan_instrumentation_crewai._constants import CREWAI_INSTRUMENTATION_NAME
 
 logger = logging.getLogger(__name__)
 
-CREWAI_INSTRUMENTATION_NAME = "crewai"
-OPENINFERENCE_CREWAI_MODULE = "openinference.instrumentation.crewai"
-USE_EVENT_LISTENER_KWARG = "use_event_listener"
-CREATE_LLM_SPANS_KWARG = "create_llm_spans"
-
-
-def _load_openinference_crewai_class() -> type:
-    crewai_module = importlib.import_module(OPENINFERENCE_CREWAI_MODULE)
-    return crewai_module.CrewAIInstrumentor
-
 
 class CrewAIInstrumentor:
-    """Respan instrumentor for CrewAI.
-
-    Activates the OpenInference CrewAI instrumentor and registers Respan's
-    OpenInference translator so CrewAI spans reach the Respan OTLP pipeline
-    with the expected ``traceloop.*``, ``gen_ai.*``, and ``respan.*`` fields.
-
-    """
+    """Subscribe to CrewAI lifecycle events and emit canonical Respan spans."""
 
     name = CREWAI_INSTRUMENTATION_NAME
 
-    def __init__(
-        self,
-        *,
-        use_event_listener: bool = True,
-        create_llm_spans: bool = True,
-        **instrumentor_kwargs: Any,
-    ) -> None:
-        self._instrumentor_kwargs = {
-            USE_EVENT_LISTENER_KWARG: use_event_listener,
-            CREATE_LLM_SPANS_KWARG: create_llm_spans,
-            **instrumentor_kwargs,
-        }
-        self._delegate = None
+    _activation_lock: ClassVar[threading.RLock] = threading.RLock()
+    _active_owner: ClassVar[CrewAIInstrumentor | None] = None
+
+    def __init__(self) -> None:
+        self._listener: Any = None
         self._is_instrumented = False
 
     @staticmethod
@@ -54,50 +33,61 @@ class CrewAIInstrumentor:
         return bool(getattr(tracer, "is_enabled", True))
 
     def activate(self) -> None:
-        """Instrument CrewAI via OpenInference and Respan's translator."""
-        if self._is_instrumented:
-            return
+        """Activate the package-owned CrewAI event listener exactly once."""
+        with self._activation_lock:
+            if self._is_instrumented:
+                return
+            active_owner = type(self)._active_owner
+            if active_owner is not None and active_owner._is_instrumented:
+                logger.info("CrewAI instrumentation is already active")
+                return
+            if not self._is_respan_tracing_enabled():
+                logger.info(
+                    "CrewAI instrumentation skipped because Respan tracing is disabled"
+                )
+                return
 
-        if not self._is_respan_tracing_enabled():
-            logger.info(
-                "CrewAI instrumentation skipped because Respan tracing is disabled"
-            )
-            return
+            listener = None
+            try:
+                from respan_instrumentation_crewai._event_listener import (
+                    CrewAIEventListener,
+                )
 
-        try:
-            crewai_instrumentor_class = _load_openinference_crewai_class()
-        except ImportError as exc:
-            logger.warning(
-                "Failed to activate CrewAI instrumentation — missing dependency: %s",
-                exc,
-            )
-            return
+                listener = CrewAIEventListener()
+            except ImportError as exc:
+                logger.warning(
+                    "Failed to activate CrewAI instrumentation — missing dependency: %s",
+                    exc,
+                )
+                return
+            except Exception:
+                if listener is not None:
+                    try:
+                        listener.shutdown()
+                    except Exception:
+                        logger.exception("Failed to clean up CrewAI instrumentation")
+                logger.exception("Failed to activate CrewAI instrumentation")
+                return
 
-        try:
-            self._delegate = OpenInferenceInstrumentor(
-                crewai_instrumentor_class,
-                **self._instrumentor_kwargs,
-            )
-            self._delegate.activate()
+            self._listener = listener
             self._is_instrumented = True
+            type(self)._active_owner = self
             logger.info("CrewAI instrumentation activated")
-        except Exception:
-            if self._delegate is not None:
-                try:
-                    self._delegate.deactivate()
-                except Exception:
-                    logger.exception("Failed to clean up CrewAI instrumentation")
-            self._delegate = None
-            self._is_instrumented = False
-            logger.exception("Failed to activate CrewAI instrumentation")
 
     def deactivate(self) -> None:
-        """Deactivate the instrumentation."""
-        if self._is_instrumented and self._delegate is not None:
-            try:
-                self._delegate.deactivate()
-            except Exception:
-                logger.exception("Failed to deactivate CrewAI instrumentation")
-        self._delegate = None
-        self._is_instrumented = False
-        logger.info("CrewAI instrumentation deactivated")
+        """Unsubscribe and restore CrewAI's original runtime methods."""
+        with self._activation_lock:
+            if not self._is_instrumented:
+                return
+            listener = self._listener
+            self._listener = None
+            self._is_instrumented = False
+            if type(self)._active_owner is self:
+                type(self)._active_owner = None
+
+            if listener is not None:
+                try:
+                    listener.shutdown()
+                except Exception:
+                    logger.exception("Failed to deactivate CrewAI instrumentation")
+            logger.info("CrewAI instrumentation deactivated")

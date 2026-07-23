@@ -112,11 +112,6 @@ class LoadBalanceGroup(RespanBaseModel):
         return super().model_dump(*args, **kwargs)
 
 
-class PostHogIntegration(RespanBaseModel):
-    posthog_api_key: str
-    posthog_base_url: str
-
-
 class Customer(RespanBaseModel):
     customer_identifier: Union[str, int, None] = None
     name: Optional[Union[str, None]] = None
@@ -423,7 +418,6 @@ class RespanParams(RespanBaseModel, PreprocessLogDataMixin):
     linkup_params: Optional[LinkupParams] = None
     mem0_params: Optional[Mem0Params] = None
     moda_params: Optional[ModaParams] = None
-    posthog_integration: Optional[PostHogIntegration] = None
     # endregion: technical integrations
 
     # region: custom properties

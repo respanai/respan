@@ -32,7 +32,10 @@
   },
   "optionalDependencies": {
     "@respan/instrumentation-openai": "^1.0.0",
-    "@respan/instrumentation-anthropic": "^1.0.0"
+    "@respan/instrumentation-anthropic": "^1.0.0",
+    "@respan/instrumentation-azure-openai": "^1.0.0",
+    "@respan/instrumentation-openrouter": "^0.1.0",
+    "@respan/instrumentation-vertexai": "^0.1.0"
   },
   "devDependencies": {
     "@types/node": "^24.2.1",

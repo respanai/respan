@@ -1,0 +1,6 @@
+{
+  "summary": "Add Marqo Python instrumentation",
+  "packages": {
+    "respan-instrumentation-marqo": "new"
+  }
+}

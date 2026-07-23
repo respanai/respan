@@ -1,21 +1,23 @@
 import asyncio
-import builtins
+import importlib
 import json
 import sys
 from types import ModuleType, SimpleNamespace
 
 from opentelemetry import trace
-from opentelemetry.semconv_ai import (
-    LLMRequestTypeValues,
-    SpanAttributes,
-    TraceloopSpanKindValues,
-)
+from opentelemetry.semconv_ai import LLMRequestTypeValues, SpanAttributes
+from opentelemetry.trace import StatusCode
 from respan_tracing.exporters.respan import _prepare_spans_for_export
 
 from respan_instrumentation_claude_agent_sdk import (
     ClaudeAgentSDKInstrumentor,
     _instrumentation,
     _processor,
+)
+from respan_instrumentation_claude_agent_sdk._constants import (
+    CLAUDE_AGENT_SDK_TOOL_CALL_ARGUMENTS_ATTR,
+    CLAUDE_AGENT_SDK_TOOL_CALL_RESULT_ATTR,
+    CLAUDE_AGENT_SDK_TOOL_NAME_ATTR,
 )
 from respan_sdk.constants.llm_logging import (
     LOG_TYPE_AGENT,
@@ -24,17 +26,37 @@ from respan_sdk.constants.llm_logging import (
     LogMethodChoices,
 )
 from respan_sdk.constants.span_attributes import (
-    GEN_AI_SYSTEM,
-    GEN_AI_TOOL_CALL_ARGUMENTS,
-    GEN_AI_TOOL_CALL_RESULT,
-    GEN_AI_TOOL_NAME,
-    LLM_REQUEST_TYPE,
     RESPAN_LOG_METHOD,
     RESPAN_LOG_TYPE,
     RESPAN_SESSION_ID,
-    RESPAN_SPAN_TOOL_CALLS,
-    RESPAN_SPAN_TOOLS,
 )
+
+
+_COMPLETION_TOOL_CALLS_ATTR = f"{SpanAttributes.LLM_COMPLETIONS}.0.tool_calls"
+_BANNED_ALIASES = {
+    SpanAttributes.TRACELOOP_SPAN_KIND,
+    "respan.span.tools",
+    "respan.span.tool_calls",
+    "respan.span.handoffs",
+    "tools",
+    "tool_calls",
+    "model",
+    "prompt_tokens",
+    "completion_tokens",
+    "total_request_tokens",
+    "prompt_cache_hit_tokens",
+    "prompt_cache_creation_tokens",
+    "span_tools",
+    "span_workflow_name",
+    "input",
+    "output",
+    "has_tool_calls",
+    "parallel_tool_calls",
+}
+
+
+def _assert_no_banned_aliases(attrs):
+    assert _BANNED_ALIASES.isdisjoint(attrs)
 
 
 def _make_fake_tracer_provider(*, composite: bool = True) -> SimpleNamespace:
@@ -63,6 +85,10 @@ def _install_fake_claude_agent_sdk_modules(
     usage_cache_read_tokens_attr = "gen_ai.usage.cache_read_input_tokens"
 
     class FakeClaudeAgentSdkInstrumentor:
+        # Mirrors upstream's BaseInstrumentor singleton: instrument() applies the
+        # module-level `query` wrap once and a second call is a no-op.
+        _module_query_wrapped = False
+
         def __init__(self):
             self.instrument_kwargs = None
             self.uninstrument_calls = 0
@@ -71,9 +97,26 @@ def _install_fake_claude_agent_sdk_modules(
             self.instrument_kwargs = kwargs
             if instrument_error is not None:
                 raise instrument_error
+            if FakeClaudeAgentSdkInstrumentor._module_query_wrapped:
+                return
+            import wrapt
+
+            wrapt.wrap_function_wrapper("claude_agent_sdk", "query", self._wrap_query)
+            FakeClaudeAgentSdkInstrumentor._module_query_wrapped = True
 
         def uninstrument(self):
             self.uninstrument_calls += 1
+            if not FakeClaudeAgentSdkInstrumentor._module_query_wrapped:
+                return
+            FakeClaudeAgentSdkInstrumentor._module_query_wrapped = False
+            import claude_agent_sdk
+
+            module_query = getattr(claude_agent_sdk, "query", None)
+            if hasattr(module_query, "__wrapped__"):
+                claude_agent_sdk.query = module_query.__wrapped__
+
+        def _wrap_query(self, wrapped, instance, args, kwargs):
+            return wrapped(*args, **kwargs)
 
         def _wrap_client_query(self, wrapped, instance, args, kwargs):
             instance._otel_invocation_ctx = kwargs.get("otel_invocation_ctx")
@@ -124,6 +167,7 @@ def _install_fake_claude_agent_sdk_modules(
     )
     constants_module.GEN_AI_OUTPUT_MESSAGES = output_messages_attr
     constants_module.GEN_AI_USAGE_INPUT_TOKENS = usage_input_tokens_attr
+    constants_module.GEN_AI_USAGE_OUTPUT_TOKENS = usage_output_tokens_attr
     constants_module.GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS = (
         usage_cache_creation_tokens_attr
     )
@@ -160,6 +204,15 @@ def _install_fake_claude_agent_sdk_modules(
 
     claude_sdk_module = ModuleType("claude_agent_sdk")
     claude_sdk_module.__path__ = []
+
+    # Standalone `query()` module attribute — what upstream wraps and what
+    # `from claude_agent_sdk import query` binds. The A6 seam covers it via
+    # InternalClient.process_query below.
+    def _standalone_query(*args, **kwargs):
+        return "standalone-query-result"
+
+    claude_sdk_module.query = _standalone_query
+
     internal_module = ModuleType("claude_agent_sdk._internal")
     internal_module.__path__ = []
     query_module = ModuleType("claude_agent_sdk._internal.query")
@@ -172,6 +225,16 @@ def _install_fake_claude_agent_sdk_modules(
             return context_module.get_invocation_context()
 
     query_module.Query = FakeQuery
+
+    # Internal seam that the standalone query() delegates to (A6). Wrapping this
+    # is how respan traces `from claude_agent_sdk import query`.
+    client_module = ModuleType("claude_agent_sdk._internal.client")
+
+    class FakeInternalClient:
+        def process_query(self, *args, **kwargs):
+            return "process-query-result"
+
+    client_module.InternalClient = FakeInternalClient
 
     monkeypatch.setitem(
         sys.modules,
@@ -205,6 +268,11 @@ def _install_fake_claude_agent_sdk_modules(
         "claude_agent_sdk._internal.query",
         query_module,
     )
+    monkeypatch.setitem(
+        sys.modules,
+        "claude_agent_sdk._internal.client",
+        client_module,
+    )
 
     return SimpleNamespace(
         instrumentor_class=FakeClaudeAgentSdkInstrumentor,
@@ -214,6 +282,9 @@ def _install_fake_claude_agent_sdk_modules(
         instrumentor_module=instrumentor_module,
         original_set_response_content=_original_set_response_content,
         original_set_result_attributes=_original_set_result_attributes,
+        claude_sdk_module=claude_sdk_module,
+        standalone_query=_standalone_query,
+        internal_client=FakeInternalClient,
     )
 
 
@@ -368,7 +439,14 @@ def test_activate_patches_helpers_and_restores_originals(monkeypatch):
         },
     ]
     assert span.attributes["gen_ai.usage.input_tokens"] == 4
-    assert span.attributes["cost"] == 0.04241955
+    assert span.attributes["gen_ai.usage.output_tokens"] == 121
+    # Cost is emitted as respan.metadata.response_cost (string), matching the
+    # LiteLLM/OpenAI instrumentors, not a bare "cost" attribute (A7).
+    assert span.attributes["respan.metadata.response_cost"] == "0.04241955"
+    assert "cost" not in span.attributes
+    # The helper writes only raw input/output; the span processor owns
+    # prompt/completion/total, so the helper must not pre-empt them here.
+    assert "gen_ai.usage.total_tokens" not in span.attributes
 
     instrumentor.deactivate()
 
@@ -380,15 +458,63 @@ def test_activate_patches_helpers_and_restores_originals(monkeypatch):
     assert restored_ctx is None
 
 
-def test_activate_logs_warning_when_dependency_missing(monkeypatch, caplog):
-    real_import = builtins.__import__
+def test_activate_traces_standalone_query_via_internal_seam(monkeypatch):
+    """A6: the from-import query() path is instrumented at InternalClient.process_query."""
+    tracer_provider = _make_fake_tracer_provider()
+    monkeypatch.setattr(trace, "get_tracer_provider", lambda: tracer_provider)
+    fake = _install_fake_claude_agent_sdk_modules(monkeypatch)
 
-    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+    instrumentor = ClaudeAgentSDKInstrumentor()
+    instrumentor.activate()
+
+    # The internal seam is wrapped, so `from claude_agent_sdk import query` traces...
+    assert hasattr(fake.internal_client.process_query, "__wrapped__")
+    # ...and the bypassable module-level `query` wrap is dropped, so module-qualified
+    # and from-imported calls both hit exactly the seam (one span, no double-count).
+    assert fake.claude_sdk_module.query is fake.standalone_query
+    assert not hasattr(fake.claude_sdk_module.query, "__wrapped__")
+
+
+def test_double_activation_does_not_stack_the_query_seam(monkeypatch):
+    """A second instrumentor must not wrap the seam twice (would emit two spans)."""
+    tracer_provider = _make_fake_tracer_provider()
+    monkeypatch.setattr(trace, "get_tracer_provider", lambda: tracer_provider)
+    fake = _install_fake_claude_agent_sdk_modules(monkeypatch)
+
+    ClaudeAgentSDKInstrumentor().activate()
+    ClaudeAgentSDKInstrumentor().activate()
+
+    wrapped = fake.internal_client.process_query
+    assert hasattr(wrapped, "__wrapped__")
+    # Exactly one wrapper layer: __wrapped__ is the pristine original, not a second wrapper.
+    assert not hasattr(wrapped.__wrapped__, "__wrapped__")
+
+
+def test_deactivate_restores_the_query_seam_and_module_query(monkeypatch):
+    tracer_provider = _make_fake_tracer_provider()
+    monkeypatch.setattr(trace, "get_tracer_provider", lambda: tracer_provider)
+    fake = _install_fake_claude_agent_sdk_modules(monkeypatch)
+
+    original_process_query = fake.internal_client.process_query
+
+    instrumentor = ClaudeAgentSDKInstrumentor()
+    instrumentor.activate()
+    instrumentor.deactivate()
+
+    assert fake.internal_client.process_query is original_process_query
+    assert not hasattr(fake.internal_client.process_query, "__wrapped__")
+    assert fake.claude_sdk_module.query is fake.standalone_query
+
+
+def test_activate_logs_warning_when_dependency_missing(monkeypatch, caplog):
+    real_import_module = importlib.import_module
+
+    def fake_import_module(name, package=None):
         if name == "opentelemetry.instrumentation.claude_agent_sdk":
             raise ImportError("missing claude agent sdk instrumentation")
-        return real_import(name, globals, locals, fromlist, level)
+        return real_import_module(name, package)
 
-    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.setattr(_instrumentation.importlib, "import_module", fake_import_module)
 
     instrumentor = ClaudeAgentSDKInstrumentor()
     instrumentor.activate()
@@ -553,10 +679,13 @@ def test_extract_existing_tool_calls_and_key_helpers():
     span = _make_span(name="tool-span", trace_id=22, span_id=33, parent_span_id=11)
 
     assert _processor._extract_existing_tool_calls(
+        {_COMPLETION_TOOL_CALLS_ATTR: '[{"id":"canonical"}]'}
+    ) == [{"id": "canonical"}]
+    assert _processor._extract_existing_tool_calls(
         {"tool_calls": [{"id": "override"}]}
     ) == [{"id": "override"}]
     assert _processor._extract_existing_tool_calls(
-        {RESPAN_SPAN_TOOL_CALLS: '[{"id":"parsed"}]'}
+        {"respan.span.tool_calls": '[{"id":"parsed"}]'}
     ) == [{"id": "parsed"}]
     assert _processor._get_span_key(span) == (22, 33)
     assert _processor._get_parent_span_key(span) == (22, 11)
@@ -647,22 +776,22 @@ def test_enrich_claude_agent_sdk_span_maps_agent_fields():
 
     assert span._attributes[RESPAN_LOG_METHOD] == LogMethodChoices.TRACING_INTEGRATION.value
     assert span._attributes[RESPAN_LOG_TYPE] == LOG_TYPE_AGENT
-    assert span._attributes[SpanAttributes.TRACELOOP_SPAN_KIND] == TraceloopSpanKindValues.AGENT.value
     assert span._attributes[SpanAttributes.TRACELOOP_ENTITY_NAME] == "weather_agent"
     assert span._attributes[SpanAttributes.TRACELOOP_WORKFLOW_NAME] == "weather_agent"
     assert json.loads(span._attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT]) == [
         {"role": "system", "content": "Always call tools first."},
         {"role": "user", "content": "weather?"},
     ]
-    assert span._attributes["model"] == "claude-sonnet-4-5"
-    assert span._attributes["prompt_tokens"] == 19
-    assert span._attributes["completion_tokens"] == 7
-    assert span._attributes["total_request_tokens"] == 26
+    assert span._attributes[SpanAttributes.LLM_REQUEST_MODEL] == "claude-sonnet-4-5"
+    assert span._attributes[SpanAttributes.LLM_USAGE_PROMPT_TOKENS] == 19
+    assert span._attributes[SpanAttributes.LLM_USAGE_COMPLETION_TOKENS] == 7
+    assert span._attributes[SpanAttributes.LLM_USAGE_TOTAL_TOKENS] == 26
     assert span._attributes[RESPAN_SESSION_ID] == "session-123"
-    assert json.loads(span._attributes[RESPAN_SPAN_TOOLS]) == [
+    assert span._status.status_code == StatusCode.OK
+    assert json.loads(span._attributes[SpanAttributes.LLM_REQUEST_FUNCTIONS]) == [
         {"type": "function", "function": {"name": "get_weather"}}
     ]
-    assert json.loads(span._attributes[RESPAN_SPAN_TOOL_CALLS]) == [
+    assert json.loads(span._attributes[_COMPLETION_TOOL_CALLS_ATTR]) == [
         {
             "id": "toolu_123",
             "type": "function",
@@ -675,7 +804,10 @@ def test_enrich_claude_agent_sdk_span_maps_agent_fields():
     assert "gen_ai.agent.name" not in span._attributes
     assert "gen_ai.input.messages" not in span._attributes
     assert "gen_ai.output.messages" not in span._attributes
-    assert "tool_calls" not in span._attributes
+    assert span._attributes[f"{SpanAttributes.LLM_PROMPTS}.0.role"] == "system"
+    assert span._attributes[f"{SpanAttributes.LLM_PROMPTS}.1.role"] == "user"
+    assert span._attributes[f"{SpanAttributes.LLM_COMPLETIONS}.0.role"] == "assistant"
+    _assert_no_banned_aliases(span._attributes)
 
 
 def test_enrich_claude_agent_sdk_span_maps_tool_fields():
@@ -689,14 +821,13 @@ def test_enrich_claude_agent_sdk_span_maps_tool_fields():
             "gen_ai.response.model": "claude-sonnet-4-5",
             "gen_ai.usage.input_tokens": 6,
             "gen_ai.usage.output_tokens": 2,
-            LLM_REQUEST_TYPE: "chat",
+            SpanAttributes.LLM_REQUEST_TYPE: "chat",
         },
     )
 
     _processor.enrich_claude_agent_sdk_span(span)
 
     assert span._attributes[RESPAN_LOG_TYPE] == LOG_TYPE_TOOL
-    assert span._attributes[SpanAttributes.TRACELOOP_SPAN_KIND] == TraceloopSpanKindValues.TOOL.value
     assert span._attributes[SpanAttributes.TRACELOOP_ENTITY_NAME] == "mcp__demo__calculator"
     assert span._attributes[SpanAttributes.TRACELOOP_ENTITY_PATH] == "mcp__demo__calculator"
     assert json.loads(span._attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT]) == {
@@ -705,19 +836,16 @@ def test_enrich_claude_agent_sdk_span_maps_tool_fields():
     assert json.loads(span._attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]) == {
         "content": [{"type": "text", "text": "18"}]
     }
-    assert LLM_REQUEST_TYPE not in span._attributes
-    assert span._attributes["tools"] == [
-        {"type": "function", "function": {"name": "mcp__demo__calculator"}}
-    ]
-    assert span._attributes["span_tools"] == ["mcp__demo__calculator"]
-    assert "model" not in span._attributes
-    assert "prompt_tokens" not in span._attributes
-    assert "completion_tokens" not in span._attributes
-    assert "total_request_tokens" not in span._attributes
+    assert SpanAttributes.LLM_REQUEST_TYPE not in span._attributes
+    assert SpanAttributes.LLM_REQUEST_MODEL not in span._attributes
+    assert SpanAttributes.LLM_USAGE_PROMPT_TOKENS not in span._attributes
+    assert SpanAttributes.LLM_USAGE_COMPLETION_TOKENS not in span._attributes
+    assert SpanAttributes.LLM_USAGE_TOTAL_TOKENS not in span._attributes
     assert "cost" not in span._attributes
-    assert GEN_AI_TOOL_NAME not in span._attributes
-    assert GEN_AI_TOOL_CALL_ARGUMENTS not in span._attributes
-    assert GEN_AI_TOOL_CALL_RESULT not in span._attributes
+    _assert_no_banned_aliases(span._attributes)
+    assert CLAUDE_AGENT_SDK_TOOL_NAME_ATTR not in span._attributes
+    assert CLAUDE_AGENT_SDK_TOOL_CALL_ARGUMENTS_ATTR not in span._attributes
+    assert CLAUDE_AGENT_SDK_TOOL_CALL_RESULT_ATTR not in span._attributes
 
 
 def test_enrich_claude_agent_sdk_span_overrides_upstream_tool_chat_defaults():
@@ -725,11 +853,14 @@ def test_enrich_claude_agent_sdk_span_overrides_upstream_tool_chat_defaults():
         name="execute_tool mcp__demo__get_weather",
         attributes={
             "gen_ai.operation.name": "execute_tool",
-            GEN_AI_SYSTEM: "anthropic",
+            SpanAttributes.LLM_SYSTEM: "anthropic",
             "gen_ai.tool.name": "get_weather",
             "gen_ai.tool.call.arguments": {"city": "Tokyo", "unit": "celsius"},
             "gen_ai.tool.call.result": {"content": [{"type": "text", "text": "22C"}]},
-            "gen_ai.input.messages": '[{"role":"user","content":"{\\"city\\": \\"Tokyo\\", \\"unit\\": \\"celsius\\"}"}]',
+            "gen_ai.input.messages": (
+                '[{"role":"user","content":"{\\"city\\": \\"Tokyo\\", '
+                '\\"unit\\": \\"celsius\\"}"}]'
+            ),
             "gen_ai.output.messages": '[{"role":"assistant","content":""}]',
             "gen_ai.prompt.0.role": "user",
             "gen_ai.prompt.0.content": '{"city": "Tokyo", "unit": "celsius"}',
@@ -739,9 +870,13 @@ def test_enrich_claude_agent_sdk_span_overrides_upstream_tool_chat_defaults():
             SpanAttributes.TRACELOOP_SPAN_KIND: LLMRequestTypeValues.CHAT.value,
             SpanAttributes.TRACELOOP_ENTITY_NAME: "placeholder-chat",
             SpanAttributes.TRACELOOP_ENTITY_PATH: "placeholder-chat",
-            SpanAttributes.TRACELOOP_ENTITY_INPUT: '[{"role":"user","content":"{\\"city\\": \\"Tokyo\\"}"}]',
-            SpanAttributes.TRACELOOP_ENTITY_OUTPUT: '{"_is_placeholder": true, "content": "", "role": "assistant"}',
-            LLM_REQUEST_TYPE: "chat",
+            SpanAttributes.TRACELOOP_ENTITY_INPUT: (
+                '[{"role":"user","content":"{\\"city\\": \\"Tokyo\\"}"}]'
+            ),
+            SpanAttributes.TRACELOOP_ENTITY_OUTPUT: (
+                '{"_is_placeholder": true, "content": "", "role": "assistant"}'
+            ),
+            SpanAttributes.LLM_REQUEST_TYPE: "chat",
             "model": "gpt-4",
             "prompt_tokens": 20,
             "completion_tokens": 0,
@@ -753,7 +888,6 @@ def test_enrich_claude_agent_sdk_span_overrides_upstream_tool_chat_defaults():
     _processor.enrich_claude_agent_sdk_span(span)
 
     assert span._attributes[RESPAN_LOG_TYPE] == LOG_TYPE_TOOL
-    assert span._attributes[SpanAttributes.TRACELOOP_SPAN_KIND] == TraceloopSpanKindValues.TOOL.value
     assert span._attributes[SpanAttributes.TRACELOOP_ENTITY_NAME] == "mcp__demo__get_weather"
     assert span._attributes[SpanAttributes.TRACELOOP_ENTITY_PATH] == "mcp__demo__get_weather"
     assert json.loads(span._attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT]) == {
@@ -763,21 +897,18 @@ def test_enrich_claude_agent_sdk_span_overrides_upstream_tool_chat_defaults():
     assert json.loads(span._attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]) == {
         "content": [{"type": "text", "text": "22C"}]
     }
-    assert span._attributes["tools"] == [
-        {"type": "function", "function": {"name": "mcp__demo__get_weather"}}
-    ]
-    assert "model" not in span._attributes
-    assert "prompt_tokens" not in span._attributes
-    assert "completion_tokens" not in span._attributes
-    assert "total_request_tokens" not in span._attributes
+    assert SpanAttributes.LLM_REQUEST_MODEL not in span._attributes
+    assert SpanAttributes.LLM_USAGE_PROMPT_TOKENS not in span._attributes
+    assert SpanAttributes.LLM_USAGE_COMPLETION_TOKENS not in span._attributes
+    assert SpanAttributes.LLM_USAGE_TOTAL_TOKENS not in span._attributes
     assert "cost" not in span._attributes
-    assert GEN_AI_SYSTEM not in span._attributes
+    assert SpanAttributes.LLM_SYSTEM not in span._attributes
     assert "gen_ai.prompt.0.role" not in span._attributes
     assert "gen_ai.prompt.0.content" not in span._attributes
     assert "gen_ai.completion.0.role" not in span._attributes
     assert "gen_ai.completion.0.content" not in span._attributes
-    assert RESPAN_SPAN_TOOL_CALLS not in span._attributes
-    assert "tool_calls" not in span._attributes
+    assert _COMPLETION_TOOL_CALLS_ATTR not in span._attributes
+    _assert_no_banned_aliases(span._attributes)
 
 
 def test_enrich_claude_agent_sdk_span_reconciles_tools_with_namespaced_tool_calls():
@@ -814,11 +945,11 @@ def test_enrich_claude_agent_sdk_span_reconciles_tools_with_namespaced_tool_call
 
     _processor.enrich_claude_agent_sdk_span(span)
 
-    assert json.loads(span._attributes[RESPAN_SPAN_TOOLS]) == [
+    assert json.loads(span._attributes[SpanAttributes.LLM_REQUEST_FUNCTIONS]) == [
         {"type": "function", "function": {"name": "mcp__demo__get_weather"}},
         {"type": "function", "function": {"name": "mcp__demo__calculator"}},
     ]
-    assert json.loads(span._attributes[RESPAN_SPAN_TOOL_CALLS]) == [
+    assert json.loads(span._attributes[_COMPLETION_TOOL_CALLS_ATTR]) == [
         {
             "id": "toolu_123",
             "type": "function",
@@ -889,7 +1020,7 @@ def test_span_processor_on_end_merges_pending_tool_calls_into_parent_agent_span(
     processor.on_end(tool_span)
     processor.on_end(agent_span)
 
-    assert json.loads(agent_span._attributes[RESPAN_SPAN_TOOL_CALLS]) == [
+    assert json.loads(agent_span._attributes[_COMPLETION_TOOL_CALLS_ATTR]) == [
         {
             "id": "toolu_123",
             "type": "function",
@@ -899,19 +1030,10 @@ def test_span_processor_on_end_merges_pending_tool_calls_into_parent_agent_span(
             },
         }
     ]
-    assert agent_span._attributes["tool_calls"] == [
-        {
-            "id": "toolu_123",
-            "type": "function",
-            "function": {
-                "name": "mcp__demo__get_weather",
-                "arguments": '{"city": "Tokyo"}',
-            },
-        }
-    ]
-    assert agent_span._attributes["tools"] == [
+    assert json.loads(agent_span._attributes[SpanAttributes.LLM_REQUEST_FUNCTIONS]) == [
         {"type": "function", "function": {"name": "mcp__demo__get_weather"}}
     ]
+    _assert_no_banned_aliases(agent_span._attributes)
 
 
 def test_span_processor_on_end_discards_pending_tool_calls_for_unrelated_parent_span():
@@ -1022,7 +1144,7 @@ def test_span_processor_on_end_leaves_final_chat_child_to_shared_exporter():
     processor.on_end(agent_span)
     agent_span.attributes = agent_span._attributes
 
-    assert json.loads(agent_span._attributes[RESPAN_SPAN_TOOL_CALLS]) == [
+    assert json.loads(agent_span._attributes[_COMPLETION_TOOL_CALLS_ATTR]) == [
         {
             "id": "toolu_123",
             "type": "function",
@@ -1057,6 +1179,9 @@ def test_span_processor_on_end_leaves_final_chat_child_to_shared_exporter():
         "ClaudeAgentSDK.query",
         "assistant_message",
     ]
+    assert prepared_spans[1].attributes[_COMPLETION_TOOL_CALLS_ATTR] == json.loads(
+        agent_span._attributes[_COMPLETION_TOOL_CALLS_ATTR]
+    )
 
 
 def test_span_processor_shutdown_clears_pending_calls_and_force_flush_returns_true():

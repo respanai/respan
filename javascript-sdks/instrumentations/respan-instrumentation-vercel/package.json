@@ -1,7 +1,7 @@
 {
   "name": "@respan/instrumentation-vercel",
   "type": "module",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "description": "Respan instrumentation plugin for Vercel AI SDK",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -29,7 +29,18 @@
   "dependencies": {
     "@opentelemetry/api": "^1.9.0",
     "@opentelemetry/sdk-trace-base": "^1.29.0",
-    "@respan/respan-sdk": "^1.0.0"
+    "@opentelemetry/semantic-conventions": "^1.40.0",
+    "@respan/respan-sdk": "^1.0.0",
+    "@traceloop/ai-semantic-conventions": "^0.13.0"
+  },
+  "peerDependencies": {
+    "@ai-sdk/otel": ">=1.0.0 <2.0.0",
+    "ai": ">=4.0.0 <8.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@ai-sdk/otel": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^22.15.29",

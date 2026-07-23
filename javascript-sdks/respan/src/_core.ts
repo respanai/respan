@@ -1,8 +1,18 @@
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 import { RespanTelemetry, propagateAttributes, buildReadableSpan, injectSpan, ensureSpanId } from "@respan/tracing";
 import { RespanSpanAttributes, RespanLogType } from "@respan/respan-sdk";
-import type { RespanParams } from "@respan/respan-sdk";
+import type { RespanParams, RespanSpanNameStyle } from "@respan/respan-sdk";
 import type { ProcessorConfig } from "@respan/tracing";
 import type { RespanInstrumentation } from "./_types.js";
+import {
+  AUTO_INSTRUMENTATION_REGISTRY,
+  directLlmGenericTracingNames,
+  matchesAutoInstrumentationSelector,
+  statusFromEntry,
+  type AutoInstrumentationEntry,
+  type InstrumentationStatusEntry,
+} from "./_auto_instrumentation_registry.js";
 
 export interface RespanOptions {
   apiKey?: string;
@@ -13,6 +23,7 @@ export interface RespanOptions {
   traceContent?: boolean;
   logLevel?: "debug" | "info" | "warn" | "error";
   silenceInitializationMessage?: boolean;
+  spanNameStyle?: RespanSpanNameStyle;
 }
 
 /**
@@ -40,6 +51,7 @@ export class Respan {
   private _pendingInstrumentations: RespanInstrumentation[];
   private _hasExplicitInstrumentations: boolean;
   private _disabledInstrumentations: string[];
+  private _instrumentationStatus: InstrumentationStatusEntry[] = [];
   private _initialized = false;
 
   constructor(options: RespanOptions = {}) {
@@ -55,8 +67,7 @@ export class Respan {
       "googleVertexAI", "googleAIPlatform", "pinecone", "together",
       "langChain", "llamaIndex", "chromaDB", "qdrant"];
     const partialDisabled = [
-      "openAI",       // covered by @respan/instrumentation-openai
-      "anthropic",    // covered by @respan/instrumentation-anthropic
+      ...directLlmGenericTracingNames(), // covered by first-party direct LLM instrumentors
       "langChain",    // framework — would duplicate LLM spans
       "llamaIndex",   // framework — would duplicate LLM spans
       "pinecone",     // vector DB
@@ -76,6 +87,7 @@ export class Respan {
       logLevel: options.logLevel,
       disabledInstrumentations,
       silenceInitializationMessage: options.silenceInitializationMessage,
+      spanNameStyle: options.spanNameStyle,
     });
   }
 
@@ -95,7 +107,7 @@ export class Respan {
       await this._activate(inst);
     }
 
-    // Auto-discover Respan instrumentation packages.
+    // Auto-discover Respan direct LLM instrumentation packages.
     // Only runs when user did NOT pass instrumentations option at all.
     // Passing `instrumentations: []` explicitly disables auto-discovery.
     if (!this._hasExplicitInstrumentations) {
@@ -104,39 +116,64 @@ export class Respan {
     this._pendingInstrumentations = [];
   }
 
-  /**
-   * Try to dynamically import and activate Respan instrumentation packages.
-   * Each import is wrapped in try/catch — if the underlying SDK isn't installed,
-   * the import fails silently.
-   */
   private async _autoDiscoverInstrumentations(): Promise<void> {
-    // Only auto-discover direct LLM SDK instrumentors.
-    // Framework instrumentors (OpenAI Agents, Vercel AI, Claude Agent SDK)
-    // are NOT auto-discovered to avoid duplicate spans — they already
-    // capture LLM calls internally. Users add them explicitly.
-    const discoveries: Array<{ pkg: string; className: string }> = [
-      { pkg: "@respan/instrumentation-openai", className: "OpenAIInstrumentor" },
-      { pkg: "@respan/instrumentation-anthropic", className: "AnthropicInstrumentor" },
-    ];
+    const discoveries = [...AUTO_INSTRUMENTATION_REGISTRY].sort(
+      (a, b) => b.priority - a.priority,
+    );
 
-    for (const { pkg, className } of discoveries) {
-      // Respect user's disabledInstrumentations — match against package name
-      const shortName = pkg.replace('@respan/instrumentation-', '');
-      if (this._disabledInstrumentations.some(d => {
-        const dl = d.toLowerCase();
-        return dl === shortName.toLowerCase() || dl === pkg.toLowerCase() || dl === className.toLowerCase();
-      })) {
+    for (const entry of discoveries) {
+      if (entry.category !== "direct-llm") {
+        this._recordInstrumentationStatus(
+          statusFromEntry(
+            entry,
+            "disabled",
+            entry.autoDisabledReason ?? "not a direct LLM SDK auto-instrumentation",
+          ),
+        );
+        continue;
+      }
+
+      if (!entry.enabledByDefault) {
+        this._recordInstrumentationStatus(
+          statusFromEntry(
+            entry,
+            "disabled",
+            entry.autoDisabledReason ?? "not enabled by default",
+          ),
+        );
+        continue;
+      }
+
+      if (this._isDisabled(entry)) {
+        this._recordInstrumentationStatus(
+          statusFromEntry(entry, "disabled", "disabled by user configuration"),
+        );
         continue;
       }
 
       try {
-        const mod = await import(pkg);
-        const InstrumentorClass = mod[className];
+        const mod = await this._importInstrumentationPackage(entry.instrumentationPackage);
+        const InstrumentorClass = mod[entry.instrumentorClass] ?? mod.default;
         if (InstrumentorClass) {
           await this._activate(new InstrumentorClass());
+          this._recordInstrumentationStatus(statusFromEntry(entry, "enabled"));
+        } else {
+          this._recordInstrumentationStatus(
+            statusFromEntry(
+              entry,
+              "failed",
+              "instrumentor class " + entry.instrumentorClass + " was not exported",
+            ),
+          );
         }
-      } catch {
-        // Package not installed — skip silently
+      } catch (error) {
+        this._recordInstrumentationStatus(
+          statusFromEntry(
+            entry,
+            this._isLikelyMissingPackageError(error) ? "missing" : "failed",
+            this._errorMessage(error),
+          ),
+        );
       }
     }
   }
@@ -175,6 +212,10 @@ export class Respan {
 
   public addProcessor(config: ProcessorConfig): void {
     this.telemetry.addProcessor(config);
+  }
+
+  public getInstrumentationStatus(): InstrumentationStatusEntry[] {
+    return [...this._instrumentationStatus];
   }
 
   // ── Context propagation ──────────────────────────────────────────────
@@ -340,7 +381,7 @@ export class Respan {
    * Flush the OTEL pipeline.
    */
   async flush(): Promise<void> {
-    await this.telemetry.shutdown();
+    await this.telemetry.flush();
   }
 
   /**
@@ -361,6 +402,48 @@ export class Respan {
   }
 
   // ── Private helpers ───────────────────────────────────────────────────
+
+  private async _importInstrumentationPackage(packageName: string): Promise<any> {
+    try {
+      const hostRequire = createRequire(`${process.cwd()}/package.json`);
+      return await import(pathToFileURL(hostRequire.resolve(packageName)).href);
+    } catch {
+      return await import(packageName);
+    }
+  }
+
+  private _isDisabled(entry: AutoInstrumentationEntry): boolean {
+    return this._disabledInstrumentations.some((disabled) =>
+      matchesAutoInstrumentationSelector(entry, disabled),
+    );
+  }
+
+  private _recordInstrumentationStatus(status: InstrumentationStatusEntry): void {
+    const existingIndex = this._instrumentationStatus.findIndex(
+      (entry) => entry.id === status.id,
+    );
+    if (existingIndex >= 0) {
+      this._instrumentationStatus[existingIndex] = status;
+    } else {
+      this._instrumentationStatus.push(status);
+    }
+  }
+
+  private _isLikelyMissingPackageError(error: unknown): boolean {
+    const message = this._errorMessage(error).toLowerCase();
+    return (
+      message.includes("cannot find package") ||
+      message.includes("cannot find module") ||
+      message.includes("module not found") ||
+      message.includes("not found")
+    );
+  }
+
+  private _errorMessage(error: unknown): string {
+    if (error instanceof Error) return error.message;
+    if (typeof error === "string") return error;
+    return "unknown error";
+  }
 
   private async _activate(inst: RespanInstrumentation): Promise<void> {
     if (this._instrumentations.has(inst.name)) {

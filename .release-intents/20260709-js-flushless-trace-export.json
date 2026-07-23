@@ -1,0 +1,7 @@
+{
+  "summary": "Split JavaScript SDK flush from shutdown so short-lived examples can export traces without explicit respan.flush(), wire disableBatch to SimpleSpanProcessor, and preserve advanced tracing options through RespanTelemetry",
+  "packages": {
+    "@respan/tracing": "patch",
+    "@respan/respan": "patch"
+  }
+}

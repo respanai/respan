@@ -149,6 +149,109 @@ Examples of keys that stay inside the instrumentation package:
 - Vercel AI SDK `ai.*` raw attribute keys
 - n8n / Langflow / vendor-specific event payload keys
 
+## Semantic Span Names
+
+Both SDKs export semantic span names **by default** so trace trees look the
+same across languages and frameworks. Users opt out with
+`RESPAN_SPAN_NAME_STYLE=legacy` (or `spanNameStyle: "legacy"` in JS), which
+preserves original instrumentation span names and the emitted span tree
+exactly, apart from stripping internal `respan.internal.*` hint attributes.
+
+The naming layer is an export/display rule only. Do not change log type, span
+kind, input/output, usage, cost, or metadata mapping just to make the visible
+span name look right.
+
+Canonical semantic span names use lowercase operation prefixes:
+
+```text
+<operation>
+<operation>.<detail>
+```
+
+Use a suffix only when it is part of the shared display contract:
+
+- `llm.<model>` for LLM chat/text/response/generation calls. The suffix must be
+  the resolved model name, such as `llm.gpt-4o` or `llm.claude-3-5-sonnet`.
+  If the model cannot be resolved, emit bare `llm` — never an SDK operation
+  name such as `doGenerate`, `chat`, `completion`, or `generation`.
+- `agent.<name>` for agent execution spans.
+- `tool.<name>` for tool/function-tool execution spans.
+- `handoff.<from>_to_<to>` for agent handoffs.
+
+All other semantic operation prefixes are emitted without a suffix:
+`workflow`, `task`, `embedding`, `transcribe`, `speech`, `guardrail`, and
+`span` as the last-resort fallback.
+
+Suffixes must be stable, human-readable identifiers (model, agent, tool names,
+handoff routes). Never put prompt text, user input, URLs, request IDs, customer
+IDs, secrets, timestamps, or other high-cardinality values in `span.name`. The
+transformers sanitize whitespace, arrows, and unsupported punctuation in both
+SDKs, but instrumentations should still provide concise suffixes up front.
+
+### Where naming happens
+
+- **JavaScript**: `@respan/tracing` renames at export time
+  (`processor/spanName.ts`), driven by span kind, log type, entity name, and
+  model attributes.
+- **Python**: `respan-tracing` renames at OTLP export time
+  (`exporters/respan.py`), from the same attributes.
+
+Both exporters resolve the LLM model in the same order: GenAI request model
+(`gen_ai.request.model`), then OpenInference aliases (`llm.model_name`), then
+generic `model`. Instrumentations must set the model attribute for LLM spans
+so the exporter can build `llm.<model>`.
+
+### Internal naming hints
+
+When the desired prefix/detail cannot be derived from normal span kind, entity
+name, log type, or model attributes, instrumentations may set internal hints.
+Import the keys from the SDK — never hard-code the strings:
+
+```ts
+import { RespanSpanAttributes } from "@respan/respan-sdk";
+
+attrs[RespanSpanAttributes.RESPAN_INTERNAL_SPAN_NAME_KIND] = "tool";
+attrs[RespanSpanAttributes.RESPAN_INTERNAL_SPAN_NAME_DETAIL] = toolName;
+```
+
+```py
+from respan_sdk.constants.span_attributes import (
+    RESPAN_INTERNAL_SPAN_NAME_DETAIL,
+    RESPAN_INTERNAL_SPAN_NAME_KIND,
+)
+```
+
+These hints (and `RESPAN_INTERNAL_DROP_SPAN` /
+`RESPAN_INTERNAL_EXPORT_PARENT`) are exporter-only: both exporters strip them
+before export in both styles. They must never appear in exported
+customer-visible attributes.
+
+### Structural wrapper spans
+
+Some SDKs emit wrapper spans that carry no user-visible work of their own
+(e.g. Vercel AI SDK `ai.generateText` wrapping the detailed
+`ai.generateText.doGenerate`). The owning instrumentation may mark these with
+`RESPAN_INTERNAL_DROP_SPAN` **at span start**, and must stamp each child with
+`RESPAN_INTERNAL_EXPORT_PARENT` (the wrapper's own parent span id, or `""`
+when the wrapper is a root span) so the exporter can drop the wrapper and
+reparent children per-span, immune to export-batch boundaries. The semantic
+style drops marked wrappers; the legacy style exports them untouched.
+
+Do not use drop marking to hide errors, tools, handoffs, or spans with unique
+user-visible input/output.
+
+### Rules
+
+- Vendor-specific span names and attribute keys (`ai.*`, `openai.*`, etc.)
+  stay inside the instrumentation package that owns the translator. The core
+  `@respan/tracing` / `respan-tracing` naming layer keys off shared attributes
+  only — never off vendor span names.
+- Do not use brand, package, provider, or product prefixes such as
+  `respan.*`, `openai.*`, `anthropic.*`, or `vercel.*` as semantic span names.
+- Add focused tests for both semantic and legacy behavior when an
+  instrumentation sets span-name hints or drop markers, and Python exporter
+  tests when changing Python semantic-name inference.
+
 ## JavaScript Guidance
 
 JS instrumentation packages should generally:

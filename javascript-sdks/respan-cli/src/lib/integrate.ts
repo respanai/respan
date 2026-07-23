@@ -173,6 +173,17 @@ export function writeTextFile(filePath: string, content: string): void {
   fs.writeFileSync(filePath, content);
 }
 
+/**
+ * Read a `KEY=value` line from .env-style content. Trims before stripping a
+ * single layer of surrounding quotes — the closing quote can sit inside
+ * trailing whitespace, so order matters. Returns undefined if absent or empty.
+ */
+export function extractEnvVar(content: string, key: string): string | undefined {
+  const match = content.match(new RegExp(`^${key}=(.+)$`, 'm'));
+  if (!match) return undefined;
+  return match[1].trim().replace(/^["']|["']$/g, '').trim() || undefined;
+}
+
 export function expandHome(p: string): string {
   if (p.startsWith('~')) {
     return path.join(os.homedir(), p.slice(1));

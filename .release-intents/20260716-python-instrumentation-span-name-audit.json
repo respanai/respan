@@ -1,0 +1,7 @@
+{
+  "summary": "Fix Writer semantic tool span names and Haystack tracing compatibility",
+  "packages": {
+    "respan-instrumentation-haystack": "patch",
+    "respan-instrumentation-writer": "patch"
+  }
+}

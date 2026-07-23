@@ -9,38 +9,29 @@ import threading
 from typing import Any, Mapping
 
 from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor
-from opentelemetry.semconv_ai import (
-    SpanAttributes,
-    TraceloopSpanKindValues,
-)
+from opentelemetry.semconv_ai import SpanAttributes
+from opentelemetry.trace import Status, StatusCode
 
 from respan_instrumentation_claude_agent_sdk._constants import (
+    CLAUDE_AGENT_SDK_AGENT_NAME_ATTR,
     CLAUDE_AGENT_SDK_CONVERSATION_ID_ATTR,
     CLAUDE_AGENT_SDK_INPUT_MESSAGES_ATTR,
+    CLAUDE_AGENT_SDK_OPERATION_NAME_ATTR,
     CLAUDE_AGENT_SDK_OUTPUT_MESSAGES_ATTR,
-    CLAUDE_AGENT_SDK_RESPONSE_MODEL_ATTR,
     CLAUDE_AGENT_SDK_STRIP_ATTRS,
     CLAUDE_AGENT_SDK_SYSTEM_INSTRUCTIONS_ATTR,
+    CLAUDE_AGENT_SDK_TOOL_CALL_ARGUMENTS_ATTR,
     CLAUDE_AGENT_SDK_TOOL_CALL_ID_ATTR,
+    CLAUDE_AGENT_SDK_TOOL_CALL_RESULT_ATTR,
     CLAUDE_AGENT_SDK_TOOL_DEFINITIONS_ATTR,
-    CLAUDE_AGENT_SDK_USAGE_CACHE_CREATION_INPUT_TOKENS_ATTR,
-    CLAUDE_AGENT_SDK_USAGE_CACHE_READ_INPUT_TOKENS_ATTR,
+    CLAUDE_AGENT_SDK_TOOL_NAME_ATTR,
     CLAUDE_AGENT_SDK_USAGE_INPUT_TOKENS_ATTR,
     CLAUDE_AGENT_SDK_USAGE_OUTPUT_TOKENS_ATTR,
     INPUT_VALUE_ATTR,
     OUTPUT_VALUE_ATTR,
-    RESPAN_OVERRIDE_COMPLETION_TOKENS_ATTR,
     RESPAN_OVERRIDE_INPUT_ATTR,
-    RESPAN_OVERRIDE_MODEL_ATTR,
-    RESPAN_OVERRIDE_OUTPUT_ATTR,
     RESPAN_OVERRIDE_TOOL_CALLS_ATTR,
     RESPAN_OVERRIDE_TOOLS_ATTR,
-    RESPAN_OVERRIDE_PROMPT_CACHE_CREATION_TOKENS_ATTR,
-    RESPAN_OVERRIDE_PROMPT_CACHE_HIT_TOKENS_ATTR,
-    RESPAN_OVERRIDE_PROMPT_TOKENS_ATTR,
-    RESPAN_OVERRIDE_SPAN_TOOLS_ATTR,
-    RESPAN_OVERRIDE_SPAN_WORKFLOW_NAME_ATTR,
-    RESPAN_OVERRIDE_TOTAL_REQUEST_TOKENS_ATTR,
 )
 from respan_sdk.constants.llm_logging import (
     LOG_TYPE_AGENT,
@@ -48,21 +39,9 @@ from respan_sdk.constants.llm_logging import (
     LogMethodChoices,
 )
 from respan_sdk.constants.span_attributes import (
-    GEN_AI_AGENT_NAME,
-    GEN_AI_OPERATION_NAME,
-    GEN_AI_SYSTEM,
-    GEN_AI_TOOL_CALL_ARGUMENTS,
-    GEN_AI_TOOL_CALL_RESULT,
-    GEN_AI_TOOL_NAME,
-    LLM_REQUEST_MODEL,
-    LLM_REQUEST_TYPE,
-    LLM_USAGE_COMPLETION_TOKENS,
-    LLM_USAGE_PROMPT_TOKENS,
     RESPAN_LOG_METHOD,
     RESPAN_LOG_TYPE,
     RESPAN_SESSION_ID,
-    RESPAN_SPAN_TOOL_CALLS,
-    RESPAN_SPAN_TOOLS,
 )
 from respan_sdk.utils.serialization import serialize_value
 
@@ -70,8 +49,34 @@ logger = logging.getLogger(__name__)
 
 _CLAUDE_AGENT_OPERATION_NAME = "invoke_agent"
 _CLAUDE_TOOL_OPERATION_NAME = "execute_tool"
-_GEN_AI_PROMPT_PREFIX = "gen_ai.prompt."
-_GEN_AI_COMPLETION_PREFIX = "gen_ai.completion."
+_GEN_AI_PROMPT_PREFIX = f"{SpanAttributes.LLM_PROMPTS}."
+_GEN_AI_COMPLETION_PREFIX = f"{SpanAttributes.LLM_COMPLETIONS}."
+_COMPLETION_TOOL_CALLS_ATTR = f"{SpanAttributes.LLM_COMPLETIONS}.0.tool_calls"
+_LEGACY_RESPAN_SPAN_TOOL_CALLS_ATTR = "respan.span.tool_calls"
+_LEGACY_RESPAN_SPAN_TOOLS_ATTR = "respan.span.tools"
+
+
+def _set_if_unset_span_status(span: ReadableSpan, attrs: Mapping[str, Any]) -> None:
+    current_status = getattr(span, "status", None)
+    current_status_code = getattr(current_status, "status_code", None)
+    if current_status_code not in {None, StatusCode.UNSET}:
+        return
+
+    error_message = (
+        attrs.get("error.message")
+        or attrs.get("exception.message")
+        or attrs.get("error.type")
+        or attrs.get("exception.type")
+    )
+    status = (
+        Status(StatusCode.ERROR, str(error_message))
+        if error_message
+        else Status(StatusCode.OK)
+    )
+    try:
+        span._status = status  # type: ignore[attr-defined]
+    except Exception:
+        logger.debug("Failed to set Claude Agent SDK span status", exc_info=True)
 
 
 def _safe_json_loads(value: Any) -> Any:
@@ -137,7 +142,7 @@ def _extract_first(attrs: Mapping[str, Any], keys: tuple[str, ...]) -> Any:
 
 
 def _extract_agent_name(span: ReadableSpan, attrs: Mapping[str, Any]) -> str:
-    raw_agent_name = attrs.get(GEN_AI_AGENT_NAME)
+    raw_agent_name = attrs.get(CLAUDE_AGENT_SDK_AGENT_NAME_ATTR)
     if isinstance(raw_agent_name, str) and raw_agent_name:
         return raw_agent_name
 
@@ -153,8 +158,8 @@ def _extract_model(attrs: Mapping[str, Any]) -> str | None:
     raw_model = _extract_first(
         attrs,
         (
-            CLAUDE_AGENT_SDK_RESPONSE_MODEL_ATTR,
-            LLM_REQUEST_MODEL,
+            SpanAttributes.LLM_RESPONSE_MODEL,
+            SpanAttributes.LLM_REQUEST_MODEL,
         ),
     )
     if isinstance(raw_model, str) and raw_model:
@@ -167,9 +172,9 @@ def _extract_usage(
 ) -> tuple[int | None, int | None, int | None, int | None]:
     prompt_tokens = attrs.get(CLAUDE_AGENT_SDK_USAGE_INPUT_TOKENS_ATTR)
     completion_tokens = attrs.get(CLAUDE_AGENT_SDK_USAGE_OUTPUT_TOKENS_ATTR)
-    cache_hit_tokens = attrs.get(CLAUDE_AGENT_SDK_USAGE_CACHE_READ_INPUT_TOKENS_ATTR)
+    cache_hit_tokens = attrs.get(SpanAttributes.LLM_USAGE_CACHE_READ_INPUT_TOKENS)
     cache_creation_tokens = attrs.get(
-        CLAUDE_AGENT_SDK_USAGE_CACHE_CREATION_INPUT_TOKENS_ATTR
+        SpanAttributes.LLM_USAGE_CACHE_CREATION_INPUT_TOKENS
     )
 
     normalized_prompt_tokens = (
@@ -208,18 +213,51 @@ def _extract_messages(attrs: Mapping[str, Any], attr_name: str) -> list[Any] | N
     return None
 
 
-def _extract_input_output(attrs: Mapping[str, Any]) -> tuple[str | None, str | None]:
+def _extract_normalized_input_messages(attrs: Mapping[str, Any]) -> list[Any] | None:
     input_messages = _extract_messages(attrs, CLAUDE_AGENT_SDK_INPUT_MESSAGES_ATTR)
-    if input_messages is not None:
-        system_instructions = attrs.get(CLAUDE_AGENT_SDK_SYSTEM_INSTRUCTIONS_ATTR)
-        normalized_input_messages = []
-        if isinstance(system_instructions, str) and system_instructions:
-            normalized_input_messages.append(
-                {"role": "system", "content": system_instructions}
+    if input_messages is None:
+        return None
+
+    system_instructions = attrs.get(CLAUDE_AGENT_SDK_SYSTEM_INSTRUCTIONS_ATTR)
+    normalized_input_messages = []
+    if isinstance(system_instructions, str) and system_instructions:
+        normalized_input_messages.append(
+            {"role": "system", "content": system_instructions}
+        )
+    normalized_input_messages.extend(input_messages)
+    return normalized_input_messages
+
+
+def _set_message_attrs(
+    attrs: dict[str, Any],
+    prefix: str,
+    messages: list[Any] | None,
+) -> None:
+    if messages is None:
+        return
+    for index, message in enumerate(messages):
+        if not isinstance(message, Mapping):
+            continue
+        role = message.get("role") or message.get("type")
+        content = message.get("content")
+        message_prefix = f"{prefix}.{index}"
+        if role is not None:
+            _set_if_missing(attrs, f"{message_prefix}.role", str(role))
+        if content is not None:
+            _set_if_missing(
+                attrs,
+                f"{message_prefix}.content",
+                content
+                if isinstance(content, str)
+                else json.dumps(serialize_value(content), default=str),
             )
-        normalized_input_messages.extend(input_messages)
+
+
+def _extract_input_output(attrs: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    input_messages = _extract_normalized_input_messages(attrs)
+    if input_messages is not None:
         input_value = json.dumps(
-            serialize_value(normalized_input_messages),
+            serialize_value(input_messages),
             default=str,
         )
     else:
@@ -310,11 +348,15 @@ def _extract_tools(attrs: Mapping[str, Any]) -> list[dict[str, Any]] | None:
 
 
 def _extract_existing_tools(attrs: Mapping[str, Any]) -> list[dict[str, Any]] | None:
+    parsed_tools = _safe_json_loads(attrs.get(SpanAttributes.LLM_REQUEST_FUNCTIONS))
+    if isinstance(parsed_tools, list):
+        return [dict(tool) for tool in parsed_tools if isinstance(tool, Mapping)]
+
     raw_tools = attrs.get(RESPAN_OVERRIDE_TOOLS_ATTR)
     if isinstance(raw_tools, list):
         return [dict(tool) for tool in raw_tools if isinstance(tool, Mapping)]
 
-    parsed_tools = _safe_json_loads(attrs.get(RESPAN_SPAN_TOOLS))
+    parsed_tools = _safe_json_loads(attrs.get(_LEGACY_RESPAN_SPAN_TOOLS_ATTR))
     if isinstance(parsed_tools, list):
         return [dict(tool) for tool in parsed_tools if isinstance(tool, Mapping)]
     return None
@@ -370,11 +412,19 @@ def _extract_tool_calls(attrs: Mapping[str, Any]) -> list[dict[str, Any]] | None
 def _extract_existing_tool_calls(
     attrs: Mapping[str, Any],
 ) -> list[dict[str, Any]] | None:
+    parsed_tool_calls = _safe_json_loads(attrs.get(_COMPLETION_TOOL_CALLS_ATTR))
+    if isinstance(parsed_tool_calls, list):
+        return [
+            tool_call
+            for tool_call in parsed_tool_calls
+            if isinstance(tool_call, Mapping)
+        ]
+
     raw_tool_calls = attrs.get(RESPAN_OVERRIDE_TOOL_CALLS_ATTR)
     if isinstance(raw_tool_calls, list):
         return [tool_call for tool_call in raw_tool_calls if isinstance(tool_call, Mapping)]
 
-    parsed_tool_calls = _safe_json_loads(attrs.get(RESPAN_SPAN_TOOL_CALLS))
+    parsed_tool_calls = _safe_json_loads(attrs.get(_LEGACY_RESPAN_SPAN_TOOL_CALLS_ATTR))
     if isinstance(parsed_tool_calls, list):
         return [
             tool_call
@@ -391,7 +441,7 @@ def _build_tool_call_from_tool_span_attrs(
         attrs,
         (
             SpanAttributes.TRACELOOP_ENTITY_NAME,
-            GEN_AI_TOOL_NAME,
+            CLAUDE_AGENT_SDK_TOOL_NAME_ATTR,
             "tool",
         ),
     )
@@ -403,7 +453,7 @@ def _build_tool_call_from_tool_span_attrs(
             attrs,
             (
                 SpanAttributes.TRACELOOP_ENTITY_INPUT,
-                GEN_AI_TOOL_CALL_ARGUMENTS,
+                CLAUDE_AGENT_SDK_TOOL_CALL_ARGUMENTS_ATTR,
                 RESPAN_OVERRIDE_INPUT_ATTR,
             ),
         )
@@ -472,7 +522,9 @@ def _rename_tool_definition(
 ) -> dict[str, Any]:
     normalized_tool_definition = dict(tool_definition)
     function_payload = tool_definition.get("function")
-    normalized_function_payload = dict(function_payload) if isinstance(function_payload, Mapping) else {}
+    normalized_function_payload = (
+        dict(function_payload) if isinstance(function_payload, Mapping) else {}
+    )
     normalized_function_payload["name"] = tool_name
     normalized_tool_definition["function"] = normalized_function_payload
     return normalized_tool_definition
@@ -554,7 +606,7 @@ def _extract_tool_span_name(span: ReadableSpan, attrs: Mapping[str, Any]) -> str
     raw_tool_name = _extract_first(
         attrs,
         (
-            GEN_AI_TOOL_NAME,
+            CLAUDE_AGENT_SDK_TOOL_NAME_ATTR,
             SpanAttributes.TRACELOOP_ENTITY_NAME,
             "tool",
         ),
@@ -585,11 +637,11 @@ def _get_parent_span_key(span: ReadableSpan) -> tuple[int, int] | None:
 
 
 def is_claude_agent_sdk_span(span: ReadableSpan, attrs: Mapping[str, Any]) -> bool:
-    operation_name = attrs.get(GEN_AI_OPERATION_NAME)
+    operation_name = attrs.get(CLAUDE_AGENT_SDK_OPERATION_NAME_ATTR)
     return (
         operation_name in {_CLAUDE_AGENT_OPERATION_NAME, _CLAUDE_TOOL_OPERATION_NAME}
-        or bool(attrs.get(GEN_AI_AGENT_NAME))
-        or bool(attrs.get(GEN_AI_TOOL_NAME))
+        or bool(attrs.get(CLAUDE_AGENT_SDK_AGENT_NAME_ATTR))
+        or bool(attrs.get(CLAUDE_AGENT_SDK_TOOL_NAME_ATTR))
         or span.name.startswith(_CLAUDE_AGENT_OPERATION_NAME)
         or span.name.startswith(_CLAUDE_TOOL_OPERATION_NAME)
     )
@@ -610,43 +662,32 @@ def enrich_claude_agent_sdk_span(span: ReadableSpan) -> None:
         LogMethodChoices.TRACING_INTEGRATION.value,
     )
 
-    operation_name = attrs.get(GEN_AI_OPERATION_NAME)
+    operation_name = attrs.get(CLAUDE_AGENT_SDK_OPERATION_NAME_ATTR)
     session_id = attrs.get(CLAUDE_AGENT_SDK_CONVERSATION_ID_ATTR)
     if isinstance(session_id, str) and session_id:
         _set_if_missing(attrs, RESPAN_SESSION_ID, session_id)
 
-    if operation_name == _CLAUDE_TOOL_OPERATION_NAME or attrs.get(GEN_AI_TOOL_NAME):
+    if operation_name == _CLAUDE_TOOL_OPERATION_NAME or attrs.get(CLAUDE_AGENT_SDK_TOOL_NAME_ATTR):
         tool_name = _extract_tool_span_name(span, attrs)
-        tool_input = _json_string(attrs.get(GEN_AI_TOOL_CALL_ARGUMENTS))
-        tool_output = _json_string(attrs.get(GEN_AI_TOOL_CALL_RESULT))
+        tool_input = _json_string(attrs.get(CLAUDE_AGENT_SDK_TOOL_CALL_ARGUMENTS_ATTR))
+        tool_output = _json_string(attrs.get(CLAUDE_AGENT_SDK_TOOL_CALL_RESULT_ATTR))
 
         attrs[RESPAN_LOG_TYPE] = LOG_TYPE_TOOL
-        attrs[SpanAttributes.TRACELOOP_SPAN_KIND] = TraceloopSpanKindValues.TOOL.value
         attrs[SpanAttributes.TRACELOOP_ENTITY_NAME] = tool_name
         attrs[SpanAttributes.TRACELOOP_ENTITY_PATH] = tool_name
         _set_if_present(attrs, SpanAttributes.TRACELOOP_ENTITY_INPUT, tool_input)
         _set_if_present(attrs, SpanAttributes.TRACELOOP_ENTITY_OUTPUT, tool_output)
-        _set_if_present(attrs, RESPAN_OVERRIDE_INPUT_ATTR, tool_input)
-        _set_if_present(attrs, RESPAN_OVERRIDE_OUTPUT_ATTR, tool_output)
-        attrs[RESPAN_OVERRIDE_TOOLS_ATTR] = [
-            {"type": "function", "function": {"name": tool_name}}
-        ]
-        attrs[RESPAN_OVERRIDE_SPAN_TOOLS_ATTR] = [tool_name]
         _pop_attrs(
             attrs,
-            LLM_REQUEST_TYPE,
-            LLM_REQUEST_MODEL,
-            RESPAN_OVERRIDE_MODEL_ATTR,
-            LLM_USAGE_PROMPT_TOKENS,
-            LLM_USAGE_COMPLETION_TOKENS,
-            RESPAN_OVERRIDE_PROMPT_TOKENS_ATTR,
-            RESPAN_OVERRIDE_COMPLETION_TOKENS_ATTR,
-            RESPAN_OVERRIDE_TOTAL_REQUEST_TOKENS_ATTR,
-            RESPAN_OVERRIDE_PROMPT_CACHE_HIT_TOKENS_ATTR,
-            RESPAN_OVERRIDE_PROMPT_CACHE_CREATION_TOKENS_ATTR,
-            RESPAN_SPAN_TOOL_CALLS,
-            RESPAN_OVERRIDE_TOOL_CALLS_ATTR,
-            GEN_AI_SYSTEM,
+            SpanAttributes.LLM_REQUEST_TYPE,
+            SpanAttributes.LLM_REQUEST_MODEL,
+            SpanAttributes.LLM_USAGE_PROMPT_TOKENS,
+            SpanAttributes.LLM_USAGE_COMPLETION_TOKENS,
+            SpanAttributes.LLM_USAGE_TOTAL_TOKENS,
+            SpanAttributes.LLM_USAGE_CACHE_READ_INPUT_TOKENS,
+            SpanAttributes.LLM_USAGE_CACHE_CREATION_INPUT_TOKENS,
+            _COMPLETION_TOOL_CALLS_ATTR,
+            SpanAttributes.LLM_SYSTEM,
             "cost",
         )
         _pop_attr_prefixes(
@@ -655,12 +696,14 @@ def enrich_claude_agent_sdk_span(span: ReadableSpan) -> None:
             _GEN_AI_COMPLETION_PREFIX,
         )
         if tool_output is None:
-            _pop_attrs(attrs, SpanAttributes.TRACELOOP_ENTITY_OUTPUT, RESPAN_OVERRIDE_OUTPUT_ATTR)
+            _pop_attrs(attrs, SpanAttributes.TRACELOOP_ENTITY_OUTPUT)
         if tool_input is None:
-            _pop_attrs(attrs, SpanAttributes.TRACELOOP_ENTITY_INPUT, RESPAN_OVERRIDE_INPUT_ATTR)
+            _pop_attrs(attrs, SpanAttributes.TRACELOOP_ENTITY_INPUT)
     else:
         agent_name = _extract_agent_name(span, attrs)
         input_value, output_value = _extract_input_output(attrs)
+        input_messages = _extract_normalized_input_messages(attrs)
+        output_messages = _extract_messages(attrs, CLAUDE_AGENT_SDK_OUTPUT_MESSAGES_ATTR)
         tool_calls = _extract_tool_calls(attrs)
         tools = _reconcile_tools_with_tool_calls(
             tools=_extract_tools(attrs),
@@ -672,69 +715,55 @@ def enrich_claude_agent_sdk_span(span: ReadableSpan) -> None:
         )
 
         _set_if_missing(attrs, RESPAN_LOG_TYPE, LOG_TYPE_AGENT)
-        _set_if_missing(
-            attrs,
-            SpanAttributes.TRACELOOP_SPAN_KIND,
-            TraceloopSpanKindValues.AGENT.value,
-        )
         _set_if_missing(attrs, SpanAttributes.TRACELOOP_ENTITY_NAME, agent_name)
         _set_if_missing(attrs, SpanAttributes.TRACELOOP_ENTITY_PATH, agent_name)
         _set_if_missing(attrs, SpanAttributes.TRACELOOP_WORKFLOW_NAME, agent_name)
-        _set_if_missing(
-            attrs,
-            RESPAN_OVERRIDE_SPAN_WORKFLOW_NAME_ATTR,
-            agent_name,
-        )
         _set_if_missing(attrs, SpanAttributes.TRACELOOP_ENTITY_INPUT, input_value)
         _set_if_missing(attrs, SpanAttributes.TRACELOOP_ENTITY_OUTPUT, output_value)
+        _set_message_attrs(attrs, SpanAttributes.LLM_PROMPTS, input_messages)
+        _set_message_attrs(attrs, SpanAttributes.LLM_COMPLETIONS, output_messages)
         if model is not None:
-            _set_if_missing(attrs, LLM_REQUEST_MODEL, model)
-            _set_if_missing(attrs, RESPAN_OVERRIDE_MODEL_ATTR, model)
+            _set_if_missing(attrs, SpanAttributes.LLM_REQUEST_MODEL, model)
         if prompt_tokens is not None:
-            _set_if_missing(attrs, LLM_USAGE_PROMPT_TOKENS, prompt_tokens)
-            _set_if_missing(attrs, RESPAN_OVERRIDE_PROMPT_TOKENS_ATTR, prompt_tokens)
+            _set_if_missing(attrs, SpanAttributes.LLM_USAGE_PROMPT_TOKENS, prompt_tokens)
         if completion_tokens is not None:
-            _set_if_missing(attrs, LLM_USAGE_COMPLETION_TOKENS, completion_tokens)
-            _set_if_missing(
-                attrs,
-                RESPAN_OVERRIDE_COMPLETION_TOKENS_ATTR,
-                completion_tokens,
-            )
+            _set_if_missing(attrs, SpanAttributes.LLM_USAGE_COMPLETION_TOKENS, completion_tokens)
         if prompt_tokens is not None or completion_tokens is not None:
             _set_if_missing(
                 attrs,
-                RESPAN_OVERRIDE_TOTAL_REQUEST_TOKENS_ATTR,
+                SpanAttributes.LLM_USAGE_TOTAL_TOKENS,
                 (prompt_tokens or 0) + (completion_tokens or 0),
             )
         if cache_hit_tokens is not None:
             _set_if_missing(
                 attrs,
-                RESPAN_OVERRIDE_PROMPT_CACHE_HIT_TOKENS_ATTR,
+                SpanAttributes.LLM_USAGE_CACHE_READ_INPUT_TOKENS,
                 cache_hit_tokens,
             )
         if cache_creation_tokens is not None:
             _set_if_missing(
                 attrs,
-                RESPAN_OVERRIDE_PROMPT_CACHE_CREATION_TOKENS_ATTR,
+                SpanAttributes.LLM_USAGE_CACHE_CREATION_INPUT_TOKENS,
                 cache_creation_tokens,
             )
         if tools is not None:
-            attrs[RESPAN_SPAN_TOOLS] = json.dumps(
+            attrs[SpanAttributes.LLM_REQUEST_FUNCTIONS] = json.dumps(
                 serialize_value(tools),
                 default=str,
             )
-            attrs[RESPAN_OVERRIDE_TOOLS_ATTR] = tools
         if tool_calls is not None:
-            attrs[RESPAN_SPAN_TOOL_CALLS] = json.dumps(
+            attrs[_COMPLETION_TOOL_CALLS_ATTR] = json.dumps(
                 serialize_value(tool_calls),
                 default=str,
             )
+            _set_if_missing(attrs, f"{SpanAttributes.LLM_COMPLETIONS}.0.role", "assistant")
 
     span._attributes = {
         key: value
         for key, value in attrs.items()
         if key not in CLAUDE_AGENT_SDK_STRIP_ATTRS
     }
+    _set_if_unset_span_status(span, span._attributes)
 
 
 class ClaudeAgentSDKSpanProcessor(SpanProcessor):
@@ -817,25 +846,33 @@ class ClaudeAgentSDKSpanProcessor(SpanProcessor):
                 return
 
             updated_attrs = dict(attrs)
-            updated_attrs[RESPAN_SPAN_TOOL_CALLS] = json.dumps(
+            updated_attrs[_COMPLETION_TOOL_CALLS_ATTR] = json.dumps(
                 serialize_value(merged_tool_calls),
                 default=str,
             )
-            updated_attrs[RESPAN_OVERRIDE_TOOL_CALLS_ATTR] = merged_tool_calls
+            _set_if_missing(
+                updated_attrs,
+                f"{SpanAttributes.LLM_COMPLETIONS}.0.role",
+                "assistant",
+            )
             reconciled_tools = _reconcile_tools_with_tool_calls(
                 tools=_extract_existing_tools(updated_attrs),
                 tool_calls=merged_tool_calls,
             )
             if reconciled_tools is not None:
-                updated_attrs[RESPAN_SPAN_TOOLS] = json.dumps(
+                updated_attrs[SpanAttributes.LLM_REQUEST_FUNCTIONS] = json.dumps(
                     serialize_value(reconciled_tools),
                     default=str,
                 )
-                updated_attrs[RESPAN_OVERRIDE_TOOLS_ATTR] = reconciled_tools
             # The shared exporter synthesizes the final assistant_message child span.
             # Keep the processor focused on parent-span normalization to avoid
             # emitting the same synthetic child twice.
-            span._attributes = updated_attrs
+            span._attributes = {
+                key: value
+                for key, value in updated_attrs.items()
+                if key not in CLAUDE_AGENT_SDK_STRIP_ATTRS
+            }
+            _set_if_unset_span_status(span, span._attributes)
         except Exception:
             logger.exception("Failed to enrich Claude Agent SDK span")
 

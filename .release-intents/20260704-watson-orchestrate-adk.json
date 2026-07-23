@@ -1,0 +1,6 @@
+{
+  "summary": "Add Watson Orchestrate ADK Python instrumentation",
+  "packages": {
+    "respan-instrumentation-watson-orchestrate-adk": "new"
+  }
+}

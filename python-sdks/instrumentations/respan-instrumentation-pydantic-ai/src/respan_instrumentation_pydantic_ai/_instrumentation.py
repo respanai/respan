@@ -28,7 +28,7 @@ class PydanticAIInstrumentor:
         *,
         include_content: bool = True,
         include_binary_content: bool = True,
-        version: int = 4,
+        version: int = 5,
     ) -> None:
         self._agent = agent
         self._include_content = include_content

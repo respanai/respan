@@ -39,7 +39,3 @@ def send_webhook(topic):
 for topic in topics:
     print(f"Input: Please explain to me {topic.lower()}")
     print(f"Answer: {send_webhook(topic)} \n")
-
-# Ensure all spans are flushed before exit
-k_tl.flush()
-

@@ -37,4 +37,3 @@ def handle_request(user_id: str, question: str):
 
 handle_request("user_alice", "What is an API gateway?")
 handle_request("user_bob", "Explain rate limiting.")
-respan.flush()

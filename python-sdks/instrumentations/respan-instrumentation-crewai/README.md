@@ -1,6 +1,10 @@
 # respan-instrumentation-crewai
 
-Respan instrumentation plugin for CrewAI. Wraps OpenInference's CrewAI instrumentor and translates spans into the Respan tracing shape automatically.
+First-party Respan instrumentation for CrewAI. It subscribes to CrewAI's
+official lifecycle events and emits canonical workflow, task, agent, tool, and LLM
+spans directly. LLM spans include model, prompt/completion, and
+provider-reported token usage, which allows Respan to calculate cost for models
+in its pricing catalog.
 
 ## Configuration
 
@@ -9,6 +13,9 @@ Respan instrumentation plugin for CrewAI. Wraps OpenInference's CrewAI instrumen
 ```bash
 pip install respan-instrumentation-crewai
 ```
+
+The package requires CrewAI 1.10.1 or newer. That version introduced the
+provider-neutral LLM lifecycle and usage hooks required for complete tracing.
 
 ### 2. Set Environment Variables
 
@@ -50,12 +57,13 @@ agent = Agent(
 )
 
 task = Task(
+    name="Write recursion haiku",
     description="Write a haiku about recursion in programming.",
     expected_output="A single haiku (3 lines: 5-7-5 syllables).",
     agent=agent,
 )
 
-crew = Crew(agents=[agent], tasks=[task])
+crew = Crew(name="crewai_haiku", agents=[agent], tasks=[task])
 result = crew.kickoff()
 print(result.raw)
 

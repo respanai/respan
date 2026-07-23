@@ -2,11 +2,13 @@
 
 import contextvars
 import importlib
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any
 
 from opentelemetry import trace
+from opentelemetry.semconv_ai import SpanAttributes
 from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor
 from respan_instrumentation_haystack._constants import (
     HAYSTACK_ASYNC_PIPELINE_CLASS_NAME,
@@ -334,8 +336,161 @@ def _suppress_haystack_native_span_export(span: Any) -> None:
     if attributes is None:
         return
 
-    for attribute_name in HAYSTACK_NATIVE_PROCESSING_ATTRIBUTES:
-        attributes.pop(attribute_name, None)
+    # ReadableSpan stores ended-span attributes in an immutable
+    # BoundedAttributes instance on newer OpenTelemetry releases. Replace the
+    # private snapshot instead of mutating it so native Haystack spans remain
+    # unprocessable without raising during processor shutdown.
+    span._attributes = {
+        name: value
+        for name, value in attributes.items()
+        if name not in HAYSTACK_NATIVE_PROCESSING_ATTRIBUTES
+    }
+
+
+def _parse_json_attr(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return value
+
+
+def _json_attr(value: Any) -> str:
+    return json.dumps(value, default=str, separators=(",", ":"))
+
+
+def _message_content(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+
+    if isinstance(value, list):
+        text_parts: list[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if text is None:
+                    text = item.get("content")
+                if text is not None:
+                    text_parts.append(str(text))
+            elif item is not None:
+                text_parts.append(str(item))
+        return "\n".join(text_parts)
+
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _normalize_haystack_message(value: Any, *, fallback_role: str) -> dict[str, Any] | None:
+    if isinstance(value, str):
+        return {"role": fallback_role, "content": value}
+
+    if not isinstance(value, dict):
+        return None
+
+    role = value.get("role") or fallback_role
+    content = _message_content(value.get("content"))
+    message: dict[str, Any] = {"role": str(role), "content": content}
+
+    name = value.get("name")
+    if name is not None:
+        message["name"] = name
+
+    return message
+
+
+def _haystack_input_messages(attrs: dict[str, Any]) -> list[dict[str, Any]]:
+    payload = _parse_json_attr(attrs.get("haystack.component.input"))
+    if not isinstance(payload, dict):
+        return []
+
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        normalized = [
+            message
+            for item in messages
+            if (
+                message := _normalize_haystack_message(
+                    item,
+                    fallback_role="user",
+                )
+            )
+            is not None
+        ]
+        if normalized:
+            return normalized
+
+    for key in ("query", "question", "prompt"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return [{"role": "user", "content": value}]
+
+    return []
+
+
+def _haystack_completion_message(attrs: dict[str, Any]) -> dict[str, Any] | None:
+    payload = _parse_json_attr(attrs.get("haystack.component.output"))
+    if not isinstance(payload, dict):
+        return None
+
+    replies = payload.get("replies")
+    if isinstance(replies, list):
+        for item in reversed(replies):
+            message = _normalize_haystack_message(item, fallback_role="assistant")
+            if message is not None and message.get("content"):
+                return message
+        for item in reversed(replies):
+            message = _normalize_haystack_message(item, fallback_role="assistant")
+            if message is not None:
+                return message
+
+    answers = payload.get("answers")
+    if isinstance(answers, list):
+        for item in reversed(answers):
+            if isinstance(item, dict):
+                data = item.get("data") or item.get("answer")
+                if data is not None:
+                    return {"role": "assistant", "content": str(data)}
+            elif isinstance(item, str):
+                return {"role": "assistant", "content": item}
+
+    return None
+
+
+def _set_indexed_messages(
+    attrs: dict[str, Any],
+    *,
+    prefix: str,
+    messages: list[dict[str, Any]],
+) -> None:
+    for index, message in enumerate(messages):
+        role = message.get("role")
+        if role is not None:
+            attrs[f"{prefix}.{index}.role"] = str(role)
+        content = message.get("content")
+        if content is not None:
+            attrs[f"{prefix}.{index}.content"] = str(content)
+
+
+def _enrich_haystack_io_attrs(attrs: dict[str, Any]) -> None:
+    input_messages = _haystack_input_messages(attrs)
+    if input_messages:
+        attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = _json_attr(input_messages)
+        _set_indexed_messages(
+            attrs,
+            prefix=SpanAttributes.LLM_PROMPTS,
+            messages=input_messages,
+        )
+
+    completion_message = _haystack_completion_message(attrs)
+    if completion_message is not None:
+        attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = _json_attr(completion_message)
+        _set_indexed_messages(
+            attrs,
+            prefix=SpanAttributes.LLM_COMPLETIONS,
+            messages=[completion_message],
+        )
 
 
 class _HaystackParentSpanProcessor(SpanProcessor):
@@ -379,6 +534,10 @@ class _HaystackParentSpanProcessor(SpanProcessor):
         if _is_haystack_native_span(span):
             _suppress_haystack_native_span_export(span)
             return
+
+        attributes = getattr(span, "_attributes", None)
+        if attributes is not None:
+            _enrich_haystack_io_attrs(attributes)
 
         parent_id = _get_parent_span_id(span)
         component_context = (

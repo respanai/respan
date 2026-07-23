@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Secrets and per-account / generated artifacts
+.env
+prompt_ids.json
+
+# Runtime output
+events.ndjson
+
+# Internal notes & dev scripts - kept locally, NOT part of the published demo
+DEMO-DIAGRAM.md
+STEP0-instrumentation-change.md
+OPENAI-STREAMING-BUG.md
+gate_step0.py
+repro_streaming_bug.py

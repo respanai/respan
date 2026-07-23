@@ -1,0 +1,6 @@
+{
+  "summary": "Support AI SDK 7 telemetry and canonical, duplicate-free Vercel spans across AI SDK 4-7",
+  "packages": {
+    "@respan/instrumentation-vercel": "patch"
+  }
+}

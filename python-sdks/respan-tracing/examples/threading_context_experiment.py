@@ -509,7 +509,6 @@ def main():
     print("   • Each thread needs explicit context setup for tracing")
     
     # Flush any pending spans
-    telemetry.flush()
     
     print("\n✅ All experiments completed!")
 

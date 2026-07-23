@@ -140,7 +140,6 @@ def example_file_exporter():
             child2.set_attribute("description", "Process data")
     
     # Flush to ensure all spans are exported
-    telemetry.flush()
     print(f"\nCheck 'my_traces.jsonl' for exported spans\n")
 
 
@@ -175,7 +174,6 @@ def example_console_exporter():
         span.add_event("Request completed")
     
     # Flush to ensure export
-    telemetry.flush()
 
 
 def example_custom_backend():
@@ -215,7 +213,6 @@ def example_custom_backend():
         span.set_attribute("query", "SELECT * FROM users")
         span.set_attribute("database", "postgres")
     
-    telemetry.flush()
 
 
 if __name__ == "__main__":

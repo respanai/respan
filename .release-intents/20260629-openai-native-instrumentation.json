@@ -1,0 +1,6 @@
+{
+  "summary": "Rewrite respan-instrumentation-openai as a native (Traceloop-free) instrumentation so OpenAI chat/responses/completions/embeddings spans emit llm.request.type and roll up tokens/cost instead of being mislabeled as generic tasks",
+  "packages": {
+    "respan-instrumentation-openai": "minor"
+  }
+}

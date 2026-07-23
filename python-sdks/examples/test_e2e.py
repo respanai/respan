@@ -45,7 +45,6 @@ class TestRealBackend:
         processor = r._instrumentations["openai-agents"]._processor
         processor.on_trace_end(trace)
 
-        r.flush()
         r.shutdown()
 
     @pytest.mark.asyncio
@@ -72,5 +71,4 @@ class TestRealBackend:
         result = await Runner.run(agent, "Say hi")
         print(f"Agent output: {result.final_output}")
 
-        r.flush()
         r.shutdown()

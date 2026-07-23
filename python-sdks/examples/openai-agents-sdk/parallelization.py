@@ -26,7 +26,6 @@ async def main():
         )
         for r in results:
             print(f"{r.last_agent.name}: {r.final_output}")
-    respan.flush()
 
 
 if __name__ == "__main__":

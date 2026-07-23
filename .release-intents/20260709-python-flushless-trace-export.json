@@ -1,0 +1,8 @@
+{
+  "summary": "Add Python SDK auto-flush lifecycle support so root decorator spans and synthetic injected spans can export without explicit respan.flush(), make Respan.shutdown() drain telemetry after plugin deactivation, align Python exported semantic span names with the JS lowercase/model-suffixed style, and fix Claude Agent SDK JS package metadata for standalone installs",
+  "packages": {
+    "@respan/instrumentation-claude-agent-sdk": "patch",
+    "respan-tracing": "patch",
+    "respan-ai": "patch"
+  }
+}

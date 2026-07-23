@@ -10,6 +10,10 @@ from respan_tracing.constants.context_constants import (
     ENABLE_CONTENT_TRACING_KEY
 )
 from respan_tracing.constants.generic_constants import LOGGER_NAME_DECORATORS
+from respan_tracing.utils.auto_flush import (
+    flush_after_span,
+    has_recording_parent_span,
+)
 from respan_tracing.utils.logging import get_respan_logger
 from respan_tracing.utils.span_setup import setup_span, cleanup_span, LinksParam
 
@@ -90,7 +94,7 @@ def _handle_span_output(span, result):
         pass
 
 
-def _cleanup_span(span, ctx_token):
+def _cleanup_span(span, ctx_token, *, is_root_boundary: bool = False):
     """End span and detach all context tokens."""
     cleanup_span(
         span,
@@ -98,9 +102,10 @@ def _cleanup_span(span, ctx_token):
         entity_name_token=getattr(span, '_entity_name_token', None),
         entity_path_token=getattr(span, '_entity_path_token', None),
     )
+    flush_after_span(is_root_boundary)
 
 
-def _handle_generator(span, ctx_token, generator):
+def _handle_generator(span, ctx_token, generator, *, is_root_boundary: bool = False):
     """Handle generator functions"""
     try:
         for item in generator:
@@ -110,10 +115,10 @@ def _handle_generator(span, ctx_token, generator):
         span.record_exception(e)
         raise
     finally:
-        _cleanup_span(span, ctx_token)
+        _cleanup_span(span, ctx_token, is_root_boundary=is_root_boundary)
 
 
-async def _ahandle_generator(span, ctx_token, async_generator):
+async def _ahandle_generator(span, ctx_token, async_generator, *, is_root_boundary: bool = False):
     """Handle async generator functions"""
     try:
         async for item in async_generator:
@@ -123,7 +128,7 @@ async def _ahandle_generator(span, ctx_token, async_generator):
         span.record_exception(e)
         raise
     finally:
-        _cleanup_span(span, ctx_token)
+        _cleanup_span(span, ctx_token, is_root_boundary=is_root_boundary)
 
 
 def create_entity_method(
@@ -206,6 +211,7 @@ def _create_entity_method_decorator(
                 @wraps(fn)
                 async def async_gen_wrapper(*args: Any, **kwargs: Any) -> Any:
                     entity_name = _resolve_name(*args, **kwargs)
+                    is_root_boundary = not has_recording_parent_span()
                     span, ctx_token = _setup_span(
                         entity_name=entity_name,
                         span_kind=span_kind,
@@ -217,14 +223,26 @@ def _create_entity_method_decorator(
                     )
                     _handle_span_input(span, args, kwargs)
 
+                    cleanup_owned_by_generator = False
                     try:
                         result = fn(*args, **kwargs)
-                        async for item in _ahandle_generator(span, ctx_token, result):
+                        cleanup_owned_by_generator = True
+                        async for item in _ahandle_generator(
+                            span,
+                            ctx_token,
+                            result,
+                            is_root_boundary=is_root_boundary,
+                        ):
                             yield item
                     except Exception as e:
                         span.set_status(Status(StatusCode.ERROR, str(e)))
                         span.record_exception(e)
-                        _cleanup_span(span, ctx_token)
+                        if not cleanup_owned_by_generator:
+                            _cleanup_span(
+                                span,
+                                ctx_token,
+                                is_root_boundary=is_root_boundary,
+                            )
                         raise
 
                 return async_gen_wrapper
@@ -233,6 +251,7 @@ def _create_entity_method_decorator(
                 @wraps(fn)
                 async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
                     entity_name = _resolve_name(*args, **kwargs)
+                    is_root_boundary = not has_recording_parent_span()
                     span, ctx_token = _setup_span(
                         entity_name=entity_name,
                         span_kind=span_kind,
@@ -253,7 +272,7 @@ def _create_entity_method_decorator(
                         span.record_exception(e)
                         raise
                     finally:
-                        _cleanup_span(span, ctx_token)
+                        _cleanup_span(span, ctx_token, is_root_boundary=is_root_boundary)
 
                 return async_wrapper
         else:
@@ -261,6 +280,7 @@ def _create_entity_method_decorator(
             @wraps(fn)
             def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
                 entity_name = _resolve_name(*args, **kwargs)
+                is_root_boundary = not has_recording_parent_span()
                 span, ctx_token = _setup_span(
                     entity_name=entity_name,
                     span_kind=span_kind,
@@ -277,7 +297,12 @@ def _create_entity_method_decorator(
 
                     # Handle generators
                     if inspect.isgeneratorfunction(fn):
-                        return _handle_generator(span, ctx_token, result)
+                        return _handle_generator(
+                            span,
+                            ctx_token,
+                            result,
+                            is_root_boundary=is_root_boundary,
+                        )
                     else:
                         _handle_span_output(span, result)
                         return result
@@ -287,7 +312,7 @@ def _create_entity_method_decorator(
                     raise
                 finally:
                     if not inspect.isgeneratorfunction(fn):
-                        _cleanup_span(span, ctx_token)
+                        _cleanup_span(span, ctx_token, is_root_boundary=is_root_boundary)
 
             return sync_wrapper
 

@@ -6,7 +6,7 @@ import os
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from respan_tracing import RespanTelemetry
 from respan_tracing.utils.span_factory import (
@@ -16,6 +16,10 @@ from respan_tracing.utils.span_factory import (
     propagate_attributes as _propagate_attributes,
 )
 
+from ._auto_instrumentation_registry import (
+    AutoInstrumentationStatus,
+    activate_auto_instrumentations,
+)
 from ._types import Instrumentation
 
 logger = logging.getLogger(__name__)
@@ -25,11 +29,13 @@ class Respan:
     """Unified entry point for Respan tracing and instrumentation plugins.
 
     Sets up:
-    1. ``RespanTelemetry`` — OTEL TracerProvider for decorators and, when no
-       plugins are provided, auto-instrumentation of LLM SDKs (OpenAI,
-       Anthropic, etc.) via the OTEL pipeline.
+    1. ``RespanTelemetry`` — OTEL TracerProvider for decorators and export.
+       Broad OTEL entry-point auto-discovery is disabled here so unrelated
+       packages cannot create duplicate spans.
     2. Activates any instrumentors passed via the ``instrumentations`` list.
        Plugins emit ``ReadableSpan`` objects into the same OTEL pipeline.
+    3. When auto-instrumentation is enabled, activates installed first-party
+       Respan direct LLM SDK instrumentors from the curated registry.
 
     When ``instrumentations`` are provided, OTEL auto-instrumentation is
     disabled by default to avoid duplicate spans (plugins capture LLM calls
@@ -41,14 +47,17 @@ class Respan:
         app_name: Application name for telemetry identification.
         instrumentations: List of instrumentor instances to activate.
         is_auto_instrument: Auto-instrument LLM SDKs (OpenAI, Anthropic, etc.)
-            via OTEL.  Defaults to ``True`` when no plugins are provided,
-            ``False`` when plugins are provided (to avoid duplicate spans).
+            via Respan's curated direct-LLM registry.  Defaults to ``True``
+            when no plugins are provided, ``False`` when plugins are provided
+            (to avoid duplicate spans). Respan never forwards this flag to
+            broad OTEL entry-point auto-discovery.
         customer_identifier: Default customer/user identifier for all spans.
         thread_identifier: Default conversation thread ID for all spans.
         metadata: Default metadata dict merged into all spans.
         environment: Default environment (e.g. ``"production"``).
         **telemetry_kwargs: Extra keyword arguments forwarded to
-            ``RespanTelemetry`` (e.g. ``log_level``, ``is_batching_enabled``).
+            ``RespanTelemetry`` (e.g. ``log_level``, ``is_batching_enabled``,
+            ``auto_flush``).
 
     Examples::
 
@@ -98,12 +107,14 @@ class Respan:
         if is_auto_instrument is None:
             is_auto_instrument = instrumentations is None
 
-        # 1. OTEL TracerProvider + optional auto-instrumentation
+        # 1. OTEL TracerProvider. Keep respan-tracing broad OTEL entry-point
+        # auto-discovery off; Respan auto mode is handled by the curated
+        # direct-LLM registry below.
         self.telemetry = RespanTelemetry(
             app_name=app_name,
             api_key=api_key,
             base_url=base_url,
-            is_auto_instrument=is_auto_instrument,
+            is_auto_instrument=False,
             **telemetry_kwargs,
         )
 
@@ -112,20 +123,67 @@ class Respan:
         if default_attributes:
             _PROPAGATED_ATTRIBUTES.set(default_attributes)
 
-        # 3. Activate instrumentations
+        # 3. Activate explicit instrumentations first, so user-provided
+        # instances and constructor options win over auto-discovered defaults.
         self._instrumentations: Dict[str, object] = {}
+        self._auto_instrumentation_status: Tuple[AutoInstrumentationStatus, ...] = ()
         for inst in instrumentations or []:
             name = getattr(inst, "name", type(inst).__name__)
             self._activate(name, inst)
 
-    def _activate(self, name: str, inst: object) -> None:
+        # 4. Activate installed direct LLM SDK instrumentations from Respan's
+        # curated registry when auto mode is enabled.
+        if is_auto_instrument:
+            activations = activate_auto_instrumentations(
+                already_activated=self._instrumentations.keys(),
+            )
+            self._auto_instrumentation_status = tuple(
+                activation.status for activation in activations
+            )
+            for activation in activations:
+                if activation.instrumentor is not None:
+                    self._instrumentations[activation.status.name] = (
+                        activation.instrumentor
+                    )
+
+    @property
+    def auto_instrumentation_status(self) -> Tuple[AutoInstrumentationStatus, ...]:
+        """Status entries from the most recent Respan auto-instrumentation run."""
+
+        return self._auto_instrumentation_status
+
+    def get_auto_instrumentation_status(self) -> List[Dict[str, Optional[str]]]:
+        """Return auto-instrumentation status as JSON-serializable dicts."""
+
+        return [
+            {
+                "id": status.id,
+                "name": status.name,
+                "status": status.status,
+                "provider": status.provider,
+                "sdk_package": status.sdk_package,
+                "instrumentation_package": status.instrumentation_package,
+                "reason": status.reason,
+            }
+            for status in self._auto_instrumentation_status
+        ]
+
+    def _activate(self, name: str, inst: object) -> bool:
         """Activate a single instrumentor."""
+        if name in self._instrumentations:
+            logger.info("Instrumentation already activated: %s", name)
+            return True
         try:
             inst.activate()  # type: ignore[union-attr]
+            if getattr(inst, "_is_instrumented", True) is False:
+                logger.info("Instrumentation did not activate: %s", name)
+                return False
             self._instrumentations[name] = inst
             logger.info("Activated instrumentation: %s", name)
+            return True
         except Exception as exc:
             logger.warning("Failed to activate instrumentation %s: %s", name, exc)
+            return False
 
     @staticmethod
     @contextmanager
@@ -314,3 +372,4 @@ class Respan:
             except Exception as exc:
                 logger.warning("Error deactivating %s: %s", name, exc)
         self._instrumentations.clear()
+        self.telemetry.flush()

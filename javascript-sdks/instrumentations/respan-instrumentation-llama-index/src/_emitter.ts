@@ -1,7 +1,13 @@
 import {
   ATTR_ERROR_MESSAGE,
+  ATTR_GEN_AI_COMPLETION,
+  ATTR_GEN_AI_PROMPT,
+  ATTR_GEN_AI_REQUEST_MODEL,
+  ATTR_GEN_AI_SYSTEM,
+  ATTR_GEN_AI_USAGE_COMPLETION_TOKENS,
   ATTR_GEN_AI_USAGE_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_OUTPUT_TOKENS,
+  ATTR_GEN_AI_USAGE_PROMPT_TOKENS,
 } from "@opentelemetry/semantic-conventions/incubating";
 import { RespanLogType, RespanSpanAttributes } from "@respan/respan-sdk";
 import { SpanAttributes as TraceloopSpanAttributes } from "@traceloop/ai-semantic-conventions";
@@ -74,7 +80,7 @@ function setIndexedMessages(
   messages: Record<string, unknown>[],
 ): void {
   messages.forEach((message, index) => {
-    const prefix = `${TraceloopSpanAttributes.LLM_PROMPTS}.${index}`;
+    const prefix = `${ATTR_GEN_AI_PROMPT}.${index}`;
     attrs[`${prefix}.${MESSAGE_ROLE_SUFFIX}`] = String(message.role ?? "user");
     attrs[`${prefix}.${MESSAGE_CONTENT_SUFFIX}`] = String(message.content ?? "");
     if (message.tool_calls !== undefined) {
@@ -90,7 +96,7 @@ function setCompletionMessage(
   attrs: SpanAttributes,
   message: Record<string, unknown>,
 ): void {
-  const prefix = `${TraceloopSpanAttributes.LLM_COMPLETIONS}.0`;
+  const prefix = `${ATTR_GEN_AI_COMPLETION}.0`;
   attrs[`${prefix}.${MESSAGE_ROLE_SUFFIX}`] = String(message.role ?? "assistant");
   attrs[`${prefix}.${MESSAGE_CONTENT_SUFFIX}`] = String(message.content ?? "");
   if (message.tool_calls !== undefined) {
@@ -208,8 +214,8 @@ export class LlamaIndexSpanEmitter {
 
     attrs[TraceloopSpanAttributes.LLM_REQUEST_TYPE] = RespanLogType.CHAT;
     if (model) {
-      attrs[TraceloopSpanAttributes.LLM_REQUEST_MODEL] = model;
-      attrs[TraceloopSpanAttributes.LLM_SYSTEM] = inferGenAISystem(model);
+      attrs[ATTR_GEN_AI_REQUEST_MODEL] = model;
+      attrs[ATTR_GEN_AI_SYSTEM] = inferGenAISystem(model);
     }
     setIndexedMessages(attrs, inputMessages);
     setCompletionMessage(attrs, completion);
@@ -219,11 +225,11 @@ export class LlamaIndexSpanEmitter {
     }
     if (usage.inputTokens !== undefined) {
       attrs[ATTR_GEN_AI_USAGE_INPUT_TOKENS] = usage.inputTokens;
-      attrs[TraceloopSpanAttributes.LLM_USAGE_PROMPT_TOKENS] = usage.inputTokens;
+      attrs[ATTR_GEN_AI_USAGE_PROMPT_TOKENS] = usage.inputTokens;
     }
     if (usage.outputTokens !== undefined) {
       attrs[ATTR_GEN_AI_USAGE_OUTPUT_TOKENS] = usage.outputTokens;
-      attrs[TraceloopSpanAttributes.LLM_USAGE_COMPLETION_TOKENS] = usage.outputTokens;
+      attrs[ATTR_GEN_AI_USAGE_COMPLETION_TOKENS] = usage.outputTokens;
     }
     if (usage.totalTokens !== undefined) {
       attrs[TraceloopSpanAttributes.LLM_USAGE_TOTAL_TOKENS] = usage.totalTokens;
@@ -324,8 +330,8 @@ export class LlamaIndexSpanEmitter {
     });
     attrs[TraceloopSpanAttributes.LLM_REQUEST_TYPE] = RespanLogType.CHAT;
     if (params.model) {
-      attrs[TraceloopSpanAttributes.LLM_REQUEST_MODEL] = params.model;
-      attrs[TraceloopSpanAttributes.LLM_SYSTEM] = inferGenAISystem(params.model);
+      attrs[ATTR_GEN_AI_REQUEST_MODEL] = params.model;
+      attrs[ATTR_GEN_AI_SYSTEM] = inferGenAISystem(params.model);
     }
     setIndexedMessages(attrs, inputMessages);
     setCompletionMessage(attrs, completion);

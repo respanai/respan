@@ -33,6 +33,14 @@ export enum RespanSpanAttributes {
     // Processor routing (used by decorators to target specific processors)
     RESPAN_PROCESSORS = "respan.processors",
 
+    // Internal runtime hints. These are stripped before export.
+    RESPAN_INTERNAL_SPAN_NAME_KIND = "respan.internal.span_name.kind",
+    RESPAN_INTERNAL_SPAN_NAME_DETAIL = "respan.internal.span_name.detail",
+    RESPAN_INTERNAL_DROP_SPAN = "respan.internal.drop_span",
+    // Set by instrumentations on children of a drop-marked span so the exporter
+    // can reparent them per-span, without cross-span (batch-dependent) state.
+    RESPAN_INTERNAL_EXPORT_PARENT = "respan.internal.export_parent_span_id",
+
     // Logging
     RESPAN_LOG_METHOD = "respan.entity.log_method",
     RESPAN_LOG_TYPE = "respan.entity.log_type",
@@ -85,6 +93,8 @@ export const RESPAN_SPAN_ATTRIBUTES_MAP: { [key: string]: string } = {
     prompt: RespanSpanAttributes.RESPAN_PROMPT,
     environment: RespanSpanAttributes.RESPAN_ENVIRONMENT,
 };
+
+export type RespanSpanNameStyle = "legacy" | "semantic";
 
 // Type for valid span attribute values
 export type SpanAttributeValue = string | number | boolean | Array<string | number | boolean>;

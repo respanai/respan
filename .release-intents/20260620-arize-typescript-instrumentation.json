@@ -1,0 +1,6 @@
+{
+  "summary": "Add Arize TypeScript instrumentation package",
+  "packages": {
+    "@respan/instrumentation-arize": "new"
+  }
+}

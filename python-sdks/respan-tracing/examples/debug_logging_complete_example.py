@@ -57,5 +57,3 @@ print("✅ Environment variable support:")
 print("   - Set RESPAN_LOG_LEVEL=DEBUG")
 print("✅ Child logger inheritance:")
 print("   - Exporter and other components inherit the log level")
-
-telemetry1.flush() 

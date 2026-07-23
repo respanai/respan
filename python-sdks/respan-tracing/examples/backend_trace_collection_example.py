@@ -233,7 +233,6 @@ if __name__ == "__main__":
         return task_1()
     
     result = example_workflow()
-    telemetry.flush()
     
     print("\n✅ Each span logged immediately (no memory storage!)\n")
     
@@ -267,7 +266,6 @@ if __name__ == "__main__":
         return task_2()
     
     result = example_workflow_2()
-    telemetry2.flush()
     
     print("\n✅ Complete trace logged with automatic cleanup!\n")
     

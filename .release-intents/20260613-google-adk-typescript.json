@@ -1,0 +1,6 @@
+{
+  "summary": "Add Google ADK TypeScript instrumentation",
+  "packages": {
+    "@respan/instrumentation-google-adk": "new"
+  }
+}

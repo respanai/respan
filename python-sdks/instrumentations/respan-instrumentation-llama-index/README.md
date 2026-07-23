@@ -1,6 +1,6 @@
 # respan-instrumentation-llama-index
 
-Respan instrumentation plugin for LlamaIndex. It registers native LlamaIndex
+Respan instrumentation plugin for LlamaIndex Core and standalone Workflows. It registers native LlamaIndex
 instrumentation handlers and emits Respan-compatible OpenTelemetry spans through
 the Respan tracing pipeline.
 
@@ -73,5 +73,4 @@ After running the script, traces appear on your [Respan dashboard](https://platf
 ## Further Reading
 
 See the [python/tracing/llama-index](https://github.com/respanai/respan-example-projects/tree/main/python/tracing/llama-index)
-examples for runnable scripts covering hello world, gateway routing, workflow
-spans, Respan parameters, and tool use.
+examples for runnable scripts covering Core LLM, embedding, retrieval, and agent APIs, plus standalone Workflows success and failure paths.

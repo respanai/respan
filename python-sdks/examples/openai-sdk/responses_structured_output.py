@@ -42,5 +42,3 @@ print(f"{result.title} — {result.rating}/10")
 print(f"Summary: {result.summary}")
 print(f"Pros: {', '.join(result.pros)}")
 print(f"Cons: {', '.join(result.cons)}")
-
-respan.flush()

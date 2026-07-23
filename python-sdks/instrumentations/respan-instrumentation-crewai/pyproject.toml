@@ -13,9 +13,9 @@ packages = [
 python = ">=3.11,<3.14"
 respan-tracing = "^2.16.1"
 respan-sdk = ">=2.5.0"
-respan-instrumentation-openinference = ">=1.2.2"
-crewai = ">=0.80.0"
-openinference-instrumentation-crewai = ">=0.1.0"
+opentelemetry-semantic-conventions-ai = ">=0.4.13"
+opentelemetry-semantic-conventions = ">=0.55b1"
+crewai = ">=1.10.1"
 
 [tool.poetry.plugins."respan.instrumentations"]
 crewai = "respan_instrumentation_crewai:CrewAIInstrumentor"

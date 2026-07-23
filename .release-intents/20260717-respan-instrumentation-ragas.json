@@ -1,0 +1,6 @@
+{
+  "summary": "Add Ragas instrumentation",
+  "packages": {
+    "respan-instrumentation-ragas": "new"
+  }
+}

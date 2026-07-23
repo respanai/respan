@@ -238,9 +238,19 @@ class AnthropicInstrumentor:
 
         try:
             Messages, AsyncMessages = _load_messages_classes()
-        except (AttributeError, ImportError) as exc:
+        except ImportError as exc:
+            # SDK genuinely absent — expected when the app doesn't use Anthropic
+            # (the anthropic SDK is an optional extra).
+            logger.debug(
+                "Anthropic instrumentation inactive — missing dependency: %s",
+                exc,
+            )
+            return
+        except AttributeError as exc:
+            # SDK installed but incompatible (a class moved/renamed) — surface it
+            # so a broken install isn't silently left untraced.
             logger.warning(
-                "Failed to activate Anthropic instrumentation — missing dependency: %s",
+                "anthropic is installed but incompatible — instrumentation inactive: %s",
                 exc,
             )
             return

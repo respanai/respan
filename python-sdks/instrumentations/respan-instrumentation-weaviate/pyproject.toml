@@ -1,0 +1,28 @@
+[tool.poetry]
+name = "respan-instrumentation-weaviate"
+version = "0.1.0"
+description = "Respan instrumentation plugin for Weaviate"
+authors = ["Respan <team@respan.ai>"]
+license = "Apache 2.0"
+readme = "README.md"
+packages = [
+    { include = "respan_instrumentation_weaviate", from = "./src" },
+]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.14"
+respan-tracing = "^2.17.0"
+respan-sdk = ">=2.6.1"
+weaviate-client = ">=4.22.0,<5"
+opentelemetry-semantic-conventions-ai = ">=0.4.1"
+wrapt = ">=1.16.0"
+
+[tool.poetry.plugins."respan.instrumentations"]
+weaviate = "respan_instrumentation_weaviate:WeaviateInstrumentor"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

@@ -1,0 +1,58 @@
+{
+  "name": "@respan/instrumentation-eve",
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Respan instrumentation plugin for the Eve agent framework",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "author": "Respan <team@respan.ai>",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/respanai/respan",
+    "directory": "javascript-sdks/instrumentations/respan-instrumentation-eve"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc -p tsconfig.json && node --test tests/*.test.mjs",
+    "publish:package": "yarn npm publish",
+    "release": "yarn build && yarn version patch && yarn publish:package"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/sdk-trace-base": "^1.29.0",
+    "@opentelemetry/semantic-conventions": "^1.40.0",
+    "@respan/respan-sdk": "^1.1.7",
+    "@traceloop/ai-semantic-conventions": "^0.13.0"
+  },
+  "peerDependencies": {
+    "ai": ">=7.0.26 <8.0.0",
+    "eve": ">=0.26.0 <0.27.0"
+  },
+  "peerDependenciesMeta": {
+    "ai": {
+      "optional": false
+    },
+    "eve": {
+      "optional": false
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.29",
+    "ai": "^7.0.26",
+    "eve": "^0.26.1",
+    "typescript": "^5.7.3",
+    "zod": "^4.4.3"
+  }
+}

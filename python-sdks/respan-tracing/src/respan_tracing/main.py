@@ -6,6 +6,7 @@ from opentelemetry.sdk.trace.export import SpanExporter
 from respan_tracing.decorators import workflow, task, agent, tool
 from respan_tracing.core import RespanTracer, RespanClient
 from respan_tracing.instruments import Instruments
+from respan_tracing.utils.auto_flush import configure_auto_flush
 from respan_tracing.utils.logging import get_main_logger
 
 class RespanTelemetry:
@@ -33,6 +34,7 @@ class RespanTelemetry:
         resource_attributes: Additional resource attributes to attach to all spans
         span_postprocess_callback: Optional callback to process spans before export
         is_enabled: Whether telemetry is enabled (if False, becomes no-op)
+        auto_flush: Automatic drain policy: "off", "root", or "always".
     
     Example:
         ```python
@@ -88,6 +90,7 @@ class RespanTelemetry:
         span_postprocess_callback: Optional[Callable[[ReadableSpan], None]] = None,
         is_enabled: bool = True,
         is_auto_instrument: bool = True,
+        auto_flush: Optional[Literal["off", "root", "always"]] = None,
     ):
         # Get configuration from environment variables
         api_key = api_key or os.getenv("RESPAN_API_KEY")
@@ -109,6 +112,7 @@ class RespanTelemetry:
         
         # Configure logging level for Respan tracing
         self._configure_logging(log_level)
+        self.auto_flush = configure_auto_flush(auto_flush)
         
         # Initialize the tracer
         self.tracer = RespanTracer(

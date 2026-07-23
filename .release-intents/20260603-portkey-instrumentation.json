@@ -1,0 +1,6 @@
+{
+  "summary": "Add Portkey instrumentation package",
+  "packages": {
+    "respan-instrumentation-portkey": "new"
+  }
+}

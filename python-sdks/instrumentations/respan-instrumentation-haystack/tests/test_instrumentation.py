@@ -1,9 +1,11 @@
+import json
 import logging
 import sys
 from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from opentelemetry.attributes import BoundedAttributes
 from opentelemetry.semconv_ai import SpanAttributes
 from respan_instrumentation_haystack import HaystackInstrumentor
 from respan_instrumentation_haystack import _instrumentation
@@ -320,6 +322,33 @@ def test_haystack_parent_span_processor_suppresses_native_span_export():
     assert is_processable_span(native_component) is False
 
 
+def test_haystack_parent_span_processor_suppresses_immutable_native_attributes():
+    processor = _HaystackParentSpanProcessor()
+    native_component = _FakeSpan(
+        HAYSTACK_COMPONENT_RUN_SPAN_NAME,
+        "3000000000000004",
+    )
+    native_component._attributes = BoundedAttributes(
+        maxlen=128,
+        attributes={
+            SpanAttributes.TRACELOOP_ENTITY_NAME: HAYSTACK_COMPONENT_RUN_SPAN_NAME,
+            SpanAttributes.TRACELOOP_ENTITY_PATH: "haystack-example.Pipeline.run",
+            SpanAttributes.TRACELOOP_WORKFLOW_NAME: "haystack-example",
+            RESPAN_LOG_TYPE: "span",
+            "haystack.component.name": "prompt_builder",
+        },
+        immutable=True,
+    )
+
+    processor.on_start(native_component)
+    processor.on_end(native_component)
+
+    assert native_component.attributes == {
+        "haystack.component.name": "prompt_builder",
+    }
+    assert is_processable_span(native_component) is False
+
+
 def test_haystack_parent_span_processor_keeps_openinference_span_exportable():
     processor = _HaystackParentSpanProcessor()
     translated_component = _FakeSpan(
@@ -339,6 +368,89 @@ def test_haystack_parent_span_processor_keeps_openinference_span_exportable():
         RESPAN_LOG_TYPE: "task",
     }
     assert is_processable_span(translated_component) is True
+
+
+def test_haystack_parent_span_processor_promotes_component_chat_io():
+    processor = _HaystackParentSpanProcessor()
+    span = _FakeSpan(
+        "haystack.openai.chat",
+        "4000000000000004",
+        attributes={
+            SpanAttributes.TRACELOOP_ENTITY_INPUT: "{}",
+            SpanAttributes.TRACELOOP_ENTITY_OUTPUT: "replies",
+            "haystack.component.input": json.dumps(
+                {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [{"text": "Who created Python?"}],
+                        }
+                    ],
+                    "generation_kwargs": {
+                        "extra_body": {
+                            "prompt": {
+                                "prompt_id": "prompt-123",
+                                "variables": {"question": "Who created Python?"},
+                            }
+                        }
+                    },
+                }
+            ),
+            "haystack.component.output": json.dumps(
+                {
+                    "replies": [
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {"text": "Python was created by Guido van Rossum."}
+                            ],
+                        }
+                    ]
+                }
+            ),
+        },
+    )
+
+    processor.on_start(span)
+    processor.on_end(span)
+
+    assert json.loads(span.attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT]) == [
+        {"role": "user", "content": "Who created Python?"}
+    ]
+    assert json.loads(span.attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]) == {
+        "role": "assistant",
+        "content": "Python was created by Guido van Rossum.",
+    }
+    assert span.attributes["gen_ai.prompt.0.role"] == "user"
+    assert span.attributes["gen_ai.prompt.0.content"] == "Who created Python?"
+    assert span.attributes["gen_ai.completion.0.role"] == "assistant"
+    assert (
+        span.attributes["gen_ai.completion.0.content"]
+        == "Python was created by Guido van Rossum."
+    )
+
+
+def test_haystack_parent_span_processor_promotes_string_replies():
+    processor = _HaystackParentSpanProcessor()
+    span = _FakeSpan(
+        "OpenAIGenerator.run",
+        "4000000000000004",
+        attributes={
+            "haystack.component.input": json.dumps({"prompt": "Say hi"}),
+            "haystack.component.output": json.dumps({"replies": ["Hi"]}),
+        },
+    )
+
+    processor.on_start(span)
+    processor.on_end(span)
+
+    assert json.loads(span.attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT]) == [
+        {"role": "user", "content": "Say hi"}
+    ]
+    assert json.loads(span.attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]) == {
+        "role": "assistant",
+        "content": "Hi",
+    }
 
 
 def test_haystack_parent_span_processor_uses_pipeline_graph_parent():

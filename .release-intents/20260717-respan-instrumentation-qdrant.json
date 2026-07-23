@@ -1,0 +1,6 @@
+{
+  "summary": "Add Qdrant instrumentation",
+  "packages": {
+    "respan-instrumentation-qdrant": "new"
+  }
+}

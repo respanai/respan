@@ -1,9 +1,12 @@
-import logging
+import asyncio
 import json
+import logging
 from types import SimpleNamespace
 
 import pytest
 from llama_index.core import instrumentation
+from workflows import Workflow, step
+from workflows.events import Event, StartEvent, StopEvent
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.semconv_ai import SpanAttributes
 from opentelemetry.trace import StatusCode
@@ -30,11 +33,6 @@ from respan_instrumentation_llama_index._handlers import (
     RespanLlamaIndexEventHandler,
     RespanLlamaIndexSpanHandler,
 )
-from respan_instrumentation_llama_index._constants import (
-    RESPAN_OVERRIDE_COMPLETION_TOKENS_ATTR,
-    RESPAN_OVERRIDE_PROMPT_TOKENS_ATTR,
-    RESPAN_OVERRIDE_TOTAL_REQUEST_TOKENS_ATTR,
-)
 from respan_instrumentation_llama_index._serialization import extract_usage
 
 
@@ -50,7 +48,7 @@ def span_exporter():
     exporter = InMemorySpanExporter()
     telemetry = RespanTelemetry(
         app_name="llama-index-test",
-        api_key="test-key",
+        api_key=None,
         is_auto_instrument=False,
         is_batching_enabled=False,
     )
@@ -174,6 +172,31 @@ def test_span_handler_emits_workflow_and_task_spans(span_exporter):
     )
 
 
+def test_span_handler_error_respects_content_capture_setting(span_exporter):
+    handler = RespanLlamaIndexSpanHandler(capture_content=False)
+    bound_args = SimpleNamespace(args=("top-secret input",), kwargs={})
+    span_id = "RetrieverQueryEngine.query-private"
+
+    handler.span_enter(id_=span_id, bound_args=bound_args, parent_id=None)
+    handler.span_drop(
+        id_=span_id,
+        bound_args=bound_args,
+        err=RuntimeError("top-secret failure"),
+    )
+
+    span = span_exporter.get_finished_spans()[0]
+    assert span.status.status_code == StatusCode.ERROR
+    assert span.attributes["status_code"] == 500
+    assert span.attributes["error.message"] == "RuntimeError"
+    assert SpanAttributes.TRACELOOP_ENTITY_INPUT not in span.attributes
+    assert json.loads(span.attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]) == {
+        "error": "RuntimeError",
+        "status": "error",
+    }
+    assert "top-secret" not in json.dumps(dict(span.attributes))
+    assert not span.events
+
+
 def test_span_handler_uses_cached_parent_context_after_parent_exits(span_exporter):
     handler = RespanLlamaIndexSpanHandler()
     root_bound_args = SimpleNamespace(args=("question",), kwargs={})
@@ -244,11 +267,60 @@ def test_span_handler_groups_missing_parent_siblings_under_synthetic_parent(
     step_span = spans_by_name["BaseWorkflowAgent.run_agent_step"]
 
     assert synthetic_parent.attributes[RESPAN_LOG_TYPE] == LOG_TYPE_AGENT
-    assert synthetic_parent.attributes["llama_index.synthetic_parent"] is True
+    assert not any(
+        key.startswith("llama_index.") for key in synthetic_parent.attributes
+    )
     assert setup_span.context.trace_id == synthetic_parent.context.trace_id
     assert step_span.context.trace_id == synthetic_parent.context.trace_id
     assert setup_span.parent.span_id == synthetic_parent.context.span_id
     assert step_span.parent.span_id == synthetic_parent.context.span_id
+
+
+def test_standalone_workflows_emit_real_root_and_step_spans(span_exporter):
+    class DraftEvent(Event):
+        text: str
+
+    class DemoWorkflow(Workflow):
+        @step
+        async def draft(self, event: StartEvent) -> DraftEvent:
+            return DraftEvent(text=f"draft:{event.topic}")
+
+        @step
+        async def finish(self, event: DraftEvent) -> StopEvent:
+            return StopEvent(result=event.text.upper())
+
+    async def run_workflow():
+        return await DemoWorkflow().run(topic="respan")
+
+    instrumentor = LlamaIndexInstrumentor()
+    instrumentor.activate()
+    try:
+        result = asyncio.run(run_workflow())
+    finally:
+        instrumentor.deactivate()
+
+    assert result == "DRAFT:RESPAN"
+    spans_by_name = {span.name: span for span in span_exporter.get_finished_spans()}
+    root_span = spans_by_name["DemoWorkflow.run"]
+    draft_span = spans_by_name["DemoWorkflow.draft"]
+    finish_span = spans_by_name["DemoWorkflow.finish"]
+
+    assert root_span.attributes[RESPAN_LOG_TYPE] == LOG_TYPE_WORKFLOW
+    assert (
+        "StartEvent"
+        in json.loads(root_span.attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT])[
+            "event"
+        ]
+    )
+    assert json.loads(root_span.attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]) == {
+        "result": "DRAFT:RESPAN"
+    }
+    assert draft_span.attributes[RESPAN_LOG_TYPE] == LOG_TYPE_TASK
+    assert finish_span.attributes[RESPAN_LOG_TYPE] == LOG_TYPE_TASK
+    assert draft_span.parent.span_id == root_span.context.span_id
+    assert finish_span.parent.span_id == root_span.context.span_id
+    for span in (root_span, draft_span, finish_span):
+        assert not any(key.startswith("llama_index.") for key in span.attributes)
 
 
 def test_chat_events_emit_canonical_llm_span(span_exporter):
@@ -506,6 +578,50 @@ def test_chat_events_can_disable_content_capture(span_exporter):
 
     assert SpanAttributes.TRACELOOP_ENTITY_INPUT not in chat_span.attributes
     assert SpanAttributes.TRACELOOP_ENTITY_OUTPUT not in chat_span.attributes
+    assert not any(
+        key.startswith(f"{SpanAttributes.LLM_PROMPTS}.")
+        or key.startswith(f"{SpanAttributes.LLM_COMPLETIONS}.")
+        for key in chat_span.attributes
+    )
+    assert "hidden" not in json.dumps(dict(chat_span.attributes))
+
+
+def test_completion_events_can_disable_content_capture(span_exporter):
+    handler = RespanLlamaIndexEventHandler(capture_content=False)
+    handler.handle(
+        SimpleNamespace(
+            class_name=lambda: "LLMCompletionStartEvent",
+            span_id="span-private",
+            prompt="completion secret",
+            model_dict={},
+        )
+    )
+    handler.handle(
+        SimpleNamespace(
+            class_name=lambda: "LLMCompletionEndEvent",
+            span_id="span-private",
+            response=SimpleNamespace(
+                text="private response",
+                raw={"usage": {"input_tokens": 2, "output_tokens": 1}},
+            ),
+        )
+    )
+
+    completion_span = next(
+        span
+        for span in span_exporter.get_finished_spans()
+        if span.name == "llama_index.completion"
+    )
+    assert SpanAttributes.TRACELOOP_ENTITY_INPUT not in completion_span.attributes
+    assert SpanAttributes.TRACELOOP_ENTITY_OUTPUT not in completion_span.attributes
+    assert not any(
+        key.startswith(f"{SpanAttributes.LLM_PROMPTS}.")
+        or key.startswith(f"{SpanAttributes.LLM_COMPLETIONS}.")
+        for key in completion_span.attributes
+    )
+    assert completion_span.attributes[SpanAttributes.LLM_USAGE_TOTAL_TOKENS] == 3
+    assert "secret" not in json.dumps(dict(completion_span.attributes))
+    assert "private response" not in json.dumps(dict(completion_span.attributes))
 
 
 def test_completion_events_emit_text_span(span_exporter):
@@ -553,13 +669,16 @@ def test_completion_events_emit_text_span(span_exporter):
         attributes[f"{SpanAttributes.LLM_COMPLETIONS}.0.content"]
         == "A short completion."
     )
-    assert attributes[RESPAN_OVERRIDE_PROMPT_TOKENS_ATTR] == 4
-    assert attributes[RESPAN_OVERRIDE_COMPLETION_TOKENS_ATTR] == 3
-    assert attributes[RESPAN_OVERRIDE_TOTAL_REQUEST_TOKENS_ATTR] == 7
+    assert attributes[SpanAttributes.LLM_USAGE_PROMPT_TOKENS] == 4
+    assert attributes[SpanAttributes.LLM_USAGE_COMPLETION_TOKENS] == 3
+    assert attributes["gen_ai.usage.input_tokens"] == 4
+    assert attributes["gen_ai.usage.output_tokens"] == 3
     assert attributes[SpanAttributes.LLM_USAGE_TOTAL_TOKENS] == 7
+    for alias in ("prompt_tokens", "completion_tokens", "total_request_tokens"):
+        assert alias not in attributes
 
 
-def test_embedding_events_emit_embedding_span_without_vectors(span_exporter):
+def test_embedding_events_capture_full_vectors(span_exporter):
     handler = RespanLlamaIndexEventHandler()
 
     handler.handle(
@@ -593,10 +712,11 @@ def test_embedding_events_emit_embedding_span_without_vectors(span_exporter):
     assert attributes[f"{SpanAttributes.LLM_PROMPTS}.0.content"] == (
         '["alpha", "beta"]'
     )
-    assert "embedding_count" in attributes["llm.embeddings.0"]
-    assert "0.1" not in attributes["llm.embeddings.0"]
-    assert "embedding_count" in attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]
-    assert "0.1" not in attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]
+    assert json.loads(attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]) == [
+        [0.1, 0.2],
+        [0.3, 0.4],
+    ]
+    assert "llm.embeddings.0" not in attributes
 
 
 def test_tool_event_emits_tool_span(span_exporter):
@@ -674,6 +794,48 @@ def test_exception_event_marks_open_event_span_error(span_exporter):
     )
 
     assert completion_span.status.status_code == StatusCode.ERROR
+    assert completion_span.attributes["error.message"] == "llama failure"
+    assert completion_span.attributes["status_code"] == 500
+    assert json.loads(
+        completion_span.attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]
+    ) == {
+        "error": "RuntimeError",
+        "message": "llama failure",
+        "status": "error",
+    }
+
+
+def test_exception_event_respects_content_capture_setting(span_exporter):
+    handler = RespanLlamaIndexEventHandler(capture_content=False)
+    handler.handle(
+        SimpleNamespace(
+            class_name=lambda: "LLMCompletionStartEvent",
+            span_id="span-private-error",
+            prompt="top-secret prompt",
+            model_dict={},
+        )
+    )
+    handler.handle(
+        SimpleNamespace(
+            class_name=lambda: "ExceptionEvent",
+            span_id="span-private-error",
+            exception=RuntimeError("top-secret failure"),
+        )
+    )
+
+    completion_span = next(
+        span
+        for span in span_exporter.get_finished_spans()
+        if span.name == "llama_index.completion"
+    )
+    assert completion_span.status.status_code == StatusCode.ERROR
+    assert completion_span.attributes["error.message"] == "RuntimeError"
+    assert json.loads(
+        completion_span.attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]
+    ) == {"error": "RuntimeError", "status": "error"}
+    serialized = json.dumps(dict(completion_span.attributes))
+    assert "top-secret" not in serialized
+    assert not completion_span.events
 
 
 def test_extract_usage_ignores_fractional_token_counts():

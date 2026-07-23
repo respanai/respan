@@ -65,7 +65,6 @@ async def main():
                 agent, "Add dark mode support to the dashboard"
             )
             print(result.final_output)
-    respan.flush()
 
 
 if __name__ == "__main__":

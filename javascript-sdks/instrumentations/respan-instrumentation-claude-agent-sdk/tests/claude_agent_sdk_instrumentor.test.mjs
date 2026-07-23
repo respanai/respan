@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { trace } from "@opentelemetry/api";
+import { ATTR_GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS } from "@opentelemetry/semantic-conventions/incubating";
 
 import { ClaudeAgentSDKInstrumentor } from "../dist/index.js";
 
@@ -33,9 +34,14 @@ test.after(() => {
 });
 
 function createFakeSdk({
+  emitAssistant = true,
+  emitPartialMessages = true,
+  emitUserToolResult = false,
+  resultError = false,
+  resultUsage,
   toolFailure = false,
   toolName = "get_weather",
-  resultUsage,
+  usePostToolBatchOnly = false,
 } = {}) {
   const calls = [];
 
@@ -45,76 +51,171 @@ function createFakeSdk({
       calls.push(args);
       const hooks = args.options?.hooks ?? {};
 
-      function firstHook(name) {
+      async function runHooks(name, input, toolUseId) {
         const groups = Array.isArray(hooks[name]) ? hooks[name] : [];
         for (const group of groups) {
-          if (Array.isArray(group?.hooks) && typeof group.hooks[0] === "function") {
-            return group.hooks[0];
+          const callbacks = Array.isArray(group?.hooks) ? group.hooks : [];
+          for (const callback of callbacks) {
+            if (typeof callback === "function") {
+              await callback(input, toolUseId);
+            }
           }
         }
-        return undefined;
       }
 
       return (async function*() {
-        await firstHook("UserPromptSubmit")?.({
+        await runHooks("UserPromptSubmit", {
           session_id: "sess-123",
           prompt: args.prompt,
         });
 
-        await firstHook("PreToolUse")?.({
-          session_id: "sess-123",
-          tool_use_id: "toolu_123",
-          tool_name: toolName,
-          tool_input: { city: "Tokyo" },
-        });
-
-        yield {
-          type: "system",
-          data: {
-            session_id: "sess-123",
-          },
-        };
-
-        yield {
-          type: "assistant",
-          message: {
-            model: "claude-sonnet-4-5",
-            content: [
-              {
-                type: "tool_use",
-                id: "toolu_123",
-                name: toolName,
-                input: { city: "Tokyo" },
-              },
-              {
-                type: "text",
-                text: "Tokyo is sunny.",
-              },
-            ],
-          },
-        };
-
-        if (toolFailure) {
-          await firstHook("PostToolUseFailure")?.({
+        await runHooks(
+          "PreToolUse",
+          {
             session_id: "sess-123",
             tool_use_id: "toolu_123",
             tool_name: toolName,
             tool_input: { city: "Tokyo" },
-            error: "Tool execution failed",
+          },
+          "toolu_123",
+        );
+
+        yield {
+          type: "system",
+          subtype: "init",
+          session_id: "sess-123",
+          model: "claude-sonnet-4-5",
+          tools: [toolName],
+        };
+
+        if (emitPartialMessages) {
+          yield* streamAssistantEvents(toolName);
+        }
+
+        if (emitAssistant) {
+          yield {
+            type: "assistant",
+            session_id: "sess-123",
+            message: {
+              model: "claude-sonnet-4-5",
+              content: [
+                {
+                  type: "thinking",
+                  thinking: "Need current weather.",
+                },
+                {
+                  type: "tool_use",
+                  id: "toolu_123",
+                  name: toolName,
+                  input: { city: "Tokyo" },
+                },
+                {
+                  type: "text",
+                  text: "Tokyo is sunny.",
+                },
+              ],
+            },
+          };
+        }
+
+        if (emitUserToolResult) {
+          yield {
+            type: "user",
+            session_id: "sess-123",
+            message: {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: "toolu_123",
+                  content: [{ type: "text", text: "sunny" }],
+                },
+              ],
+            },
+          };
+        }
+
+        if (toolFailure) {
+          await runHooks(
+            "PostToolUseFailure",
+            {
+              session_id: "sess-123",
+              tool_use_id: "toolu_123",
+              tool_name: toolName,
+              tool_input: { city: "Tokyo" },
+              error: "Tool execution failed",
+            },
+            "toolu_123",
+          );
+        } else if (usePostToolBatchOnly) {
+          await runHooks("PostToolBatch", {
+            session_id: "sess-123",
+            tool_calls: [
+              {
+                tool_use_id: "toolu_123",
+                tool_name: toolName,
+                tool_input: { city: "Tokyo" },
+                tool_response: { forecast: "sunny" },
+              },
+            ],
           });
         } else {
-          await firstHook("PostToolUse")?.({
+          await runHooks(
+            "PostToolUse",
+            {
+              session_id: "sess-123",
+              tool_use_id: "toolu_123",
+              tool_name: toolName,
+              tool_response: { forecast: "sunny" },
+            },
+            "toolu_123",
+          );
+          await runHooks("PostToolBatch", {
             session_id: "sess-123",
-            tool_use_id: "toolu_123",
-            tool_name: toolName,
-            tool_response: { forecast: "sunny" },
+            tool_calls: [
+              {
+                tool_use_id: "toolu_123",
+                tool_name: toolName,
+                tool_input: { city: "Tokyo" },
+                tool_response: { forecast: "sunny" },
+              },
+            ],
           });
+        }
+
+        if (resultError) {
+          yield {
+            type: "result",
+            subtype: "error_during_execution",
+            session_id: "sess-123",
+            is_error: true,
+            api_error_status: 429,
+            errors: ["rate limited"],
+            total_cost_usd: 0.0123,
+            usage:
+              resultUsage ?? {
+                inputTokens: 21,
+                outputTokens: 4,
+                cacheReadInputTokens: 3,
+                cacheCreationInputTokens: 1,
+              },
+            modelUsage: {
+              "claude-sonnet-4-5": {
+                inputTokens: 17,
+                outputTokens: 4,
+                cacheReadInputTokens: 3,
+                cacheCreationInputTokens: 1,
+              },
+            },
+          };
+          return;
         }
 
         yield {
           type: "result",
           subtype: "success",
           session_id: "sess-123",
+          is_error: false,
           result: "Tokyo is sunny.",
           total_cost_usd: 0.04241955,
           usage:
@@ -130,9 +231,143 @@ function createFakeSdk({
   };
 }
 
-test("instrumentor patches query, merges hooks, and emits tool + agent spans", async () => {
+function* streamAssistantEvents(toolName) {
+  yield {
+    type: "stream_event",
+    session_id: "sess-123",
+    event: {
+      type: "message_start",
+      message: {
+        model: "claude-sonnet-4-5",
+        usage: { input_tokens: 3, output_tokens: 0 },
+      },
+    },
+  };
+  yield {
+    type: "stream_event",
+    session_id: "sess-123",
+    event: {
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "thinking", thinking: "" },
+    },
+  };
+  yield {
+    type: "stream_event",
+    session_id: "sess-123",
+    event: {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "thinking_delta", thinking: "Need current weather." },
+    },
+  };
+  yield {
+    type: "stream_event",
+    session_id: "sess-123",
+    event: { type: "content_block_stop", index: 0 },
+  };
+  yield {
+    type: "stream_event",
+    session_id: "sess-123",
+    event: {
+      type: "content_block_start",
+      index: 1,
+      content_block: {
+        type: "tool_use",
+        id: "toolu_123",
+        name: toolName,
+        input: {},
+      },
+    },
+  };
+  yield {
+    type: "stream_event",
+    session_id: "sess-123",
+    event: {
+      type: "content_block_delta",
+      index: 1,
+      delta: { type: "input_json_delta", partial_json: "{\"city\":\"Tokyo\"}" },
+    },
+  };
+  yield {
+    type: "stream_event",
+    session_id: "sess-123",
+    event: { type: "content_block_stop", index: 1 },
+  };
+  yield {
+    type: "stream_event",
+    session_id: "sess-123",
+    event: {
+      type: "content_block_start",
+      index: 2,
+      content_block: { type: "text", text: "" },
+    },
+  };
+  yield {
+    type: "stream_event",
+    session_id: "sess-123",
+    event: {
+      type: "content_block_delta",
+      index: 2,
+      delta: { type: "text_delta", text: "Tokyo is " },
+    },
+  };
+  yield {
+    type: "stream_event",
+    session_id: "sess-123",
+    event: {
+      type: "content_block_delta",
+      index: 2,
+      delta: { type: "text_delta", text: "sunny." },
+    },
+  };
+  yield {
+    type: "stream_event",
+    session_id: "sess-123",
+    event: { type: "content_block_stop", index: 2 },
+  };
+  yield {
+    type: "stream_event",
+    session_id: "sess-123",
+    event: { type: "message_stop" },
+  };
+}
+
+function spanByLogType(logType) {
+  return captureState.spans.find(
+    (span) => span.attributes["respan.entity.log_type"] === logType,
+  );
+}
+
+function parseAttr(span, key) {
+  return JSON.parse(span.attributes[key]);
+}
+
+function assertNoOffContractAliases(attrs) {
+  for (const key of [
+    "respan.span.tools",
+    "respan.span.tool_calls",
+    "respan.span.handoffs",
+    "tools",
+    "tool_calls",
+    "model",
+    "prompt_tokens",
+    "completion_tokens",
+    "total_request_tokens",
+    "span_tools",
+    "has_tool_calls",
+    "parallel_tool_calls",
+    "prompt_cache_hit_tokens",
+    "prompt_cache_creation_tokens",
+    "cost",
+  ]) {
+    assert.equal(attrs[key], undefined, `${key} should not be emitted`);
+  }
+}
+
+test("instrumentor patches query, merges hooks, and emits canonical tool/agent/chat spans", async () => {
   captureState.spans = [];
-  const sdk = createFakeSdk();
+  const sdk = createFakeSdk({ emitUserToolResult: true });
   const existingHook = async () => ({ ok: true });
   const originalQuery = sdk.query;
 
@@ -160,79 +395,100 @@ test("instrumentor patches query, merges hooks, and emits tool + agent spans", a
     yielded.push(item.type);
   }
 
-  assert.deepEqual(yielded, ["system", "assistant", "result"]);
+  assert.deepEqual(yielded, [
+    "system",
+    "stream_event",
+    "stream_event",
+    "stream_event",
+    "stream_event",
+    "stream_event",
+    "stream_event",
+    "stream_event",
+    "stream_event",
+    "stream_event",
+    "stream_event",
+    "stream_event",
+    "stream_event",
+    "assistant",
+    "user",
+    "result",
+  ]);
   assert.equal(sdk.calls.length, 1);
   assert.equal(sdk.calls[0].options.hooks.Stop[0].hooks[0], existingHook);
   assert.ok(Array.isArray(sdk.calls[0].options.hooks.UserPromptSubmit));
   assert.ok(Array.isArray(sdk.calls[0].options.hooks.PreToolUse));
   assert.ok(Array.isArray(sdk.calls[0].options.hooks.PostToolUse));
   assert.ok(Array.isArray(sdk.calls[0].options.hooks.PostToolUseFailure));
+  assert.ok(Array.isArray(sdk.calls[0].options.hooks.PostToolBatch));
 
-  assert.equal(captureState.spans.length, 2);
+  assert.equal(captureState.spans.length, 3);
 
-  const toolSpan = captureState.spans.find(
-    (span) => span.attributes["respan.entity.log_type"] === "tool",
-  );
-  const agentSpan = captureState.spans.find(
-    (span) => span.attributes["respan.entity.log_type"] === "agent",
-  );
+  const toolSpan = spanByLogType("tool");
+  const agentSpan = spanByLogType("agent");
+  const chatSpan = spanByLogType("chat");
 
   assert.ok(toolSpan);
   assert.ok(agentSpan);
+  assert.ok(chatSpan);
   assert.equal(toolSpan.instrumentationLibrary?.name, "@respan/instrumentation-claude-agent-sdk");
   assert.equal(agentSpan.instrumentationLibrary?.name, "@respan/instrumentation-claude-agent-sdk");
+  assert.equal(chatSpan.instrumentationLibrary?.name, "@respan/instrumentation-claude-agent-sdk");
+
   assert.equal(toolSpan.attributes["traceloop.entity.name"], "get_weather");
-  assert.deepEqual(JSON.parse(toolSpan.attributes["traceloop.entity.input"]), {
-    city: "Tokyo",
+  assert.deepEqual(parseAttr(toolSpan, "traceloop.entity.input"), {
+    name: "get_weather",
+    arguments: { city: "Tokyo" },
   });
-  assert.deepEqual(JSON.parse(toolSpan.attributes["traceloop.entity.output"]), {
+  assert.deepEqual(parseAttr(toolSpan, "traceloop.entity.output"), {
     forecast: "sunny",
   });
-  assert.equal(toolSpan.attributes["respan.span.tools"], undefined);
+  assertNoOffContractAliases(toolSpan.attributes);
 
   assert.equal(agentSpan.attributes["traceloop.entity.name"], "weather_agent");
-  assert.equal(agentSpan.attributes["gen_ai.request.model"], "claude-sonnet-4-5");
-  assert.equal(agentSpan.attributes.model, "claude-sonnet-4-5");
-  assert.equal(agentSpan.attributes.prompt_tokens, 16);
-  assert.equal(agentSpan.attributes.completion_tokens, 7);
-  assert.equal(agentSpan.attributes.total_request_tokens, 26);
-  assert.equal(agentSpan.attributes.prompt_cache_hit_tokens, 2);
-  assert.equal(agentSpan.attributes.prompt_cache_creation_tokens, 1);
-  assert.equal(agentSpan.attributes.cost, 0.04241955);
+  assert.equal(agentSpan.attributes["gen_ai.request.model"], undefined);
+  assert.equal(agentSpan.attributes["llm.request.type"], undefined);
+  assert.equal(agentSpan.attributes["traceloop.entity.output"], "Tokyo is sunny.");
+  assertNoOffContractAliases(agentSpan.attributes);
+
+  assert.equal(chatSpan.attributes["traceloop.entity.name"], "weather_agent.chat");
+  assert.equal(chatSpan.attributes["gen_ai.system"], "anthropic");
+  assert.equal(chatSpan.attributes["llm.request.type"], "chat");
+  assert.equal(chatSpan.attributes["gen_ai.request.model"], "claude-sonnet-4-5");
+  assert.equal(chatSpan.attributes["gen_ai.usage.input_tokens"], 16);
+  assert.equal(chatSpan.attributes["gen_ai.usage.output_tokens"], 7);
+  assert.equal(chatSpan.attributes["gen_ai.usage.prompt_tokens"], 16);
+  assert.equal(chatSpan.attributes["gen_ai.usage.completion_tokens"], 7);
+  assert.equal(chatSpan.attributes["llm.usage.total_tokens"], 26);
+  assert.equal(chatSpan.attributes["llm.usage.cache_read_input_tokens"], 2);
   assert.equal(
-    agentSpan.attributes["respan.sessions.session_identifier"],
+    chatSpan.attributes[ATTR_GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS],
+    1,
+  );
+  assert.deepEqual(parseAttr(chatSpan, "respan.metadata"), {
+    response_cost: 0.04241955,
+  });
+  assert.equal(
+    chatSpan.attributes["respan.sessions.session_identifier"],
     "sess-123",
   );
-  assert.deepEqual(JSON.parse(agentSpan.attributes["respan.span.tools"]), [
+  assert.deepEqual(parseAttr(chatSpan, "llm.request.functions"), [
     {
       type: "function",
       function: { name: "get_weather", parameters: { type: "object" } },
     },
   ]);
-  assert.equal(agentSpan.attributes.tools, undefined);
+  assert.equal(chatSpan.attributes["gen_ai.prompt.0.role"], "user");
   assert.equal(
-    agentSpan.attributes["llm.request.functions"],
-    JSON.stringify([
-      {
-        type: "function",
-        function: { name: "get_weather", parameters: { type: "object" } },
-      },
-    ]),
+    chatSpan.attributes["gen_ai.prompt.0.content"],
+    "What is the weather in Tokyo?",
   );
-  assert.deepEqual(JSON.parse(agentSpan.attributes["respan.span.tool_calls"]), [
-    {
-      id: "toolu_123",
-      type: "function",
-      function: {
-        name: "get_weather",
-        arguments: "{\"city\":\"Tokyo\"}",
-      },
-    },
+  assert.equal(chatSpan.attributes["gen_ai.prompt.1.role"], "tool");
+  assert.deepEqual(JSON.parse(chatSpan.attributes["gen_ai.prompt.1.content"]), [
+    { type: "text", text: "sunny" },
   ]);
-  assert.equal(agentSpan.attributes.tool_calls, undefined);
-  assert.equal(agentSpan.attributes["gen_ai.completion.0.role"], "assistant");
-  assert.equal(agentSpan.attributes["gen_ai.completion.0.content"], "Tokyo is sunny.");
-  assert.deepEqual(agentSpan.attributes["gen_ai.completion.0.tool_calls"], [
+  assert.equal(chatSpan.attributes["gen_ai.completion.0.role"], "assistant");
+  assert.equal(chatSpan.attributes["gen_ai.completion.0.content"], "Tokyo is sunny.");
+  assert.deepEqual(parseAttr(chatSpan, "gen_ai.completion.0.tool_calls"), [
     {
       id: "toolu_123",
       type: "function",
@@ -243,21 +499,14 @@ test("instrumentor patches query, merges hooks, and emits tool + agent spans", a
     },
   ]);
   assert.equal(
-    agentSpan.attributes["gen_ai.completion.0.tool_calls.0.function.name"],
+    chatSpan.attributes["gen_ai.completion.0.tool_calls.0.function.name"],
     undefined,
   );
-  assert.equal(
-    agentSpan.attributes["gen_ai.completion.0.tool_calls.0.function.arguments"],
-    undefined,
-  );
-  assert.equal(agentSpan.attributes["has_tool_calls"], true);
-  assert.deepEqual(
-    JSON.parse(agentSpan.attributes["traceloop.entity.input"]),
-    [{ role: "user", content: "What is the weather in Tokyo?" }],
-  );
-  assert.equal(agentSpan.attributes["traceloop.entity.output"], "Tokyo is sunny.");
+  assertNoOffContractAliases(chatSpan.attributes);
   assert.equal(toolSpan.parentSpanId, agentSpan.spanContext().spanId);
+  assert.equal(chatSpan.parentSpanId, agentSpan.spanContext().spanId);
   assert.equal(toolSpan.spanContext().traceId, agentSpan.spanContext().traceId);
+  assert.equal(chatSpan.spanContext().traceId, agentSpan.spanContext().traceId);
 
   instrumentor.deactivate();
 
@@ -284,25 +533,24 @@ test("instrumentor emits errored tool spans for PostToolUseFailure", async () =>
     // Drain the stream so spans are emitted.
   }
 
-  const toolSpan = captureState.spans.find(
-    (span) => span.attributes["respan.entity.log_type"] === "tool",
-  );
-  const agentSpan = captureState.spans.find(
-    (span) => span.attributes["respan.entity.log_type"] === "agent",
-  );
+  const toolSpan = spanByLogType("tool");
+  const agentSpan = spanByLogType("agent");
 
   assert.ok(toolSpan);
   assert.ok(agentSpan);
   assert.equal(toolSpan.status.code, 2);
   assert.equal(toolSpan.status.message, "Tool execution failed");
   assert.equal(
-    JSON.parse(toolSpan.attributes["traceloop.entity.output"]),
+    parseAttr(toolSpan, "traceloop.entity.output"),
     "Tool execution failed",
   );
   assert.equal(toolSpan.parentSpanId, agentSpan.spanContext().spanId);
+  assertNoOffContractAliases(toolSpan.attributes);
+
+  instrumentor.deactivate();
 });
 
-test("instrumentor derives total_request_tokens from raw prompt usage details", async () => {
+test("instrumentor derives usage from legacy prompt token details", async () => {
   captureState.spans = [];
   const sdk = createFakeSdk({
     resultUsage: {
@@ -331,16 +579,73 @@ test("instrumentor derives total_request_tokens from raw prompt usage details", 
     // Drain the stream so spans are emitted.
   }
 
-  const agentSpan = captureState.spans.find(
-    (span) => span.attributes["respan.entity.log_type"] === "agent",
-  );
+  const chatSpan = spanByLogType("chat");
 
+  assert.ok(chatSpan);
+  assert.equal(chatSpan.attributes["gen_ai.usage.input_tokens"], 16);
+  assert.equal(chatSpan.attributes["gen_ai.usage.output_tokens"], 7);
+  assert.equal(chatSpan.attributes["gen_ai.usage.prompt_tokens"], 16);
+  assert.equal(chatSpan.attributes["gen_ai.usage.completion_tokens"], 7);
+  assert.equal(chatSpan.attributes["llm.usage.total_tokens"], 26);
+  assert.equal(chatSpan.attributes["llm.usage.cache_read_input_tokens"], 2);
+  assertNoOffContractAliases(chatSpan.attributes);
+
+  instrumentor.deactivate();
+});
+
+test("instrumentor handles streaming-only assistant output, result errors, and PostToolBatch completion", async () => {
+  captureState.spans = [];
+  const sdk = createFakeSdk({
+    emitAssistant: false,
+    resultError: true,
+    usePostToolBatchOnly: true,
+  });
+
+  const instrumentor = new ClaudeAgentSDKInstrumentor({
+    sdkModule: sdk,
+    agentName: "weather_agent",
+  });
+
+  await instrumentor.activate();
+
+  const iterator = await sdk.query({
+    prompt: "What is the weather in Tokyo?",
+    options: {},
+  });
+
+  for await (const _item of iterator) {
+    // Drain the stream so spans are emitted.
+  }
+
+  const toolSpan = spanByLogType("tool");
+  const agentSpan = spanByLogType("agent");
+  const chatSpan = spanByLogType("chat");
+
+  assert.ok(toolSpan);
   assert.ok(agentSpan);
-  assert.equal(agentSpan.attributes.prompt_tokens, 16);
-  assert.equal(agentSpan.attributes.completion_tokens, 7);
-  assert.equal(agentSpan.attributes.total_request_tokens, 26);
-  assert.equal(agentSpan.attributes.prompt_cache_hit_tokens, 2);
-  assert.equal(agentSpan.attributes.prompt_cache_creation_tokens, 1);
+  assert.ok(chatSpan);
+  assert.deepEqual(parseAttr(toolSpan, "traceloop.entity.output"), {
+    forecast: "sunny",
+  });
+  assert.equal(chatSpan.attributes["gen_ai.completion.0.content"], "Tokyo is sunny.");
+  assert.deepEqual(parseAttr(chatSpan, "gen_ai.completion.0.tool_calls"), [
+    {
+      id: "toolu_123",
+      type: "function",
+      function: {
+        name: "get_weather",
+        arguments: "{\"city\":\"Tokyo\"}",
+      },
+    },
+  ]);
+  assert.equal(chatSpan.attributes["gen_ai.usage.input_tokens"], 17);
+  assert.equal(chatSpan.attributes["gen_ai.usage.output_tokens"], 4);
+  assert.equal(chatSpan.attributes["llm.usage.total_tokens"], 25);
+  assert.equal(chatSpan.attributes["llm.usage.cache_read_input_tokens"], 3);
+  assert.equal(chatSpan.status.code, 2);
+  assert.equal(chatSpan.status.message, "rate limited");
+  assert.equal(agentSpan.status.code, 2);
+  assertNoOffContractAliases(chatSpan.attributes);
 
   instrumentor.deactivate();
 });
@@ -391,12 +696,10 @@ test("instrumentor extracts SDK MCP server tool definitions", async () => {
     // Drain the stream so spans are emitted.
   }
 
-  const agentSpan = captureState.spans.find(
-    (span) => span.attributes["respan.entity.log_type"] === "agent",
-  );
+  const chatSpan = spanByLogType("chat");
 
-  assert.ok(agentSpan);
-  assert.deepEqual(JSON.parse(agentSpan.attributes["respan.span.tools"]), [
+  assert.ok(chatSpan);
+  assert.deepEqual(parseAttr(chatSpan, "llm.request.functions"), [
     {
       type: "function",
       function: {
@@ -411,25 +714,7 @@ test("instrumentor extracts SDK MCP server tool definitions", async () => {
       },
     },
   ]);
-  assert.equal(
-    agentSpan.attributes["llm.request.functions"],
-    JSON.stringify([
-      {
-        type: "function",
-        function: {
-          name: "mcp__demo__get_weather",
-          description: "Get weather",
-          parameters: {
-            type: "object",
-            properties: {
-              city: { type: "string" },
-            },
-          },
-        },
-      },
-    ]),
-  );
-  assert.deepEqual(JSON.parse(agentSpan.attributes["respan.span.tool_calls"]), [
+  assert.deepEqual(parseAttr(chatSpan, "gen_ai.completion.0.tool_calls"), [
     {
       id: "toolu_123",
       type: "function",
@@ -439,8 +724,7 @@ test("instrumentor extracts SDK MCP server tool definitions", async () => {
       },
     },
   ]);
-  assert.equal(agentSpan.attributes.tools, undefined);
-  assert.equal(agentSpan.attributes.tool_calls, undefined);
+  assertNoOffContractAliases(chatSpan.attributes);
 });
 
 test("instrumentor normalizes Zod-like MCP server schemas", async () => {
@@ -502,12 +786,10 @@ test("instrumentor normalizes Zod-like MCP server schemas", async () => {
     // Drain the stream so spans are emitted.
   }
 
-  const agentSpan = captureState.spans.find(
-    (span) => span.attributes["respan.entity.log_type"] === "agent",
-  );
+  const chatSpan = spanByLogType("chat");
 
-  assert.ok(agentSpan);
-  assert.deepEqual(JSON.parse(agentSpan.attributes["respan.span.tools"]), [
+  assert.ok(chatSpan);
+  assert.deepEqual(parseAttr(chatSpan, "llm.request.functions"), [
     {
       type: "function",
       function: {
@@ -524,25 +806,5 @@ test("instrumentor normalizes Zod-like MCP server schemas", async () => {
       },
     },
   ]);
-  assert.equal(
-    agentSpan.attributes["llm.request.functions"],
-    JSON.stringify([
-      {
-        type: "function",
-        function: {
-          name: "mcp__demo__get_weather",
-          description: "Get weather",
-          parameters: {
-            type: "object",
-            properties: {
-              city: { type: "string" },
-              unit: { type: "string" },
-            },
-            required: ["city"],
-          },
-        },
-      },
-    ]),
-  );
-  assert.equal(agentSpan.attributes.tools, undefined);
+  assertNoOffContractAliases(chatSpan.attributes);
 });

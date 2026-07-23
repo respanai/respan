@@ -1,0 +1,8 @@
+{
+  "summary": "Add a curated Python auto-instrumentation registry for gateway-verified LLM SDKs and suppress nested OpenAI spans during LiteLLM calls to prevent duplicate logs",
+  "packages": {
+    "respan-ai": "minor",
+    "respan-instrumentation-openai": "patch",
+    "respan-instrumentation-litellm": "patch"
+  }
+}

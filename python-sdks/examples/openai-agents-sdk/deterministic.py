@@ -58,7 +58,6 @@ async def main():
         else:
             print("Outline quality too low, skipping story generation.")
 
-    respan.flush()
 
 
 if __name__ == "__main__":

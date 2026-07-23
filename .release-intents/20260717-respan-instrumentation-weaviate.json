@@ -1,0 +1,6 @@
+{
+  "summary": "Add Weaviate instrumentation",
+  "packages": {
+    "respan-instrumentation-weaviate": "new"
+  }
+}

@@ -48,7 +48,6 @@ result = simple_workflow()
 print(f"Result: {result}")
 
 # Force flush to ensure all spans are sent
-telemetry_debug.flush()
 
 print("\n=== Available log levels ===")
 print("- DEBUG: Shows all debug messages including trace endpoints")

@@ -159,14 +159,22 @@ function withEntity<
         // STEP 10: Capture input parameters if tracing is enabled
         if (shouldSendTraces()) {
           try {
+            const hasDisplayInput = inputParameters !== undefined;
             const input = inputParameters ?? args;
 
-            // Handle single object parameter (common pattern)
-            if (
+            // Explicit display inputs should be recorded as the caller-provided
+            // payload instead of leaking the wrapper's args/kwargs shape.
+            if (hasDisplayInput && input.length === 1) {
+              span.setAttribute(
+                SpanAttributes.TRACELOOP_ENTITY_INPUT,
+                serialize(input[0])
+              );
+            } else if (
               input.length === 1 &&
               typeof input[0] === "object" &&
               !(input[0] instanceof Map)
             ) {
+              // Handle single object parameter (common pattern)
               span.setAttribute(
                 SpanAttributes.TRACELOOP_ENTITY_INPUT,
                 serialize({ args: [], kwargs: input[0] })

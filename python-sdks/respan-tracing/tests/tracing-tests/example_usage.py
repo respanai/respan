@@ -184,8 +184,6 @@ def main():
     print("  • Error handling and exception recording")
     print("  • Direct OpenTelemetry integration")
     
-    # Flush any remaining spans
-    telemetry.flush()
 
 if __name__ == "__main__":
     main() 

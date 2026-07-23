@@ -53,7 +53,6 @@ async def main():
         except Exception as e:
             print(f"Guardrail tripped: {e}")
 
-    respan.flush()
 
 
 if __name__ == "__main__":

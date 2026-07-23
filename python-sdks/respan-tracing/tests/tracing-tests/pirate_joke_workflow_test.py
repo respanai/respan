@@ -194,7 +194,6 @@ def pirate_joke_plus_audience():
     logging_joke(
         joke=joke, reactions=reactions
     )  # THis show case the tracing of a function with arbitrary inputs/outputs
-    k_tl.flush()
 
 
 pirate_joke_plus_audience()

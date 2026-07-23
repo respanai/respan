@@ -1,7 +1,7 @@
 {
   "name": "@respan/instrumentation-openai-agents",
   "type": "module",
-  "version": "1.0.6",
+  "version": "1.0.8",
   "description": "Respan instrumentation plugin for OpenAI Agents SDK (OTEL pipeline)",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -22,7 +22,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "yarn build && node --test tests/*.test.mjs",
+    "test": "npm run build && node --test tests/*.test.mjs",
     "publish:package": "yarn npm publish",
     "release": "yarn build && yarn version patch && yarn publish:package"
   },
@@ -30,11 +30,12 @@
     "@opentelemetry/api": "^1.9.0",
     "@opentelemetry/core": "^1.26.0",
     "@opentelemetry/sdk-trace-base": "^1.26.0",
+    "@opentelemetry/semantic-conventions": "^1.40.0",
     "@respan/respan-sdk": "^1.1.7",
     "@traceloop/ai-semantic-conventions": "^0.13.0"
   },
   "peerDependencies": {
-    "@openai/agents": ">=0.8.0"
+    "@openai/agents": ">=0.12.0 <1"
   },
   "peerDependenciesMeta": {
     "@openai/agents": {
@@ -42,8 +43,9 @@
     }
   },
   "devDependencies": {
-    "@openai/agents": "^0.8.1",
+    "@openai/agents": "^0.12.0",
     "@types/node": "^22.15.29",
-    "typescript": "^5.7.3"
+    "typescript": "^5.7.3",
+    "zod": "^4.1.8"
   }
 }
