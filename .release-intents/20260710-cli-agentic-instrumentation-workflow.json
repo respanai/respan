@@ -1,0 +1,6 @@
+{
+  "summary": "Add deterministic OpenAI Agents TypeScript setup, smoke, environment, and trace assertion workflows to the Respan CLI",
+  "packages": {
+    "@respan/cli": "minor"
+  }
+}

@@ -20,6 +20,7 @@
     "build": "npm run generate:skill-refs && tsc && npm run build:hooks",
     "build:hooks": "node -e \"const{build}=require('esbuild');const hooks=['claude-code','codex-cli','gemini-cli'];Promise.all(hooks.map(h=>build({entryPoints:['src/hooks/'+h+'.ts'],bundle:true,platform:'node',target:'node18',format:'cjs',outfile:'dist/hooks/'+h+'.cjs',external:[]}))).then(()=>console.log('Hooks bundled.'))\"",
     "generate:skill-refs": "node scripts/embed-skill-refs.mjs",
+    "test": "npm run build && node --test tests/*.test.mjs",
     "clean": "rm -rf dist",
     "dev": "node --loader ts-node/esm bin/dev.js",
     "postpack": "rm -f oclif.manifest.json",

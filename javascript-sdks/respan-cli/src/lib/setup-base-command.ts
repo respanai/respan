@@ -54,6 +54,7 @@ export abstract class SetupBaseCommand extends BaseCommand {
   // inherited --json/--csv flags so --help doesn't advertise dead options.
   static baseFlags = {
     ...BaseCommand.baseFlags,
+    'env-file': Flags.string({ hidden: true }),
     json: Flags.boolean({ hidden: true, default: false }),
     csv: Flags.boolean({ hidden: true, default: false }),
   };

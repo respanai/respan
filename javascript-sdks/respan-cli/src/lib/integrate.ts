@@ -174,14 +174,22 @@ export function writeTextFile(filePath: string, content: string): void {
 }
 
 /**
- * Read a `KEY=value` line from .env-style content. Trims before stripping a
- * single layer of surrounding quotes — the closing quote can sit inside
- * trailing whitespace, so order matters. Returns undefined if absent or empty.
+ * Read a KEY=value line from .env-style content. Common dotenv whitespace,
+ * optional `export`, and one matching layer of quotes are accepted.
  */
 export function extractEnvVar(content: string, key: string): string | undefined {
-  const match = content.match(new RegExp(`^${key}=(.+)$`, 'm'));
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = content.match(new RegExp(`^\\s*(?:export\\s+)?${escapedKey}\\s*=\\s*(.*?)\\s*$`, 'm'));
   if (!match) return undefined;
-  return match[1].trim().replace(/^["']|["']$/g, '').trim() || undefined;
+  let value = match[1].trim();
+  if (
+    value.length >= 2
+    && ((value.startsWith('"') && value.endsWith('"'))
+      || (value.startsWith("'") && value.endsWith("'")))
+  ) {
+    value = value.slice(1, -1).trim();
+  }
+  return value || undefined;
 }
 
 export function expandHome(p: string): string {

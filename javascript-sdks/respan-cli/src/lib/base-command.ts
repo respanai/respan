@@ -6,6 +6,10 @@ import { createSpinner } from './spinner.js';
 
 export type GlobalFlags = Interfaces.InferredFlags<typeof BaseCommand.baseFlags>;
 
+export function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : 'An unexpected error occurred.';
+}
+
 export abstract class BaseCommand extends Command {
   static baseFlags = {
     'api-key': Flags.string({
@@ -14,6 +18,9 @@ export abstract class BaseCommand extends Command {
     }),
     'base-url': Flags.string({
       description: 'Temporary API base URL override for this command',
+    }),
+    'env-file': Flags.string({
+      description: 'Read RESPAN_API_KEY from an explicit .env file',
     }),
     profile: Flags.string({
       description: 'Named profile to use',
@@ -35,16 +42,19 @@ export abstract class BaseCommand extends Command {
 
   protected globalFlags!: GlobalFlags;
 
-  protected getAuth(): AuthConfig {
+  protected getAuth(projectRoot?: string): AuthConfig {
     return resolveAuth({
       'api-key': this.globalFlags['api-key'],
       'base-url': this.globalFlags['base-url'],
       profile: this.globalFlags.profile,
+    }, {
+      projectRoot,
+      envFile: this.globalFlags['env-file'],
     });
   }
 
-  protected getClient(): RespanClient {
-    const auth = this.getAuth();
+  protected getClient(projectRoot?: string): RespanClient {
+    const auth = this.getAuth(projectRoot);
     const token = auth.apiKey || auth.accessToken;
     if (!token) throw new Error('No API key or access token available.');
     return new RespanClient({
@@ -53,15 +63,15 @@ export abstract class BaseCommand extends Command {
     });
   }
 
-  protected getAuthHeader(): string {
-    const auth = this.getAuth();
+  protected getAuthHeader(projectRoot?: string): string {
+    const auth = this.getAuth(projectRoot);
     const token = auth.apiKey || auth.accessToken;
     if (!token) throw new Error('No API key or access token available.');
     return `Bearer ${token}`;
   }
 
-  protected getBaseUrl(): string {
-    return this.getAuth().baseUrl || 'https://api.respan.ai';
+  protected getBaseUrl(projectRoot?: string): string {
+    return this.getAuth(projectRoot).baseUrl || 'https://api.respan.ai';
   }
 
   protected getOutputFormat(): 'json' | 'csv' | 'table' {
@@ -88,9 +98,6 @@ export abstract class BaseCommand extends Command {
   }
 
   protected handleError(error: unknown): never {
-    if (error instanceof Error) {
-      this.error(error.message, { exit: 1 });
-    }
-    this.error('An unexpected error occurred.', { exit: 1 });
+    this.error(getErrorMessage(error), { exit: 1 });
   }
 }

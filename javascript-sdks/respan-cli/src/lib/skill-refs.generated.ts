@@ -52,8 +52,9 @@ export const TRACING_MD = `# Tracing
 Set up and configure Respan SDK tracing: instrument an app to capture LLM calls as
 structured traces, then refine with decorators, context propagation, and processors.
 
-This file covers **both** the initial setup steps and the advanced reference. Tracing
-is a separate setup from the gateway — do one at a time, never both in the same pass.
+This file covers **both** the initial setup steps and the advanced reference. Treat
+tracing and gateway as separate application changes and implement one at a time. A
+bounded framework smoke probe may use the gateway only to make its validation call.
 
 Docs: \`https://respan.ai/docs/documentation/features/tracing/traces/tracing-sdk.md\`
 Full docs index: \`https://www.respan.ai/docs/llms.txt\`
@@ -93,15 +94,49 @@ Check higher-priority categories first. If a match is found, use that instrument
 | OpenAI Agents SDK | \`openai-agents\` | \`@openai/agents\` | \`respan-instrumentation-openai-agents\` | \`@respan/instrumentation-openai-agents\` | [docs](https://respan.ai/docs/integrations/openai-agents-sdk.md) |
 | Claude Agent SDK | \`claude-agent-sdk\` | — | \`respan-instrumentation-claude-agent-sdk\` | — | [docs](https://respan.ai/docs/integrations/claude-agents-sdk.md) |
 | Pydantic AI | \`pydantic-ai\` | — | \`respan-instrumentation-pydantic-ai\` | — | [docs](https://respan.ai/docs/integrations/pydantic-ai.md) |
-| LangChain | \`langchain\` | \`langchain\` | via OpenInference | — | [docs](https://respan.ai/docs/integrations/langchain.md) |
-| LangGraph | \`langgraph\` | — | via OpenInference | — | [docs](https://respan.ai/docs/integrations/langgraph.md) |
+| LangChain | \`langchain\` | \`langchain\` | \`respan-instrumentation-langchain\` (callback) | — | [docs](https://respan.ai/docs/integrations/langchain.md) |
+| LangGraph | \`langgraph\` | — | \`respan-instrumentation-langchain\` (callback) | — | [docs](https://respan.ai/docs/integrations/langgraph.md) |
 | CrewAI | \`crewai\` | — | \`respan-instrumentation-crewai\` | — | [docs](https://respan.ai/docs/integrations/crewai.md) |
-| LlamaIndex | \`llama-index\` | — | via OpenInference | — | [docs](https://respan.ai/docs/integrations/llama-index.md) |
+| LlamaIndex | \`llama-index\` | — | \`respan-instrumentation-llama-index\` | — | [docs](https://respan.ai/docs/integrations/llama-index.md) |
 | Haystack | \`haystack-ai\` | — | \`respan-instrumentation-haystack\` | — | [docs](https://respan.ai/docs/integrations/haystack.md) |
 | Mastra | — | \`mastra\` | — | via OTEL | [docs](https://respan.ai/docs/integrations/mastra.md) |
-| Google ADK | \`google-adk\` | — | via OpenInference | — | [docs](https://respan.ai/docs/integrations/google-adk.md) |
+| Google ADK | \`google-adk\` | — | \`respan-instrumentation-google-adk\` | — | [docs](https://respan.ai/docs/integrations/google-adk.md) |
 
 If a Priority 1 framework is found, use its instrumentation. Do NOT also add Priority 2 instrumentation for the same provider.
+
+**LangChain / LangGraph use a callback pattern, not \`Respan(instrumentations=[...])\`.** Set up \`RespanTelemetry\` and pass \`add_respan_callback(config=...)\` into the chain/graph invocation: \`from respan_tracing import RespanTelemetry\` + \`from respan_instrumentation_langchain import add_respan_callback\`. (The other Priority-1 frameworks use the standard \`Respan(instrumentations=[XInstrumentor()])\` plugin pattern.)
+
+#### Deterministic OpenAI Agents TypeScript probe
+
+When \`@openai/agents\` is detected, use the CLI recipe after the user confirms the
+integration plan. The recipe is a bounded validation fixture; it does not replace
+reading and instrumenting the application's real entrypoint.
+
+\`\`\`bash
+# Resolve auth, gateway, and model settings without printing the API key.
+respan env --format json
+
+# Preview every file and install command first.
+respan init openai-agents-ts --dry-run --json
+
+# Scaffold the probe and install its pinned dependencies.
+respan init openai-agents-ts
+
+# Exercise workflow, handoff, model, and function-tool spans, then query Respan
+# until the complete trace satisfies the expected contract.
+respan smoke openai-agents-ts --json
+\`\`\`
+
+For SDK maintainers validating unpublished packages, point the recipe at the checkout:
+
+\`\`\`bash
+respan init openai-agents-ts --local-respan /path/to/respan
+\`\`\`
+
+The probe routes model calls through the Respan gateway using Chat Completions and
+keeps OpenAI Agents tracing enabled. Do not copy \`setTracingDisabled(true)\` from the
+standalone gateway-only example into a traced workflow; the Respan instrumentation
+consumes the Agents SDK trace processor events.
 
 **Priority 2 — Direct LLM SDKs** (only if no P1 framework covers this provider):
 
@@ -254,6 +289,18 @@ As the final step, **run the user's program once with a small request** and conf
 - The app runs without errors
 - A trace appears at https://platform.respan.ai or via \`respan traces list --limit 5\`
 - If wrappers were added, the trace shows the expected nested span hierarchy
+
+When the run exposes a trace ID, prefer deterministic polling and assertions over
+manually refreshing the dashboard:
+
+\`\`\`bash
+respan traces wait TRACE_ID --min-spans 1 --timeout 60
+respan traces assert TRACE_ID \\
+  --expect-type workflow \\
+  --expect-type agent \\
+  --expect-type chat \\
+  --max-errors 0
+\`\`\`
 
 If no trace appears, the instrumentation isn't taking effect — debug (init placement, missing \`flush()\`, wrong entrypoint) and re-run before declaring setup done.
 
