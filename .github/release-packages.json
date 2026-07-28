@@ -617,6 +617,12 @@
       "name": "respan-instrumentation-burr",
       "path": "python-sdks/instrumentations/respan-instrumentation-burr",
       "registry": "pypi"
+    },
+    {
+      "ecosystem": "python",
+      "name": "respan-instrumentation-restate",
+      "path": "python-sdks/instrumentations/respan-instrumentation-restate",
+      "registry": "pypi"
     }
   ]
 }

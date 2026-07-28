@@ -1,0 +1,6 @@
+{
+  "summary": "Add Restate instrumentation",
+  "packages": {
+    "respan-instrumentation-restate": "new"
+  }
+}
