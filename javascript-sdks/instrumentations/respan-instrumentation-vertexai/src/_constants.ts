@@ -49,6 +49,8 @@ export const PROMPT_TOKEN_COUNT_KEY = "promptTokenCount";
 export const PROMPT_TOKEN_COUNT_SNAKE_KEY = "prompt_token_count";
 export const CANDIDATES_TOKEN_COUNT_KEY = "candidatesTokenCount";
 export const CANDIDATES_TOKEN_COUNT_SNAKE_KEY = "candidates_token_count";
+export const THOUGHTS_TOKEN_COUNT_KEY = "thoughtsTokenCount";
+export const THOUGHTS_TOKEN_COUNT_SNAKE_KEY = "thoughts_token_count";
 export const TOTAL_TOKEN_COUNT_KEY = "totalTokenCount";
 export const TOTAL_TOKEN_COUNT_SNAKE_KEY = "total_token_count";
 

@@ -407,6 +407,7 @@ export { buildGenerateContentAttrs } from "./_otel_emitter.js";
 export {
   extractToolCalls,
   extractTools,
+  extractUsage,
   formatInput,
   formatOutput,
   normalizeInputMessages,

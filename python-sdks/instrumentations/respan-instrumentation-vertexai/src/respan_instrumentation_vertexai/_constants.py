@@ -39,6 +39,7 @@ SYSTEM_INSTRUCTION_KEY = "system_instruction"
 
 PROMPT_TOKEN_COUNT_KEY = "prompt_token_count"
 CANDIDATES_TOKEN_COUNT_KEY = "candidates_token_count"
+THOUGHTS_TOKEN_COUNT_KEY = "thoughts_token_count"
 TOTAL_TOKEN_COUNT_KEY = "total_token_count"
 
 ASSISTANT_ROLE = "assistant"

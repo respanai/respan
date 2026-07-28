@@ -12,6 +12,7 @@ from respan_instrumentation_google_genai._constants import (
     BUILTIN_TOOL_FIELDS,
     CANDIDATES_KEY,
     CANDIDATES_TOKEN_COUNT_KEY,
+    THOUGHTS_TOKEN_COUNT_KEY,
     CONFIG_KEY,
     CONTENT_KEY,
     CONTENTS_KEY,
@@ -297,11 +298,17 @@ def extract_usage(response_or_chunks: Any) -> dict[str, int]:
     result: dict[str, int] = {}
     prompt_tokens = _field(usage, PROMPT_TOKEN_COUNT_KEY)
     completion_tokens = _field(usage, CANDIDATES_TOKEN_COUNT_KEY)
+    thoughts_tokens = _field(usage, THOUGHTS_TOKEN_COUNT_KEY)
     total_tokens = _field(usage, TOTAL_TOKEN_COUNT_KEY)
     if isinstance(prompt_tokens, int):
         result[PROMPT_TOKEN_COUNT_KEY] = prompt_tokens
     if isinstance(completion_tokens, int):
-        result[CANDIDATES_TOKEN_COUNT_KEY] = completion_tokens
+        # Gemini reports thinking tokens separately from candidatesTokenCount and
+        # bills them at the output rate, so they belong in the output count. This
+        # matches the google-adk instrumentation, which already folds them in.
+        result[CANDIDATES_TOKEN_COUNT_KEY] = completion_tokens + (
+            thoughts_tokens if isinstance(thoughts_tokens, int) else 0
+        )
     if isinstance(total_tokens, int):
         result[TOTAL_TOKEN_COUNT_KEY] = total_tokens
     return result

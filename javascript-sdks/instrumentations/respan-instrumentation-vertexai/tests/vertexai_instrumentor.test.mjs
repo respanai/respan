@@ -10,6 +10,7 @@ import { SpanAttributes } from "@traceloop/ai-semantic-conventions";
 import {
   VertexAIInstrumentor,
   buildGenerateContentAttrs,
+  extractUsage,
   requestPayloadFromCall,
 } from "../dist/index.js";
 
@@ -315,4 +316,62 @@ test("records failed generation as an error span", async () => {
   assert.equal(capturedSpans[0].attributes["gen_ai.request.model"], "gemini-2.0-flash");
 
   instrumentor.deactivate();
+});
+
+// Gemini reports thinking tokens separately but bills them at the output rate. Left out
+// of the completion count the span contradicts itself: prompt + completion stops
+// reconciling against the total the API returned, and the thinking tokens land on no
+// attribute at all, so anything costing off the span under-reports output.
+test("thinking tokens fold into the output count", () => {
+  const result = extractUsage({
+    usageMetadata: {
+      promptTokenCount: 100,
+      candidatesTokenCount: 50,
+      thoughtsTokenCount: 800,
+      totalTokenCount: 950,
+    },
+  });
+
+  assert.equal(result.promptTokenCount, 100);
+  assert.equal(result.candidatesTokenCount, 850);
+  assert.equal(result.totalTokenCount, 950);
+  assert.equal(
+    result.promptTokenCount + result.candidatesTokenCount,
+    result.totalTokenCount,
+  );
+});
+
+test("thinking tokens fold in when the payload uses snake_case", () => {
+  const result = extractUsage({
+    usage_metadata: {
+      prompt_token_count: 100,
+      candidates_token_count: 50,
+      thoughts_token_count: 800,
+      total_token_count: 950,
+    },
+  });
+
+  assert.equal(result.candidatesTokenCount, 850);
+});
+
+// Control: no thoughts field at all, which is every non-thinking model. This is why the
+// defect went unnoticed, since the existing fixtures all look like this.
+test("usage is unchanged when the model does not think", () => {
+  const result = extractUsage({ usageMetadata: makeUsage(100, 50) });
+
+  assert.equal(result.candidatesTokenCount, 50);
+  assert.equal(result.totalTokenCount, 150);
+});
+
+test("zero thinking tokens leave the output count alone", () => {
+  const result = extractUsage({
+    usageMetadata: {
+      promptTokenCount: 100,
+      candidatesTokenCount: 50,
+      thoughtsTokenCount: 0,
+      totalTokenCount: 150,
+    },
+  });
+
+  assert.equal(result.candidatesTokenCount, 50);
 });

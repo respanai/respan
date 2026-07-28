@@ -1,0 +1,8 @@
+{
+  "summary": "Fold Gemini thinking tokens into the output token count in the Vertex AI and google-genai instrumentations. Gemini reports thoughtsTokenCount separately from candidatesTokenCount but bills it at the output rate, so a thinking-enabled span reported prompt + completion that no longer reconciled against the total the API returned, and the thinking tokens landed on no attribute at all. Matches the google-adk instrumentation, which already folds them in.",
+  "packages": {
+    "respan-instrumentation-vertexai": "patch",
+    "respan-instrumentation-google-genai": "patch",
+    "@respan/instrumentation-vertexai": "patch"
+  }
+}

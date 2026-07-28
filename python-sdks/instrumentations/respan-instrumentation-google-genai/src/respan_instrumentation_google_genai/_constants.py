@@ -42,6 +42,7 @@ USAGE_METADATA_KEY = "usage_metadata"
 
 AUTOMATIC_FUNCTION_CALLING_HISTORY_KEY = "automatic_function_calling_history"
 CANDIDATES_TOKEN_COUNT_KEY = "candidates_token_count"
+THOUGHTS_TOKEN_COUNT_KEY = "thoughts_token_count"
 PROMPT_TOKEN_COUNT_KEY = "prompt_token_count"
 TOTAL_TOKEN_COUNT_KEY = "total_token_count"
 

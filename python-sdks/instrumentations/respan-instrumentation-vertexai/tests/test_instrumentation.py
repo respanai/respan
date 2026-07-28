@@ -16,6 +16,9 @@ from opentelemetry.semconv_ai import SpanAttributes
 from respan_instrumentation_vertexai import VertexAIInstrumentor
 from respan_instrumentation_vertexai import _instrumentation
 from respan_instrumentation_vertexai._constants import (
+    CANDIDATES_TOKEN_COUNT_KEY,
+    PROMPT_TOKEN_COUNT_KEY,
+    TOTAL_TOKEN_COUNT_KEY,
     CHAT_SESSION_CLASS_NAME,
     GENERATE_CONTENT_ASYNC_METHOD_NAME,
     GENERATE_CONTENT_METHOD_NAME,
@@ -25,6 +28,7 @@ from respan_instrumentation_vertexai._constants import (
     VERTEXAI_GENERATIVE_MODELS_MODULE,
 )
 from respan_instrumentation_vertexai._otel_emitter import build_generate_content_attrs
+from respan_instrumentation_vertexai._translator import extract_usage
 from respan_instrumentation_vertexai._translator import request_payload_from_call
 from respan_sdk.constants.llm_logging import LOG_TYPE_CHAT
 from respan_sdk.constants.span_attributes import (
@@ -408,3 +412,52 @@ def test_request_payload_reads_model_defaults(
     assert payload["contents"] == "Hello"
     assert payload["system_instruction"] == "Use short answers"
     assert payload["tools"] == [tool]
+
+
+def test_thinking_tokens_fold_into_the_output_count() -> None:
+    """Gemini reports thinking tokens separately but bills them at the output rate.
+
+    Left out of the completion count the span contradicts itself: prompt + completion
+    stops reconciling against the total the API returned, and the thinking tokens land
+    on no attribute at all, so anything costing off the span under-reports output.
+    """
+    usage = Obj(
+        prompt_token_count=100,
+        candidates_token_count=50,
+        thoughts_token_count=800,
+        total_token_count=950,
+    )
+    result = extract_usage(make_response(usage=usage))
+
+    assert result[PROMPT_TOKEN_COUNT_KEY] == 100
+    assert result[CANDIDATES_TOKEN_COUNT_KEY] == 850
+    assert result[TOTAL_TOKEN_COUNT_KEY] == 950
+    assert (
+        result[PROMPT_TOKEN_COUNT_KEY] + result[CANDIDATES_TOKEN_COUNT_KEY]
+        == result[TOTAL_TOKEN_COUNT_KEY]
+    )
+
+
+def test_usage_is_unchanged_when_the_model_does_not_think() -> None:
+    """Control: no thoughts field at all, which is every non-thinking model.
+
+    This is why the defect went unnoticed - the existing fixtures all look like this.
+    """
+    result = extract_usage(make_response(usage=make_usage(100, 50)))
+
+    assert result[CANDIDATES_TOKEN_COUNT_KEY] == 50
+    assert result[TOTAL_TOKEN_COUNT_KEY] == 150
+
+
+def test_zero_thinking_tokens_leave_the_output_count_alone() -> None:
+    """Thinking budget set to zero still emits the field, and must be a no-op."""
+    usage = Obj(
+        prompt_token_count=100,
+        candidates_token_count=50,
+        thoughts_token_count=0,
+        total_token_count=150,
+    )
+    result = extract_usage(make_response(usage=usage))
+
+    assert result[CANDIDATES_TOKEN_COUNT_KEY] == 50
+    assert result[TOTAL_TOKEN_COUNT_KEY] == 150

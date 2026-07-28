@@ -4,6 +4,8 @@ import {
   CANDIDATES_KEY,
   CANDIDATES_TOKEN_COUNT_KEY,
   CANDIDATES_TOKEN_COUNT_SNAKE_KEY,
+  THOUGHTS_TOKEN_COUNT_KEY,
+  THOUGHTS_TOKEN_COUNT_SNAKE_KEY,
   CONTENT_KEY,
   FUNCTION_CALL_KEY,
   FUNCTION_CALL_SNAKE_KEY,
@@ -352,11 +354,20 @@ export function extractUsage(responseOrChunks: unknown): Record<string, number> 
     CANDIDATES_TOKEN_COUNT_KEY,
     CANDIDATES_TOKEN_COUNT_SNAKE_KEY,
   );
+  const thoughtsTokens = getField(
+    usage,
+    THOUGHTS_TOKEN_COUNT_KEY,
+    THOUGHTS_TOKEN_COUNT_SNAKE_KEY,
+  );
   const totalTokens = getField(usage, TOTAL_TOKEN_COUNT_KEY, TOTAL_TOKEN_COUNT_SNAKE_KEY);
 
   if (typeof promptTokens === "number") result[PROMPT_TOKEN_COUNT_KEY] = promptTokens;
   if (typeof completionTokens === "number") {
-    result[CANDIDATES_TOKEN_COUNT_KEY] = completionTokens;
+    // Gemini reports thinking tokens separately from candidatesTokenCount and bills
+    // them at the output rate, so they belong in the output count. This matches the
+    // google-adk instrumentation, which already folds them in.
+    result[CANDIDATES_TOKEN_COUNT_KEY] =
+      completionTokens + (typeof thoughtsTokens === "number" ? thoughtsTokens : 0);
   }
   if (typeof totalTokens === "number") result[TOTAL_TOKEN_COUNT_KEY] = totalTokens;
   return result;
