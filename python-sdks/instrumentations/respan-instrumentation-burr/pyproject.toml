@@ -1,0 +1,26 @@
+[tool.poetry]
+name = "respan-instrumentation-burr"
+version = "0.1.0"
+description = "Respan instrumentation plugin for Apache Burr"
+authors = ["Respan <team@respan.ai>"]
+license = "Apache 2.0"
+readme = "README.md"
+packages = [
+    { include = "respan_instrumentation_burr", from = "./src" },
+]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.14"
+apache-burr = ">=0.42.0,<1.0.0"
+opentelemetry-api = ">=1.38.0,<2.0.0"
+opentelemetry-semantic-conventions-ai = ">=0.4.1"
+respan-sdk = ">=2.6.1"
+respan-tracing = "^2.17.0"
+wrapt = ">=1.16.0"
+
+[tool.poetry.plugins."respan.instrumentations"]
+burr = "respan_instrumentation_burr:BurrInstrumentor"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

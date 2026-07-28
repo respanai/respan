@@ -611,6 +611,12 @@
       "name": "respan-instrumentation-agentops",
       "path": "python-sdks/instrumentations/respan-instrumentation-agentops",
       "registry": "pypi"
+    },
+    {
+      "ecosystem": "python",
+      "name": "respan-instrumentation-burr",
+      "path": "python-sdks/instrumentations/respan-instrumentation-burr",
+      "registry": "pypi"
     }
   ]
 }

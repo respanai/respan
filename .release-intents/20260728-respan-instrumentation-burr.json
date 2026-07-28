@@ -1,0 +1,6 @@
+{
+  "summary": "Add Burr instrumentation",
+  "packages": {
+    "respan-instrumentation-burr": "new"
+  }
+}
