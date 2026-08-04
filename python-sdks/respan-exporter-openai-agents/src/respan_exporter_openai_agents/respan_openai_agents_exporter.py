@@ -318,6 +318,7 @@ class RespanSpanExporter(BackendSpanExporter):
         max_retries: int = 3,
         base_delay: float = 1.0,
         max_delay: float = 30.0,
+        default_params: Optional[Dict[str, Any]] = None,
     ):
         """
         Initialize the Respan exporter.
@@ -330,6 +331,12 @@ class RespanSpanExporter(BackendSpanExporter):
             max_retries: Maximum number of retries upon failures.
             base_delay: Base delay (in seconds) for the first backoff.
             max_delay: Maximum delay (in seconds) for backoff growth.
+            default_params: Optional mapping merged into every exported span
+                payload. Span-provided keys win, so these act as defaults that
+                fill gaps the converted span does not already set. Use it to
+                attach fields uniformly across a trace export — e.g. an
+                environment tag, or an event-dispatch opt-out for first-party
+                self-tracing so exported spans do not trigger automations.
         """
         super().__init__(
             api_key=api_key,
@@ -340,6 +347,7 @@ class RespanSpanExporter(BackendSpanExporter):
             base_delay=base_delay,
             max_delay=max_delay,
         )
+        self.default_params: Dict[str, Any] = default_params or {}
 
     def set_endpoint(self, endpoint: str) -> None:
         """
@@ -381,6 +389,12 @@ class RespanSpanExporter(BackendSpanExporter):
 
         if not data:
             return
+
+        # Merge caller-supplied defaults into every span. Span-provided keys
+        # win so real converted data is never overwritten; the defaults only
+        # fill fields the span did not set.
+        if self.default_params:
+            data = [{**self.default_params, **item} for item in data]
 
         payload = {"data": data}
 
@@ -447,6 +461,7 @@ class RespanTraceProcessor(BatchTraceProcessor):
         max_batch_size: int = 128,
         schedule_delay: float = 5.0,
         export_trigger_ratio: float = 0.7,
+        default_params: Optional[Dict[str, Any]] = None,
     ):
         """
         Initialize the Respan processor.
@@ -463,6 +478,9 @@ class RespanTraceProcessor(BatchTraceProcessor):
             max_batch_size: The maximum number of spans to export in a single batch.
             schedule_delay: The delay between checks for new spans to export.
             export_trigger_ratio: The ratio of the queue size at which we will trigger an export.
+            default_params: Optional mapping merged into every exported span
+                payload (span-provided keys win). Forwarded to
+                ``RespanSpanExporter``; see its docstring.
         """
 
         # Create the exporter
@@ -474,6 +492,7 @@ class RespanTraceProcessor(BatchTraceProcessor):
             max_retries=max_retries,
             base_delay=base_delay,
             max_delay=max_delay,
+            default_params=default_params,
         )
 
         # Initialize the BatchTraceProcessor with our exporter

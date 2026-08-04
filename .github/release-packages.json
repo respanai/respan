@@ -296,6 +296,12 @@
     },
     {
       "ecosystem": "python",
+      "name": "respan-exporter-openai-agents",
+      "path": "python-sdks/respan-exporter-openai-agents",
+      "registry": "pypi"
+    },
+    {
+      "ecosystem": "python",
       "name": "respan-instrumentation-openai-agents",
       "path": "python-sdks/instrumentations/respan-instrumentation-openai-agents",
       "registry": "pypi"

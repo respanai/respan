@@ -1,0 +1,6 @@
+{
+  "summary": "Add a generic default_params mapping to RespanSpanExporter/RespanTraceProcessor, merged into every exported span (span keys win), and re-include respan-exporter-openai-agents in the release inventory",
+  "packages": {
+    "respan-exporter-openai-agents": "minor"
+  }
+}
