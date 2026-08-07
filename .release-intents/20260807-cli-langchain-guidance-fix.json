@@ -1,0 +1,6 @@
+{
+  "summary": "CLI: correct LangChain/LangGraph skill guidance. Python uses Respan(instrumentations=[LangChainInstrumentor()]) (global callback-manager patching, add_respan_callback optional); TypeScript needs instrumentor.addCallback(...) on the outermost invocation. Fills in the @respan/instrumentation-langchain JS package. Regenerated bundled skill-refs.",
+  "packages": {
+    "@respan/cli": "patch"
+  }
+}
