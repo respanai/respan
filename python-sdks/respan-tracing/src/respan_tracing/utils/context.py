@@ -22,17 +22,32 @@ class RespanContextSnapshot:
     python_context: contextvars.Context
     otel_context: Context
 
-    def run(self, fn: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
-        """Run ``fn`` with the context that was active when this snapshot was made."""
+    def run(self, fn: Callable[P, R], /, *args: P.args, **kwargs: P.kwargs) -> R:
+        """Run ``fn`` with the context that was active when this snapshot was made.
+
+        ``fn`` is positional-only so a wrapped callable that itself takes ``fn`` or
+        ``self`` keyword arguments does not collide with this method's parameters.
+
+        Each call runs inside a *fresh* copy of the captured context, so a single
+        snapshot can be reused as a wrapper and invoked repeatedly or concurrently
+        from multiple threads — a live ``contextvars.Context`` can only be entered
+        once, so re-entering the stored one directly would raise ``RuntimeError``
+        under concurrency and would leak contextvar mutations between calls.
+        """
+
+        captured = list(self.python_context.items())
+        otel_context = self.otel_context
 
         def invoke() -> R:
-            token = context_api.attach(self.otel_context)
+            for var, value in captured:
+                var.set(value)
+            token = context_api.attach(otel_context)
             try:
                 return fn(*args, **kwargs)
             finally:
                 context_api.detach(token)
 
-        return self.python_context.run(invoke)
+        return contextvars.copy_context().run(invoke)
 
     def wrap(self, fn: Callable[P, R]) -> Callable[P, R]:
         """Return a callable that always runs in this captured context."""
@@ -76,6 +91,7 @@ def add_done_callback_with_current_context(
 def submit_with_current_context(
     executor: Executor,
     fn: Callable[P, R],
+    /,
     *args: P.args,
     **kwargs: P.kwargs,
 ) -> Future[R]:
@@ -88,6 +104,7 @@ def submit_with_current_context(
 def run_in_executor_with_current_context(
     executor: Executor | None,
     fn: Callable[P, R],
+    /,
     *args: P.args,
     **kwargs: P.kwargs,
 ) -> Awaitable[R]:
@@ -108,6 +125,7 @@ def run_in_executor_with_current_context(
 
 async def to_thread_with_current_context(
     fn: Callable[P, R],
+    /,
     *args: P.args,
     **kwargs: P.kwargs,
 ) -> R:
@@ -118,7 +136,17 @@ async def to_thread_with_current_context(
 
 
 class ContextPropagatingThread(Thread):
-    """Thread that preserves the Respan and OpenTelemetry context from creation."""
+    """Thread that preserves the Respan and OpenTelemetry context from creation.
+
+    Both the ``target=`` form and subclasses that call ``super().run()`` from an
+    overridden ``run()`` propagate the captured context. A subclass that overrides
+    ``run()`` without calling ``super().run()`` must apply the context itself
+    (e.g. wrap its body with ``capture_context().run(...)``), since a base class
+    cannot wrap a method the subclass replaces.
+
+    A ``context_snapshot`` may be shared across several threads — each thread runs
+    inside its own fresh copy (see :meth:`RespanContextSnapshot.run`).
+    """
 
     def __init__(
         self,
@@ -131,16 +159,20 @@ class ContextPropagatingThread(Thread):
         daemon: Optional[bool] = None,
         context_snapshot: Optional[RespanContextSnapshot] = None,
     ) -> None:
-        snapshot = context_snapshot or capture_context()
-        wrapped_target = snapshot.wrap(target) if target is not None else None
+        self._respan_snapshot = context_snapshot or capture_context()
         super().__init__(
             group=group,
-            target=wrapped_target,
+            target=target,
             name=name,
             args=args,
             kwargs=kwargs or {},
             daemon=daemon,
         )
+
+    def run(self) -> None:
+        # Apply the captured context around the whole thread body so both the
+        # target= form and subclasses that call super().run() propagate correctly.
+        self._respan_snapshot.run(super().run)
 
 
 class ContextPropagatingThreadPoolExecutor(ThreadPoolExecutor):

@@ -252,12 +252,19 @@ class BufferingSpanProcessor(SpanProcessor):
         # Check if there's an active SpanBuffer in this context
         buffer = _active_span_buffer.get()
 
-        if buffer is not None and buffer._is_buffering:
-            # Route to the buffer's local queue (deduplicated)
-            buffer.buffer_span(span)
-        else:
-            # No active buffer - use original processor (normal export)
-            self.original_processor.on_end(span)
+        if buffer is not None:
+            # Check-and-buffer atomically under the buffer's lock so this gate
+            # cannot race SpanBuffer.__exit__ (which flips _is_buffering and drains
+            # the queue). Without it, a worker span ending during exit could be
+            # appended after the drain snapshot (lost) or fall through un-enriched.
+            # RLock is reentrant, so buffer_span's own lock nests safely.
+            with buffer._queue_lock:
+                if buffer._is_buffering:
+                    buffer.buffer_span(span)
+                    return
+
+        # No active buffer (or buffering already stopped) - normal export
+        self.original_processor.on_end(span)
 
     def shutdown(self):
         """Shutdown the processor."""
@@ -503,8 +510,11 @@ class SpanBuffer:
         )
 
         # Mark as not buffering FIRST so replayed spans don't re-enter
-        # THIS buffer via BufferingSpanProcessor.on_end
-        self._is_buffering = False
+        # THIS buffer via BufferingSpanProcessor.on_end. Flip under the queue
+        # lock so it is atomic with on_end's check-and-buffer gate: once this
+        # returns, no worker can append to the queue we are about to drain.
+        with self._queue_lock:
+            self._is_buffering = False
 
         # Auto-flush BEFORE resetting the context variable. While this
         # buffer is still the active one in the ContextVar,

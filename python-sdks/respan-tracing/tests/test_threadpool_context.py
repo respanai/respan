@@ -14,6 +14,7 @@ from respan_tracing import (
     submit_with_current_context,
     task,
     to_thread_with_current_context,
+    wrap_with_current_context,
 )
 from respan_tracing.core.tracer import RespanTracer
 from respan_tracing.testing.exporters import InMemorySpanExporter
@@ -289,3 +290,83 @@ class TestThreadPoolContextPropagation:
 
         self.assert_exported(names, "parent_workflow")
         self.assert_exported(names, "to_thread_worker")
+
+    def test_run_preserves_fn_and_self_kwargs(self):
+        # Regression: RespanContextSnapshot.run(fn, /, ...) is positional-only, so a
+        # wrapped callable that itself takes `fn` or `self` keyword arguments does
+        # not collide with run()'s own parameters (previously raised TypeError).
+        @task(name="kwarg_worker")
+        def worker(*, fn, self):
+            return (fn, self)
+
+        with self.client.start_span(
+            "parent_workflow",
+            kind="workflow",
+            processors="dogfood",
+        ):
+            with ContextPropagatingThreadPoolExecutor(max_workers=1) as executor:
+                assert executor.submit(worker, fn="cb", self="obj").result() == (
+                    "cb",
+                    "obj",
+                )
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                assert submit_with_current_context(
+                    executor, worker, fn="x", self="y"
+                ).result() == ("x", "y")
+
+        names = self.exported_names()
+        self.assert_exported(names, "parent_workflow")
+        self.assert_exported(names, "kwarg_worker")
+
+    def test_wrapped_callable_reusable_across_concurrent_threads(self):
+        # Regression: a single captured snapshot / wrapped callable must be safe to
+        # invoke concurrently. A live contextvars.Context can only be entered once,
+        # so reusing the stored one directly raised RuntimeError under parallel load.
+        @task(name="wrapped_worker")
+        def worker(index: int):
+            return index * 2
+
+        with self.client.start_span(
+            "parent_workflow",
+            kind="workflow",
+            processors="dogfood",
+        ):
+            # One wrapped callable fanned across worker threads via ex.map.
+            wrapped = wrap_with_current_context(worker)
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                assert sorted(executor.map(wrapped, range(12))) == [
+                    i * 2 for i in range(12)
+                ]
+
+        names = self.exported_names()
+        self.assert_exported(names, "parent_workflow")
+        assert sum(name.startswith("wrapped_worker") for name in names) == 12
+
+    def test_context_propagating_thread_subclass_run_preserves_routing(self):
+        # Regression: subclasses overriding run() and calling super().run() must
+        # still propagate the captured context (not only the target= form).
+        class Worker(ContextPropagatingThread):
+            def run(self):
+                super().run()
+
+        def work():
+            with self.client.start_span("subclass_worker", kind="task"):
+                pass
+
+        with self.client.start_span(
+            "parent_workflow",
+            kind="workflow",
+            processors="dogfood",
+        ):
+            thread = Worker(target=work)
+            thread.start()
+            thread.join()
+
+        names = self.exported_names()
+        self.assert_exported(names, "parent_workflow")
+        self.assert_exported(names, "subclass_worker")
+
+        parent = self.span_by_prefix("parent_workflow")
+        worker_span = self.span_by_prefix("subclass_worker")
+        assert worker_span.context.trace_id == parent.context.trace_id
+        assert worker_span.parent.span_id == parent.context.span_id
