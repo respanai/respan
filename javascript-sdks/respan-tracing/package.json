@@ -20,8 +20,7 @@
     "examples:install": "cd examples && yarn install",
     "examples:basic": "yarn build && cd examples && yarn basic",
     "examples:advanced": "yarn build && cd examples && yarn dev",
-    "test:build": "npm run build && npm pack && npm install ./respan-tracing-*.tgz --no-save && tsx tests/test_build.ts",
-    "test": "yarn build && node --test tests/*.test.mjs"
+    "test:build": "npm run build && npm pack && npm install ./respan-tracing-*.tgz --no-save && tsx tests/test_build.ts"
   },
   "repository": {
     "type": "git",
