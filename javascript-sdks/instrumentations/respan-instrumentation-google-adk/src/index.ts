@@ -301,7 +301,7 @@ function getAttributes(span: ReadableSpan): Attributes | undefined {
 function getInstrumentationScopeName(span: ReadableSpan): string {
   return (
     ((span as any).instrumentationScope?.name as string | undefined) ??
-    ((span as any).instrumentationLibrary?.name as string | undefined) ??
+    ((span as any).instrumentationScope?.name as string | undefined) ??
     ""
   );
 }

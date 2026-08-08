@@ -6,13 +6,13 @@ import { VercelAITranslator } from "../dist/_translator.js";
 function runTranslator(name, attributes, options = {}) {
   const span = {
     name,
-    instrumentationLibrary: options.instrumentationLibrary,
+    instrumentationScope: options.instrumentationScope,
     instrumentationScope: options.instrumentationScope ?? { name: "ai" },
     attributes: { ...attributes },
   };
   const writableSpan = {
     name,
-    instrumentationLibrary: options.instrumentationLibrary,
+    instrumentationScope: options.instrumentationScope,
     instrumentationScope: options.instrumentationScope ?? { name: "ai" },
     setAttribute(key, value) {
       span.attributes[key] = value;

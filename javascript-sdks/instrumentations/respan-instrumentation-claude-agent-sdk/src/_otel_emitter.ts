@@ -1640,13 +1640,13 @@ function buildClaudeReadableSpan(
   options: Parameters<typeof buildReadableSpan>[0],
 ): ReadableSpan {
   const span = buildReadableSpan(options) as ReadableSpan & {
-    instrumentationLibrary?: {
+    instrumentationScope?: {
       name: string;
       version?: string;
     };
   };
 
-  span.instrumentationLibrary = {
+  span.instrumentationScope = {
     name: CLAUDE_AGENT_INSTRUMENTATION_NAME,
     version: PACKAGE_VERSION,
   };

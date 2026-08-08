@@ -147,8 +147,8 @@ export class MastraInstrumentor {
       ? ensureTraceId(activeSpanContext?.traceId)
       : undefined;
     const traceId = this._resolveTraceId(span.traceId, activeTraceId);
-    const parentId = forcedParentId ?? span.parentSpanId ?? (
-      !span.parentSpanId && activeTraceId === traceId
+    const parentId = forcedParentId ?? (span.parentSpanId ?? (span as any).parentSpanContext?.spanId) ?? (
+      !(span.parentSpanId ?? (span as any).parentSpanContext?.spanId) && activeTraceId === traceId
         ? activeSpanContext?.spanId
         : undefined
     );
@@ -164,10 +164,10 @@ export class MastraInstrumentor {
       statusCode: span.errorInfo ? 500 : 200,
       errorMessage: span.errorInfo?.message,
     }) as ReadableSpan & {
-      instrumentationLibrary?: { name: string; version?: string };
+      instrumentationScope?: { name: string; version?: string };
     };
 
-    readableSpan.instrumentationLibrary = {
+    readableSpan.instrumentationScope = {
       name: INSTRUMENTATION_NAME,
       version: PACKAGE_VERSION,
     };
@@ -186,7 +186,7 @@ export class MastraInstrumentor {
   }
 
   private _shouldBufferToolSpan(span: MastraExportedSpan): boolean {
-    return isToolSpan(span) && (!span.parentSpanId || !this._emittedSpanIds.has(span.parentSpanId));
+    return isToolSpan(span) && (!(span.parentSpanId ?? (span as any).parentSpanContext?.spanId) || !this._emittedSpanIds.has((span.parentSpanId ?? (span as any).parentSpanContext?.spanId)));
   }
 
   private _rememberEmittedSpan(span: MastraExportedSpan, readableSpan: ReadableSpan): void {

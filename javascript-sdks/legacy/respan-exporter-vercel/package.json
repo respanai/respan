@@ -30,8 +30,8 @@
   },
   "dependencies": {
     "@opentelemetry/api": "^1.9.0",
-    "@opentelemetry/core": "^2.0.1",
-    "@opentelemetry/sdk-trace-base": "^2.0.1",
+    "@opentelemetry/core": "^2.10.0",
+    "@opentelemetry/sdk-trace-base": "^2.10.0",
     "@respan/respan-sdk": "^1.1.2"
   },
   "devDependencies": {

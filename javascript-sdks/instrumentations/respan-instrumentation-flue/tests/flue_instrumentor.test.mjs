@@ -189,10 +189,10 @@ test("exports Flue workflow, operation, model turn, and tool events as canonical
   assert.ok(operationSpan);
   assert.ok(modelSpan);
   assert.ok(toolSpan);
-  assert.equal(modelSpan.instrumentationLibrary.name, "@respan/instrumentation-flue");
-  assert.equal(operationSpan.parentSpanId, workflowSpan.spanContext().spanId);
-  assert.equal(modelSpan.parentSpanId, operationSpan.spanContext().spanId);
-  assert.equal(toolSpan.parentSpanId, operationSpan.spanContext().spanId);
+  assert.equal(modelSpan.instrumentationScope.name, "@respan/instrumentation-flue");
+  assert.equal(operationSpan.parentSpanContext?.spanId, workflowSpan.spanContext().spanId);
+  assert.equal(modelSpan.parentSpanContext?.spanId, operationSpan.spanContext().spanId);
+  assert.equal(toolSpan.parentSpanContext?.spanId, operationSpan.spanContext().spanId);
 
   assert.equal(workflowSpan.attributes["traceloop.workflow.name"], "Flue Weather.workflow");
   assert.equal(modelSpan.attributes["traceloop.workflow.name"], "Flue Weather.workflow");
@@ -372,8 +372,8 @@ test("marks failed Flue events with error status and backend status attributes",
     assert.equal(span.attributes.status_code, 500);
     assert.equal(typeof span.attributes["error.message"], "string");
   }
-  assert.equal(operationSpan.parentSpanId, workflowSpan.spanContext().spanId);
-  assert.equal(toolSpan.parentSpanId, operationSpan.spanContext().spanId);
+  assert.equal(operationSpan.parentSpanContext?.spanId, workflowSpan.spanContext().spanId);
+  assert.equal(toolSpan.parentSpanContext?.spanId, operationSpan.spanContext().spanId);
 });
 
 test("activate and deactivate wire the Flue observe subscriber", async () => {

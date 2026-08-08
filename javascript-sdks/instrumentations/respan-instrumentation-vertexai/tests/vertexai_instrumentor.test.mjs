@@ -279,7 +279,7 @@ test("patches generate, stream, and chat methods and emits spans", async () => {
 
   assert.equal(capturedSpans.length, 4);
   assert.equal(capturedSpans[0].name, "vertexai.generate_content");
-  assert.equal(capturedSpans[0].instrumentationLibrary.name, "@respan/instrumentation-vertexai");
+  assert.equal(capturedSpans[0].instrumentationScope.name, "@respan/instrumentation-vertexai");
   assert.equal(capturedSpans[0].attributes["gen_ai.request.model"], "gemini-2.0-flash");
   assert.equal(capturedSpans[0].attributes["gen_ai.usage.input_tokens"], 5);
   assert.equal(capturedSpans[1].attributes["gen_ai.completion.0.content"], "stream done");

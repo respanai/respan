@@ -94,7 +94,8 @@ export class VercelAITranslator implements SpanProcessor {
       typeof writableSpan.spanContext === "function"
         ? writableSpan.spanContext()?.spanId
         : undefined;
-    const parentSpanId: string | undefined = writableSpan.parentSpanId;
+    const parentSpanId: string | undefined =
+      writableSpan.parentSpanId ?? (writableSpan as any).parentSpanContext?.spanId;
 
     // If the parent chain starts inside an open structural wrapper, stamp the
     // export-time parent (the wrapper's own parent) so the exporter can drop

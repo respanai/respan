@@ -9,8 +9,8 @@
   },
   "dependencies": {
     "@opentelemetry/api": "^1.9.0",
-    "@opentelemetry/sdk-trace-base": "^2.6.0",
-    "@opentelemetry/sdk-trace-node": "^2.6.0",
+    "@opentelemetry/sdk-trace-base": "^2.10.0",
+    "@opentelemetry/sdk-trace-node": "^2.10.0",
     "@respan/instrumentation-openai": "file:../../instrumentations/respan-instrumentation-openai",
     "@respan/respan": "file:../../respan",
     "@respan/respan-sdk": "file:../../respan-sdk",

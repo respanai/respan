@@ -725,7 +725,10 @@ function buildReadableSpan(opts: BuildSpanOptions): ReadableSpan {
       traceFlags: 1,
       isRemote: false,
     }),
-    parentSpanId,
+    // OTEL 2.x: parent is a SpanContext (parentSpanId was removed in 2.0)
+    parentSpanContext: parentSpanId
+      ? { traceId, spanId: parentSpanId, traceFlags: 1, isRemote: false }
+      : undefined,
     startTime,
     endTime,
     duration: hrTimeDuration(startTime, endTime),
@@ -734,7 +737,7 @@ function buildReadableSpan(opts: BuildSpanOptions): ReadableSpan {
     links: [],
     events: [],
     resource: { attributes: {} } as any,
-    instrumentationLibrary: {
+    instrumentationScope: {
       name: "@respan/instrumentation-openai-agents",
       version: PACKAGE_VERSION,
     },
@@ -742,7 +745,7 @@ function buildReadableSpan(opts: BuildSpanOptions): ReadableSpan {
     droppedAttributesCount: 0,
     droppedEventsCount: 0,
     droppedLinksCount: 0,
-  } as unknown as ReadableSpan;
+  } satisfies ReadableSpan;
 }
 
 function injectSpan(span: ReadableSpan): void {

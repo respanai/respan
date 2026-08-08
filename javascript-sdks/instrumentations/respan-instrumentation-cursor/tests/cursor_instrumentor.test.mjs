@@ -111,7 +111,7 @@ test("instrumentor emits canonical spans for Agent.create, send, stream, and too
   assert.ok(toolSpan);
   assert.ok(taskSpan);
 
-  assert.equal(agentSpan.instrumentationLibrary?.name, "@respan/instrumentation-cursor");
+  assert.equal(agentSpan.instrumentationScope?.name, "@respan/instrumentation-cursor");
   assert.equal(agentSpan.attributes["traceloop.entity.name"], "cursor_docs_agent");
   assert.equal(agentSpan.attributes["respan.metadata.cursor_run_id"], "run_123");
   assert.equal(chatSpan.attributes["llm.request.type"], "chat");
@@ -126,8 +126,8 @@ test("instrumentor emits canonical spans for Agent.create, send, stream, and too
   ]);
   assert.deepEqual(JSON.parse(toolSpan.attributes["traceloop.entity.input"]), { name: "search_docs", arguments: { query: "Cursor SDK tracing" } });
   assert.deepEqual(JSON.parse(toolSpan.attributes["traceloop.entity.output"]), { matches: 2 });
-  assert.equal(toolSpan.parentSpanId, agentSpan.spanContext().spanId);
-  assert.equal(chatSpan.parentSpanId, agentSpan.spanContext().spanId);
+  assert.equal(toolSpan.parentSpanContext?.spanId, agentSpan.spanContext().spanId);
+  assert.equal(chatSpan.parentSpanContext?.spanId, agentSpan.spanContext().spanId);
 
   for (const span of [agentSpan, chatSpan, toolSpan, taskSpan]) {
     assert.equal(span.attributes["traceloop.span.kind"], undefined);

@@ -70,8 +70,15 @@ export class RespanFilteringSpanProcessor implements SpanProcessor {
       const rootSpan = Object.create(Object.getPrototypeOf(span));
       Object.assign(rootSpan, span);
       
-      // Override the parentSpanId to make it a root span
+      // Override the parent to make it a root span. OTEL 2.x reads
+      // parentSpanContext on the wire (parentSpanId is ignored), so clear both.
       Object.defineProperty(rootSpan, 'parentSpanId', {
+        value: undefined,
+        writable: false,
+        configurable: true,
+        enumerable: true
+      });
+      Object.defineProperty(rootSpan, 'parentSpanContext', {
         value: undefined,
         writable: false,
         configurable: true,

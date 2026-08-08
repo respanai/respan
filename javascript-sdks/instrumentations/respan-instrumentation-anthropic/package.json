@@ -29,8 +29,8 @@
   "packageManager": "yarn@4.6.0",
   "dependencies": {
     "@opentelemetry/api": "^1.9.0",
-    "@opentelemetry/core": "^1.26.0",
-    "@opentelemetry/sdk-trace-base": "^1.26.0",
+    "@opentelemetry/core": "^2.10.0",
+    "@opentelemetry/sdk-trace-base": "^2.10.0",
     "@respan/respan-sdk": "^1.1.7",
     "@respan/tracing": "^1.1.4",
     "@traceloop/ai-semantic-conventions": "^0.13.0"

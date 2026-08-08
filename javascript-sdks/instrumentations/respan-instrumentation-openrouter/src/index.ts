@@ -29,7 +29,7 @@ type AnyFunction = (...args: any[]) => any;
 type Patch = () => void;
 type ParentContext = { traceId?: string; parentId?: string };
 
-const instrumentationLibrary = {
+const instrumentationScope = {
   name: INSTRUMENTATION_NAME,
   version: INSTRUMENTATION_VERSION,
 };

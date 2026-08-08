@@ -541,13 +541,13 @@ function buildCodexReadableSpan(
   options: Parameters<typeof buildReadableSpan>[0],
 ): ReturnType<typeof buildReadableSpan> {
   const span = buildReadableSpan(options) as ReturnType<typeof buildReadableSpan> & {
-    instrumentationLibrary?: {
+    instrumentationScope?: {
       name: string;
       version?: string;
     };
   };
 
-  span.instrumentationLibrary = {
+  span.instrumentationScope = {
     name: CODEX_INSTRUMENTATION_NAME,
     version: PACKAGE_VERSION,
   };

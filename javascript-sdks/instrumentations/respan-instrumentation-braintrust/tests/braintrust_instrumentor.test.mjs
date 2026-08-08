@@ -83,7 +83,7 @@ test("exports Braintrust LLM rows with canonical Respan attrs", () => {
 
   const span = captureState.spans[0];
   const attrs = span.attributes;
-  assert.equal(span.instrumentationLibrary.name, "@respan/instrumentation-braintrust");
+  assert.equal(span.instrumentationScope.name, "@respan/instrumentation-braintrust");
   assert.equal(attrs["respan.entity.log_type"], "chat");
   assert.equal(attrs["traceloop.entity.name"], "braintrust.llm.chat");
   assert.equal(attrs["llm.request.type"], "chat");

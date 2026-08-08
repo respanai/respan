@@ -209,7 +209,7 @@ test("captures v2 chat tools with canonical Cohere LLM attributes", async () => 
   const [span] = captureState.spans;
   const attrs = span.attributes;
 
-  assert.equal(span.instrumentationLibrary?.name, "@respan/instrumentation-cohere");
+  assert.equal(span.instrumentationScope?.name, "@respan/instrumentation-cohere");
   assert.equal(attrs["respan.entity.log_type"], "chat");
   assert.equal(attrs["respan.entity.log_method"], "ts_tracing");
   assert.equal(attrs["gen_ai.system"], "cohere");

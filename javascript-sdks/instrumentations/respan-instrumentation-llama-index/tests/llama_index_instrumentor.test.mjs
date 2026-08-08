@@ -80,7 +80,7 @@ test("emits canonical chat span from LlamaIndex LLM callbacks", async () => {
   assert.equal(captureState.spans.length, 1);
   const [span] = captureState.spans;
   const attrs = span.attributes;
-  assert.equal(span.instrumentationLibrary?.name, "@respan/instrumentation-llama-index");
+  assert.equal(span.instrumentationScope?.name, "@respan/instrumentation-llama-index");
   assert.equal(attrs["respan.entity.log_type"], "chat");
   assert.equal(attrs["respan.entity.log_method"], "ts_tracing");
   assert.equal(attrs["traceloop.entity.name"], "llamaindex.llm");

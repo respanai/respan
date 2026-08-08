@@ -293,7 +293,7 @@ test("instrumentor patches BedrockRuntimeClient send and emits Converse spans", 
   assert.equal(captureState.spans.length, 1);
   const span = captureState.spans[0];
   assert.equal(span.name, "aws_bedrock.chat");
-  assert.equal(span.instrumentationLibrary?.name, "@respan/instrumentation-aws-bedrock");
+  assert.equal(span.instrumentationScope?.name, "@respan/instrumentation-aws-bedrock");
   assert.equal(span.attributes["respan.entity.log_type"], "chat");
   assert.equal(span.attributes["gen_ai.system"], "bedrock");
   assert.equal(span.attributes["gen_ai.completion.0.content"], "Tokyo is sunny.");

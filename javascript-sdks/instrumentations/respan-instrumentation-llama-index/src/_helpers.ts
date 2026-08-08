@@ -250,7 +250,7 @@ export function emitReadableSpan(opts: {
     errorMessage: opts.errorMessage,
     mergePropagated: true,
   }) as ReadableSpan & {
-    instrumentationLibrary?: { name: string; version?: string };
+    instrumentationScope?: { name: string; version?: string };
     spanContext: () => ReturnType<ReadableSpan["spanContext"]>;
   };
 
@@ -259,7 +259,7 @@ export function emitReadableSpan(opts: {
     ...originalSpanContext(),
     traceFlags: activeContext?.traceFlags ?? TraceFlags.SAMPLED,
   });
-  span.instrumentationLibrary = {
+  span.instrumentationScope = {
     name: INSTRUMENTATION_LIBRARY_NAME,
     version: PACKAGE_VERSION,
   };

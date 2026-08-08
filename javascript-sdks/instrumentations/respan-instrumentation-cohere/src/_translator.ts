@@ -57,7 +57,7 @@ export function logTypeForOperation(operation: string): string {
 export function isCohereSpan(span: ReadableSpan): boolean {
   const attrs = ((span as any).attributes ?? {}) as SpanAttributes;
   const scopeName =
-    (span as any).instrumentationLibrary?.name ??
+    (span as any).instrumentationScope?.name ??
     (span as any).instrumentationScope?.name ??
     "";
 

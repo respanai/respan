@@ -205,10 +205,10 @@ export class BraintrustInstrumentor {
       errorMessage,
       mergePropagated: options.propagatedAttributes === undefined,
     }) as ReadableSpan & {
-      instrumentationLibrary?: { name: string; version?: string };
+      instrumentationScope?: { name: string; version?: string };
     };
 
-    readableSpan.instrumentationLibrary = {
+    readableSpan.instrumentationScope = {
       name: INSTRUMENTATION_NAME,
       version: PACKAGE_VERSION,
     };

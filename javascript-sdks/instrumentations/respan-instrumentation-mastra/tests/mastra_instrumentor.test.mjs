@@ -110,9 +110,9 @@ test("exports Mastra agent, model, and tool spans with canonical Respan attrs", 
   assert.ok(agentSpan);
   assert.ok(modelSpan);
   assert.ok(toolSpan);
-  assert.equal(agentSpan.instrumentationLibrary.name, "@respan/instrumentation-mastra");
-  assert.equal(modelSpan.parentSpanId, agentSpan.spanContext().spanId);
-  assert.equal(toolSpan.parentSpanId, agentSpan.spanContext().spanId);
+  assert.equal(agentSpan.instrumentationScope.name, "@respan/instrumentation-mastra");
+  assert.equal(modelSpan.parentSpanContext?.spanId, agentSpan.spanContext().spanId);
+  assert.equal(toolSpan.parentSpanContext?.spanId, agentSpan.spanContext().spanId);
   assert.equal(modelSpan.spanContext().traceId, agentSpan.spanContext().traceId);
   assert.equal(toolSpan.spanContext().traceId, agentSpan.spanContext().traceId);
 
@@ -203,7 +203,7 @@ test("parents orphan tool spans under the later agent span for the same run", as
 
   assert.ok(agentSpan);
   assert.ok(toolSpan);
-  assert.equal(toolSpan.parentSpanId, agentSpan.spanContext().spanId);
+  assert.equal(toolSpan.parentSpanContext?.spanId, agentSpan.spanContext().spanId);
   assert.equal(toolSpan.spanContext().traceId, agentSpan.spanContext().traceId);
 });
 

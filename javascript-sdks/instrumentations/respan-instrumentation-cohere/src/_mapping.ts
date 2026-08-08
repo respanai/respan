@@ -480,10 +480,10 @@ export function emitSpanRecord(
     errorMessage: error === undefined ? undefined : errorMessage(error),
     mergePropagated: true,
   }) as ReadableSpan & {
-    instrumentationLibrary?: { name: string; version?: string };
+    instrumentationScope?: { name: string; version?: string };
   };
 
-  span.instrumentationLibrary = {
+  span.instrumentationScope = {
     name: INSTRUMENTATION_NAME,
     version: PACKAGE_VERSION,
   };

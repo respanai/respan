@@ -92,7 +92,7 @@ test("emit trace stores SDK trace metadata on workflow span", () => {
   const attrs = span.attributes;
 
   assert.equal(attrs[RespanSpanAttributes.RESPAN_LOG_TYPE], "workflow");
-  assert.equal(span.instrumentationLibrary.version, "1.0.6");
+  assert.equal(span.instrumentationScope.version, "1.0.6");
   assert.equal(
     attrs[SpanAttributes.TRACELOOP_WORKFLOW_NAME],
     "openai_agents_gateway_basic.workflow",

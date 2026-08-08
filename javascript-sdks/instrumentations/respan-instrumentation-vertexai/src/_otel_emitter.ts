@@ -83,10 +83,10 @@ function buildInstrumentedReadableSpan(opts: {
     errorMessage: opts.errorMessage,
     statusCode: opts.statusCode,
   }) as ReadableSpan & {
-    instrumentationLibrary?: { name: string; version?: string };
+    instrumentationScope?: { name: string; version?: string };
   };
 
-  span.instrumentationLibrary = {
+  span.instrumentationScope = {
     name: INSTRUMENTATION_LIBRARY_NAME,
     version: PACKAGE_VERSION,
   };

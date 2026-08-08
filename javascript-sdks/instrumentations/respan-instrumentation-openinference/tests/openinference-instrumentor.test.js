@@ -28,7 +28,7 @@ function makeSpan({
       name: instrumentationScopeName,
       version: "1.0.0",
     },
-    instrumentationLibrary: {
+    instrumentationScope: {
       name: instrumentationScopeName,
       version: "1.0.0",
     },
@@ -265,7 +265,7 @@ test("instrumentor hook preserves processor-visible span state and sanitizes exp
       "custom.attr": "kept",
     });
     assert.equal(exportedSpans[0].instrumentationScope.name, "");
-    assert.equal(exportedSpans[0].instrumentationLibrary.name, "");
+    assert.equal(exportedSpans[0].instrumentationScope.name, "");
     assert.equal(oiSpan.resource.attributes["process.pid"], 42);
     assert.equal(
       oiSpan.instrumentationScope.name,

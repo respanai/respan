@@ -2,7 +2,7 @@
   "name": "@respan/respan",
   "type": "module",
   "version": "2.1.0",
-  "description": "Respan unified SDK \u2014 entry point with plugin system for OTEL & OpenInference instrumentors",
+  "description": "Respan unified SDK — entry point with plugin system for OTEL & OpenInference instrumentors",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "author": "Respan <team@respan.ai>",
@@ -32,11 +32,11 @@
     "@respan/tracing": "^1.0.0"
   },
   "optionalDependencies": {
-    "@respan/instrumentation-openai": "^1.0.0",
     "@respan/instrumentation-anthropic": "^1.0.0",
-    "@respan/instrumentation-azure-openai": "^1.0.0",
     "@respan/instrumentation-aws-bedrock": "^1.0.0",
+    "@respan/instrumentation-azure-openai": "^1.0.0",
     "@respan/instrumentation-cohere": "^0.1.0",
+    "@respan/instrumentation-openai": "^1.0.0",
     "@respan/instrumentation-openrouter": "^0.1.0",
     "@respan/instrumentation-together-ai": "^0.1.0",
     "@respan/instrumentation-vertexai": "^0.1.0",

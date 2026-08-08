@@ -147,6 +147,13 @@ export class RespanCompositeProcessor implements SpanProcessor {
           configurable: true,
           enumerable: true
         });
+        // OTEL 2.x reads parentSpanContext (parentSpanId is ignored on the wire)
+        Object.defineProperty(rootSpan, 'parentSpanContext', {
+          value: undefined,
+          writable: false,
+          configurable: true,
+          enumerable: true
+        });
         this._processorManager.onEnd(rootSpan);
       } else {
         // Task, tool, agent spans keep their parent — preserving the hierarchy.

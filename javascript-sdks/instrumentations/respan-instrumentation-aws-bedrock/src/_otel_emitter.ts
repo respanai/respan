@@ -175,7 +175,7 @@ function buildInstrumentedReadableSpan(
 ): ReadableSpan {
   const activeContext = activeSpanContext();
   const span = buildReadableSpan(options) as ReadableSpan & {
-    instrumentationLibrary?: {
+    instrumentationScope?: {
       name: string;
       version?: string;
     };
@@ -187,7 +187,7 @@ function buildInstrumentedReadableSpan(
     ...originalSpanContext(),
     traceFlags: activeContext?.traceFlags ?? TraceFlags.SAMPLED,
   });
-  span.instrumentationLibrary = {
+  span.instrumentationScope = {
     name: AWS_BEDROCK_INSTRUMENTATION_PACKAGE,
     version: PACKAGE_VERSION,
   };

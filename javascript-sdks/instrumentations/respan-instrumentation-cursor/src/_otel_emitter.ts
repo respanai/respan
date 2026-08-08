@@ -565,9 +565,9 @@ function baseAttrs(entityName: string, entityPath: string, logType: string): Any
 
 function buildCursorReadableSpan(options: Parameters<typeof buildReadableSpan>[0]): ReadableSpan {
   const span = buildReadableSpan(options) as ReadableSpan & {
-    instrumentationLibrary?: { name: string; version?: string };
+    instrumentationScope?: { name: string; version?: string };
   };
-  span.instrumentationLibrary = { name: INSTRUMENTATION_NAME, version: PACKAGE_VERSION };
+  span.instrumentationScope = { name: INSTRUMENTATION_NAME, version: PACKAGE_VERSION };
   return span;
 }
 

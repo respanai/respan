@@ -217,7 +217,7 @@ test("patchMessagesPrototype emits a chat span for successful create calls", asy
   assert.equal(captureState.spans.length, 1);
 
   const [span] = captureState.spans;
-  assert.equal(span.instrumentationLibrary?.name, "@respan/instrumentation-anthropic");
+  assert.equal(span.instrumentationScope?.name, "@respan/instrumentation-anthropic");
   assert.equal(span.attributes["respan.entity.log_method"], "ts_tracing");
   assert.equal(span.attributes["respan.entity.log_type"], "chat");
   assert.deepEqual(JSON.parse(span.attributes["traceloop.entity.input"]), [

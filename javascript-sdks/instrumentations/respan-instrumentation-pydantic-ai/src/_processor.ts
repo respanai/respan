@@ -979,7 +979,7 @@ function getInstrumentationScopeName(span: ReadableSpan): string {
   const spanAny = span as any;
   return String(
     spanAny.instrumentationScope?.name ??
-      spanAny.instrumentationLibrary?.name ??
+      spanAny.instrumentationScope?.name ??
       "",
   );
 }

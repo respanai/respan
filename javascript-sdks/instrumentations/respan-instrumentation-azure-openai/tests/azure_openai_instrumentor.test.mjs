@@ -191,7 +191,7 @@ test("patches modern AzureOpenAI chat completions with canonical attrs", async (
 
   const [span] = captureState.spans;
   const attrs = span.attributes;
-  assert.equal(span.instrumentationLibrary.name, "@respan/instrumentation-azure-openai");
+  assert.equal(span.instrumentationScope.name, "@respan/instrumentation-azure-openai");
   assert.equal(attrs["respan.entity.log_method"], "ts_tracing");
   assert.equal(attrs["respan.entity.log_type"], "chat");
   assert.equal(attrs["gen_ai.system"], "azure");

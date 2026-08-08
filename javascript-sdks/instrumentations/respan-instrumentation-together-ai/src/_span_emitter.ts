@@ -70,7 +70,7 @@ function buildInstrumentedReadableSpan(opts: {
     statusCode: opts.statusCode,
     errorMessage: opts.errorMessage,
   }) as ReadableSpan & {
-    instrumentationLibrary?: { name: string; version?: string };
+    instrumentationScope?: { name: string; version?: string };
     spanContext: () => ReturnType<ReadableSpan["spanContext"]>;
   };
 
@@ -79,7 +79,7 @@ function buildInstrumentedReadableSpan(opts: {
     ...originalSpanContext(),
     traceFlags: activeSpanContext?.traceFlags ?? TraceFlags.SAMPLED,
   });
-  span.instrumentationLibrary = {
+  span.instrumentationScope = {
     name: INSTRUMENTATION_LIBRARY_NAME,
     version: PACKAGE_VERSION,
   };

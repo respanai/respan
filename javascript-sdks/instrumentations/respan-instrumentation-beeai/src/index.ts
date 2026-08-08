@@ -104,7 +104,7 @@ function firstDefined<T>(...values: Array<T | undefined>): T | undefined {
 function getInstrumentationScopeName(span: ReadableSpan): string {
   return (
     ((span as any).instrumentationScope?.name as string | undefined) ??
-    ((span as any).instrumentationLibrary?.name as string | undefined) ??
+    ((span as any).instrumentationScope?.name as string | undefined) ??
     ((span as any).attributes?.[OTEL_SCOPE_NAME] as string | undefined) ??
     ""
   );
@@ -196,7 +196,8 @@ function getOtelSpanId(span: ReadableSpan): string | undefined {
 }
 
 function getOtelParentSpanId(span: ReadableSpan): string | undefined {
-  const parentSpanId = (span as any).parentSpanId;
+  const parentSpanId =
+    (span as any).parentSpanId ?? (span as any).parentSpanContext?.spanId;
   return typeof parentSpanId === "string" && parentSpanId.length > 0
     ? parentSpanId
     : undefined;
@@ -252,6 +253,20 @@ function reparentFromDroppedSpans(span: ReadableSpan): void {
 
   Object.defineProperty(span, "parentSpanId", {
     value: resolvedParentSpanId,
+    writable: false,
+    configurable: true,
+    enumerable: true,
+  });
+  // OTEL 2.x reads parentSpanContext on the wire, not parentSpanId.
+  Object.defineProperty(span, "parentSpanContext", {
+    value: resolvedParentSpanId
+      ? {
+          traceId,
+          spanId: resolvedParentSpanId,
+          traceFlags: span.spanContext().traceFlags,
+          isRemote: false,
+        }
+      : undefined,
     writable: false,
     configurable: true,
     enumerable: true,

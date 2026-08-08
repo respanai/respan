@@ -136,7 +136,7 @@ test("patchResourceMethod emits canonical chat attributes without off-contract a
 
   const chatSpan = captureState.spans[1];
   const attrs = chatSpan.attributes;
-  assert.equal(chatSpan.instrumentationLibrary?.name, "@respan/instrumentation-together-ai");
+  assert.equal(chatSpan.instrumentationScope?.name, "@respan/instrumentation-together-ai");
   assert.equal(attrs["respan.entity.log_method"], "ts_tracing");
   assert.equal(attrs["respan.entity.log_type"], "chat");
   assert.equal(attrs["gen_ai.system"], "together");

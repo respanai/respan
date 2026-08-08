@@ -30,7 +30,7 @@ function makeSpan({
       name: instrumentationScopeName,
       version: "1.0.0",
     },
-    instrumentationLibrary: {
+    instrumentationScope: {
       name: instrumentationScopeName,
       version: "1.0.0",
     },

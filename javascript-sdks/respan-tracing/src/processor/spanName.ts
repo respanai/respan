@@ -212,10 +212,26 @@ function cloneReadableSpan(
     configurable: true,
   });
   if (reparent !== undefined) {
-    // OTel SDK 1.x exposes parentSpanId on ReadableSpan; revisit for SDK 2.x
-    // (parentSpanContext) when the workspace upgrades.
+    const reparentId = reparent === null ? undefined : reparent;
     Object.defineProperty(clone, "parentSpanId", {
-      value: reparent === null ? undefined : reparent,
+      value: reparentId,
+      enumerable: true,
+      configurable: true,
+    });
+    // OTEL 2.x reads parentSpanContext on the wire, not parentSpanId. Read the
+    // trace context from the source span (the clone isn't fully built yet);
+    // guard spanContext so a malformed span never crashes the exporter.
+    const ctx =
+      typeof span.spanContext === "function" ? span.spanContext() : undefined;
+    Object.defineProperty(clone, "parentSpanContext", {
+      value: reparentId && ctx
+        ? {
+            traceId: ctx.traceId,
+            spanId: reparentId,
+            traceFlags: ctx.traceFlags,
+            isRemote: false,
+          }
+        : undefined,
       enumerable: true,
       configurable: true,
     });

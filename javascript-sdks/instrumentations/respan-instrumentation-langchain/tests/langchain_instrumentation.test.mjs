@@ -113,7 +113,7 @@ test("chain root and child emit workflow and task spans with parent linkage", ()
   assert.equal(childSpan.attributes["respan.entity.log_type"], "task");
   assert.equal(rootSpan.attributes["respan.entity.log_type"], "workflow");
   assert.equal(childSpan.spanContext().traceId, rootSpan.spanContext().traceId);
-  assert.equal(childSpan.parentSpanId, rootSpan.spanContext().spanId);
+  assert.equal(childSpan.parentSpanContext?.spanId, rootSpan.spanContext().spanId);
   assert.equal(rootSpan.attributes["langchain.framework"], "langgraph");
 });
 
@@ -146,8 +146,8 @@ test("explicit Langflow handler groups independent root runs into one trace", ()
 
   assert.equal(captured.length, 2);
   assert.equal(captured[0].spanContext().traceId, captured[1].spanContext().traceId);
-  assert.equal(captured[0].parentSpanId, undefined);
-  assert.equal(captured[1].parentSpanId, undefined);
+  assert.equal(captured[0].parentSpanContext?.spanId, undefined);
+  assert.equal(captured[1].parentSpanContext?.spanId, undefined);
 });
 
 test("chat model output maps messages, usage, model, tool calls, and strips JSON fences", () => {

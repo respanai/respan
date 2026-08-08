@@ -146,7 +146,7 @@ export function isRecord(value: unknown): value is Record<string, any> {
 }
 
 export function instrumentationScopeName(span: Partial<ReadableSpan> | any): string | undefined {
-  return span.instrumentationScope?.name ?? span.instrumentationLibrary?.name;
+  return span.instrumentationScope?.name ?? span.instrumentationScope?.name;
 }
 
 export function isVercelAIScope(scopeName: unknown): boolean {

@@ -2,7 +2,7 @@ import { NodeSDK } from "@opentelemetry/sdk-node";
 import { diag, DiagLogLevel } from "@opentelemetry/api";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
 import type { ReadableSpan } from "@opentelemetry/sdk-trace-base";
-import { Resource } from "@opentelemetry/resources";
+import { resourceFromAttributes } from "@opentelemetry/resources";
 import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions";
 import { RespanOptions, ProcessorConfig } from "../types/clientTypes.js";
 import { MultiProcessorManager } from "../processor/manager.js";
@@ -191,7 +191,7 @@ export const startTracing = async (options: RespanOptions) => {
   );
 
   // Create resource with custom attributes
-  const resource = new Resource({
+  const resource = resourceFromAttributes({
     [ATTR_SERVICE_NAME]: appName,
     ...resourceAttributes,
   });

@@ -430,9 +430,9 @@ test("instrumentor patches query, merges hooks, and emits canonical tool/agent/c
   assert.ok(toolSpan);
   assert.ok(agentSpan);
   assert.ok(chatSpan);
-  assert.equal(toolSpan.instrumentationLibrary?.name, "@respan/instrumentation-claude-agent-sdk");
-  assert.equal(agentSpan.instrumentationLibrary?.name, "@respan/instrumentation-claude-agent-sdk");
-  assert.equal(chatSpan.instrumentationLibrary?.name, "@respan/instrumentation-claude-agent-sdk");
+  assert.equal(toolSpan.instrumentationScope?.name, "@respan/instrumentation-claude-agent-sdk");
+  assert.equal(agentSpan.instrumentationScope?.name, "@respan/instrumentation-claude-agent-sdk");
+  assert.equal(chatSpan.instrumentationScope?.name, "@respan/instrumentation-claude-agent-sdk");
 
   assert.equal(toolSpan.attributes["traceloop.entity.name"], "get_weather");
   assert.deepEqual(parseAttr(toolSpan, "traceloop.entity.input"), {
@@ -503,8 +503,8 @@ test("instrumentor patches query, merges hooks, and emits canonical tool/agent/c
     undefined,
   );
   assertNoOffContractAliases(chatSpan.attributes);
-  assert.equal(toolSpan.parentSpanId, agentSpan.spanContext().spanId);
-  assert.equal(chatSpan.parentSpanId, agentSpan.spanContext().spanId);
+  assert.equal(toolSpan.parentSpanContext?.spanId, agentSpan.spanContext().spanId);
+  assert.equal(chatSpan.parentSpanContext?.spanId, agentSpan.spanContext().spanId);
   assert.equal(toolSpan.spanContext().traceId, agentSpan.spanContext().traceId);
   assert.equal(chatSpan.spanContext().traceId, agentSpan.spanContext().traceId);
 
@@ -544,7 +544,7 @@ test("instrumentor emits errored tool spans for PostToolUseFailure", async () =>
     parseAttr(toolSpan, "traceloop.entity.output"),
     "Tool execution failed",
   );
-  assert.equal(toolSpan.parentSpanId, agentSpan.spanContext().spanId);
+  assert.equal(toolSpan.parentSpanContext?.spanId, agentSpan.spanContext().spanId);
   assertNoOffContractAliases(toolSpan.attributes);
 
   instrumentor.deactivate();

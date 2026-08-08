@@ -278,7 +278,7 @@ test("patchWriterMethod emits success, error, and tool execution spans", async (
   const [toolSpan, chatSpan] = captureState.spans;
   assert.equal(toolSpan.attributes["respan.entity.log_type"], "tool");
   assert.equal(toolSpan.attributes["traceloop.entity.name"], "lookup");
-  assert.equal(chatSpan.instrumentationLibrary?.name, "@respan/instrumentation-writer");
+  assert.equal(chatSpan.instrumentationScope?.name, "@respan/instrumentation-writer");
   assert.equal(chatSpan.attributes["respan.entity.log_method"], "ts_tracing");
   assert.equal(chatSpan.attributes["respan.entity.log_type"], "chat");
   assert.equal(chatSpan.attributes["gen_ai.usage.completion_tokens"], 1);

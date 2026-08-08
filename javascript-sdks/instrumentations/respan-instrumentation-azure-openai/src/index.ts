@@ -486,7 +486,7 @@ export class AzureOpenAIInstrumentor {
       attributes,
       errorMessage,
     }) as ReturnType<typeof buildReadableSpan> & {
-      instrumentationLibrary?: { name: string; version?: string };
+      instrumentationScope?: { name: string; version?: string };
       spanContext: () => ReturnType<ReturnType<typeof buildReadableSpan>["spanContext"]>;
     };
 
@@ -495,7 +495,7 @@ export class AzureOpenAIInstrumentor {
       ...originalSpanContext(),
       traceFlags: activeSpanContext?.traceFlags ?? TraceFlags.SAMPLED,
     });
-    span.instrumentationLibrary = {
+    span.instrumentationScope = {
       name: INSTRUMENTATION_NAME,
       version: PACKAGE_VERSION,
     };
