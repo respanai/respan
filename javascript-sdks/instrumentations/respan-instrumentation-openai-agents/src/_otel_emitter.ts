@@ -752,8 +752,11 @@ function injectSpan(span: ReadableSpan): void {
   const tp = trace.getTracerProvider() as any;
   const processor =
     tp?.activeSpanProcessor ??
-    tp?._delegate?.activeSpanProcessor ??
-    tp?._delegate?._tracerProvider?.activeSpanProcessor;
+      tp?._activeSpanProcessor ??
+      tp?._delegate?.activeSpanProcessor ??
+      tp?._delegate?._activeSpanProcessor ??
+      tp?._delegate?._tracerProvider?.activeSpanProcessor ??
+      tp?._delegate?._tracerProvider?._activeSpanProcessor;
   if (processor && typeof processor.onEnd === "function") {
     processor.onEnd(span);
   }

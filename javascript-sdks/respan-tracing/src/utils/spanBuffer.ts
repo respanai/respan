@@ -207,9 +207,15 @@ export class SpanBufferManager {
         return false;
       }
 
-      // Get active span processors
-      // @ts-ignore - Access internal structure
-      const activeSpanProcessor = tracerProvider.activeSpanProcessor;
+      // Get active span processor. OTEL 2.x renamed the internal field to
+      // `_activeSpanProcessor` (underscore) and wraps in a ProxyTracerProvider,
+      // so check both names at the top level and under `_delegate`.
+      const tp = tracerProvider as any;
+      const activeSpanProcessor =
+        tp.activeSpanProcessor ??
+        tp._activeSpanProcessor ??
+        tp._delegate?.activeSpanProcessor ??
+        tp._delegate?._activeSpanProcessor;
       if (!activeSpanProcessor) {
         console.warn("[Respan] No active span processor found");
         return false;

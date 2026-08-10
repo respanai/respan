@@ -72,8 +72,11 @@ export class OpenInferenceInstrumentor {
     const tracerProvider = trace.getTracerProvider() as any;
     return (
       tracerProvider?.activeSpanProcessor ??
+      tracerProvider?._activeSpanProcessor ??
       tracerProvider?._delegate?.activeSpanProcessor ??
-      tracerProvider?._delegate?._tracerProvider?.activeSpanProcessor
+      tracerProvider?._delegate?._activeSpanProcessor ??
+      tracerProvider?._delegate?._tracerProvider?.activeSpanProcessor ??
+      tracerProvider?._delegate?._tracerProvider?._activeSpanProcessor
     );
   }
 

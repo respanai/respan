@@ -173,8 +173,14 @@ export function buildReadableSpan(opts: BuildSpanOptions): ReadableSpan {
  */
 export function injectSpan(span: ReadableSpan): boolean {
   const tp = trace.getTracerProvider() as any;
+  // OTEL 2.x renamed the internal field to `_activeSpanProcessor` (underscore).
+  // Check both so injection works on 1.x and 2.x, at the top level and under
+  // the ProxyTracerProvider's `_delegate`.
   const processor =
-    tp?.activeSpanProcessor ?? tp?._delegate?.activeSpanProcessor;
+    tp?.activeSpanProcessor ??
+    tp?._activeSpanProcessor ??
+    tp?._delegate?.activeSpanProcessor ??
+    tp?._delegate?._activeSpanProcessor;
   if (processor && typeof processor.onEnd === "function") {
     processor.onEnd(span);
     return true;
