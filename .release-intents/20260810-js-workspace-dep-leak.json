@@ -1,0 +1,11 @@
+{
+  "summary": "Replace unreleasable workspace: dependency ranges in JS instrumentation packages and republish the broken tarballs (aws-bedrock, openrouter, codex-sdk, cursor, llama-index, pydantic-ai)",
+  "packages": {
+    "@respan/instrumentation-aws-bedrock": "patch",
+    "@respan/instrumentation-openrouter": "patch",
+    "@respan/instrumentation-codex-sdk": "patch",
+    "@respan/instrumentation-cursor": "patch",
+    "@respan/instrumentation-llama-index": "patch",
+    "@respan/instrumentation-pydantic-ai": "patch"
+  }
+}

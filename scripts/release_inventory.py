@@ -391,6 +391,17 @@ def validate(entries: list[dict]) -> list[str]:
             publish_access = manifest.get("publishConfig", {}).get("access")
             if entry["registry"] == "npm" and publish_access != "public":
                 errors.append(f"{entry['name']} is missing publishConfig.access=public")
+            # `npm publish` does not rewrite the `workspace:` protocol (only
+            # yarn berry / pnpm do), so any workspace: range leaks verbatim into
+            # the published tarball and makes the package uninstallable from npm.
+            for section in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+                for dep_name, dep_range in (manifest.get(section) or {}).items():
+                    if isinstance(dep_range, str) and dep_range.startswith("workspace:"):
+                        errors.append(
+                            f"{entry['name']} declares {section}.{dep_name} as "
+                            f"'{dep_range}'; replace the workspace: range with a "
+                            f"concrete version before publishing"
+                        )
         else:
             project_version = manifest.get("project", {}).get("version")
             poetry_version = manifest["tool"]["poetry"]["version"]
