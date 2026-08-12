@@ -1,0 +1,6 @@
+{
+  "summary": "claude-agent-sdk instrumentation: default capture_content=True so traces carry prompts, tool arguments, and tool results by default. It silently overrode the upstream default to False, leaving Claude Agent SDK traces content-empty while every other Respan instrumentation captures content by default. Pass capture_content=False to opt out.",
+  "packages": {
+    "respan-instrumentation-claude-agent-sdk": "minor"
+  }
+}

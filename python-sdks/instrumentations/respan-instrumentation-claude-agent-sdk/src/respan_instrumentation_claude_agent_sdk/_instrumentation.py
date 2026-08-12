@@ -48,8 +48,16 @@ class ClaudeAgentSDKInstrumentor:
         self,
         *,
         agent_name: str | None = None,
-        capture_content: bool = False,
+        capture_content: bool = True,
     ) -> None:
+        """
+        Args:
+            agent_name: Optional name applied to the root agent span.
+            capture_content: Capture prompts, tool arguments, and tool results as
+                span content. Defaults to True to match Respan's other
+                instrumentations (which capture content by default); pass False to
+                emit structure-only spans when content must not leave the process.
+        """
         self._agent_name = agent_name
         self._capture_content = capture_content
         self._otel_instrumentor = None
