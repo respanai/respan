@@ -1,0 +1,7 @@
+{
+  "summary": "Fix two broken Python instrumentations found by trace verification: autogen crashed the user's agent.run() by mutating an ended span's immutable attributes; smolagents failed to import due to six SPAN_ALIAS_* constants that were never published in respan-sdk",
+  "packages": {
+    "respan-instrumentation-autogen": "patch",
+    "respan-instrumentation-smolagents": "patch"
+  }
+}

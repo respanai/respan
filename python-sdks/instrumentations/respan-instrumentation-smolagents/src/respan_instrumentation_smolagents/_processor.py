@@ -12,15 +12,15 @@ from opentelemetry.semconv_ai import SpanAttributes as TLSpanAttributes
 from respan_sdk.constants.span_attributes import (
     RESPAN_SPAN_TOOL_CALLS,
     RESPAN_SPAN_TOOLS,
+)
+from respan_instrumentation_smolagents._constants import (
+    ASSISTANT_ROLE,
     SPAN_ALIAS_COMPLETION_TOKENS,
     SPAN_ALIAS_MODEL,
     SPAN_ALIAS_PROMPT_TOKENS,
     SPAN_ALIAS_TOOL_CALLS,
     SPAN_ALIAS_TOOLS,
     SPAN_ALIAS_TOTAL_REQUEST_TOKENS,
-)
-from respan_instrumentation_smolagents._constants import (
-    ASSISTANT_ROLE,
     GEN_AI_COMPLETION_CONTENT_ATTR,
     GEN_AI_COMPLETION_ROLE_ATTR,
     GEN_AI_COMPLETION_TOOL_CALLS_ATTR,

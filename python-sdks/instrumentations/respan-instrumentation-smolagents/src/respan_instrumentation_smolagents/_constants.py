@@ -37,3 +37,13 @@ OPENINFERENCE_MESSAGE_CONTENT_TYPE_ATTR = (
 OPENINFERENCE_MESSAGE_CONTENT_TEXT_ATTR = (
     OIMessageContentAttributes.MESSAGE_CONTENT_TEXT
 )
+
+# Off-contract OpenInference source attributes. The smolagents processor
+# translates these into the canonical Respan/GenAI contract and then strips the
+# raw aliases before export so they do not leak to the backend.
+SPAN_ALIAS_MODEL = OISpanAttributes.LLM_MODEL_NAME
+SPAN_ALIAS_PROMPT_TOKENS = OISpanAttributes.LLM_TOKEN_COUNT_PROMPT
+SPAN_ALIAS_COMPLETION_TOKENS = OISpanAttributes.LLM_TOKEN_COUNT_COMPLETION
+SPAN_ALIAS_TOTAL_REQUEST_TOKENS = OISpanAttributes.LLM_TOKEN_COUNT_TOTAL
+SPAN_ALIAS_TOOLS = OISpanAttributes.LLM_TOOLS
+SPAN_ALIAS_TOOL_CALLS = OIMessageAttributes.MESSAGE_TOOL_CALLS

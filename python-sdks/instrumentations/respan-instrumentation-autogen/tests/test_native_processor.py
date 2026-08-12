@@ -62,6 +62,35 @@ def test_processor_maps_native_execute_tool_to_tool_log_type():
     assert SpanAttributes.LLM_REQUEST_TYPE not in span._attributes
 
 
+def test_processor_handles_immutable_ended_span_attributes():
+    """Regression: a real *ended* span exposes ``_attributes`` as a frozen
+    ``BoundedAttributes``. Mutating it in place raises ``TypeError`` (which
+    previously propagated out of the user's ``agent.run()``). The processor
+    must copy + reassign instead."""
+    from opentelemetry.attributes import BoundedAttributes
+
+    frozen = BoundedAttributes(
+        attributes={
+            GEN_AI_OPERATION_NAME: AUTOGEN_OPERATION_INVOKE_AGENT,
+            GEN_AI_SYSTEM: "autogen",
+            GEN_AI_AGENT_NAME: "planner",
+        },
+        immutable=True,
+    )
+    span = SimpleNamespace(
+        name="test-span",
+        _attributes=frozen,
+        instrumentation_scope=SimpleNamespace(name=AUTOGEN_CORE_SCOPE_NAME),
+    )
+
+    # Must not raise TypeError.
+    AutoGenNativeSpanProcessor().on_end(span)
+
+    assert span._attributes[RESPAN_LOG_TYPE] == LOG_TYPE_AGENT
+    assert span._attributes[SpanAttributes.TRACELOOP_ENTITY_NAME] == "planner"
+    assert GEN_AI_SYSTEM not in span._attributes
+
+
 def test_processor_ignores_non_autogen_core_scope():
     span = _make_span(
         {

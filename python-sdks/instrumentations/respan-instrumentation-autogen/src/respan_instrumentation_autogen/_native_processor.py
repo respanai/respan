@@ -29,10 +29,14 @@ _AUTOGEN_OPERATION_LOG_TYPES = {
 
 
 def _get_mutable_attributes(span: ReadableSpan) -> dict[str, Any] | None:
+    # An ended span's ``_attributes`` is a ``BoundedAttributes`` that is frozen
+    # (``_immutable``) on opentelemetry-sdk once the span has ended, so writing
+    # to it in place raises ``TypeError``. Return a mutable copy; the caller
+    # reassigns ``span._attributes`` after normalizing.
     attrs = getattr(span, "_attributes", None)
     if attrs is None:
         return None
-    return attrs
+    return dict(attrs)
 
 
 def _get_scope_name(span: ReadableSpan) -> str | None:
@@ -80,6 +84,9 @@ class AutoGenNativeSpanProcessor(SpanProcessor):
         )
         attrs.pop(GEN_AI_SYSTEM, None)
         attrs.pop(SpanAttributes.LLM_REQUEST_TYPE, None)
+        # Reassign the normalized copy; the original frozen BoundedAttributes
+        # cannot be mutated in place after the span has ended.
+        span._attributes = attrs
 
     def shutdown(self) -> None:
         return None
