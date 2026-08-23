@@ -30,7 +30,7 @@ The API key is stored in `.env` as `RESPAN_API_KEY`.
 
 **Before analyzing anything, ask the user which setup they want.** This is the first question — the two branches diverge immediately.
 
-1. **Auto** — the fastest path. Install the core SDK and add `Respan()` (one line). Every LLM call from a supported direct SDK — OpenAI, Anthropic, Azure OpenAI, Bedrock, Vertex, Cohere, Together, Gemini, LiteLLM — is automatically captured as a flat span. **No decorators and no framework instrumentor, even if a framework is detected.** Best for a quick start or a live demo: traces flowing in under two minutes.
+1. **Auto** — the fastest path. Install the core SDK and add `Respan()` (one line). Every LLM call from a direct SDK whose Respan instrumentation adapter the facade bundles for that language is automatically captured as a flat span. **Python:** OpenAI, Azure OpenAI, Anthropic, Vertex AI, Google GenAI, Bedrock, Together AI, Ollama. **TypeScript:** OpenAI, Azure OpenAI, Anthropic, Vertex AI, Bedrock, Cohere, Together AI, OpenRouter, Writer. Any other provider needs the Full path. **No decorators and no framework instrumentor, even if a framework is detected.** Best for a quick start or a live demo: traces flowing in under two minutes.
 2. **Full** — structured setup. Adds framework-specific instrumentation and/or workflow structure on top:
    - **Explicit instrumentor** — for agent frameworks (LangChain, CrewAI, OpenAI Agents, Claude Agent SDK, LlamaIndex, Haystack, …) so the framework's agent / tool / chain structure is captured.
    - **Decorators** — wrap the user's own functions with `@workflow` / `@task` for nested spans.

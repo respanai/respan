@@ -1,0 +1,6 @@
+{
+  "summary": "Fix the auto mode provider list in the tracing skill and rebuild the generated skill files",
+  "packages": {
+    "@respan/cli": "patch"
+  }
+}
