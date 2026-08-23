@@ -79,7 +79,7 @@ The API key is stored in \`.env\` as \`RESPAN_API_KEY\`.
 
 **Before analyzing anything, ask the user which setup they want.** This is the first question — the two branches diverge immediately.
 
-1. **Auto** — the fastest path. Install the core SDK and add \`Respan()\` (one line). Every LLM call from a supported direct SDK — OpenAI, Anthropic, Azure OpenAI, Bedrock, Vertex, Cohere, Together, Gemini, LiteLLM — is automatically captured as a flat span. **No decorators and no framework instrumentor, even if a framework is detected.** Best for a quick start or a live demo: traces flowing in under two minutes.
+1. **Auto** — the fastest path. Install the core SDK and add \`Respan()\` (one line). Every LLM call from a direct SDK whose Respan instrumentation adapter the facade bundles for that language is automatically captured as a flat span. **Python:** OpenAI, Azure OpenAI, Anthropic, Vertex AI, Google GenAI, Bedrock, Together AI, Ollama. **TypeScript:** OpenAI, Azure OpenAI, Anthropic, Vertex AI, Bedrock, Cohere, Together AI, OpenRouter, Writer. Any other provider needs the Full path. **No decorators and no framework instrumentor, even if a framework is detected.** Best for a quick start or a live demo: traces flowing in under two minutes.
 2. **Full** — structured setup. Adds framework-specific instrumentation and/or workflow structure on top:
    - **Explicit instrumentor** — for agent frameworks (LangChain, CrewAI, OpenAI Agents, Claude Agent SDK, LlamaIndex, Haystack, …) so the framework's agent / tool / chain structure is captured.
    - **Decorators** — wrap the user's own functions with \`@workflow\` / \`@task\` for nested spans.
@@ -156,19 +156,23 @@ If a Priority 1 framework is found, use its instrumentation. Do NOT also add Pri
 
 **Priority 2 — Direct LLM SDKs** (only if no P1 framework covers this provider):
 
-These are **auto-instrumented** — just \`Respan()\` / \`new Respan()\`, no extra packages needed:
+The integrations listed for each language are **auto-instrumented** with \`Respan()\` / \`new Respan()\`. The application still provides the provider SDK; the matching first-party instrumentation adapter is bundled by the Respan facade. A dash means that language currently requires an explicit instrumentation package and instrumentor.
 
-| Library | Python package | JS/TS package | Docs |
-|---------|---------------|---------------|------|
+| Library | Python SDK (auto) | JS/TS SDK (auto) | Docs |
+|---------|-------------------|------------------|------|
 | OpenAI SDK | \`openai\` | \`openai\` | [docs](https://respan.ai/docs/integrations/openai-sdk.md) |
 | Anthropic SDK | \`anthropic\` | \`@anthropic-ai/sdk\` | [docs](https://respan.ai/docs/integrations/anthropic.md) |
-| Azure OpenAI | \`openai\` (azure config) | \`openai\` | [docs](https://respan.ai/docs/integrations/providers/azure.md) |
-| Google Vertex AI | \`google-cloud-aiplatform\` | — | [docs](https://respan.ai/docs/integrations/vertex-ai.md) |
-| AWS Bedrock | \`boto3\` | — | [docs](https://respan.ai/docs/integrations/aws-bedrock.md) |
-| Cohere | \`cohere\` | — | [docs](https://respan.ai/docs/integrations/providers/cohere.md) |
-| Together AI | \`together\` | — | [docs](https://respan.ai/docs/integrations/together-ai.md) |
+| Azure OpenAI | \`openai\` (Azure config) | \`openai\` (Azure client) | [docs](https://respan.ai/docs/integrations/providers/azure.md) |
+| Google Vertex AI | \`google-cloud-aiplatform\` | \`@google-cloud/vertexai\` | [docs](https://respan.ai/docs/integrations/vertex-ai.md) |
+| Google GenAI | \`google-genai\` | — | [docs](https://respan.ai/docs/integrations/google-genai.md) |
+| AWS Bedrock | \`boto3\` | \`@aws-sdk/client-bedrock-runtime\` | [docs](https://respan.ai/docs/integrations/aws-bedrock.md) |
+| Cohere | — | \`cohere-ai\` | [docs](https://respan.ai/docs/integrations/providers/cohere.md) |
+| Together AI | \`together\` | \`together-ai\` | [docs](https://respan.ai/docs/integrations/together-ai.md) |
+| OpenRouter | — | \`@openrouter/sdk\` | [docs](https://respan.ai/docs/integrations/providers/openrouter.md) |
+| Writer | — | \`writer-sdk\` | [docs](https://respan.ai/docs/integrations/writer.md) |
+| Ollama | \`ollama\` | — | [docs](https://respan.ai/docs/integrations/ollama.md) |
 
-**Note:** LiteLLM in JS uses the OpenAI-compatible API, so the OpenAI auto-instrument covers it. For Python LiteLLM, see [LiteLLM guide](https://respan.ai/docs/integrations/litellm.md). For Google GenAI (\`@google/genai\`), see [Google GenAI guide](https://respan.ai/docs/integrations/google-genai.md).
+**Note:** LLM wrappers such as Python LiteLLM stay explicit-only to avoid overlapping provider spans. See the [LiteLLM guide](https://respan.ai/docs/integrations/litellm.md) for its explicit setup.
 
 **1c. Read the actual code and understand the workflow:**
 
