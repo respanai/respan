@@ -4234,7 +4234,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@opentelemetry/otlp-transformer@npm:0.205.0":
+"@opentelemetry/otlp-transformer@npm:0.205.0, @opentelemetry/otlp-transformer@npm:^0.205.0":
   version: 0.205.0
   resolution: "@opentelemetry/otlp-transformer@npm:0.205.0"
   dependencies:
@@ -9863,17 +9863,10 @@ __metadata:
   languageName: node
   linkType: hard
 
-"hono@npm:^4.11.4":
-  version: 4.12.9
-  resolution: "hono@npm:4.12.9"
-  checksum: 10c0/393256552642f681e52935163508d9605e5552e186d9b99ff2caf219d4248341b83e3eb975c40a97149c86890d19d73421efc889aa465a28eb5920ccc42cff34
-  languageName: node
-  linkType: hard
-
-"hono@npm:^4.8.3":
-  version: 4.12.30
-  resolution: "hono@npm:4.12.30"
-  checksum: 10c0/3262ba275e44dc9515032e15aa6a88e8915bc65f5a4b9a1bc538f3ac2bdd19aa2235e6e2fdd6af3b0e5551c162856c3dccd4f353e721c43fe81e5f3268573dde
+"hono@npm:4.13.3":
+  version: 4.13.3
+  resolution: "hono@npm:4.13.3"
+  checksum: 10c0/51ab0e8f2f769e806c7e2d6d0e1577643fa35e442250ffe4cc69cffa4a276aad5d2db4edc15ab2210ae0ef478638e44937d8b3e2eded313a05793bc219239c4b
   languageName: node
   linkType: hard
 
