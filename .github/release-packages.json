@@ -629,6 +629,12 @@
       "name": "respan-instrumentation-restate",
       "path": "python-sdks/instrumentations/respan-instrumentation-restate",
       "registry": "pypi"
+    },
+    {
+      "ecosystem": "javascript",
+      "name": "@respan/instrumentation-helicone",
+      "path": "javascript-sdks/instrumentations/respan-instrumentation-helicone",
+      "registry": "npm"
     }
   ]
 }
