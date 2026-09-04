@@ -1,0 +1,8 @@
+{
+  "summary": "Add Python Exa instrumentation with canonical metadata propagation and require the first compatible tracing release",
+  "packages": {
+    "respan-ai": "none",
+    "respan-instrumentation-exa": "new",
+    "respan-tracing": "minor"
+  }
+}
