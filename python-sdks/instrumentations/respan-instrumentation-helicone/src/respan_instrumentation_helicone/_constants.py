@@ -1,0 +1,22 @@
+"""Helicone SDK-specific constants owned by this translator."""
+
+HELICONE_INSTRUMENTATION_NAME = "helicone"
+HELICONE_HELPERS_MODULE = "helicone_helpers"
+HELICONE_MANUAL_LOGGER_CLASS = "HeliconeManualLogger"
+HELICONE_LOG_BUILDER_CLASS = "HeliconeLogBuilder"
+HELICONE_BUILDER_CONTEXT_ATTR = "_respan_helicone_emission_context"
+
+HELICONE_TYPE_KEY = "_type"
+HELICONE_TYPE_TOOL = "tool"
+HELICONE_TYPE_VECTOR_DB = "vector_db"
+HELICONE_TYPE_DATA = "data"
+HELICONE_TYPE_EMBEDDING = "embedding"
+
+HELICONE_TOOL_NAME_KEY = "toolName"
+HELICONE_OPERATION_KEY = "operation"
+HELICONE_DATA_NAME_KEY = "name"
+
+MAX_ATTRIBUTE_BYTES = 32_000
+MAX_TEXT_BYTES = 12_000
+MAX_COLLECTION_ITEMS = 128
+MAX_DEPTH = 8
