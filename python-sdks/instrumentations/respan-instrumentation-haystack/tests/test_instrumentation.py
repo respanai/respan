@@ -2,13 +2,12 @@ import json
 import logging
 import sys
 from types import ModuleType, SimpleNamespace
+from typing import ClassVar
 
 import pytest
-
 from opentelemetry.attributes import BoundedAttributes
 from opentelemetry.semconv_ai import SpanAttributes
-from respan_instrumentation_haystack import HaystackInstrumentor
-from respan_instrumentation_haystack import _instrumentation
+from respan_instrumentation_haystack import HaystackInstrumentor, _instrumentation
 from respan_instrumentation_haystack._constants import (
     HAYSTACK_ASYNC_PIPELINE_CLASS_NAME,
     HAYSTACK_ASYNC_PIPELINE_MODULE,
@@ -23,6 +22,7 @@ from respan_instrumentation_haystack._constants import (
     HAYSTACK_PIPELINE_RUN_METHOD_SPAN_NAME,
     HAYSTACK_PIPELINE_RUN_SPAN_NAME,
     OPENINFERENCE_HAYSTACK_MODULE,
+    OPENINFERENCE_HAYSTACK_WRAPPERS_MODULE,
 )
 from respan_instrumentation_haystack._instrumentation import (
     _HaystackParentSpanProcessor,
@@ -39,7 +39,7 @@ def _install_fake_modules(monkeypatch):
         pass
 
     class FakeOpenInferenceInstrumentor:
-        created = []
+        created: ClassVar[list[object]] = []
 
         def __init__(self, instrumentor_class, **kwargs):
             self.instrumentor_class = instrumentor_class
@@ -131,9 +131,9 @@ def test_patch_main_component_wrapping_falls_back_to_registered_class(monkeypatc
 
     calls = []
 
-    def fake_wrap_function_wrapper(module, name, wrapper):
-        calls.append((module, name, wrapper))
-        if module == "__main__":
+    def fake_wrap_function_wrapper(target, name, wrapper):
+        calls.append((target, name, wrapper))
+        if target == "__main__":
             raise AttributeError("module '__main__' has no attribute")
         return "wrapped"
 
@@ -166,6 +166,74 @@ def test_patch_main_component_wrapping_falls_back_to_registered_class(monkeypatc
         ("__main__", "FakeMainComponent.run", "wrapper"),
         (FakeMainComponent, "run", "wrapper"),
     ]
+
+
+def test_patch_late_component_registration_wraps_direct_components(monkeypatch):
+    class FakeComponentDecorator:
+        def _component(self, component_class):
+            return component_class
+
+    class FakeSyncWrapper:
+        def __init__(self, tracer):
+            self.tracer = tracer
+
+    class FakeAsyncWrapper:
+        def __init__(self, tracer):
+            self.tracer = tracer
+
+    component_decorator = FakeComponentDecorator()
+    component_module = ModuleType(HAYSTACK_COMPONENT_MODULE)
+    component_module.component = component_decorator
+    wrapped_methods = []
+
+    def fake_wrap_function_wrapper(target, name, wrapper):
+        wrapped_methods.append((target, name, wrapper))
+
+    haystack_module = ModuleType(OPENINFERENCE_HAYSTACK_MODULE)
+    haystack_module.wrap_function_wrapper = fake_wrap_function_wrapper
+    wrappers_module = ModuleType(OPENINFERENCE_HAYSTACK_WRAPPERS_MODULE)
+    wrappers_module._ComponentRunWrapper = FakeSyncWrapper
+    wrappers_module._AsyncComponentRunWrapper = FakeAsyncWrapper
+    monkeypatch.setitem(sys.modules, HAYSTACK_COMPONENT_MODULE, component_module)
+    monkeypatch.setitem(sys.modules, OPENINFERENCE_HAYSTACK_MODULE, haystack_module)
+    monkeypatch.setitem(
+        sys.modules,
+        OPENINFERENCE_HAYSTACK_WRAPPERS_MODULE,
+        wrappers_module,
+    )
+
+    tracer = object()
+    openinference_instrumentor = SimpleNamespace(
+        _tracer=tracer,
+        _original_component_run_methods={},
+        _original_component_run_async_methods={},
+    )
+    delegate = SimpleNamespace(_instrumentor=openinference_instrumentor)
+    original_component = component_decorator._component
+
+    patch = _instrumentation._patch_late_component_registration(delegate)
+
+    class LateComponent:
+        def run(self):
+            return {"sync": True}
+
+        async def run_async(self):
+            return {"async": True}
+
+    registered = component_decorator._component(LateComponent)
+
+    assert registered is LateComponent
+    assert openinference_instrumentor._original_component_run_methods[registered]
+    assert openinference_instrumentor._original_component_run_async_methods[registered]
+    assert [(target, name) for target, name, _ in wrapped_methods] == [
+        (LateComponent, "run"),
+        (LateComponent, "run_async"),
+    ]
+    assert all(wrapper.tracer is tracer for _, _, wrapper in wrapped_methods)
+
+    _instrumentation._restore_late_component_registration(patch)
+
+    assert component_decorator._component == original_component
 
 
 class _FakeSpanContext:
@@ -676,6 +744,7 @@ def test_activate_uses_openinference_haystack(monkeypatch):
     assert delegate.kwargs == {}
     assert delegate.is_activated is True
     assert instrumentor._is_instrumented is True
+    assert instrumentor.is_instrumented is True
 
     instrumentor.deactivate()
 
@@ -707,8 +776,8 @@ def test_reactivate_does_not_duplicate_pipeline_context_wrappers(monkeypatch):
 
     wrapped_methods = []
 
-    def fake_wrap_function_wrapper(*, module, name, wrapper):
-        wrapped_methods.append((module, name, wrapper))
+    def fake_wrap_function_wrapper(target, name, wrapper):
+        wrapped_methods.append((target, name, wrapper))
 
     openinference_haystack_module = sys.modules[OPENINFERENCE_HAYSTACK_MODULE]
     openinference_haystack_module.wrap_function_wrapper = fake_wrap_function_wrapper

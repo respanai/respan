@@ -6,6 +6,12 @@ import json
 from collections import defaultdict
 from typing import Any
 
+from openinference.semconv.trace import (
+    MessageAttributes as OIMessageAttributes,
+)
+from openinference.semconv.trace import (
+    SpanAttributes as OISpanAttributes,
+)
 from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor
 from opentelemetry.semconv_ai import SpanAttributes as TLSpanAttributes
 
@@ -14,6 +20,7 @@ GEN_AI_PROMPT_PREFIX = f"{TLSpanAttributes.LLM_PROMPTS}."
 GEN_AI_COMPLETION_PREFIX = f"{TLSpanAttributes.LLM_COMPLETIONS}."
 GEN_AI_TOOL_CALLS_SUFFIX = ".tool_calls"
 GEN_AI_TOOL_CALLS_INDEX_FRAGMENT = ".tool_calls."
+OI_INPUT_MESSAGES_PREFIX = f"{OISpanAttributes.LLM_INPUT_MESSAGES}."
 
 _OFF_CONTRACT_ALIAS_ATTRIBUTES = frozenset(
     {
@@ -81,10 +88,9 @@ def _is_gen_ai_message_tool_call_key(key: str) -> bool:
 
 
 def _is_gen_ai_message_tool_call_aggregate_key(key: str) -> bool:
-    return (
-        key.startswith((GEN_AI_PROMPT_PREFIX, GEN_AI_COMPLETION_PREFIX))
-        and key.endswith(GEN_AI_TOOL_CALLS_SUFFIX)
-    )
+    return key.startswith(
+        (GEN_AI_PROMPT_PREFIX, GEN_AI_COMPLETION_PREFIX)
+    ) and key.endswith(GEN_AI_TOOL_CALLS_SUFFIX)
 
 
 def _structured_tool_calls(value: Any) -> Any:
@@ -143,22 +149,45 @@ def _normalize_gen_ai_tool_calls(attrs: Any) -> None:
 
     for aggregate_key, tool_calls_by_index in indexed_calls.items():
         if aggregate_key not in attrs:
-            attrs[aggregate_key] = [
-                tool_calls_by_index[index] for index in sorted(tool_calls_by_index)
-            ]
+            attrs[aggregate_key] = json.dumps(
+                [tool_calls_by_index[index] for index in sorted(tool_calls_by_index)],
+                default=str,
+                separators=(",", ":"),
+            )
 
     for key in tuple(attrs):
         if _is_gen_ai_message_tool_call_aggregate_key(key):
-            attrs[key] = _structured_tool_calls(attrs[key])
+            structured_tool_calls = _structured_tool_calls(attrs[key])
             message_key = key[: -len(GEN_AI_TOOL_CALLS_SUFFIX)]
             content_key = f"{message_key}.content"
             if attrs.get(content_key) in {None, ""}:
-                attrs[content_key] = _tool_calls_content(attrs[key]) or ""
+                attrs[content_key] = _tool_calls_content(structured_tool_calls) or ""
             role_key = f"{message_key}.role"
             if attrs.get(role_key) is None:
                 attrs[role_key] = "assistant"
+            attrs[key] = json.dumps(
+                structured_tool_calls,
+                default=str,
+                separators=(",", ":"),
+            )
         elif _is_gen_ai_message_tool_call_key(key):
             _drop_attribute(attrs, key)
+
+
+def _promote_tool_result_identity(attrs: Any) -> None:
+    """Retain OI tool-result identity before the shared translator strips it."""
+    for key, value in tuple(attrs.items()):
+        if not key.startswith(OI_INPUT_MESSAGES_PREFIX):
+            continue
+        suffix = key[len(OI_INPUT_MESSAGES_PREFIX) :]
+        index, separator, message_field = suffix.partition(".")
+        if separator != "." or not index.isdigit():
+            continue
+        target = f"{GEN_AI_PROMPT_PREFIX}{index}"
+        if message_field == OIMessageAttributes.MESSAGE_TOOL_CALL_ID:
+            attrs.setdefault(f"{target}.tool_call_id", value)
+        elif message_field == OIMessageAttributes.MESSAGE_NAME:
+            attrs.setdefault(f"{target}.name", value)
 
 
 def _is_groq_span(span: ReadableSpan, attrs: Any) -> bool:
@@ -187,3 +216,18 @@ class GroqSpanProcessor(SpanProcessor):
         for key in tuple(attrs):
             if key in _OFF_CONTRACT_ALIAS_ATTRIBUTES or _is_groq_omit(attrs[key]):
                 _drop_attribute(attrs, key)
+
+
+class GroqInputSpanProcessor(SpanProcessor):
+    """Promote Groq-only message fields before OpenInference translation."""
+
+    def on_start(self, span, parent_context=None) -> None:
+        return None
+
+    def on_end(self, span: ReadableSpan) -> None:
+        original_attrs = getattr(span, "_attributes", None)
+        if original_attrs is None or not _is_groq_span(span, original_attrs):
+            return
+        attrs = dict(original_attrs)
+        _promote_tool_result_identity(attrs)
+        span._attributes = attrs

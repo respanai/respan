@@ -8,8 +8,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from opentelemetry import trace
-from opentelemetry.semconv_ai import SpanAttributes
 from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor
+from opentelemetry.semconv_ai import SpanAttributes
+from respan_instrumentation_openinference import OpenInferenceInstrumentor
+from respan_sdk.utils.data_processing.id_processing import format_span_id
+from respan_tracing.core.tracer import RespanTracer
+
 from respan_instrumentation_haystack._constants import (
     HAYSTACK_ASYNC_PIPELINE_CLASS_NAME,
     HAYSTACK_ASYNC_PIPELINE_MODULE,
@@ -28,16 +32,14 @@ from respan_instrumentation_haystack._constants import (
     HAYSTACK_RUN_COMPONENT_ASYNC_METHOD_NAME,
     HAYSTACK_RUN_COMPONENT_METHOD_NAME,
     HAYSTACK_RUN_METHOD_NAME,
-    OPENINFERENCE_HAYSTACK_MODULE,
     OPENINFERENCE_HAYSTACK_INSTRUMENTOR_CLASS_NAME,
+    OPENINFERENCE_HAYSTACK_MODULE,
+    OPENINFERENCE_HAYSTACK_WRAPPERS_MODULE,
     OPENINFERENCE_TRANSLATOR_CLASS_NAME,
     RESPAN_HAYSTACK_COMPONENT_CONTEXT_VAR_NAME,
     RESPAN_HAYSTACK_MAIN_COMPONENT_PATCH_FLAG,
     RESPAN_HAYSTACK_PIPELINE_CONTEXT_VAR_NAME,
 )
-from respan_sdk.utils.data_processing.id_processing import format_span_id
-from respan_instrumentation_openinference import OpenInferenceInstrumentor
-from respan_tracing.core.tracer import RespanTracer
 
 logger = logging.getLogger(__name__)
 
@@ -131,11 +133,7 @@ def _patch_main_component_wrapping() -> None:
 
     def compatible_wrap_function_wrapper(module: Any, name: str, wrapper: Any) -> Any:
         try:
-            return original_wrap_function_wrapper(
-                module=module,
-                name=name,
-                wrapper=wrapper,
-            )
+            return original_wrap_function_wrapper(module, name, wrapper)
         except AttributeError:
             if not isinstance(module, str):
                 raise
@@ -148,14 +146,84 @@ def _patch_main_component_wrapping() -> None:
                 raise
 
             _, _, method_name = name.partition(".")
-            return original_wrap_function_wrapper(
-                module=component_class,
-                name=method_name,
-                wrapper=wrapper,
-            )
+            return original_wrap_function_wrapper(component_class, method_name, wrapper)
 
     haystack_module.wrap_function_wrapper = compatible_wrap_function_wrapper
     setattr(haystack_module, RESPAN_HAYSTACK_MAIN_COMPONENT_PATCH_FLAG, True)
+
+
+def _patch_late_component_registration(delegate: Any) -> tuple[Any, Any, Any] | None:
+    """Wrap components imported after OpenInference activation.
+
+    OpenInference wraps the component registry only once during activation.
+    Haystack applications commonly initialize tracing before importing their
+    components, so later direct ``component.run()`` calls otherwise disappear.
+    """
+    openinference_instrumentor = getattr(delegate, "_instrumentor", None)
+    tracer = getattr(openinference_instrumentor, "_tracer", None)
+    sync_originals = getattr(
+        openinference_instrumentor,
+        "_original_component_run_methods",
+        None,
+    )
+    async_originals = getattr(
+        openinference_instrumentor,
+        "_original_component_run_async_methods",
+        None,
+    )
+    if (
+        tracer is None
+        or not isinstance(sync_originals, dict)
+        or not isinstance(async_originals, dict)
+    ):
+        return None
+
+    component_module = importlib.import_module(HAYSTACK_COMPONENT_MODULE)
+    haystack_module = importlib.import_module(OPENINFERENCE_HAYSTACK_MODULE)
+    wrappers_module = importlib.import_module(OPENINFERENCE_HAYSTACK_WRAPPERS_MODULE)
+    component_decorator = getattr(
+        component_module,
+        HAYSTACK_COMPONENT_DECORATOR_ATTRIBUTE,
+    )
+    original_component = component_decorator._component
+    wrap_function_wrapper = haystack_module.wrap_function_wrapper
+
+    def wrap_registered_component(component_class: type[Any]) -> None:
+        run_method = getattr(component_class, "run", None)
+        if callable(run_method) and component_class not in sync_originals:
+            sync_originals[component_class] = run_method
+            wrap_function_wrapper(
+                component_class,
+                "run",
+                wrappers_module._ComponentRunWrapper(tracer=tracer),
+            )
+
+        run_async_method = getattr(component_class, "run_async", None)
+        if callable(run_async_method) and component_class not in async_originals:
+            async_originals[component_class] = run_async_method
+            wrap_function_wrapper(
+                component_class,
+                "run_async",
+                wrappers_module._AsyncComponentRunWrapper(tracer=tracer),
+            )
+
+    def component_with_late_wrapping(component_class: type[Any]) -> type[Any]:
+        registered_component = original_component(component_class)
+        wrap_registered_component(registered_component)
+        return registered_component
+
+    component_decorator._component = component_with_late_wrapping
+    return component_decorator, original_component, component_with_late_wrapping
+
+
+def _restore_late_component_registration(
+    patch: tuple[Any, Any, Any] | None,
+) -> None:
+    if patch is None:
+        return
+    component_decorator, original_component, patched_component = patch
+    if getattr(component_decorator, "_component", None) is patched_component:
+        component_decorator._component = original_component
 
 
 def _patch_pipeline_context_wrapping() -> None:
@@ -182,34 +250,34 @@ def _patch_pipeline_context_wrapping() -> None:
     pipeline_class = getattr(pipeline_module, HAYSTACK_PIPELINE_CLASS_NAME)
 
     wrap_function_wrapper(
-        module=pipeline_class,
-        name=HAYSTACK_RUN_METHOD_NAME,
-        wrapper=_pipeline_run_context_wrapper,
+        pipeline_class,
+        HAYSTACK_RUN_METHOD_NAME,
+        _pipeline_run_context_wrapper,
     )
     wrap_function_wrapper(
-        module=async_pipeline_class,
-        name=HAYSTACK_RUN_METHOD_NAME,
-        wrapper=_pipeline_run_context_wrapper,
+        async_pipeline_class,
+        HAYSTACK_RUN_METHOD_NAME,
+        _pipeline_run_context_wrapper,
     )
     wrap_function_wrapper(
-        module=async_pipeline_class,
-        name=HAYSTACK_RUN_ASYNC_METHOD_NAME,
-        wrapper=_async_pipeline_run_context_wrapper,
+        async_pipeline_class,
+        HAYSTACK_RUN_ASYNC_METHOD_NAME,
+        _async_pipeline_run_context_wrapper,
     )
     wrap_function_wrapper(
-        module=async_pipeline_class,
-        name=HAYSTACK_RUN_ASYNC_GENERATOR_METHOD_NAME,
-        wrapper=_async_pipeline_run_async_generator_context_wrapper,
+        async_pipeline_class,
+        HAYSTACK_RUN_ASYNC_GENERATOR_METHOD_NAME,
+        _async_pipeline_run_async_generator_context_wrapper,
     )
     wrap_function_wrapper(
-        module=pipeline_class,
-        name=HAYSTACK_RUN_COMPONENT_METHOD_NAME,
-        wrapper=_component_run_context_wrapper,
+        pipeline_class,
+        HAYSTACK_RUN_COMPONENT_METHOD_NAME,
+        _component_run_context_wrapper,
     )
     wrap_function_wrapper(
-        module=async_pipeline_class,
-        name=HAYSTACK_RUN_COMPONENT_ASYNC_METHOD_NAME,
-        wrapper=_async_component_run_context_wrapper,
+        async_pipeline_class,
+        HAYSTACK_RUN_COMPONENT_ASYNC_METHOD_NAME,
+        _async_component_run_context_wrapper,
     )
     _PIPELINE_CONTEXT_PATCH_APPLIED = True
 
@@ -382,7 +450,9 @@ def _message_content(value: Any) -> str:
     return str(value)
 
 
-def _normalize_haystack_message(value: Any, *, fallback_role: str) -> dict[str, Any] | None:
+def _normalize_haystack_message(
+    value: Any, *, fallback_role: str
+) -> dict[str, Any] | None:
     if isinstance(value, str):
         return {"role": fallback_role, "content": value}
 
@@ -633,7 +703,7 @@ class _HaystackParentSpanProcessor(SpanProcessor):
 
         try:
             predecessors = tuple(graph.predecessors(component_context.component_name))
-        except Exception:
+        except Exception:  # noqa: BLE001
             return None
 
         candidates: list[tuple[int, str]] = []
@@ -705,12 +775,10 @@ def _register_haystack_parent_processor(
             insert_index = index + 1
             break
 
-    active_span_processor._span_processors = tuple(
-        [
-            *remaining_processors[:insert_index],
-            processor,
-            *remaining_processors[insert_index:],
-        ]
+    active_span_processor._span_processors = (
+        *remaining_processors[:insert_index],
+        processor,
+        *remaining_processors[insert_index:],
     )
 
 
@@ -754,8 +822,14 @@ class HaystackInstrumentor:
     def __init__(self, **instrumentor_kwargs: Any) -> None:
         self._instrumentor_kwargs = instrumentor_kwargs
         self._delegate = None
+        self._late_component_patch = None
         self._parent_processor = _HaystackParentSpanProcessor()
         self._is_instrumented = False
+
+    @property
+    def is_instrumented(self) -> bool:
+        """Whether the upstream instrumentor and Respan processor are active."""
+        return self._is_instrumented
 
     @staticmethod
     def _is_respan_tracing_enabled() -> bool:
@@ -791,11 +865,16 @@ class HaystackInstrumentor:
                 **self._instrumentor_kwargs,
             )
             self._delegate.activate()
+            self._late_component_patch = _patch_late_component_registration(
+                self._delegate
+            )
             _patch_pipeline_context_wrapping()
             _register_haystack_parent_processor(self._parent_processor)
             self._is_instrumented = True
             logger.info("Haystack instrumentation activated")
         except Exception:
+            _restore_late_component_registration(self._late_component_patch)
+            self._late_component_patch = None
             _remove_haystack_parent_processor(self._parent_processor)
             if self._delegate is not None:
                 try:
@@ -812,10 +891,13 @@ class HaystackInstrumentor:
         if self._is_instrumented and self._delegate is not None:
             try:
                 _remove_haystack_parent_processor(self._parent_processor)
+                _restore_late_component_registration(self._late_component_patch)
+                self._late_component_patch = None
                 self._delegate.deactivate()
             except Exception:
                 logger.exception("Failed to deactivate Haystack instrumentation")
         self._parent_processor.shutdown()
         self._delegate = None
+        self._late_component_patch = None
         self._is_instrumented = False
         logger.info("Haystack instrumentation deactivated")

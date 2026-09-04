@@ -1,18 +1,14 @@
 """Guardrails AI instrumentation plugin for Respan."""
 
 import ast
-import functools
 import importlib
 import json
 import logging
-from collections.abc import Callable
 from typing import Any
 
 from opentelemetry import trace
 from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor
 from opentelemetry.semconv_ai import LLMRequestTypeValues, SpanAttributes
-from opentelemetry.trace import Status, StatusCode
-
 from respan_sdk.constants.llm_logging import LOG_TYPE_CHAT, LOG_TYPE_GUARDRAIL
 from respan_sdk.constants.span_attributes import (
     LLM_REQUEST_MODEL,
@@ -22,6 +18,7 @@ from respan_sdk.constants.span_attributes import (
     RESPAN_LOG_TYPE,
 )
 from respan_tracing.core.tracer import RespanTracer
+from respan_tracing.utils.span_factory import read_propagated_attributes
 
 logger = logging.getLogger(__name__)
 
@@ -29,15 +26,10 @@ GUARDRAILS_INSTRUMENTATION_NAME = "guardrails"
 GUARDRAILS_RUNTIME_MODULE = "guardrails"
 GUARDRAILS_GUARD_CLASS = "Guard"
 
-_GUARD_METHODS = ("__call__", "parse", "validate")
-_METHOD_LABELS = {
-    "__call__": "call",
-    "parse": "parse",
-    "validate": "validate",
-}
-_RESPAN_WRAPPED_ATTRIBUTE = "_respan_guardrails_wrapped"
 _GUARDRAILS_SPAN_TYPE = "type"
 _GUARDRAILS_SPAN_TYPE_PREFIX = "guardrails/"
+_GUARDRAILS_GUARD_TYPE = "guardrails/guard"
+_GUARDRAILS_STEP_TYPE = "guardrails/guard/step"
 _GUARDRAILS_LLM_CALL_TYPE = "guardrails/guard/step/call"
 _GUARDRAILS_INPUT_VALUE = "input.value"
 _GUARDRAILS_OUTPUT_VALUE = "output.value"
@@ -55,25 +47,6 @@ _LLM_USAGE_TOTAL_TOKENS = SpanAttributes.LLM_USAGE_TOTAL_TOKENS
 def _load_guardrails_guard_class() -> type:
     guardrails_module = importlib.import_module(GUARDRAILS_RUNTIME_MODULE)
     return getattr(guardrails_module, GUARDRAILS_GUARD_CLASS)
-
-
-def _json_safe(value: Any) -> Any:
-    if value is None or isinstance(value, str | int | float | bool):
-        return value
-    if isinstance(value, dict):
-        return {
-            str(item_key): _json_safe(item_value)
-            for item_key, item_value in value.items()
-        }
-    if isinstance(value, list | tuple | set):
-        return [_json_safe(item) for item in value]
-    if hasattr(value, "model_dump"):
-        return value.model_dump(mode="json")
-    return repr(value)
-
-
-def _json_string(value: Any) -> str:
-    return json.dumps(_json_safe(value), default=repr)
 
 
 def _parse_invocation_parameters(value: Any) -> dict[str, Any]:
@@ -111,7 +84,7 @@ def _translate_guardrails_message_attrs(
         if not key.startswith(source_prefix):
             continue
 
-        suffix = key[len(source_prefix):]
+        suffix = key[len(source_prefix) :]
         parts = suffix.split(".", 2)
         if len(parts) != 3 or not parts[0].isdigit() or parts[1] != "message":
             continue
@@ -133,106 +106,76 @@ def _has_guardrails_llm_attrs(attrs: dict[str, Any]) -> bool:
     if attrs.get(_GUARDRAILS_LLM_TOKEN_COUNT_TOTAL) is not None:
         return True
     return any(
-        key.startswith(_GUARDRAILS_LLM_INPUT_MESSAGES_PREFIX)
-        or key.startswith(_GUARDRAILS_LLM_OUTPUT_MESSAGES_PREFIX)
+        key.startswith(
+            (
+                _GUARDRAILS_LLM_INPUT_MESSAGES_PREFIX,
+                _GUARDRAILS_LLM_OUTPUT_MESSAGES_PREFIX,
+            )
+        )
         for key in attrs
     )
 
 
-def _result_payload(result: Any) -> dict[str, Any]:
-    payload: dict[str, Any] = {"result": repr(result)}
-    for attribute_name in (
-        "validation_passed",
-        "validated_output",
-        "raw_llm_output",
-        "error",
-    ):
-        if hasattr(result, attribute_name):
-            payload[attribute_name] = getattr(result, attribute_name)
-    return payload
-
-
-def _span_input_payload(
-    method_label: str,
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-) -> dict[str, Any]:
-    return {
-        "method": method_label,
-        "args": [_json_safe(argument) for argument in args],
-        "kwargs": {
-            str(argument_name): _json_safe(argument_value)
-            for argument_name, argument_value in kwargs.items()
-        },
-    }
-
-
-def _set_guardrail_span_attributes(
-    span: trace.Span,
-    span_name: str,
-    input_payload: dict[str, Any],
-) -> None:
-    span.set_attribute(RESPAN_LOG_TYPE, LOG_TYPE_GUARDRAIL)
-    span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_NAME, span_name)
-    span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_PATH, "")
-    span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_INPUT, _json_string(input_payload))
-
-
-def _build_guard_method_wrapper(
-    method_name: str,
-    original_method: Callable[..., Any],
-) -> Callable[..., Any]:
-    method_label = _METHOD_LABELS[method_name]
-    span_name = f"guardrails.{method_label}"
-
-    @functools.wraps(original_method)
-    def wrapped_method(guard_instance: Any, *args: Any, **kwargs: Any) -> Any:
-        tracer = trace.get_tracer(__name__)
-        input_payload = _span_input_payload(
-            method_label=method_label,
-            args=args,
-            kwargs=kwargs,
-        )
-
-        with tracer.start_as_current_span(span_name) as span:
-            _set_guardrail_span_attributes(
-                span=span,
-                span_name=span_name,
-                input_payload=input_payload,
-            )
-            try:
-                result = original_method(guard_instance, *args, **kwargs)
-            except Exception as exc:
-                span.record_exception(exc)
-                span.set_status(Status(StatusCode.ERROR, str(exc)))
-                span.set_attribute(
-                    SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
-                    _json_string(
-                        {
-                            "error_type": type(exc).__name__,
-                            "error": str(exc),
-                        }
-                    ),
-                )
-                raise
-
-            span.set_attribute(
-                SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
-                _json_string(_result_payload(result)),
-            )
-            return result
-
-    setattr(wrapped_method, _RESPAN_WRAPPED_ATTRIBUTE, True)
-    return wrapped_method
+def _guardrails_operation_name(guardrails_type: str, span_name: str) -> str:
+    if guardrails_type == _GUARDRAILS_GUARD_TYPE:
+        return "guardrails.guard"
+    if guardrails_type == _GUARDRAILS_STEP_TYPE:
+        return "guardrails.step"
+    if guardrails_type == _GUARDRAILS_LLM_CALL_TYPE:
+        return "guardrails.call"
+    if guardrails_type.endswith("/validator"):
+        return "guardrails.validator"
+    return f"guardrails.{span_name}"
 
 
 class GuardrailsSpanProcessor(SpanProcessor):
     """Normalize Guardrails internal OTEL spans for the Respan backend."""
 
+    def __init__(self) -> None:
+        self._propagated_by_trace: dict[int, dict[str, Any]] = {}
+        self._active_spans_by_trace: dict[int, int] = {}
+
+    @staticmethod
+    def _trace_id(span: Any) -> int | None:
+        get_span_context = getattr(span, "get_span_context", None)
+        if not callable(get_span_context):
+            return None
+        return getattr(get_span_context(), "trace_id", None)
+
     def on_start(self, span: Any, parent_context: Any = None) -> None:
-        pass
+        del parent_context
+        trace_id = self._trace_id(span)
+        if trace_id is not None:
+            self._active_spans_by_trace[trace_id] = (
+                self._active_spans_by_trace.get(trace_id, 0) + 1
+            )
+
+        propagated = read_propagated_attributes()
+        if propagated and trace_id is not None:
+            cached = self._propagated_by_trace.setdefault(trace_id, {})
+            cached.update(propagated)
+        elif trace_id is not None:
+            propagated = self._propagated_by_trace.get(trace_id, {})
+
+        for key, value in propagated.items():
+            attributes = getattr(span, "attributes", None) or {}
+            if attributes.get(key) is None:
+                span.set_attribute(key, value)
 
     def on_end(self, span: ReadableSpan) -> None:
+        trace_id = self._trace_id(span)
+        try:
+            self._normalize_span(span)
+        finally:
+            if trace_id is not None:
+                remaining = self._active_spans_by_trace.get(trace_id, 1) - 1
+                if remaining <= 0:
+                    self._active_spans_by_trace.pop(trace_id, None)
+                    self._propagated_by_trace.pop(trace_id, None)
+                else:
+                    self._active_spans_by_trace[trace_id] = remaining
+
+    def _normalize_span(self, span: ReadableSpan) -> None:
         original_attrs = getattr(span, "_attributes", None)
         if original_attrs is None:
             return
@@ -247,7 +190,7 @@ class GuardrailsSpanProcessor(SpanProcessor):
 
         attrs.setdefault(
             SpanAttributes.TRACELOOP_ENTITY_NAME,
-            f"guardrails.{span.name}",
+            _guardrails_operation_name(guardrails_type, span.name),
         )
         attrs.setdefault(SpanAttributes.TRACELOOP_ENTITY_PATH, "")
 
@@ -259,16 +202,24 @@ class GuardrailsSpanProcessor(SpanProcessor):
         if output_value is not None:
             attrs.setdefault(SpanAttributes.TRACELOOP_ENTITY_OUTPUT, str(output_value))
 
-        if guardrails_type != _GUARDRAILS_LLM_CALL_TYPE or not _has_guardrails_llm_attrs(
-            attrs
+        if (
+            guardrails_type != _GUARDRAILS_LLM_CALL_TYPE
+            or not _has_guardrails_llm_attrs(attrs)
         ):
             attrs.setdefault(RESPAN_LOG_TYPE, LOG_TYPE_GUARDRAIL)
-            attrs.setdefault(SpanAttributes.TRACELOOP_SPAN_KIND, LOG_TYPE_GUARDRAIL)
+            attrs.pop(SpanAttributes.TRACELOOP_SPAN_KIND, None)
+            if guardrails_type == _GUARDRAILS_GUARD_TYPE:
+                token_consumption = _int_value(attrs.get("token_consumption"))
+                if (
+                    not token_consumption
+                    and attrs.get("number_of_llm_calls") is not None
+                ):
+                    attrs["number_of_llm_calls"] = 0
             span._attributes = attrs
             return
 
         attrs[RESPAN_LOG_TYPE] = LOG_TYPE_CHAT
-        attrs.setdefault(SpanAttributes.TRACELOOP_SPAN_KIND, LOG_TYPE_CHAT)
+        attrs.pop(SpanAttributes.TRACELOOP_SPAN_KIND, None)
         attrs.setdefault(LLM_REQUEST_TYPE, LLMRequestTypeValues.CHAT.value)
 
         invocation_parameters = _parse_invocation_parameters(
@@ -314,7 +265,8 @@ class GuardrailsSpanProcessor(SpanProcessor):
         span._attributes = attrs
 
     def shutdown(self) -> None:
-        pass
+        self._propagated_by_trace.clear()
+        self._active_spans_by_trace.clear()
 
     def force_flush(self, timeout_millis: int = 30000) -> bool:
         return True
@@ -323,8 +275,8 @@ class GuardrailsSpanProcessor(SpanProcessor):
 class GuardrailsInstrumentor:
     """Respan instrumentor for Guardrails AI.
 
-    Wraps the stable public ``Guard`` execution methods and emits Respan
-    ``guardrail`` spans into the active OpenTelemetry pipeline.
+    Normalizes Guardrails' native OTEL spans into the Respan contract without
+    adding a duplicate public-method wrapper span.
     """
 
     name = GUARDRAILS_INSTRUMENTATION_NAME
@@ -333,8 +285,11 @@ class GuardrailsInstrumentor:
 
     def __init__(self) -> None:
         self._guard_class: type | None = None
-        self._original_methods: dict[str, Callable[..., Any]] = {}
         self._is_instrumented = False
+
+    @property
+    def is_instrumented(self) -> bool:
+        return self._is_instrumented
 
     @staticmethod
     def _is_respan_tracing_enabled() -> bool:
@@ -342,24 +297,6 @@ class GuardrailsInstrumentor:
         if tracer is None:
             return True
         return bool(getattr(tracer, "is_enabled", True))
-
-    def _instrument_guard_class(self, guard_class: type) -> None:
-        for method_name in _GUARD_METHODS:
-            original_method = getattr(guard_class, method_name, None)
-            if original_method is None:
-                continue
-            if getattr(original_method, _RESPAN_WRAPPED_ATTRIBUTE, False):
-                continue
-
-            self._original_methods[method_name] = original_method
-            setattr(
-                guard_class,
-                method_name,
-                _build_guard_method_wrapper(
-                    method_name=method_name,
-                    original_method=original_method,
-                ),
-            )
 
     @classmethod
     def _register_span_processor(cls) -> None:
@@ -434,20 +371,12 @@ class GuardrailsInstrumentor:
 
         self._guard_class = guard_class
         self._register_span_processor()
-        self._instrument_guard_class(guard_class=guard_class)
         self._is_instrumented = True
         logger.info("Guardrails instrumentation activated")
 
     def deactivate(self) -> None:
         """Restore original Guardrails methods."""
-        if self._guard_class is not None:
-            for method_name, original_method in self._original_methods.items():
-                current_method = getattr(self._guard_class, method_name, None)
-                if getattr(current_method, _RESPAN_WRAPPED_ATTRIBUTE, False):
-                    setattr(self._guard_class, method_name, original_method)
-
         self._guard_class = None
-        self._original_methods.clear()
         self._remove_span_processor()
         self._is_instrumented = False
         logger.info("Guardrails instrumentation deactivated")

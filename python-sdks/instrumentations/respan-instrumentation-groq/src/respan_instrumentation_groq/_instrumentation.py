@@ -5,10 +5,17 @@ import logging
 from typing import Any
 
 from opentelemetry import trace
-
-from respan_instrumentation_groq._processor import GroqSpanProcessor
 from respan_instrumentation_openinference import OpenInferenceInstrumentor
 from respan_tracing.core.tracer import RespanTracer
+
+from respan_instrumentation_groq._processor import (
+    GroqInputSpanProcessor,
+    GroqSpanProcessor,
+)
+from respan_instrumentation_groq._streaming import (
+    patch_openinference_stream_wrappers,
+    restore_openinference_stream_wrappers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +42,9 @@ class GroqInstrumentor:
     def __init__(self, **instrumentor_kwargs: Any) -> None:
         self._instrumentor_kwargs = instrumentor_kwargs
         self._delegate = None
+        self._input_processor: GroqInputSpanProcessor | None = None
         self._processor: GroqSpanProcessor | None = None
+        self._stream_wrapper_patch = None
         self._is_instrumented = False
 
     @staticmethod
@@ -46,7 +55,11 @@ class GroqInstrumentor:
         return bool(getattr(tracer, "is_enabled", True))
 
     @staticmethod
-    def _register_processor(tracer_provider: Any, processor: GroqSpanProcessor) -> None:
+    def _register_processors(
+        tracer_provider: Any,
+        input_processor: GroqInputSpanProcessor,
+        processor: GroqSpanProcessor,
+    ) -> None:
         active_span_processor = getattr(tracer_provider, "_active_span_processor", None)
         processors = (
             getattr(active_span_processor, "_span_processors", None)
@@ -55,28 +68,38 @@ class GroqInstrumentor:
         )
         if active_span_processor is None or processors is None:
             if hasattr(tracer_provider, "add_span_processor"):
+                tracer_provider.add_span_processor(input_processor)
                 tracer_provider.add_span_processor(processor)
             return
 
         remaining_processors = tuple(
             existing_processor
             for existing_processor in processors
-            if existing_processor is not processor
+            if existing_processor not in {input_processor, processor}
         )
         translator = getattr(OpenInferenceInstrumentor, "_translator", None)
 
         processor_chain = list(remaining_processors)
-        insert_index = 0
+        translator_index = None
         if translator is not None:
             for index, existing_processor in enumerate(processor_chain):
                 if existing_processor is translator:
-                    insert_index = index + 1
+                    translator_index = index
                     break
-        processor_chain.insert(insert_index, processor)
+        if translator_index is None:
+            processor_chain.insert(0, input_processor)
+            processor_chain.insert(1, processor)
+        else:
+            processor_chain.insert(translator_index, input_processor)
+            processor_chain.insert(translator_index + 2, processor)
         active_span_processor._span_processors = tuple(processor_chain)
 
     @staticmethod
-    def _unregister_processor(tracer_provider: Any, processor: GroqSpanProcessor) -> None:
+    def _unregister_processors(
+        tracer_provider: Any,
+        input_processor: GroqInputSpanProcessor | None,
+        processor: GroqSpanProcessor | None,
+    ) -> None:
         active_span_processor = getattr(tracer_provider, "_active_span_processor", None)
         processors = (
             getattr(active_span_processor, "_span_processors", None)
@@ -88,7 +111,7 @@ class GroqInstrumentor:
         active_span_processor._span_processors = tuple(
             existing_processor
             for existing_processor in processors
-            if existing_processor is not processor
+            if existing_processor not in {input_processor, processor}
         )
 
     def activate(self) -> None:
@@ -112,13 +135,19 @@ class GroqInstrumentor:
             return
 
         try:
+            self._stream_wrapper_patch = patch_openinference_stream_wrappers()
             self._delegate = OpenInferenceInstrumentor(
                 groq_instrumentor_class,
                 **self._instrumentor_kwargs,
             )
             self._delegate.activate()
+            self._input_processor = GroqInputSpanProcessor()
             self._processor = GroqSpanProcessor()
-            self._register_processor(trace.get_tracer_provider(), self._processor)
+            self._register_processors(
+                trace.get_tracer_provider(),
+                self._input_processor,
+                self._processor,
+            )
             self._is_instrumented = True
             logger.info("Groq instrumentation activated")
         except Exception:
@@ -128,20 +157,30 @@ class GroqInstrumentor:
                 except Exception:
                     logger.exception("Failed to clean up Groq instrumentation")
             self._delegate = None
+            self._input_processor = None
             self._processor = None
+            restore_openinference_stream_wrappers(self._stream_wrapper_patch)
+            self._stream_wrapper_patch = None
             self._is_instrumented = False
             logger.exception("Failed to activate Groq instrumentation")
 
     def deactivate(self) -> None:
         """Deactivate the instrumentation."""
-        if self._processor is not None:
-            self._unregister_processor(trace.get_tracer_provider(), self._processor)
+        if self._input_processor is not None or self._processor is not None:
+            self._unregister_processors(
+                trace.get_tracer_provider(),
+                self._input_processor,
+                self._processor,
+            )
         if self._is_instrumented and self._delegate is not None:
             try:
                 self._delegate.deactivate()
             except Exception:
                 logger.exception("Failed to deactivate Groq instrumentation")
         self._delegate = None
+        self._input_processor = None
         self._processor = None
+        restore_openinference_stream_wrappers(self._stream_wrapper_patch)
+        self._stream_wrapper_patch = None
         self._is_instrumented = False
         logger.info("Groq instrumentation deactivated")
