@@ -4,4 +4,4 @@ from respan_instrumentation_dify._instrumentation import DifyInstrumentor
 
 DifyAIInstrumentor = DifyInstrumentor
 
-__all__ = ["DifyInstrumentor", "DifyAIInstrumentor"]
+__all__ = ["DifyAIInstrumentor", "DifyInstrumentor"]

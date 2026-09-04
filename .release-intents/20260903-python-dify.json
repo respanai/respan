@@ -1,0 +1,7 @@
+{
+  "summary": "Refresh Python Dify instrumentation and align its explicit facade registration",
+  "packages": {
+    "respan-ai": "patch",
+    "respan-instrumentation-dify": "minor"
+  }
+}
