@@ -1,0 +1,8 @@
+{
+  "summary": "Record the manually bootstrapped n8n instrumentation; tracing compatibility was consolidated in 1.6.1 without republishing packages or facade on merge",
+  "packages": {
+    "@respan/instrumentation-n8n": "none",
+    "@respan/tracing": "none",
+    "@respan/respan": "none"
+  }
+}
