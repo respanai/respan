@@ -339,6 +339,18 @@ export const AUTO_INSTRUMENTATION_REGISTRY: AutoInstrumentationEntry[] = [
     autoDisabledReason: TOOLING_DISABLED_REASON,
   },
   {
+    id: "exa",
+    category: "protocol-or-tooling",
+    provider: "exa",
+    sdkPackage: "exa-js",
+    instrumentationPackage: "@respan/instrumentation-exa",
+    instrumentorClass: "ExaInstrumentor",
+    enabledByDefault: false,
+    priority: 30,
+    aliases: ["ExaInstrumentor"],
+    autoDisabledReason: TOOLING_DISABLED_REASON,
+  },
+  {
     id: "superagent",
     category: "protocol-or-tooling",
     sdkPackage: "safety-agent",

@@ -1387,9 +1387,15 @@ test("respan.propagateAttributes() overrides correlation for a run", () => {
       assert.equal(span.attributes["respan.threads.thread_identifier"], "email-chain-7");
       assert.equal(span.attributes["respan.sessions.session_identifier"], "propagated-session");
       assert.equal(span.attributes["respan.customer_params.customer_identifier"], "cust-7");
-      assert.equal(span.attributes["respan.metadata.mailbox"], "billing");
-      // Explicit tracer metadata wins over propagated metadata.
-      assert.equal(span.attributes["respan.metadata.source"], "sdk");
+      // Explicit tracer metadata wins over propagated metadata in the single
+      // canonical metadata object.
+      const metadata = JSON.parse(span.attributes["respan.metadata"]);
+      assert.equal(metadata.mailbox, "billing");
+      assert.equal(metadata.source, "sdk");
+      assert.equal(
+        Object.keys(span.attributes).some((key) => key.startsWith("respan.metadata.")),
+        false,
+      );
       assertCommonContract(span);
     }
 

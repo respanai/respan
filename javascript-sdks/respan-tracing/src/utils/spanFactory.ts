@@ -10,8 +10,9 @@ import { trace, SpanKind, SpanStatusCode } from "@opentelemetry/api";
 import type { ReadableSpan } from "@opentelemetry/sdk-trace-base";
 import { hrTime, hrTimeDuration } from "@opentelemetry/core";
 import { RESPAN_SPAN_ATTRIBUTES_MAP, RespanSpanAttributes } from "@respan/respan-sdk";
-import { RESPAN_PACKAGE_NAME, metadataAttributeKey } from "../constants/index.js";
+import { RESPAN_PACKAGE_NAME } from "../constants/index.js";
 import { getPropagatedAttributes } from "./context.js";
+import { mergeCanonicalMetadataAttributes } from "./metadata.js";
 
 // ── ID helpers ──────────────────────────────────────────────────────────────
 
@@ -105,16 +106,11 @@ export function buildReadableSpan(opts: BuildSpanOptions): ReadableSpan {
         if (value === undefined || value === null) continue;
         const attrKey = RESPAN_SPAN_ATTRIBUTES_MAP[key];
         if (!attrKey) continue;
-        // Only set if not already present (caller attrs take precedence)
-        if (attrs[attrKey] !== undefined) continue;
-
-        if (key === "metadata" && typeof value === "object") {
-          for (const [mk, mv] of Object.entries(value as Record<string, any>)) {
-            const fullKey = metadataAttributeKey(mk);
-            if (attrs[fullKey] === undefined) {
-              attrs[fullKey] = typeof mv === "string" ? mv : JSON.stringify(mv);
-            }
-          }
+        if (key === "metadata") {
+          attrs[attrKey] = mergeCanonicalMetadataAttributes(attrs, value);
+        // Only set non-metadata values when caller attrs do not already exist.
+        } else if (attrs[attrKey] !== undefined) {
+          continue;
         } else if (key === "prompt" && typeof value === "object") {
           attrs[attrKey] = JSON.stringify(value);
         } else {

@@ -80,6 +80,12 @@
     },
     {
       "ecosystem": "javascript",
+      "name": "@respan/instrumentation-exa",
+      "path": "javascript-sdks/instrumentations/respan-instrumentation-exa",
+      "registry": "npm"
+    },
+    {
+      "ecosystem": "javascript",
       "name": "@respan/instrumentation-flue",
       "path": "javascript-sdks/instrumentations/respan-instrumentation-flue",
       "registry": "npm"

@@ -1,7 +1,7 @@
 {
   "name": "@respan/tracing",
   "type": "module",
-  "version": "1.1.6",
+  "version": "1.6.1",
   "description": "TypeScript support for Respan SDK",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -45,6 +45,7 @@
   "devDependencies": {
     "@ai-sdk/openai": "^4.0.30",
     "@anthropic-ai/sdk": "0.41.0",
+    "@opentelemetry/context-async-hooks": "^2.10.0",
     "@vercel/otel": "^2.1.3",
     "ai": "^7.0.65",
     "dotenv": "^16.4.7",
