@@ -166,6 +166,8 @@ def _install_fake_claude_agent_sdk_modules(
         "opentelemetry.instrumentation.claude_agent_sdk._constants"
     )
     constants_module.GEN_AI_OUTPUT_MESSAGES = output_messages_attr
+    constants_module.ERROR_TYPE = "error.type"
+    constants_module.GEN_AI_TOOL_CALL_RESULT = "gen_ai.tool.call.result"
     constants_module.GEN_AI_USAGE_INPUT_TOKENS = usage_input_tokens_attr
     constants_module.GEN_AI_USAGE_OUTPUT_TOKENS = usage_output_tokens_attr
     constants_module.GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS = (
@@ -201,6 +203,9 @@ def _install_fake_claude_agent_sdk_modules(
     instrumentor_module.ClaudeAgentSdkInstrumentor = FakeClaudeAgentSdkInstrumentor
     instrumentor_module.set_response_content = _original_set_response_content
     instrumentor_module.set_result_attributes = _original_set_result_attributes
+
+    hooks_module = ModuleType("opentelemetry.instrumentation.claude_agent_sdk._hooks")
+    hooks_module.set_tool_error_attributes = lambda span, error: None
 
     claude_sdk_module = ModuleType("claude_agent_sdk")
     claude_sdk_module.__path__ = []
@@ -260,6 +265,11 @@ def _install_fake_claude_agent_sdk_modules(
         sys.modules,
         "opentelemetry.instrumentation.claude_agent_sdk._instrumentor",
         instrumentor_module,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "opentelemetry.instrumentation.claude_agent_sdk._hooks",
+        hooks_module,
     )
     monkeypatch.setitem(sys.modules, "claude_agent_sdk", claude_sdk_module)
     monkeypatch.setitem(sys.modules, "claude_agent_sdk._internal", internal_module)
@@ -1054,7 +1064,10 @@ def test_span_processor_on_end_merges_pending_tool_calls_into_parent_agent_span(
     processor.on_end(tool_span)
     processor.on_end(agent_span)
 
-    assert not any(key.startswith("gen_ai.tool.") for key in tool_span._attributes)
+    assert tool_span._attributes["gen_ai.tool.call.id"] == "toolu_123"
+    assert {
+        key for key in tool_span._attributes if key.startswith("gen_ai.tool.")
+    } == {"gen_ai.tool.call.id"}
     assert json.loads(agent_span._attributes[_COMPLETION_TOOL_CALLS_ATTR]) == [
         {
             "id": "toolu_123",

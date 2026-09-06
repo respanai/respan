@@ -1,0 +1,6 @@
+{
+  "summary": "Preserve Claude Agent SDK tool correlation and failure results, reconcile terminal tool outcomes, and make repeated instrumentation safe",
+  "packages": {
+    "respan-instrumentation-claude-agent-sdk": "patch"
+  }
+}

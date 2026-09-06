@@ -470,10 +470,28 @@ def _build_tool_call_from_tool_span_attrs(
     }
 
 
+def _normalized_tool_arguments(arguments: Any) -> str:
+    """Compare structured arguments without depending on JSON formatting."""
+    if isinstance(arguments, str):
+        try:
+            parsed_arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            # Match the Python-literal compatibility supported by _json_string.
+            parsed_arguments = _safe_json_loads(arguments)
+            if parsed_arguments is None:
+                return f"raw:{arguments}"
+    else:
+        parsed_arguments = arguments
+    return "json:" + json.dumps(
+        serialize_value(parsed_arguments), sort_keys=True, separators=(",", ":"),
+        default=str,
+    )
+
+
 def _tool_call_signature(tool_call: Mapping[str, Any]) -> tuple[str, str, str]:
     function_payload = tool_call.get("function")
     if not isinstance(function_payload, Mapping):
-        return ("", "", "")
+        function_payload = {}
 
     tool_call_id = tool_call.get("id")
     tool_name = function_payload.get("name")
@@ -481,7 +499,7 @@ def _tool_call_signature(tool_call: Mapping[str, Any]) -> tuple[str, str, str]:
     return (
         str(tool_call_id or ""),
         str(tool_name or ""),
-        str(tool_arguments or ""),
+        _normalized_tool_arguments(tool_arguments),
     )
 
 
@@ -489,7 +507,8 @@ def _merge_tool_calls(
     *tool_call_lists: list[dict[str, Any]] | None,
 ) -> list[dict[str, Any]] | None:
     merged_tool_calls = []
-    seen_signatures = set()
+    calls_by_id: dict[str, dict[str, Any]] = {}
+    anonymous_signatures: set[tuple[str, str, str]] = set()
 
     for tool_call_list in tool_call_lists:
         if not isinstance(tool_call_list, list):
@@ -498,12 +517,60 @@ def _merge_tool_calls(
             if not isinstance(tool_call, Mapping):
                 continue
             signature = _tool_call_signature(tool_call)
-            if signature in seen_signatures:
-                continue
-            seen_signatures.add(signature)
-            merged_tool_calls.append(dict(tool_call))
+            tool_call_id = signature[0]
+            if tool_call_id:
+                existing_call = calls_by_id.get(tool_call_id)
+                if existing_call is not None:
+                    _merge_tool_call_observation(existing_call, tool_call)
+                    continue
+            else:
+                if signature in anonymous_signatures:
+                    continue
+                anonymous_signatures.add(signature)
+            merged_call = dict(tool_call)
+            if tool_call_id:
+                calls_by_id[tool_call_id] = merged_call
+            merged_tool_calls.append(merged_call)
 
     return merged_tool_calls or None
+
+
+def _merge_tool_call_observation(
+    existing_call: dict[str, Any], incoming_call: Mapping[str, Any],
+) -> None:
+    """Fill absent fields without replacing the first populated observation."""
+    incoming_function = incoming_call.get("function")
+    if not isinstance(incoming_function, Mapping):
+        return
+    existing_function = existing_call.get("function")
+    merged_function = (
+        dict(existing_function) if isinstance(existing_function, Mapping) else {}
+    )
+    conflicting = False
+    for field in ("name", "arguments"):
+        incoming_value = incoming_function.get(field)
+        existing_value = merged_function.get(field)
+        if incoming_value is None or incoming_value == "":
+            continue
+        if existing_value is None or existing_value == "":
+            merged_function[field] = incoming_value
+        elif field == "arguments":
+            conflicting |= (
+                _normalized_tool_arguments(existing_value)
+                != _normalized_tool_arguments(incoming_value)
+            )
+        else:
+            conflicting |= existing_value != incoming_value
+    if conflicting:
+        logger.warning(
+            "Conflicting Claude Agent SDK tool call for invocation ID %s "
+            "(name or arguments differ); keeping the first call",
+            existing_call.get("id"),
+        )
+    else:
+        existing_call["function"] = merged_function
+        if not existing_call.get("type") and incoming_call.get("type"):
+            existing_call["type"] = incoming_call["type"]
 
 
 def _extract_function_name(payload: Mapping[str, Any]) -> str | None:
@@ -667,10 +734,22 @@ def enrich_claude_agent_sdk_span(span: ReadableSpan) -> None:
     if isinstance(session_id, str) and session_id:
         _set_if_missing(attrs, RESPAN_SESSION_ID, session_id)
 
-    if operation_name == _CLAUDE_TOOL_OPERATION_NAME or attrs.get(CLAUDE_AGENT_SDK_TOOL_NAME_ATTR):
+    if (
+        operation_name == _CLAUDE_TOOL_OPERATION_NAME
+        or attrs.get(CLAUDE_AGENT_SDK_TOOL_NAME_ATTR)
+        or attrs.get(RESPAN_LOG_TYPE) == LOG_TYPE_TOOL
+        or span.name.startswith(f"{_CLAUDE_TOOL_OPERATION_NAME} ")
+    ):
         tool_name = _extract_tool_span_name(span, attrs)
-        tool_input = _json_string(attrs.get(CLAUDE_AGENT_SDK_TOOL_CALL_ARGUMENTS_ATTR))
-        tool_output = _json_string(attrs.get(CLAUDE_AGENT_SDK_TOOL_CALL_RESULT_ATTR))
+        # A previous normalizer may already have removed the native attributes.
+        tool_input = attrs.get(CLAUDE_AGENT_SDK_TOOL_CALL_ARGUMENTS_ATTR)
+        if tool_input is None:
+            tool_input = attrs.get(SpanAttributes.TRACELOOP_ENTITY_INPUT)
+        tool_input = _json_string(tool_input)
+        tool_output = attrs.get(CLAUDE_AGENT_SDK_TOOL_CALL_RESULT_ATTR)
+        if tool_output is None:
+            tool_output = attrs.get(SpanAttributes.TRACELOOP_ENTITY_OUTPUT)
+        tool_output = _json_string(tool_output)
 
         attrs[RESPAN_LOG_TYPE] = LOG_TYPE_TOOL
         attrs[SpanAttributes.TRACELOOP_ENTITY_NAME] = tool_name
@@ -704,7 +783,9 @@ def enrich_claude_agent_sdk_span(span: ReadableSpan) -> None:
         input_value, output_value = _extract_input_output(attrs)
         input_messages = _extract_normalized_input_messages(attrs)
         output_messages = _extract_messages(attrs, CLAUDE_AGENT_SDK_OUTPUT_MESSAGES_ATTR)
-        tool_calls = _extract_tool_calls(attrs)
+        tool_calls = _merge_tool_calls(
+            _extract_existing_tool_calls(attrs), _extract_tool_calls(attrs),
+        )
         tools = _reconcile_tools_with_tool_calls(
             tools=_extract_tools(attrs),
             tool_calls=tool_calls,
@@ -764,7 +845,13 @@ def enrich_claude_agent_sdk_span(span: ReadableSpan) -> None:
         key: value
         for key, value in attrs.items()
         if key not in CLAUDE_AGENT_SDK_STRIP_ATTRS
-        and not key.startswith("gen_ai.tool.")
+        and (
+            not key.startswith("gen_ai.tool.")
+            or (
+                key == CLAUDE_AGENT_SDK_TOOL_CALL_ID_ATTR
+                and attrs.get(RESPAN_LOG_TYPE) == LOG_TYPE_TOOL
+            )
+        )
     }
     _set_if_unset_span_status(span, span._attributes)
 
@@ -830,9 +917,6 @@ class ClaudeAgentSDKSpanProcessor(SpanProcessor):
 
     def on_end(self, span: ReadableSpan) -> None:
         try:
-            original_attrs = getattr(span, "_attributes", None)
-            if isinstance(original_attrs, Mapping):
-                original_attrs = dict(original_attrs)
             enrich_claude_agent_sdk_span(span)
 
             attrs = getattr(span, "_attributes", None)
@@ -841,19 +925,9 @@ class ClaudeAgentSDKSpanProcessor(SpanProcessor):
                 return
 
             if attrs.get(RESPAN_LOG_TYPE) == LOG_TYPE_TOOL:
-                # Correlate with the upstream call ID before helper attributes
-                # are stripped, while using the normalized canonical name and
-                # arguments from the exported tool span.
-                pending_attrs = dict(attrs)
-                if isinstance(original_attrs, Mapping):
-                    tool_call_id = original_attrs.get(
-                        CLAUDE_AGENT_SDK_TOOL_CALL_ID_ATTR
-                    )
-                    if tool_call_id:
-                        pending_attrs[CLAUDE_AGENT_SDK_TOOL_CALL_ID_ATTR] = (
-                            tool_call_id
-                        )
-                self._store_pending_tool_call(span, pending_attrs)
+                # The exported tool keeps its invocation ID so the parent call
+                # and the tool's result remain correlated after normalization.
+                self._store_pending_tool_call(span, attrs)
                 # Only agent spans merge queued tool calls into their final attrs.
                 # Drop any child calls queued against non-agent parents on span end.
                 self._consume_pending_tool_calls(span)
