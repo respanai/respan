@@ -1,0 +1,6 @@
+{
+  "summary": "Support Google ADK 1.5 and correct its output token normalization",
+  "packages": {
+    "respan-instrumentation-google-adk": "patch"
+  }
+}
