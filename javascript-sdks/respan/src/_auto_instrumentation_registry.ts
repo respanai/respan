@@ -328,6 +328,18 @@ export const AUTO_INSTRUMENTATION_REGISTRY: AutoInstrumentationEntry[] = [
     autoDisabledReason: FRAMEWORK_DISABLED_REASON,
   },
   {
+    id: "dify",
+    category: "app-framework",
+    provider: "dify",
+    sdkPackage: "dify-client",
+    instrumentationPackage: "@respan/instrumentation-dify",
+    instrumentorClass: "DifyInstrumentor",
+    enabledByDefault: false,
+    priority: 40,
+    aliases: ["DifyInstrumentor"],
+    autoDisabledReason: FRAMEWORK_DISABLED_REASON,
+  },
+  {
     id: "mcp",
     category: "protocol-or-tooling",
     sdkPackage: "@modelcontextprotocol/sdk",

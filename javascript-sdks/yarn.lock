@@ -5105,6 +5105,25 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"@respan/instrumentation-dify@workspace:instrumentations/respan-instrumentation-dify":
+  version: 0.0.0-use.local
+  resolution: "@respan/instrumentation-dify@workspace:instrumentations/respan-instrumentation-dify"
+  dependencies:
+    "@opentelemetry/api": "npm:^1.9.0"
+    "@opentelemetry/core": "npm:^2.10.0"
+    "@opentelemetry/sdk-trace-base": "npm:^2.10.0"
+    "@opentelemetry/semantic-conventions": "npm:^1.43.0"
+    "@respan/respan-sdk": "workspace:^"
+    "@respan/tracing": "workspace:^"
+    "@traceloop/ai-semantic-conventions": "npm:^0.13.0"
+    "@types/node": "npm:^22.15.29"
+    dify-client: "npm:^3.1.0"
+    typescript: "npm:^5.7.3"
+  peerDependencies:
+    dify-client: ">=3.1.0 <4.0.0"
+  languageName: unknown
+  linkType: soft
+
 "@respan/instrumentation-eve@workspace:instrumentations/respan-instrumentation-eve":
   version: 0.0.0-use.local
   resolution: "@respan/instrumentation-eve@workspace:instrumentations/respan-instrumentation-eve"
@@ -8425,6 +8444,13 @@ __metadata:
   version: 9.0.0
   resolution: "diff@npm:9.0.0"
   checksum: 10c0/a971cc88f66071a33bd3942db2f51b57d484e9856265ae45cf44fb28ab2fde91f132d9c26d8be0fb6082d2be94d29e1295c1adb251b7461935d6a2dd304cd161
+  languageName: node
+  linkType: hard
+
+"dify-client@npm:^3.1.0":
+  version: 3.1.0
+  resolution: "dify-client@npm:3.1.0"
+  checksum: 10c0/146dc648eb31324512f9a7e2b3006bfb753132f875ccdc5c3f4e248800209981614cf8d8f5eca27a5221fa29dc281d2514f78874b2b5fba2eef158fa26876987
   languageName: node
   linkType: hard
 

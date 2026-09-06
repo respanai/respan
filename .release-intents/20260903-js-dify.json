@@ -1,0 +1,7 @@
+{
+  "summary": "Record the manually bootstrapped Dify JavaScript instrumentation 0.1.0 release without republishing the package or facade on merge",
+  "packages": {
+    "@respan/instrumentation-dify": "none",
+    "@respan/respan": "none"
+  }
+}
