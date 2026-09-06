@@ -1,0 +1,6 @@
+{
+  "summary": "Support legacy autogen chat, reply, and tool APIs alongside AgentChat",
+  "packages": {
+    "respan-instrumentation-autogen": "minor"
+  }
+}

@@ -165,17 +165,21 @@ def _load_openinference_autogen_agentchat_class() -> type:
 
 
 class AutoGenInstrumentor:
-    """Respan instrumentor for AutoGen AgentChat.
+    """Respan instrumentor for AgentChat or explicit ``api="legacy"`` autogen.
 
     Activates OpenInference's AutoGen AgentChat instrumentor and registers
     Respan's OpenInference translator so AutoGen spans reach the Respan OTLP
     pipeline with the expected ``traceloop.*``, ``gen_ai.*``, and
-    ``respan.*`` fields.
+    ``respan.*`` fields. Legacy mode adapts the upstream AG2 chat, reply and
+    tool wrappers; compose a provider instrumentor for actual LLM spans.
     """
 
     name = AUTOGEN_INSTRUMENTATION_NAME
 
-    def __init__(self, **instrumentor_kwargs: Any) -> None:
+    def __init__(self, *, api: str = "agentchat", **instrumentor_kwargs: Any) -> None:
+        if api not in ("agentchat", "legacy"):
+            raise ValueError("api must be 'agentchat' or 'legacy'")
+        self._api = api
         instrumentor_kwargs.pop(TRACER_PROVIDER_KWARG, None)
         self._instrumentor_kwargs = instrumentor_kwargs
         self._delegate = None
@@ -231,7 +235,7 @@ class AutoGenInstrumentor:
         return bool(getattr(tracer, "is_enabled", True))
 
     def activate(self) -> None:
-        """Instrument AutoGen AgentChat via OpenInference and Respan's translator."""
+        """Activate the selected AutoGen API and Respan's translator."""
         if self._is_instrumented:
             return
 
@@ -239,6 +243,10 @@ class AutoGenInstrumentor:
             logger.info(
                 "AutoGen instrumentation skipped because Respan tracing is disabled"
             )
+            return
+
+        if self._api == "legacy":
+            self._activate_legacy()
             return
 
         try:
@@ -287,6 +295,25 @@ class AutoGenInstrumentor:
             self._delegate = None
             self._is_instrumented = False
             logger.exception("Failed to activate AutoGen instrumentation")
+
+    def _activate_legacy(self) -> None:
+        from respan_instrumentation_autogen._legacy import LegacyAutoGenInstrumentor
+
+        try:
+            self._delegate = OpenInferenceInstrumentor(
+                LegacyAutoGenInstrumentor, **self._instrumentor_kwargs
+            )
+            self._delegate.activate()
+            if not LegacyAutoGenInstrumentor().is_instrumented_by_opentelemetry:
+                raise RuntimeError("Install a supported legacy-pyautogen or legacy-autogen extra")
+            self._is_instrumented = True
+            logger.info("Legacy AutoGen instrumentation activated")
+        except Exception:
+            if self._delegate is not None:
+                self._delegate.deactivate()
+            self._delegate = None
+            self._is_instrumented = False
+            logger.exception("Failed to activate legacy AutoGen instrumentation")
 
     def deactivate(self) -> None:
         """Deactivate the instrumentation."""
