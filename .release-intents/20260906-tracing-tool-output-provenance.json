@@ -1,0 +1,6 @@
+{
+  "summary": "Require assistant or LLM provenance before exporting synthetic Claude Agent chat children and preserve tool result content.",
+  "packages": {
+    "respan-tracing": "patch"
+  }
+}
