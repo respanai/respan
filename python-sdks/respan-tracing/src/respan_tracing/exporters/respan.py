@@ -192,16 +192,69 @@ def _derive_synthetic_span_id(*parts: Any) -> int:
     return span_id
 
 
+def _is_tool_execution_span(span: ReadableSpan) -> bool:
+    """Tool execution identity takes precedence over inherited LLM metadata."""
+    attrs = span.attributes or {}
+    return (
+        attrs.get(RESPAN_LOG_TYPE) in {LOG_TYPE_TOOL, LOG_TYPE_FUNCTION}
+        or attrs.get(SpanAttributes.TRACELOOP_SPAN_KIND) == LOG_TYPE_TOOL
+        or attrs.get(GEN_AI_OPERATION_NAME) == "execute_tool"
+        or bool(attrs.get(GEN_AI_TOOL_NAME))
+        or span.name == "execute_tool"
+        or span.name.startswith("execute_tool ")
+    )
+
+
+def _has_llm_response_metadata(attrs: Mapping[str, Any]) -> bool:
+    """Provider/request type alone do not establish an LLM response."""
+    model = attrs.get(SpanAttributes.LLM_REQUEST_MODEL)
+    if isinstance(model, str) and model.strip():
+        return True
+    if any(
+        (key.startswith("gen_ai.usage.") or key.startswith("llm.usage."))
+        and isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and value >= 0
+        for key, value in attrs.items()
+    ):
+        return True
+    if attrs.get(f"{SpanAttributes.LLM_COMPLETIONS}.0.role") not in {None, "assistant"}:
+        return False
+    return any(
+        isinstance(tool_calls := _parse_structured_json_attr(attrs.get(key)), list)
+        and bool(tool_calls)
+        for key in (_COMPLETION_TOOL_CALLS_ATTR, RESPAN_SPAN_TOOL_CALLS)
+    )
+
+
 def _is_claude_agent_response_span(span: ReadableSpan) -> bool:
     """Return whether this span is a Claude Agent SDK response-turn parent."""
     scope = getattr(span, "instrumentation_scope", None)
     scope_name = getattr(scope, "name", None)
     attrs = span.attributes or {}
+    if scope_name not in _CLAUDE_AGENT_SCOPE_NAMES or _is_tool_execution_span(span):
+        return False
+    assistant_message = _select_primary_completion_from_attrs(attrs, allow_untyped=False)
+    has_assistant_output = assistant_message is not None and (
+        bool(_extract_text_from_message(assistant_message))
+        or bool(assistant_message.get("tool_calls"))
+    )
     return (
-        scope_name in _CLAUDE_AGENT_SCOPE_NAMES
-        and (
+        (
             attrs.get(RESPAN_LOG_TYPE) == LOG_TYPE_AGENT
             or span.name in _CLAUDE_AGENT_RESPONSE_SPAN_NAMES
+        )
+        and (
+            has_assistant_output
+            or (
+                _has_llm_response_metadata(attrs)
+                and (
+                    span.name in _CLAUDE_AGENT_RESPONSE_SPAN_NAMES
+                    or attrs.get(GEN_AI_OPERATION_NAME) == "invoke_agent"
+                    or span.name == "invoke_agent"
+                    or span.name.startswith("invoke_agent ")
+                )
+            )
         )
     )
 
@@ -214,31 +267,35 @@ def _build_claude_agent_final_chat_span(
         return None
 
     attrs = span.attributes or {}
-    tool_calls = _parse_structured_json_attr(attrs.get(_COMPLETION_TOOL_CALLS_ATTR))
-    if not isinstance(tool_calls, list) or not tool_calls:
-        tool_calls = _parse_structured_json_attr(attrs.get(RESPAN_SPAN_TOOL_CALLS))
-
     primary_completion_message = _select_primary_completion_from_attrs(attrs)
-    has_llm_payload = bool(tool_calls) or any(
-        key in attrs
-        for key in (
-            SpanAttributes.LLM_SYSTEM,
-            SpanAttributes.LLM_REQUEST_MODEL,
-            SpanAttributes.LLM_REQUEST_TYPE,
-        )
-    ) or any(
-        key.startswith("gen_ai.usage.") or key.startswith("llm.usage.")
-        for key in attrs
-    )
     if primary_completion_message is None:
-        if not has_llm_payload:
+        # Missing/redacted output may still carry real model or usage data.
+        # Rejected tool/user output must never become an empty assistant child.
+        if (
+            not _has_llm_response_metadata(attrs)
+            or _parse_json_like(attrs.get(SpanAttributes.TRACELOOP_ENTITY_OUTPUT)) is not None
+            or any(key.startswith(_GEN_AI_COMPLETION_PREFIX) for key in attrs)
+        ):
             return None
         primary_completion_message = {"role": "assistant", "content": ""}
+
+    tool_calls = _parse_structured_json_attr(primary_completion_message.get("tool_calls"))
+    if (
+        (not isinstance(tool_calls, list) or not tool_calls)
+        and attrs.get(f"{SpanAttributes.LLM_COMPLETIONS}.0.role") in {None, "assistant"}
+    ):
+        tool_calls = _parse_structured_json_attr(attrs.get(_COMPLETION_TOOL_CALLS_ATTR))
+        if not isinstance(tool_calls, list) or not tool_calls:
+            tool_calls = _parse_structured_json_attr(attrs.get(RESPAN_SPAN_TOOL_CALLS))
 
     completion_text = _extract_text_from_message(primary_completion_message)
     if completion_text is None:
         completion_text = ""
-    if not completion_text and not has_llm_payload:
+    if (
+        not completion_text
+        and not _has_llm_response_metadata(attrs)
+        and not primary_completion_message.get("tool_calls")
+    ):
         return None
 
     span_context = span.get_span_context()
@@ -362,7 +419,13 @@ def _prepare_spans_for_export(spans: Sequence[ReadableSpan]) -> List[ReadableSpa
             if overrides
             else span
         )
-        synthetic_child = _build_claude_agent_final_chat_span(prepared_span)
+        # Enrichment can infer assistant fields from legacy helper attributes;
+        # response provenance must come from the original instrumentation span.
+        synthetic_child = (
+            _build_claude_agent_final_chat_span(prepared_span)
+            if _is_claude_agent_response_span(span)
+            else None
+        )
         if (
             synthetic_child is not None
             and prepared_span.attributes.get(RESPAN_LOG_TYPE) == LOG_TYPE_AGENT
@@ -899,9 +962,13 @@ def _extract_text_from_message(message: Any) -> Optional[str]:
 
 def _coerce_raw_output_to_completion_message(
     raw_output_payload: Any,
+    *,
+    allow_untyped: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """Normalize raw output payloads into an assistant message when possible."""
+    """Select assistant output without relabeling tool/user messages."""
     if isinstance(raw_output_payload, str):
+        if not allow_untyped:
+            return None
         return {
             "role": "assistant",
             "content": raw_output_payload,
@@ -909,10 +976,22 @@ def _coerce_raw_output_to_completion_message(
 
     if isinstance(raw_output_payload, Mapping):
         role = raw_output_payload.get("role")
+        if role != "assistant":
+            return None
+        if raw_output_payload.get("type") == "tool_result":
+            return None
         content = raw_output_payload.get("content")
-        tool_calls = raw_output_payload.get("tool_calls")
-        if role is not None or content is not None or tool_calls is not None:
-            return dict(raw_output_payload)
+        if isinstance(content, list):
+            # Tool-result blocks are not assistant-authored, even when wrapped
+            # in an otherwise valid assistant message.
+            assistant_content = [
+                block for block in content
+                if not isinstance(block, Mapping) or block.get("type") != "tool_result"
+            ]
+            if content and not assistant_content:
+                return None
+            raw_output_payload = {**raw_output_payload, "content": assistant_content}
+        return dict(raw_output_payload)
 
     if isinstance(raw_output_payload, list):
         candidates = [
@@ -935,14 +1014,29 @@ def _select_primary_completion_message(
     *,
     completion_messages: Optional[List[Dict[str, Any]]],
     raw_output_payload: Any,
+    allow_untyped: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Choose the assistant completion that best represents the final answer."""
-    raw_output_message = _coerce_raw_output_to_completion_message(raw_output_payload)
+    assistant_messages = [
+        candidate
+        for message in completion_messages or []
+        if (candidate := _coerce_raw_output_to_completion_message(
+            {**message, "role": "assistant"}
+            if allow_untyped and message.get("role") is None
+            else message,
+        )) is not None
+    ]
+    raw_output_message = _coerce_raw_output_to_completion_message(
+        raw_output_payload,
+        # Explicit non-assistant completions cannot be overridden by raw text.
+        allow_untyped=allow_untyped
+        and (not completion_messages or bool(assistant_messages)),
+    )
 
-    if not completion_messages:
+    if not assistant_messages:
         return raw_output_message
 
-    for message in reversed(completion_messages):
+    for message in reversed(assistant_messages):
         message_text = _extract_text_from_message(message)
         if message_text not in {None, ""}:
             return message
@@ -951,11 +1045,13 @@ def _select_primary_completion_message(
     if raw_output_text not in {None, ""}:
         return raw_output_message
 
-    return completion_messages[-1]
+    return assistant_messages[-1]
 
 
 def _select_primary_completion_from_attrs(
     attrs: Mapping[str, Any],
+    *,
+    allow_untyped: Optional[bool] = None,
 ) -> Optional[Dict[str, Any]]:
     """Choose the best completion message using traced attrs plus raw output."""
     return _select_primary_completion_message(
@@ -965,6 +1061,11 @@ def _select_primary_completion_from_attrs(
         ),
         raw_output_payload=_parse_json_like(
             attrs.get(SpanAttributes.TRACELOOP_ENTITY_OUTPUT)
+        ),
+        allow_untyped=(
+            _has_llm_response_metadata(attrs)
+            if allow_untyped is None
+            else allow_untyped
         ),
     )
 
@@ -1172,6 +1273,17 @@ def _get_enrichment_attrs(span: ReadableSpan) -> Dict[str, Any]:
             _RESPAN_TRACING_SDK_VERSION
         )
 
+    if _is_tool_execution_span(span):
+        return extra
+
+    scope = getattr(span, "instrumentation_scope", None)
+    if (
+        getattr(scope, "name", None) in _CLAUDE_AGENT_SCOPE_NAMES
+        and attrs.get(RESPAN_LOG_TYPE) == LOG_TYPE_AGENT
+        and not _is_claude_agent_response_span(span)
+    ):
+        return extra
+
     if attrs.get(SpanAttributes.LLM_SYSTEM) and not attrs.get(SpanAttributes.LLM_REQUEST_TYPE):
         extra[SpanAttributes.LLM_REQUEST_TYPE] = LLMRequestTypeValues.CHAT.value
 
@@ -1189,7 +1301,11 @@ def _get_enrichment_attrs(span: ReadableSpan) -> Dict[str, Any]:
     tool_calls = _parse_structured_json_attr(attrs.get(_COMPLETION_TOOL_CALLS_ATTR))
     if not isinstance(tool_calls, list) or not tool_calls:
         tool_calls = _parse_structured_json_attr(attrs.get(RESPAN_SPAN_TOOL_CALLS))
-    if isinstance(tool_calls, list) and tool_calls:
+    if (
+        isinstance(tool_calls, list)
+        and tool_calls
+        and attrs.get(f"{SpanAttributes.LLM_COMPLETIONS}.0.role") in {None, "assistant"}
+    ):
         if _COMPLETION_TOOL_CALLS_ATTR not in attrs:
             extra[_COMPLETION_TOOL_CALLS_ATTR] = tool_calls
         if f"{SpanAttributes.LLM_COMPLETIONS}.0.role" not in attrs:

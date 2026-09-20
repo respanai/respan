@@ -623,6 +623,260 @@ def test_prepare_spans_splits_tool_only_current_claude_agent():
     ) == tool_calls
 
 
+@pytest.mark.parametrize("scope_name", [
+    "opentelemetry.instrumentation.claude_agent_sdk",
+    "openinference.instrumentation.claude_agent_sdk",
+])
+@pytest.mark.parametrize("name, attributes", [
+    ("Grep", {RESPAN_LOG_TYPE: "agent"}),
+    ("Grep", {RESPAN_LOG_TYPE: "agent", "gen_ai.request.model": "claude-sonnet-4-5"}),
+    ("ClaudeAgentSDK.query", {}),
+    ("ClaudeAgentSDK.ClaudeSDKClient.receive_response", {}),
+    ("invoke_agent", {RESPAN_LOG_TYPE: "agent", "gen_ai.system": "anthropic"}),
+    ("invoke_agent", {RESPAN_LOG_TYPE: "agent", "llm.request.type": "chat"}),
+    ("invoke_agent", {RESPAN_LOG_TYPE: "agent", "gen_ai.request.model": ""}),
+    ("invoke_agent", {RESPAN_LOG_TYPE: "agent", "gen_ai.usage.output_tokens": None}),
+])
+def test_export_does_not_turn_unattributed_tool_output_into_chat(
+    scope_name, name, attributes,
+):
+    output = "src/main.py:195: matching Grep result"
+    span = _make_span(
+        name=name,
+        span_id=3100,
+        attributes={**attributes, SpanAttributes.TRACELOOP_ENTITY_OUTPUT: output},
+        scope_name=scope_name,
+    )
+    exporter = RespanSpanExporter(endpoint="https://example.com/api", api_key="test-key")
+    exporter._session = Mock()
+    exporter._session.post.return_value = SimpleNamespace(status_code=200, text="ok")
+
+    assert exporter.export([span]) == SpanExportResult.SUCCESS
+
+    payload = json.loads(exporter._session.post.call_args.kwargs["data"])
+    exported = [
+        item
+        for resource in payload[OTLP_RESOURCE_SPANS_KEY]
+        for scope in resource[OTLP_SCOPE_SPANS_KEY]
+        for item in scope[OTLP_SPANS_KEY]
+    ]
+    assert len(exported) == 1
+    attrs = {item[OTLP_ATTR_KEY]: item[OTLP_ATTR_VALUE] for item in exported[0][OTLP_ATTRIBUTES_KEY]}
+    assert attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT][OTLP_STRING_VALUE] == output
+    assert f"{SpanAttributes.LLM_COMPLETIONS}.0.role" not in attrs
+
+
+@pytest.mark.parametrize("output", [
+    {"role": "tool", "content": "Grep result", "tool_call_id": "call_grep"},
+    {"role": "user", "content": "Grep result"},
+    {"type": "tool_result", "content": "Grep result", "tool_use_id": "call_grep"},
+    [{"role": "tool", "content": "Grep result"}],
+    {"role": "assistant", "content": [{"type": "tool_result", "content": "Grep result"}]},
+    {"content": [{"type": "text", "text": "Grep result"}]},
+    {"tool_call_id": "call_grep", "content": "Grep result"},
+    [{"role": "tool", "content": "Grep result"}, "Grep result"],
+])
+def test_prepare_spans_rejects_non_assistant_output_even_with_llm_metadata(output):
+    span = _make_span(
+        name="ClaudeAgentSDK.query",
+        span_id=3101,
+        attributes={
+            RESPAN_LOG_TYPE: "agent",
+            "gen_ai.request.model": "claude-sonnet-4-5",
+            "gen_ai.usage.output_tokens": 1,
+            SpanAttributes.TRACELOOP_ENTITY_OUTPUT: json.dumps(output),
+        },
+        scope_name="openinference.instrumentation.claude_agent_sdk",
+    )
+
+    prepared = _prepare_spans_for_export([span])
+
+    assert len(prepared) == 1
+    assert prepared[0].attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] == json.dumps(output)
+
+
+@pytest.mark.parametrize("tool_attrs, name", [
+    ({RESPAN_LOG_TYPE: "tool"}, "ClaudeAgentSDK.query"),
+    ({"gen_ai.operation.name": "execute_tool"}, "Grep"),
+    ({"gen_ai.tool.name": "Grep"}, "Grep"),
+    ({}, "execute_tool Grep"),
+    ({SpanAttributes.TRACELOOP_SPAN_KIND: "tool"}, "Grep"),
+])
+def test_prepare_spans_does_not_enrich_tool_executions_as_llm(tool_attrs, name):
+    span = _make_span(
+        name=name,
+        span_id=3102,
+        attributes={
+            RESPAN_LOG_TYPE: "agent",
+            "gen_ai.system": "anthropic",
+            "gen_ai.request.model": "claude-sonnet-4-5",
+            RESPAN_SPAN_TOOL_CALLS: json.dumps([{"id": "call_grep"}]),
+            SpanAttributes.TRACELOOP_ENTITY_OUTPUT: "Grep result",
+            **tool_attrs,
+        },
+        scope_name="opentelemetry.instrumentation.claude_agent_sdk",
+    )
+
+    prepared = _prepare_spans_for_export([span])
+
+    assert len(prepared) == 1
+    assert "llm.request.type" not in prepared[0].attributes
+    assert "gen_ai.completion.0.role" not in prepared[0].attributes
+    assert prepared[0].attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] == "Grep result"
+
+
+@pytest.mark.parametrize("attributes", [
+    {SpanAttributes.TRACELOOP_ENTITY_OUTPUT: json.dumps({"role": "assistant", "content": "Done"})},
+    {"gen_ai.completion.0.role": "assistant", "gen_ai.completion.0.content": "Done"},
+    {"gen_ai.request.model": "claude-sonnet-4-5", SpanAttributes.TRACELOOP_ENTITY_OUTPUT: "Done"},
+    {"gen_ai.usage.output_tokens": 0},
+    {"gen_ai.request.model": "claude-sonnet-4-5"},
+])
+def test_prepare_spans_preserves_assistant_response_provenance(attributes):
+    span = _make_span(
+        name="invoke_agent assistant",
+        span_id=3103,
+        attributes={RESPAN_LOG_TYPE: "agent", **attributes},
+        scope_name="opentelemetry.instrumentation.claude_agent_sdk",
+    )
+
+    prepared = _prepare_spans_for_export([span])
+
+    assert len(prepared) == 2
+    assert prepared[1].attributes[RESPAN_LOG_TYPE] == "chat"
+    assert prepared[1].attributes["gen_ai.completion.0.content"] == (
+        "Done" if (
+            SpanAttributes.TRACELOOP_ENTITY_OUTPUT in attributes
+            or "gen_ai.completion.0.content" in attributes
+        ) else ""
+    )
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+def test_prepare_spans_selects_assistant_instead_of_trailing_tool_result(indexed):
+    messages = [
+        {"role": "assistant", "content": "Assistant answer"},
+        {"role": "tool", "content": "Grep result"},
+    ]
+    attrs = {RESPAN_LOG_TYPE: "agent", SpanAttributes.TRACELOOP_ENTITY_OUTPUT: json.dumps(messages)}
+    if indexed:
+        attrs.update({
+            f"{SpanAttributes.LLM_COMPLETIONS}.{i}.{key}": value
+            for i, message in enumerate(messages)
+            for key, value in message.items()
+        })
+    span = _make_span(
+        name="invoke_agent assistant", span_id=3104, attributes=attrs,
+        scope_name="opentelemetry.instrumentation.claude_agent_sdk",
+    )
+
+    prepared = _prepare_spans_for_export([span])
+
+    assert len(prepared) == 2
+    assert prepared[1].attributes["gen_ai.completion.0.content"] == "Assistant answer"
+
+
+def test_prepare_spans_does_not_backfill_assistant_tool_calls_with_tool_results():
+    tool_calls = [{"id": "call_grep", "type": "function", "function": {"name": "Grep", "arguments": "{}"}}]
+    span = _make_span(
+        name="invoke_agent assistant", span_id=3105,
+        attributes={
+            RESPAN_LOG_TYPE: "agent",
+            "gen_ai.completion.0.role": "assistant",
+            "gen_ai.completion.0.content": "",
+            "gen_ai.completion.0.tool_calls": json.dumps(tool_calls),
+            "gen_ai.completion.1.role": "tool",
+            "gen_ai.completion.1.content": "Grep result",
+            SpanAttributes.TRACELOOP_ENTITY_OUTPUT: json.dumps({"role": "tool", "content": "Grep result"}),
+        },
+        scope_name="opentelemetry.instrumentation.claude_agent_sdk",
+    )
+
+    prepared = _prepare_spans_for_export([span])
+
+    assert len(prepared) == 2
+    child_attrs = prepared[1].attributes
+    assert child_attrs["gen_ai.completion.0.content"] == ""
+    assert json.loads(child_attrs["gen_ai.completion.0.tool_calls"]) == tool_calls
+    assert "Grep result" not in child_attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]
+
+
+def test_prepare_spans_rejects_non_assistant_completion_with_untyped_raw_output():
+    span = _make_span(
+        name="ClaudeAgentSDK.query", span_id=3106,
+        attributes={
+            "gen_ai.request.model": "claude-sonnet-4-5",
+            "gen_ai.completion.0.role": "tool",
+            "gen_ai.completion.0.content": "Grep result",
+            SpanAttributes.TRACELOOP_ENTITY_OUTPUT: "Grep result",
+        },
+        scope_name="openinference.instrumentation.claude_agent_sdk",
+    )
+
+    assert len(_prepare_spans_for_export([span])) == 1
+
+
+def test_enrichment_preserves_explicit_tool_completion_content():
+    span = _make_span(
+        name="chat", span_id=3107,
+        attributes={
+            "gen_ai.completion.0.role": "tool",
+            "gen_ai.completion.0.content": "",
+            "gen_ai.completion.0.tool_calls": json.dumps([{"id": "call_grep"}]),
+            "gen_ai.completion.1.role": "assistant",
+            "gen_ai.completion.1.content": "Assistant answer",
+        },
+    )
+
+    attrs = _prepare_spans_for_export([span])[0].attributes
+
+    assert attrs["gen_ai.completion.0.role"] == "tool"
+    assert attrs["gen_ai.completion.0.content"] == ""
+
+
+def test_prepare_spans_does_not_copy_tool_calls_from_a_tool_role_message():
+    span = _make_span(
+        name="invoke_agent assistant", span_id=3109,
+        attributes={
+            RESPAN_LOG_TYPE: "agent",
+            "gen_ai.completion.0.role": "tool",
+            "gen_ai.completion.0.content": "Grep result",
+            "gen_ai.completion.0.tool_calls": json.dumps([{"id": "not_an_assistant_call"}]),
+            "gen_ai.completion.1.role": "assistant",
+            "gen_ai.completion.1.content": "Assistant answer",
+        },
+        scope_name="opentelemetry.instrumentation.claude_agent_sdk",
+    )
+
+    prepared = _prepare_spans_for_export([span])
+
+    assert len(prepared) == 2
+    assert prepared[1].attributes["gen_ai.completion.0.content"] == "Assistant answer"
+    assert "gen_ai.completion.0.tool_calls" not in prepared[1].attributes
+
+
+@pytest.mark.parametrize("attributes", [
+    {"gen_ai.completion.0.role": "assistant", "gen_ai.completion.0.content": ""},
+    {
+        "gen_ai.completion.0.role": "assistant",
+        "gen_ai.completion.0.content": "",
+        "gen_ai.request.model": "claude-sonnet-4-5",
+        SpanAttributes.TRACELOOP_ENTITY_OUTPUT: "Grep result",
+    },
+    {SpanAttributes.TRACELOOP_ENTITY_OUTPUT: json.dumps({
+        "_is_placeholder": True, "role": "assistant", "content": "",
+    })},
+])
+def test_prepare_spans_does_not_treat_empty_assistant_placeholders_as_provenance(attributes):
+    span = _make_span(
+        name="Grep", span_id=3108,
+        attributes={RESPAN_LOG_TYPE: "agent", **attributes},
+        scope_name="opentelemetry.instrumentation.claude_agent_sdk",
+    )
+
+    assert len(_prepare_spans_for_export([span])) == 1
+
+
 def test_prepare_spans_remaps_tool_call_helpers_and_strips_helper_attrs():
     """Exporter remaps helper attrs to completion message fields before OTLP serialization."""
 
