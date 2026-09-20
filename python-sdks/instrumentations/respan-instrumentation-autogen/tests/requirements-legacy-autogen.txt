@@ -1,0 +1,6 @@
+# Agent-E uses autogen~=0.7; pin a reproducible representative of that API.
+autogen==0.7.6
+openai==1.109.1
+httpx==0.28.1
+respan-instrumentation-openai==1.2.2
+pytest>=8

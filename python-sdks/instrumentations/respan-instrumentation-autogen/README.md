@@ -1,8 +1,10 @@
 # respan-instrumentation-autogen
 
-Respan instrumentation plugin for AutoGen AgentChat. Wraps OpenInference's
-AutoGen AgentChat instrumentor and translates spans into the Respan tracing
-shape automatically.
+Respan instrumentation for modern AutoGen AgentChat and the legacy `autogen`
+API. The default `AutoGenInstrumentor()` wraps OpenInference's AgentChat
+instrumentor. Select `AutoGenInstrumentor(api="legacy")` for legacy
+`ConversableAgent`, `AssistantAgent`, `UserProxyAgent`, and `GroupChat` workflows.
+Both paths translate OpenInference spans into Respan's canonical attributes.
 
 ## Configuration
 
@@ -66,6 +68,93 @@ async def main() -> None:
 
 asyncio.run(main())
 ```
+
+## Legacy `autogen` (Agent-E and auto-news)
+
+Select the extra matching the application's installed SDK. The distributions
+share the `autogen` import namespace; do not combine the two extras in one
+environment. Modern AgentChat dependencies remain installed for compatibility
+with existing users, but legacy mode does not activate the AgentChat patches.
+
+```bash
+# auto-news's exact pin requires Python 3.11 (pyautogen 0.2.2 requires <3.12).
+pip install respan-ai 'respan-instrumentation-autogen[legacy-pyautogen]' \
+  'pyautogen==0.2.2' 'openai==1.109.1' respan-instrumentation-openai
+
+# In a separate environment, for Agent-E's autogen 0.7 API:
+pip install respan-ai 'respan-instrumentation-autogen[legacy-autogen]' \
+  'autogen==0.7.6' 'openai==1.109.1' respan-instrumentation-openai
+```
+
+`AutoGenInstrumentor()` continues to target modern AgentChat; select
+`api="legacy"` explicitly. Legacy mode records sync and async chat,
+reply, and function execution spans. Add the provider's instrumentor to record
+actual LLM requests, responses, model names, and usage. A function result is
+always tool content, including results containing an `assistant` role.
+
+```python
+import os
+
+from autogen import AssistantAgent, UserProxyAgent
+from respan import Respan
+from respan_instrumentation_autogen import AutoGenInstrumentor
+from respan_instrumentation_openai import OpenAIInstrumentor
+
+respan = Respan(
+    api_key=os.environ["RESPAN_API_KEY"],
+    is_auto_instrument=False,
+    instrumentations=[AutoGenInstrumentor(api="legacy"), OpenAIInstrumentor()],
+)
+assistant = AssistantAgent(
+    "assistant",
+    llm_config={
+        "model": "gpt-4o-mini",
+        "api_key": os.environ["OPENAI_API_KEY"],
+        "cache_seed": None,
+    },
+)
+user = UserProxyAgent(
+    "user",
+    llm_config=False,
+    human_input_mode="NEVER",
+    code_execution_config=False,
+    max_consecutive_auto_reply=0,
+)
+user.initiate_chat(assistant, message="Write one sentence about the news.")
+respan.flush()
+```
+
+The same setup supports `await user.a_initiate_chat(...)`. Respan's runtime
+propagates context into AutoGen's executor threads so provider spans stay under
+their calling agent. Return values remain the SDK's own values, including
+`None` from pyautogen 0.2.2 chats. The adapter also preserves function failure
+results and marks their tool spans as errors.
+
+The legacy dependency contract is `pyautogen>=0.2.2,<0.3` or
+`autogen>=0.7,<0.8`. Real SDK fixtures cover pyautogen 0.2.2 (auto-news) and
+autogen 0.7.6 (Agent-E's API family), with OpenAI 1.109.1 and OpenInference AG2
+0.1.6. These are integration compatibility tests, not full application runs.
+For example, Agent-E's separate `pydantic==2.6.2` pin must still be reconciled
+with the application's Respan SDK dependency before installing the full app.
+
+## Offline compatibility tests
+
+Run each legacy requirements file in its own virtual environment. Use Python
+3.11 for the exact pyautogen 0.2.2 fixture:
+
+```bash
+pip install -e . -r tests/requirements-legacy-pyautogen.txt
+python -m pytest tests -q
+
+# Separate environment:
+pip install -e . -r tests/requirements-legacy-autogen.txt
+python -m pytest tests -q
+```
+
+The fixtures execute the installed SDK's chats, GroupChat dispatch, synchronous
+and asynchronous functions, error paths, suppression, and repeated activation.
+The model roundtrip uses the actual legacy OpenAI wrapper and OpenAI client
+with a deterministic HTTP transport; no API keys or model service are needed.
 
 ## Further Reading
 

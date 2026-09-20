@@ -1,0 +1,6 @@
+# Python 3.11: auto-news pins this SDK, which requires Python <3.12.
+pyautogen==0.2.2
+openai==1.109.1
+httpx==0.28.1
+respan-instrumentation-openai==1.2.2
+pytest>=8
