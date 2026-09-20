@@ -13,8 +13,9 @@ packages = [
 python = ">=3.11,<3.14"
 respan-tracing = "^2.16.1"
 respan-instrumentation-openinference = ">=1.2.2"
-google-adk = ">=1.17.0"
+google-adk = ">=1.5.0"
 openinference-instrumentation-google-adk = ">=0.1.12"
+packaging = ">=21.0"
 
 [tool.poetry.plugins."respan.instrumentations"]
 google-adk = "respan_instrumentation_google_adk:GoogleADKInstrumentor"

@@ -505,28 +505,22 @@ def _apply_google_adk_payload_fallbacks(
             if isinstance(usage, dict):
                 prompt_tokens = usage.get("prompt_token_count")
                 if isinstance(prompt_tokens, int):
-                    attrs.setdefault(
-                        TLSpanAttributes.LLM_USAGE_PROMPT_TOKENS,
-                        prompt_tokens,
-                    )
-                    attrs.setdefault(GEN_AI_USAGE_INPUT_TOKENS, prompt_tokens)
+                    attrs[TLSpanAttributes.LLM_USAGE_PROMPT_TOKENS] = prompt_tokens
+                    attrs[GEN_AI_USAGE_INPUT_TOKENS] = prompt_tokens
 
                 completion_tokens = usage.get("candidates_token_count")
                 thoughts_tokens = usage.get("thoughts_token_count")
                 if isinstance(completion_tokens, int):
                     if isinstance(thoughts_tokens, int):
                         completion_tokens += thoughts_tokens
-                    attrs.setdefault(
-                        TLSpanAttributes.LLM_USAGE_COMPLETION_TOKENS,
-                        completion_tokens,
-                    )
-                    attrs.setdefault(GEN_AI_USAGE_OUTPUT_TOKENS, completion_tokens)
+                    # ADK 1.5 writes total_token_count into the modern output
+                    # field. The response usage is authoritative, including 0.
+                    attrs[TLSpanAttributes.LLM_USAGE_COMPLETION_TOKENS] = completion_tokens
+                    attrs[GEN_AI_USAGE_OUTPUT_TOKENS] = completion_tokens
 
                 total_tokens = usage.get("total_token_count")
                 if isinstance(total_tokens, int):
-                    attrs.setdefault(
-                        TLSpanAttributes.LLM_USAGE_TOTAL_TOKENS, total_tokens
-                    )
+                    attrs[TLSpanAttributes.LLM_USAGE_TOTAL_TOKENS] = total_tokens
 
             content = response.get("content")
             if isinstance(content, dict):
@@ -540,9 +534,11 @@ def _apply_google_adk_payload_fallbacks(
     if oi_kind == "TOOL" or attrs.get(RESPAN_LOG_TYPE) == LOG_TYPE_TOOL:
         tool_args = raw_attrs.get(_GOOGLE_ADK_TOOL_CALL_ARGS)
         if tool_args is not None:
-            attrs.setdefault(
-                TLSpanAttributes.TRACELOOP_ENTITY_INPUT,
-                _safe_json_str(tool_args),
+            tool_name = raw_attrs.get(OISpanAttributes.TOOL_NAME) or raw_attrs.get(
+                GEN_AI_TOOL_NAME
+            )
+            attrs[TLSpanAttributes.TRACELOOP_ENTITY_INPUT] = _safe_json_str(
+                {"name": tool_name, "arguments": _parse_json(tool_args)}
             )
         tool_response = raw_attrs.get(_GOOGLE_ADK_TOOL_RESPONSE)
         if tool_response is not None:
@@ -670,7 +666,7 @@ class GoogleADKSpanProcessor(SpanProcessor):
         elif trace_id is not None and log_type in (LOG_TYPE_AGENT, LOG_TYPE_WORKFLOW):
             with self._context_lock:
                 context = self._trace_context.pop(trace_id, {})
-            if translated_attrs.get(TLSpanAttributes.TRACELOOP_ENTITY_INPUT) in (
+            if _parse_json(translated_attrs.get(TLSpanAttributes.TRACELOOP_ENTITY_INPUT)) in (
                 None,
                 "",
             ) and context.get("prompt"):

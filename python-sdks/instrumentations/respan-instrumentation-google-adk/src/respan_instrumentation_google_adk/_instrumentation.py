@@ -5,6 +5,7 @@ import logging
 from typing import Any
 
 from opentelemetry import trace
+from respan_instrumentation_google_adk._compat import patch_legacy_agent_iterator
 from respan_instrumentation_google_adk._processor import (
     GoogleADKSpanProcessor,
     insert_span_processor_before_export,
@@ -37,6 +38,7 @@ class GoogleADKInstrumentor:
         self._instrumentor_kwargs = dict(instrumentor_kwargs)
         self._instrumentor = None
         self._processor = None
+        self._undo_legacy_iterator = None
         self._is_instrumented = False
 
     @staticmethod
@@ -68,16 +70,35 @@ class GoogleADKInstrumentor:
 
         tracer_provider = trace.get_tracer_provider()
         try:
+            upstream = google_adk_instrumentor_class()
+            if getattr(upstream, "is_instrumented_by_opentelemetry", False):
+                logger.warning(
+                    "Google ADK instrumentation is already active under another "
+                    "owner; deactivate that owner before activating this adapter"
+                )
+                return
             self._processor = GoogleADKSpanProcessor()
             insert_span_processor_before_export(tracer_provider, self._processor)
-            self._instrumentor = google_adk_instrumentor_class()
+            self._instrumentor = upstream
             self._instrumentor.instrument(
                 tracer_provider=tracer_provider,
                 **self._instrumentor_kwargs,
             )
+            # OTel instrumentors may log dependency conflicts and return without
+            # raising. Do not report an active adapter or retain its processor.
+            if not getattr(
+                self._instrumentor, "is_instrumented_by_opentelemetry", True
+            ):
+                raise RuntimeError(
+                    "OpenInference Google ADK instrumentation did not activate"
+                )
+            self._undo_legacy_iterator = patch_legacy_agent_iterator()
             self._is_instrumented = True
             logger.info("Google ADK instrumentation activated")
         except Exception:
+            if self._undo_legacy_iterator is not None:
+                self._undo_legacy_iterator()
+                self._undo_legacy_iterator = None
             if self._instrumentor is not None:
                 try:
                     self._instrumentor.uninstrument()
@@ -93,6 +114,9 @@ class GoogleADKInstrumentor:
     def deactivate(self) -> None:
         """Deactivate the instrumentation."""
         tracer_provider = trace.get_tracer_provider()
+        if self._undo_legacy_iterator is not None:
+            self._undo_legacy_iterator()
+            self._undo_legacy_iterator = None
         if self._is_instrumented and self._instrumentor is not None:
             try:
                 self._instrumentor.uninstrument()

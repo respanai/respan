@@ -46,6 +46,8 @@ class FakeSpan:
 
 
 def _install_fake_modules(monkeypatch):
+    monkeypatch.setattr(_instrumentation, "patch_legacy_agent_iterator", lambda: None)
+
     class FakeGoogleADKInstrumentor:
         created = []
 
@@ -138,6 +140,44 @@ def test_activate_passes_custom_openinference_kwargs(monkeypatch, fake_tracer_pr
         "tracer_provider": fake_tracer_provider,
         "trace_content": False,
     }
+
+
+def test_activate_cleans_up_when_upstream_declines(monkeypatch, fake_tracer_provider):
+    fake = _install_fake_modules(monkeypatch)
+    fake.google_adk_instrumentor_class.is_instrumented_by_opentelemetry = False
+    instrumentor = GoogleADKInstrumentor()
+    instrumentor.activate()
+    assert instrumentor._is_instrumented is False
+    assert instrumentor._processor is None
+    assert instrumentor._instrumentor is None
+    assert len(fake_tracer_provider._active_span_processor._span_processors) == 1
+
+
+@pytest.mark.parametrize("completion,thoughts", [(3, 0), (3, 2), (0, 0)])
+def test_processor_replaces_adk15_total_as_output_tokens(completion, thoughts):
+    span = FakeSpan(
+        {
+            "openinference.span.kind": "LLM",
+            "gen_ai.usage.input_tokens": 11,
+            "gen_ai.usage.output_tokens": 11 + completion + thoughts,
+            "gcp.vertex.agent.llm_response": json.dumps(
+                {
+                    "usage_metadata": {
+                        "prompt_token_count": 11,
+                        "candidates_token_count": completion,
+                        "thoughts_token_count": thoughts,
+                        "total_token_count": 11 + completion + thoughts,
+                    }
+                }
+            ),
+        }
+    )
+    GoogleADKSpanProcessor().on_end(span)
+    assert span._attributes["gen_ai.usage.input_tokens"] == 11
+    assert span._attributes["gen_ai.usage.prompt_tokens"] == 11
+    assert span._attributes["gen_ai.usage.output_tokens"] == completion + thoughts
+    assert span._attributes["gen_ai.usage.completion_tokens"] == completion + thoughts
+    assert span._attributes["llm.usage.total_tokens"] == 11 + completion + thoughts
 
 
 def test_activate_is_idempotent(monkeypatch, fake_tracer_provider):
@@ -362,7 +402,10 @@ def test_processor_cleans_google_adk_tool_attrs():
     GoogleADKSpanProcessor().on_end(span)
 
     assert span._attributes["respan.entity.log_type"] == "tool"
-    assert span._attributes["traceloop.entity.input"] == '{"city":"Paris"}'
+    assert json.loads(span._attributes["traceloop.entity.input"]) == {
+        "name": "get_weather",
+        "arguments": {"city": "Paris"},
+    }
     assert span._attributes["traceloop.entity.output"] == '{"result":"sunny"}'
     assert "gen_ai.system" not in span._attributes
     assert "traceloop.span.kind" not in span._attributes
