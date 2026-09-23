@@ -142,7 +142,7 @@ test("free-form metadata is merged into the canonical JSON attribute", () => {
     custom: "custom-value",
     prompt_unit_price: "0.01",
     userId: "user-1",
-    time_to_first_token: "0.25",
+    generation_time: "0.25",
     cost: "0.002",
   });
   assertNoRawAIAttrs(attrs);
@@ -937,4 +937,107 @@ test("ended and disposed embedding candidates cannot capture later spans", () =>
     lateAfterDispose.attributes["respan.internal.export_parent_span_id"],
     undefined,
   );
+});
+
+test("AI SDK 7 separate instructions and mixed media survive prompt normalization", () => {
+  const file = { type: "blob", modality: "image", mime_type: "image/png", content: "aGVsbG8=" };
+  const attrs = runTranslator("chat fixture", {
+    "gen_ai.operation.name": "chat",
+    "gen_ai.system_instructions": JSON.stringify([{ type: "text", content: "Be concise." }]),
+    "gen_ai.input.messages": JSON.stringify([{ role: "user", parts: [{ type: "text", content: "Describe it" }, file] }]),
+    "gen_ai.output.messages": JSON.stringify([{ role: "assistant", parts: [{ type: "reasoning", content: "fixture reasoning" }, { type: "text", content: "A picture" }, file] }]),
+  });
+  const input = JSON.parse(attrs["traceloop.entity.input"]);
+  assert.deepEqual(input[0], { role: "system", content: "Be concise." });
+  assert.deepEqual(input[1].content, [{ type: "text", text: "Describe it" }, file]);
+  const output = JSON.parse(attrs["traceloop.entity.output"]);
+  assert.deepEqual(output.content, [{ type: "reasoning", content: "fixture reasoning" }, { type: "text", text: "A picture" }, file]);
+  assert.equal(attrs["gen_ai.system_instructions"], undefined);
+});
+
+test("AI SDK 7 privacy-disabled content remains absent", () => {
+  const attrs = runTranslator("chat fixture", { "gen_ai.operation.name": "chat" });
+  assert.equal(attrs["traceloop.entity.input"], undefined);
+  assert.equal(attrs["traceloop.entity.output"], undefined);
+  assert.equal(attrs["gen_ai.prompt.0.content"], undefined);
+});
+
+test("AI SDK 7 reranking maps recorded documents and ranked indices before stripping", () => {
+  const attrs = runTranslator("rerank fixture", {
+    "gen_ai.operation.name": "rerank",
+    "ai.documents": ['"first"', '"second"'],
+    "ai.ranking": ['{"index":1,"relevanceScore":0.9}'],
+  });
+  assert.equal(attrs["respan.entity.log_type"], "task");
+  assert.deepEqual(JSON.parse(attrs["traceloop.entity.input"]), { documents: ["first", "second"] });
+  assert.deepEqual(JSON.parse(attrs["traceloop.entity.output"]), [{ index: 1, relevanceScore: 0.9 }]);
+  assertNoRawAIAttrs(attrs);
+});
+
+test("AI SDK 7 chat-named streaming spans preserve first chunk and total duration", () => {
+  const attrs = runTranslator("chat fixture", {
+    "gen_ai.operation.name": "chat",
+    "gen_ai.client.operation.time_to_first_chunk": 0.125,
+    "gen_ai.client.operation.duration": 1.25,
+  });
+  assert.equal(attrs["llm.is_streaming"], true);
+  assert.deepEqual(JSON.parse(attrs["respan.metadata"]), { time_to_first_token: "0.125", generation_time: "1.25" });
+});
+
+test("legacy streaming latency uses first chunk, never finish duration, as TTFT", () => {
+  const attrs = runTranslator("ai.streamText.doStream", {
+    ...baseLLMSpan,
+    "ai.response.msToFirstChunk": 0,
+    "ai.response.msToFinish": 900,
+  });
+  assert.deepEqual(JSON.parse(attrs["respan.metadata"]), { time_to_first_token: "0", generation_time: "0.9" });
+});
+
+test("evaluation translates state, questions, and answers as task content", () => {
+  const attrs = runTranslator("evaluate fixture", {
+    "gen_ai.operation.name": "evaluate",
+    "ai.evaluation.state": '"4 is even"',
+    "ai.evaluation.questions": '{"correct":{"type":"boolean","instructions":"Is it true?"}}',
+    "ai.evaluation.answers": '{"correct":{"type":"boolean","probability":0.95}}',
+  });
+  assert.equal(attrs["respan.entity.log_type"], "task");
+  assert.equal(JSON.parse(attrs["traceloop.entity.input"]).state, "4 is even");
+  assert.equal(JSON.parse(attrs["traceloop.entity.output"]).correct.probability, 0.95);
+  assertNoRawAIAttrs(attrs);
+});
+
+for (const operation of ["ai.harness", "ai.workflowAgent.stream"]) {
+  test(`${operation} roots preserve agent content without model usage`, () => {
+    const attrs = runTranslator(`${operation} fixture`, {
+      "gen_ai.operation.name": operation,
+      "gen_ai.input.messages": JSON.stringify([{ role: "user", parts: [{ type: "text", content: "input" }] }]),
+      "gen_ai.output.messages": JSON.stringify([{ role: "assistant", parts: [{ type: "text", content: "output" }] }]),
+      "gen_ai.request.model": "fixture",
+    });
+    assert.equal(attrs["respan.entity.log_type"], "agent");
+    assert.equal(JSON.parse(attrs["traceloop.entity.output"]).content, "output");
+    assertNoLLMSpecificAttrs(attrs);
+  });
+}
+
+test("global content opt-out strips raw and already canonical content", () => {
+  const previous = process.env.RESPAN_TRACE_CONTENT;
+  try {
+    process.env.RESPAN_TRACE_CONTENT = "false";
+    const attrs = runTranslator("chat fixture", {
+      ...baseLLMSpan,
+      "gen_ai.operation.name": "chat",
+      "traceloop.entity.input": "PRIVATE",
+      "gen_ai.system_instructions": "PRIVATE",
+      "gen_ai.input.messages": JSON.stringify([{ role: "user", parts: [{ type: "text", content: "PRIVATE" }] }]),
+      "gen_ai.output.messages": JSON.stringify([{ role: "assistant", parts: [{ type: "text", content: "PRIVATE" }] }]),
+      "llm.request.functions": "PRIVATE",
+    });
+    assert.equal(attrs["traceloop.entity.input"], undefined);
+    assert.equal(attrs["traceloop.entity.output"], undefined);
+    assert.ok(!JSON.stringify(attrs).includes("PRIVATE"));
+  } finally {
+    if (previous === undefined) delete process.env.RESPAN_TRACE_CONTENT;
+    else process.env.RESPAN_TRACE_CONTENT = previous;
+  }
 });

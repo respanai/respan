@@ -1,0 +1,7 @@
+{
+  "name": "respan-vercel-latest-sdk-tests",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test compatibility.test.mjs" },
+  "dependencies": { "ai": "7.0.112", "@ai-sdk/otel": "1.0.112" }
+}

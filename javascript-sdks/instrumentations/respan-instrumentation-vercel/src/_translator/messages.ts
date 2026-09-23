@@ -1,6 +1,7 @@
 import {
   ATTR_GEN_AI_INPUT_MESSAGES,
   ATTR_GEN_AI_OUTPUT_MESSAGES,
+  ATTR_GEN_AI_SYSTEM_INSTRUCTIONS,
   ATTR_GEN_AI_TOOL_CALL_ARGUMENTS,
   ATTR_GEN_AI_TOOL_CALL_ID,
   ATTR_GEN_AI_TOOL_CALL_RESULT,
@@ -347,7 +348,7 @@ function normalizeMessageForBackend(message: unknown): MessagePayload[] {
         continue;
       }
 
-      if (part.type === "text" || part.type === "reasoning") {
+      if (part.type === "text") {
         const content = part.content ?? part.text;
         if (content !== undefined && content !== null) {
           textParts.push(String(content));
@@ -383,8 +384,16 @@ function normalizeMessageForBackend(message: unknown): MessagePayload[] {
       role: typeof message.role === "string" ? message.role : "assistant",
       content: textParts.join("\n"),
     };
-    if (!normalized.content && unknownParts.length > 0) {
-      normalized.content = safeJsonStr(unknownParts);
+    if (unknownParts.length > 0) {
+      // Mixed text/media, reasoning, approval, and provider-specific parts must
+      // survive normalization. Keep their order and structured representation.
+      normalized.content = message.parts.filter((part: unknown) =>
+        !isRecord(part) || !["tool_call", "tool_call_response"].includes(part.type),
+      ).map((part: unknown) =>
+        isRecord(part) && part.type === "text"
+          ? { type: "text", text: part.content ?? part.text ?? "" }
+          : part,
+      );
     }
     if (toolCalls.length > 0) {
       normalized.tool_calls = toolCalls;
@@ -573,8 +582,17 @@ function enrichCompletionAttrs(attrs: SpanAttributes, payload: unknown): void {
 
 function parsePromptInputValue(attrs: SpanAttributes): Record<string, any>[] | undefined {
   const genAiMessages = normalizeMessageCollection(attrs[ATTR_GEN_AI_INPUT_MESSAGES]);
-  if (genAiMessages && genAiMessages.length > 0) {
-    return genAiMessages;
+  const instructions = safeJsonParse(attrs[ATTR_GEN_AI_SYSTEM_INSTRUCTIONS]);
+  const systemMessages = instructions === undefined || instructions === null
+    ? []
+    : normalizeMessageCollection({
+        role: "system",
+        ...(Array.isArray(instructions)
+          ? { parts: instructions }
+          : { content: instructions }),
+      }) ?? [];
+  if (genAiMessages || systemMessages.length > 0) {
+    return [...systemMessages, ...(genAiMessages ?? [])];
   }
 
   const normalizedMessages = normalizeMessageCollection(attrs[AI_PROMPT_MESSAGES]);

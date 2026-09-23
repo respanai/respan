@@ -7,6 +7,9 @@ import {
   ATTR_GEN_AI_RESPONSE_FINISH_REASONS,
   ATTR_GEN_AI_RESPONSE_ID,
   ATTR_GEN_AI_SYSTEM,
+  ATTR_GEN_AI_SYSTEM_INSTRUCTIONS,
+  METRIC_GEN_AI_CLIENT_OPERATION_DURATION,
+  METRIC_GEN_AI_CLIENT_OPERATION_TIME_TO_FIRST_CHUNK,
   ATTR_GEN_AI_TOOL_DEFINITIONS,
   ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_INPUT_TOKENS,
@@ -16,6 +19,7 @@ import { RespanLogType, RespanSpanAttributes } from "@respan/respan-sdk";
 import { SpanAttributes as TraceloopSpanAttributes } from "@traceloop/ai-semantic-conventions";
 import {
   AI_RESPONSE_MS_TO_FINISH,
+  AI_RESPONSE_MS_TO_FIRST_CHUNK,
   AI_PREFIX,
   AI_MODEL_PROVIDER,
   AI_TELEMETRY_METADATA_PREFIX,
@@ -214,11 +218,21 @@ export function enrichTokens(attrs: SpanAttributes): void {
 
 export function enrichPerformanceMetrics(attrs: SpanAttributes, spanName: string): void {
   // Streaming is a first-class promoted attribute (llm.is_streaming), not metadata.
-  setDefault(attrs, "llm.is_streaming", spanName.toLowerCase().includes("stream"));
+  const firstChunkSeconds = numberAttr(attrs[METRIC_GEN_AI_CLIENT_OPERATION_TIME_TO_FIRST_CHUNK]) ??
+    (numberAttr(attrs[AI_RESPONSE_MS_TO_FIRST_CHUNK]) !== undefined
+      ? Number(attrs[AI_RESPONSE_MS_TO_FIRST_CHUNK]) / 1000
+      : undefined);
+  setDefault(attrs, "llm.is_streaming", spanName.toLowerCase().includes("stream") || firstChunkSeconds !== undefined);
+  if (firstChunkSeconds !== undefined) {
+    setMetadata(attrs, "time_to_first_token", String(firstChunkSeconds));
+  }
 
-  const msToFinish = attrs[AI_RESPONSE_MS_TO_FINISH];
-  if (msToFinish !== undefined) {
-    setMetadata(attrs, "time_to_first_token", String(Number(msToFinish) / 1000));
+  const durationSeconds = numberAttr(attrs[METRIC_GEN_AI_CLIENT_OPERATION_DURATION]) ??
+    (numberAttr(attrs[AI_RESPONSE_MS_TO_FINISH]) !== undefined
+      ? Number(attrs[AI_RESPONSE_MS_TO_FINISH]) / 1000
+      : undefined);
+  if (durationSeconds !== undefined) {
+    setMetadata(attrs, "generation_time", String(durationSeconds));
   }
 
   const cost = attrs["gen_ai.usage.cost"];
@@ -257,6 +271,7 @@ const NON_CONTRACT_ATTRS_TO_STRIP = [
   ATTR_GEN_AI_RESPONSE_ID,
   ATTR_GEN_AI_TOOL_DEFINITIONS,
   ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
+  ATTR_GEN_AI_SYSTEM_INSTRUCTIONS,
   "gen_ai.usage.cost",
   "gen_ai.usage.ttft",
   "gen_ai.usage.generation_time",

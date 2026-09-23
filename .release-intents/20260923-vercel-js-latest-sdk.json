@@ -1,0 +1,4 @@
+{
+  "summary": "Verify current Vercel AI SDK features and preserve canonical message, reranking, and timing telemetry",
+  "packages": { "@respan/instrumentation-vercel": "none" }
+}

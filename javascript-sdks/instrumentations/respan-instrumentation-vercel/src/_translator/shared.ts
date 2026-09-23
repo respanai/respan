@@ -36,6 +36,12 @@ export const AI_PROMPT_TOOL_CHOICE = "ai.prompt.toolChoice";
 export const AI_RESPONSE_OBJECT = "ai.response.object";
 export const AI_RESPONSE_TEXT = "ai.response.text";
 export const AI_RESPONSE_TOOL_CALLS = "ai.response.toolCalls";
+export const AI_EVALUATION_STATE = "ai.evaluation.state";
+export const AI_EVALUATION_QUESTIONS = "ai.evaluation.questions";
+export const AI_EVALUATION_ANSWERS = "ai.evaluation.answers";
+export const AI_DOCUMENTS = "ai.documents";
+export const AI_RANKING = "ai.ranking";
+export const AI_RESPONSE_MS_TO_FIRST_CHUNK = "ai.response.msToFirstChunk";
 export const AI_RESPONSE_MS_TO_FINISH = "ai.response.msToFinish";
 export const AI_USAGE_PROMPT_TOKENS = "ai.usage.promptTokens";
 export const AI_USAGE_COMPLETION_TOKENS = "ai.usage.completionTokens";
@@ -59,6 +65,9 @@ const MODERN_OPERATION_LOG_TYPES: Record<string, string> = {
   [GEN_AI_OPERATION_NAME_VALUE_EXECUTE_TOOL]: RespanLogType.TOOL,
   agent_step: RespanLogType.TASK,
   rerank: RespanLogType.TASK,
+  evaluate: RespanLogType.TASK,
+  "ai.workflowAgent.stream": RespanLogType.AGENT,
+  "ai.harness": RespanLogType.AGENT,
 };
 
 export function setMetadata(
