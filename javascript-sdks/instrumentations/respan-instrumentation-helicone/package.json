@@ -1,0 +1,57 @@
+{
+  "name": "@respan/instrumentation-helicone",
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Respan instrumentation plugin for the Helicone TypeScript helpers",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "author": "Respan <team@respan.ai>",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/respanai/respan",
+    "directory": "javascript-sdks/instrumentations/respan-instrumentation-helicone"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "publish:package": "yarn npm publish",
+    "release": "yarn build && yarn version patch && yarn publish:package"
+  },
+  "keywords": [
+    "respan",
+    "opentelemetry",
+    "helicone",
+    "instrumentation"
+  ],
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/sdk-trace-base": "^2.10.0",
+    "@opentelemetry/semantic-conventions": "^1.43.0",
+    "@respan/respan-sdk": "^1.1.7",
+    "@respan/tracing": "^1.1.6",
+    "@traceloop/ai-semantic-conventions": "^0.13.0"
+  },
+  "peerDependencies": {
+    "@helicone/helpers": ">=1.8.3 <1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@helicone/helpers": {
+      "optional": false
+    }
+  },
+  "devDependencies": {
+    "@helicone/helpers": "1.8.3",
+    "@opentelemetry/context-async-hooks": "^2.10.0",
+    "@types/node": "^22.15.29",
+    "openai": "^5.10.2",
+    "typescript": "^5.7.3"
+  }
+}
