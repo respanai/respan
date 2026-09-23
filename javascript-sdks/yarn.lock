@@ -4073,7 +4073,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@opentelemetry/instrumentation@npm:0.221.0":
+"@opentelemetry/instrumentation@npm:0.221.0, @opentelemetry/instrumentation@npm:>=0.213.0 <0.222.0":
   version: 0.221.0
   resolution: "@opentelemetry/instrumentation@npm:0.221.0"
   dependencies:
@@ -4399,7 +4399,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@opentelemetry/resources@npm:2.10.0, @opentelemetry/resources@npm:^2.10.0":
+"@opentelemetry/resources@npm:2.10.0, @opentelemetry/resources@npm:>=2.10.0 <2.11.0, @opentelemetry/resources@npm:^2.10.0":
   version: 2.10.0
   resolution: "@opentelemetry/resources@npm:2.10.0"
   dependencies:
@@ -4662,7 +4662,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@opentelemetry/sdk-trace-base@npm:2.10.0, @opentelemetry/sdk-trace-base@npm:^2.10.0":
+"@opentelemetry/sdk-trace-base@npm:2.10.0, @opentelemetry/sdk-trace-base@npm:>=2.6.0 <2.11.0, @opentelemetry/sdk-trace-base@npm:^2.10.0":
   version: 2.10.0
   resolution: "@opentelemetry/sdk-trace-base@npm:2.10.0"
   dependencies:
@@ -5276,6 +5276,29 @@ __metadata:
   peerDependenciesMeta:
     "@modelcontextprotocol/sdk":
       optional: false
+  languageName: unknown
+  linkType: soft
+
+"@respan/instrumentation-n8n@workspace:instrumentations/respan-instrumentation-n8n":
+  version: 0.0.0-use.local
+  resolution: "@respan/instrumentation-n8n@workspace:instrumentations/respan-instrumentation-n8n"
+  dependencies:
+    "@opentelemetry/api": "npm:^1.9.0"
+    "@opentelemetry/instrumentation": "npm:>=0.213.0 <0.222.0"
+    "@opentelemetry/resources": "npm:>=2.10.0 <2.11.0"
+    "@opentelemetry/sdk-node": "npm:^0.221.0"
+    "@opentelemetry/sdk-trace-base": "npm:>=2.6.0 <2.11.0"
+    "@opentelemetry/semantic-conventions": "npm:^1.40.0"
+    "@respan/respan-sdk": "npm:^1.1.7"
+    "@respan/tracing": "workspace:^"
+    "@traceloop/ai-semantic-conventions": "npm:^0.13.0"
+    "@types/node": "npm:^24.10.1"
+    typescript: "npm:^5.7.3"
+  peerDependencies:
+    n8n: ">=2.19.0 <2.38.0"
+  peerDependenciesMeta:
+    n8n:
+      optional: true
   languageName: unknown
   linkType: soft
 
@@ -7069,6 +7092,15 @@ __metadata:
   dependencies:
     undici-types: "npm:~7.16.0"
   checksum: 10c0/d2c36b78b6050d8677769fa05a32243061675e81ddc2bb43955d91a671af3465506ef2731a24c0c9ab42b6b679bd5c1513de45bbe9ea278c2c07ee63b564b61b
+  languageName: node
+  linkType: hard
+
+"@types/node@npm:^24.10.1":
+  version: 24.13.3
+  resolution: "@types/node@npm:24.13.3"
+  dependencies:
+    undici-types: "npm:~7.18.0"
+  checksum: 10c0/a5bc08f49b9581dcdca90e02cd77197a3c799840807664942e5cd5161a553d4d2ae8064f7e3294410d748d7d098b5c1848be7fa50c06f29c4193ab16be4e59eb
   languageName: node
   linkType: hard
 

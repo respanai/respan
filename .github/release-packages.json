@@ -104,6 +104,12 @@
     },
     {
       "ecosystem": "javascript",
+      "name": "@respan/instrumentation-n8n",
+      "path": "javascript-sdks/instrumentations/respan-instrumentation-n8n",
+      "registry": "npm"
+    },
+    {
+      "ecosystem": "javascript",
       "name": "@respan/instrumentation-livekit",
       "path": "javascript-sdks/instrumentations/respan-instrumentation-livekit",
       "registry": "npm"
