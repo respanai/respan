@@ -329,6 +329,10 @@ class TestAutoInstrumentationRegistry(unittest.TestCase):
                 "protocol",
                 "respan_instrumentation_cursor_sdk:CursorSDKInstrumentor",
             ),
+            "exa": (
+                "protocol_tooling",
+                "respan_instrumentation_exa:ExaInstrumentor",
+            ),
         }
 
         for spec_id, (category, import_path) in expected.items():
@@ -338,6 +342,8 @@ class TestAutoInstrumentationRegistry(unittest.TestCase):
                 self.assertEqual(specs[spec_id].import_path, import_path)
                 self.assertFalse(specs[spec_id].enabled_by_default)
                 self.assertTrue(specs[spec_id].auto_disabled_reason)
+
+        self.assertEqual(specs["exa"].sdk_package, "exa-py")
 
     def test_respan_auto_mode_does_not_forward_broad_otel_auto(self):
         captured = {}

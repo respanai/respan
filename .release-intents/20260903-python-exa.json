@@ -1,0 +1,8 @@
+{
+  "summary": "Record the manually published Exa 0.1.0 and required tracing 2.20.0 releases without republishing packages or facade on merge",
+  "packages": {
+    "respan-ai": "none",
+    "respan-instrumentation-exa": "none",
+    "respan-tracing": "none"
+  }
+}

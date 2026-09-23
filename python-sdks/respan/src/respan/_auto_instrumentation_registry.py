@@ -486,6 +486,17 @@ AUTO_INSTRUMENTATION_REGISTRY: Tuple[AutoInstrumentationSpec, ...] = (
         auto_disabled_reason=_AGENT_FRAMEWORK_REASON,
     ),
     AutoInstrumentationSpec(
+        id="exa",
+        category="protocol_tooling",
+        provider="Exa",
+        sdk_package="exa-py",
+        instrumentation_package="respan-instrumentation-exa",
+        entry_point="exa",
+        import_path="respan_instrumentation_exa:ExaInstrumentor",
+        enabled_by_default=False,
+        auto_disabled_reason=_PROTOCOL_REASON,
+    ),
+    AutoInstrumentationSpec(
         id="agentspec",
         category="agent_framework",
         provider="AgentSpec",
