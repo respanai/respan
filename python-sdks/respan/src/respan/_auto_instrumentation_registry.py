@@ -476,14 +476,14 @@ AUTO_INSTRUMENTATION_REGISTRY: Tuple[AutoInstrumentationSpec, ...] = (
     ),
     AutoInstrumentationSpec(
         id="dify",
-        category="agent_framework",
+        category="app_framework",
         provider="Dify",
-        sdk_package="dify",
+        sdk_package="dify-client",
         instrumentation_package="respan-instrumentation-dify",
         entry_point="dify",
         import_path="respan_instrumentation_dify:DifyInstrumentor",
         enabled_by_default=False,
-        auto_disabled_reason=_AGENT_FRAMEWORK_REASON,
+        auto_disabled_reason=_FRAMEWORK_REASON,
     ),
     AutoInstrumentationSpec(
         id="agentspec",

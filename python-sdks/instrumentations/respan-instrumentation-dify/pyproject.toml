@@ -13,7 +13,7 @@ packages = [
 python = ">=3.11,<3.14"
 respan-tracing = "^2.17.0"
 respan-sdk = ">=2.6.1"
-dify-client = ">=0.1.10"
+dify-client = ">=0.1.10,<0.2.0"
 opentelemetry-semantic-conventions-ai = ">=0.4.1"
 
 [tool.poetry.plugins."respan.instrumentations"]
