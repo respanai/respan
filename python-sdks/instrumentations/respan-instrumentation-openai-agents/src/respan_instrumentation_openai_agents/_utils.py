@@ -31,27 +31,30 @@ def _responses_api_item_to_message(item: dict[str, Any]) -> dict[str, Any] | Non
                 text_parts.append(block)
         return {"role": role, "content": "\n".join(text_parts)}
 
-    if item_type == "function_call":
+    if item_type.endswith("_call"):
         return {
             "role": "assistant",
             "content": "",
             "tool_calls": [
                 {
-                    "id": item.get("call_id", ""),
+                    "id": item.get("call_id") or item.get("id", ""),
                     "type": "function",
                     "function": {
-                        "name": item.get("name", ""),
-                        "arguments": item.get("arguments", ""),
+                        "name": item.get("name", item_type),
+                        "arguments": item.get(
+                            "arguments",
+                            json_string(item.get("action", item.get("operation", {}))),
+                        ),
                     },
                 }
             ],
         }
 
-    if item_type == "function_call_output":
+    if item_type.endswith("_call_output"):
         return {
             "role": "tool",
             "content": item.get("output", ""),
-            "tool_call_id": item.get("call_id", ""),
+            "tool_call_id": item.get("call_id") or item.get("id", ""),
         }
 
     return None
@@ -104,7 +107,10 @@ def _format_output(resp_output: Any) -> str:
         return serialized
 
     if isinstance(serialized, dict):
-        if serialized.get("type") in ("function_call", "function_call_output"):
+        if (
+            str(serialized.get("type", "")).endswith(("_call", "_call_output"))
+            or serialized.get("type") == "reasoning"
+        ):
             return ""
         if serialized.get("tool_calls") and serialized.get("content") is None:
             return ""
@@ -122,7 +128,10 @@ def _format_output(resp_output: Any) -> str:
                 text_parts.append(json_string(item))
                 continue
             item_type = item.get("type", "")
-            if item_type in ("function_call", "function_call_output"):
+            if (
+                item_type.endswith(("_call", "_call_output"))
+                or item_type == "reasoning"
+            ):
                 continue
             if item_type in ("output_text", "text", "input_text"):
                 text_parts.append(item.get("text", ""))

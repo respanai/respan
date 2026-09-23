@@ -1,0 +1,4 @@
+{
+  "summary": "Verify current Agents SDK and preserve MCP, voice, metadata, and structural spans",
+  "packages": {"respan-instrumentation-openai-agents": "none"}
+}

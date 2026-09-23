@@ -34,8 +34,6 @@ from openai.types.responses.response_created_event import ResponseCreatedEvent
 from openai.types.responses.response_text_delta_event import ResponseTextDeltaEvent
 from opentelemetry.semconv_ai import SpanAttributes
 from opentelemetry.trace.status import StatusCode
-from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE, RESPAN_METADATA
-
 from respan_instrumentation_openai_agents import _otel_emitter
 from respan_instrumentation_openai_agents._instrumentation import (
     _RespanTracingProcessor,
@@ -47,6 +45,7 @@ from respan_instrumentation_openai_agents._serialization import (
     flatten_metadata_attributes,
     json_string,
 )
+from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE, RESPAN_METADATA
 
 _BANNED_ALIASES = {
     "completion_tokens",
@@ -737,3 +736,288 @@ async def test_real_runner_offline_stream_closes_source_and_marks_chat(monkeypat
     assert chats[0].attributes[f"{SpanAttributes.LLM_COMPLETIONS}.0.content"] == (
         "Hello stream."
     )
+
+
+@pytest.mark.parametrize(
+    ("factory_name", "kwargs", "log_type", "expected_input", "expected_output"),
+    [
+        (
+            "mcp_tools_span",
+            {"server": "weather", "result": ["forecast"]},
+            "tool",
+            {"name": "weather.list_tools", "arguments": {"server": "weather"}},
+            ["forecast"],
+        ),
+        (
+            "transcription_span",
+            {"input": "YXVkaW8=", "input_format": "pcm", "output": "Hello"},
+            "transcription",
+            {"data": "YXVkaW8=", "format": "pcm"},
+            "Hello",
+        ),
+        (
+            "speech_span",
+            {"input": "Hello", "output": "YXVkaW8=", "output_format": "pcm"},
+            "speech",
+            "Hello",
+            {"data": "YXVkaW8=", "format": "pcm"},
+        ),
+        ("speech_group_span", {"input": "Hello"}, "task", "Hello", None),
+    ],
+)
+def test_current_sdk_mcp_and_voice_spans_preserve_content(
+    monkeypatch, factory_name, kwargs, log_type, expected_input, expected_output
+):
+    import agents.tracing as sdk_tracing
+
+    captured = _capture_spans(monkeypatch)
+    set_trace_processors([_RespanTracingProcessor()])
+    with trace("native-span-coverage"):  # noqa: SIM117 - assert explicit SDK nesting
+        with getattr(sdk_tracing, factory_name)(**kwargs):
+            pass
+    child, root = captured
+    assert child.parent.span_id == root.get_span_context().span_id
+    assert child.attributes[RESPAN_LOG_TYPE] == log_type
+    assert (
+        json.loads(child.attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT])
+        == expected_input
+    )
+    if expected_output is not None:
+        assert (
+            json.loads(child.attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT])
+            == expected_output
+        )
+    assert not _BANNED_ALIASES.intersection(child.attributes)
+
+
+def test_structural_rollups_do_not_double_count_model_usage(monkeypatch):
+    captured = _capture_spans(monkeypatch)
+    set_trace_processors([_RespanTracingProcessor()])
+    with trace("usage-rollup"):  # noqa: SIM117 - assert explicit SDK nesting
+        with task_span("run") as task:
+            task.span_data.usage = {
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "total_tokens": 12,
+            }
+            task.span_data.metadata = {"checkpoint": "saved"}
+            with turn_span(1, "Assistant") as turn:
+                turn.span_data.usage = {"input_tokens": 10, "output_tokens": 2}
+                with generation_span(
+                    model="gpt-4o-mini", usage={"input_tokens": 10, "output_tokens": 2}
+                ):
+                    pass
+    assert sum(s.attributes.get("gen_ai.usage.input_tokens", 0) for s in captured) == 10
+    task_attrs = next(
+        s.attributes
+        for s in captured
+        if s.attributes.get(SpanAttributes.TRACELOOP_ENTITY_NAME) == "run"
+    )
+    metadata = json.loads(task_attrs[RESPAN_METADATA])
+    assert metadata["checkpoint"] == "saved"
+    assert metadata["openai_agents.usage"]["total_tokens"] == 12
+
+
+@pytest.mark.parametrize(
+    "tool_type, action",
+    [
+        ("shell_call", {"commands": ["pwd"]}),
+        (
+            "apply_patch_call",
+            {"type": "update_file", "path": "hello.txt", "diff": "+hello"},
+        ),
+        ("image_generation_call", {"action": "generate"}),
+    ],
+)
+def test_responses_hosted_tools_are_calls_not_assistant_text(
+    monkeypatch, tool_type, action
+):
+    captured = _capture_spans(monkeypatch)
+    _otel_emitter.emit_response(
+        _make_span_item(),
+        SimpleNamespace(
+            input=[{"role": "user", "content": "Perform the action"}],
+            usage=None,
+            response=SimpleNamespace(
+                model="gpt-4o",
+                usage=None,
+                tools=[],
+                output=[
+                    {"type": tool_type, "id": "hosted_call", "action": action},
+                    {"type": "reasoning", "summary": []},
+                ],
+            ),
+        ),
+    )
+    attrs = captured[0].attributes
+    calls = json.loads(attrs[f"{SpanAttributes.LLM_COMPLETIONS}.0.tool_calls"])
+    assert calls[0]["function"]["name"] == tool_type
+    assert json.loads(calls[0]["function"]["arguments"]) == action
+    assert attrs[f"{SpanAttributes.LLM_COMPLETIONS}.0.content"] == ""
+
+
+def test_streamed_chat_generation_unwraps_native_response_envelope(monkeypatch):
+    from agents.tracing.span_data import GenerationSpanData
+
+    captured = _capture_spans(monkeypatch)
+    response = Response(
+        id="response_stream",
+        object="response",
+        created_at=1,
+        model="gpt-4o-mini",
+        parallel_tool_calls=True,
+        tool_choice="auto",
+        tools=[],
+        output=[
+            ResponseFunctionToolCall(
+                type="function_call",
+                call_id="call_forecast",
+                name="forecast",
+                arguments='{"city":"Paris"}',
+            ),
+            ResponseOutputMessage(
+                id="message",
+                type="message",
+                role="assistant",
+                status="completed",
+                content=[
+                    ResponseOutputText(
+                        type="output_text",
+                        text="Sunny in Paris.",
+                        annotations=[],
+                        logprobs=[],
+                    )
+                ],
+            ),
+        ],
+    )
+    _otel_emitter.emit_generation(
+        _make_span_item(),
+        GenerationSpanData(
+            input=[{"role": "user", "content": "Weather?"}],
+            output=[response.model_dump()],
+            model="gpt-4o-mini",
+        ),
+        is_streaming=True,
+    )
+    attrs = captured[0].attributes
+    assert attrs[f"{SpanAttributes.LLM_COMPLETIONS}.0.content"] == "Sunny in Paris."
+    assert (
+        json.loads(attrs[f"{SpanAttributes.LLM_COMPLETIONS}.0.tool_calls"])[0][
+            "function"
+        ]["name"]
+        == "forecast"
+    )
+    assert attrs[SpanAttributes.LLM_IS_STREAMING] is True
+
+
+@pytest.mark.parametrize("control", ["environment", "context"])
+def test_content_opt_out_removes_native_mcp_and_audio_payloads(monkeypatch, control):
+    from agents.tracing import mcp_tools_span, speech_span
+    from opentelemetry import context as otel_context
+    from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+
+    captured = _capture_spans(monkeypatch)
+    set_trace_processors([_RespanTracingProcessor()])
+    token = None
+    if control == "environment":
+        monkeypatch.setenv("TRACELOOP_TRACE_CONTENT", "false")
+    else:
+        token = otel_context.attach(
+            otel_context.set_value(ENABLE_CONTENT_TRACING_KEY, False)
+        )
+    try:
+        with trace("privacy"):
+            with mcp_tools_span(server="weather", result=["PRIVATE_CONTENT"]):
+                pass
+            with speech_span(
+                input="PRIVATE_CONTENT", output="PRIVATE_CONTENT", model="tts-1"
+            ):
+                pass
+    finally:
+        if token is not None:
+            otel_context.detach(token)
+    assert len(captured) == 3
+    for span in captured:
+        assert "PRIVATE_CONTENT" not in json.dumps(dict(span.attributes))
+        assert SpanAttributes.TRACELOOP_ENTITY_INPUT not in span.attributes
+        assert SpanAttributes.TRACELOOP_ENTITY_OUTPUT not in span.attributes
+
+
+@pytest.mark.parametrize(
+    "style, expected", [("semantic", "transcribe"), ("legacy", "transcription")]
+)
+def test_audio_model_does_not_change_semantic_operation(monkeypatch, style, expected):
+    from agents.tracing.span_data import TranscriptionSpanData
+    from respan_tracing.exporters.respan import _span_to_otlp_json
+
+    captured = _capture_spans(monkeypatch)
+    monkeypatch.setenv("RESPAN_SPAN_NAME_STYLE", style)
+    _otel_emitter.emit_audio(
+        _make_span_item(),
+        TranscriptionSpanData(input="YXVkaW8=", output="Hello", model="whisper-1"),
+    )
+    payload = _span_to_otlp_json(captured[0])
+    assert payload["name"] == expected
+    assert captured[0].attributes[RESPAN_LOG_TYPE] == "transcription"
+    assert captured[0].attributes[SpanAttributes.LLM_REQUEST_MODEL] == "whisper-1"
+    assert not any(
+        a["key"].startswith("respan.internal.") for a in payload["attributes"]
+    )
+
+
+def test_hosted_tool_history_preserves_native_item_id():
+    from respan_instrumentation_openai_agents._utils import _format_input_messages
+
+    messages = _format_input_messages(
+        [
+            {
+                "type": "web_search_call",
+                "id": "ws_123",
+                "action": {"type": "search", "query": "weather"},
+            },
+            {"type": "web_search_call_output", "call_id": "ws_123", "output": "Sunny"},
+        ]
+    )
+    assert messages[0]["tool_calls"][0]["id"] == "ws_123"
+    assert messages[1]["tool_call_id"] == "ws_123"
+
+
+@pytest.mark.parametrize(
+    "payload, expected_input, expected_output",
+    [
+        (
+            {"type": "file_search_call", "id": "fs", "queries": ["hello"]},
+            {"queries": ["hello"]},
+            None,
+        ),
+        (
+            {
+                "type": "code_interpreter_call",
+                "id": "ci",
+                "code": "print(42)",
+                "container_id": "c",
+                "outputs": [{"type": "logs", "logs": "42"}],
+            },
+            {"code": "print(42)", "container_id": "c"},
+            [{"type": "logs", "logs": "42"}],
+        ),
+        (
+            {
+                "type": "image_generation_call",
+                "id": "img",
+                "revised_prompt": "cat",
+                "result": "BASE64",
+            },
+            {"revised_prompt": "cat"},
+            "BASE64",
+        ),
+    ],
+)
+def test_hosted_call_payloads_retain_native_arguments_and_results(
+    payload, expected_input, expected_output
+):
+    call = _otel_emitter._extract_tool_calls([payload])[0]
+    assert json.loads(call["function"]["arguments"]) == expected_input
+    if expected_output is not None:
+        assert call["output"] == expected_output

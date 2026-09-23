@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -14,12 +15,17 @@ from agents.tracing.span_data import (
     GenerationSpanData,
     GuardrailSpanData,
     HandoffSpanData,
+    MCPListToolsSpanData,
     ResponseSpanData,
+    SpeechGroupSpanData,
+    SpeechSpanData,
     TaskSpanData,
+    TranscriptionSpanData,
     TurnSpanData,
 )
 from agents.tracing.spans import Span, SpanImpl
 from agents.tracing.traces import Trace
+from opentelemetry import context as context_api
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import (
     GEN_AI_USAGE_INPUT_TOKENS,
     GEN_AI_USAGE_OUTPUT_TOKENS,
@@ -31,8 +37,10 @@ from respan_sdk.constants.llm_logging import (
     LOG_TYPE_CUSTOM,
     LOG_TYPE_GUARDRAIL,
     LOG_TYPE_HANDOFF,
+    LOG_TYPE_SPEECH,
     LOG_TYPE_TASK,
     LOG_TYPE_TOOL,
+    LOG_TYPE_TRANSCRIPTION,
     LOG_TYPE_WORKFLOW,
 )
 from respan_sdk.constants.span_attributes import (
@@ -47,6 +55,7 @@ from respan_sdk.constants.span_attributes import (
     RESPAN_METADATA_TRIGGERED,
     RESPAN_TRACE_GROUP_ID,
 )
+from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
 from respan_tracing.utils.span_factory import build_readable_span, inject_span
 
 from respan_instrumentation_openai_agents._serialization import (
@@ -110,6 +119,9 @@ def _item_metadata(
     trace_metadata = getattr(item, "trace_metadata", None)
     if isinstance(trace_metadata, Mapping):
         metadata.update(trace_metadata)
+    span_metadata = getattr(getattr(item, "span_data", None), "metadata", None)
+    if isinstance(span_metadata, Mapping):
+        metadata.update(span_metadata)
     if extra_metadata:
         metadata.update(extra_metadata)
     return metadata
@@ -206,8 +218,28 @@ def _normalize_tool_call(value: Any) -> dict[str, Any] | None:
         name = function.get("name")
         arguments = function.get("arguments", {})
     else:
-        name = dumped.get("name")
-        arguments = dumped.get("arguments", {})
+        item_type = dumped.get("type", "")
+        name = dumped.get("name") or (
+            item_type if item_type.endswith("_call") else None
+        )
+        hosted_arguments = {
+            key: value
+            for key, value in dumped.items()
+            if key
+            not in {
+                "id",
+                "call_id",
+                "type",
+                "name",
+                "status",
+                "result",
+                "output",
+                "outputs",
+            }
+        }
+        arguments = dumped.get(
+            "arguments", dumped.get("action", dumped.get("operation", hosted_arguments))
+        )
     if not name:
         return None
     normalized: dict[str, Any] = {
@@ -219,6 +251,10 @@ def _normalize_tool_call(value: Any) -> dict[str, Any] | None:
             ),
         },
     }
+    for output_key in ("result", "output", "outputs"):
+        if output_key in dumped:
+            normalized["output"] = dumped[output_key]
+            break
     call_id = dumped.get("call_id") or dumped.get("id")
     if call_id:
         normalized["id"] = safe_text(call_id, limit=256)
@@ -234,7 +270,7 @@ def _extract_tool_calls(output: Any) -> list[dict[str, Any]]:
         if not isinstance(item, Mapping):
             continue
         candidates: list[Any] = []
-        if item.get("type") == "function_call":
+        if str(item.get("type", "")).endswith("_call"):
             candidates.append(item)
         nested = item.get("tool_calls")
         if isinstance(nested, list):
@@ -296,6 +332,24 @@ def _is_streaming(
     return bool(agent_context and agent_context.get("is_streaming"))
 
 
+def _apply_content_privacy(attributes: dict[str, Any]) -> None:
+    enabled = os.getenv("TRACELOOP_TRACE_CONTENT", "true").strip().lower()
+    if (
+        enabled not in {"0", "false", "no", "off"}
+        and context_api.get_value(ENABLE_CONTENT_TRACING_KEY) is not False
+    ):
+        return
+    for key in tuple(attributes):
+        if key in {
+            SpanAttributes.TRACELOOP_ENTITY_INPUT,
+            SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+            SpanAttributes.LLM_REQUEST_FUNCTIONS,
+        } or key.startswith(
+            (f"{SpanAttributes.LLM_PROMPTS}.", f"{SpanAttributes.LLM_COMPLETIONS}.")
+        ):
+            attributes.pop(key, None)
+
+
 def _build_item_span(
     item: SpanImpl,
     *,
@@ -310,6 +364,7 @@ def _build_item_span(
         attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = json_string(
             {"error": {"message": message, "status_code": status_code}}
         )
+    _apply_content_privacy(attributes)
     return build_readable_span(
         name=safe_text(name, default="span"),
         trace_id=item.trace_id,
@@ -345,6 +400,7 @@ def emit_trace(
     group_id = getattr(trace_obj, "group_id", None)
     if group_id:
         attrs[RESPAN_TRACE_GROUP_ID] = safe_text(group_id, limit=512)
+    _apply_content_privacy(attrs)
     inject_span(
         build_readable_span(
             name=f"{name}.workflow",
@@ -455,7 +511,21 @@ def emit_generation(
     if span_data.model:
         attrs[SpanAttributes.LLM_REQUEST_MODEL] = safe_text(span_data.model)
         attrs[SpanAttributes.LLM_RESPONSE_MODEL] = safe_text(span_data.model)
-    _set_llm_content(attrs, input_value=span_data.input, output_value=span_data.output)
+    # Streaming Chat Completions reports a complete Responses object inside
+    # GenerationSpanData.output. Unwrap it before bounded serialization, or
+    # tool calls disappear and the assistant answer becomes response JSON.
+    output = span_data.output
+    if isinstance(output, (list, tuple)):
+        output = [
+            child
+            for entry in output
+            for child in (
+                _get_field(entry, "output")
+                if isinstance(_get_field(entry, "output"), (list, tuple))
+                else [entry]
+            )
+        ]
+    _set_llm_content(attrs, input_value=span_data.input, output_value=output)
     tools = _agent_tools(agent_context)
     if tools:
         attrs[SpanAttributes.LLM_REQUEST_FUNCTIONS] = json_string(tools)
@@ -594,7 +664,12 @@ def _emit_structural(
     agent_name = getattr(span_data, "agent_name", None)
     if agent_name:
         attrs[RESPAN_METADATA_AGENT_NAME] = safe_text(agent_name)
-    _set_usage(attrs, getattr(span_data, "usage", None))
+    usage = getattr(span_data, "usage", None)
+    if usage is not None:
+        # Task/turn usage is a rollup of child model calls, not another charge.
+        metadata = _item_metadata(item, extra_metadata)
+        metadata["openai_agents.usage"] = usage
+        attrs[RESPAN_METADATA] = json_string(metadata)
     inject_span(_build_item_span(item, name=f"{name}.task", attributes=attrs))
 
 
@@ -635,6 +710,71 @@ def emit_turn(
     )
 
 
+def emit_mcp_tools(
+    item: SpanImpl,
+    span_data: MCPListToolsSpanData,
+    *,
+    extra_metadata: Mapping[str, Any] | None = None,
+    **_: Any,
+) -> None:
+    server = safe_text(span_data.server, default="mcp")
+    name = f"{server}.list_tools"
+    attrs = _base_attrs(
+        entity_name=name,
+        entity_path=name,
+        log_type=LOG_TYPE_TOOL,
+        metadata=_item_metadata(item, extra_metadata),
+    )
+    attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = json_string(
+        {"name": name, "arguments": {"server": server}}
+    )
+    attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = json_string(span_data.result or [])
+    inject_span(_build_item_span(item, name=f"{name}.tool", attributes=attrs))
+
+
+def emit_audio(
+    item: SpanImpl,
+    span_data: Any,
+    *,
+    extra_metadata: Mapping[str, Any] | None = None,
+    **_: Any,
+) -> None:
+    transcription = isinstance(span_data, TranscriptionSpanData)
+    group = isinstance(span_data, SpeechGroupSpanData)
+    name = "speech_group" if group else "transcription" if transcription else "speech"
+    log_type = (
+        LOG_TYPE_TASK
+        if group
+        else LOG_TYPE_TRANSCRIPTION
+        if transcription
+        else LOG_TYPE_SPEECH
+    )
+    attrs = _base_attrs(
+        entity_name=name,
+        entity_path=name,
+        log_type=log_type,
+        metadata=_item_metadata(item, extra_metadata),
+    )
+    input_value = span_data.input
+    if transcription:
+        input_value = {"data": input_value, "format": span_data.input_format}
+    if input_value is not None:
+        attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = json_string(input_value)
+    output = getattr(span_data, "output", None)
+    if output is not None:
+        if isinstance(span_data, SpeechSpanData):
+            output = {"data": output, "format": span_data.output_format}
+        attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = json_string(output)
+    model = getattr(span_data, "model", None)
+    if model:
+        attrs[SpanAttributes.LLM_REQUEST_MODEL] = safe_text(model)
+    if not group:
+        attrs[RESPAN_INTERNAL_SPAN_NAME_KIND] = (
+            "transcribe" if transcription else "speech"
+        )
+    inject_span(_build_item_span(item, name=name, attributes=attrs))
+
+
 _EMITTERS = {
     ResponseSpanData: emit_response,
     FunctionSpanData: emit_function,
@@ -645,6 +785,10 @@ _EMITTERS = {
     CustomSpanData: emit_custom,
     TaskSpanData: emit_task,
     TurnSpanData: emit_turn,
+    MCPListToolsSpanData: emit_mcp_tools,
+    TranscriptionSpanData: emit_audio,
+    SpeechSpanData: emit_audio,
+    SpeechGroupSpanData: emit_audio,
 }
 
 
