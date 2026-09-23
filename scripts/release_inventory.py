@@ -470,6 +470,7 @@ def build_record(entry: dict, manifest: dict) -> dict:
         record["has_peer_dependencies"] = bool(manifest.get("peerDependencies"))
     else:
         record["import_name"] = python_import_name(manifest)
+        record["python_version"] = entry.get("python_version", "3.11")
     return record
 
 

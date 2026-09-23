@@ -1,0 +1,6 @@
+{
+  "summary": "Add and verify Vercel Python AI SDK instrumentation without publishing",
+  "packages": {
+    "respan-instrumentation-vercel": "none"
+  }
+}

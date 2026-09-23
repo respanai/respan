@@ -165,7 +165,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python_version || '3.11' }}
 
       - name: Install Python build tooling
         run: python3 -m pip install --upgrade build pip

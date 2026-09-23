@@ -1,0 +1,26 @@
+[tool.poetry]
+name = "respan-instrumentation-vercel"
+version = "0.1.0"
+description = "Respan instrumentation for Vercel AI SDK for Python"
+authors = ["Respan <team@respan.ai>"]
+license = "Apache-2.0"
+packages = [{ include = "respan_instrumentation_vercel", from = "src" }]
+
+[tool.poetry.dependencies]
+python = ">=3.12,<3.14"
+ai = { version = ">=0.7.0,<0.8.0", extras = ["otel"] }
+respan-tracing = ">=2.20.0"
+respan-sdk = ">=2.7.6"
+opentelemetry-semantic-conventions-ai = ">=0.5.1"
+opentelemetry-semantic-conventions = ">=0.65b0"
+pydantic = ">=2.13,<3"
+
+[tool.poetry.plugins."respan.instrumentations"]
+vercel = "respan_instrumentation_vercel:VercelInstrumentor"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
