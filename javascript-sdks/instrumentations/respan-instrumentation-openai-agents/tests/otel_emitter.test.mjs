@@ -747,3 +747,165 @@ test("emit span without ended_at defaults end time to start time", () => {
   assert.deepEqual(span.endTime, [1774828800, 0]);
   assert.deepEqual(span.duration, [0, 0]);
 });
+
+test("real latest SDK Runner retains task and turn parents without double counting", async () => {
+  const { Agent, Runner, Usage, withGenerationSpan, withTrace } = await import("@openai/agents");
+  const { OpenAIAgentsInstrumentor } = await import("../dist/index.js");
+  const instrumentor = new OpenAIAgentsInstrumentor();
+  instrumentor.activate();
+  captureState.spans = [];
+  const model = {
+    async getResponse(request) {
+      const output = [{ type: "message", role: "assistant", status: "completed",
+        content: [{ type: "output_text", text: "Verified" }] }];
+      return withGenerationSpan(async () => ({ output,
+        usage: new Usage({ inputTokens: 7, outputTokens: 2, totalTokens: 9 }),
+        responseId: "test_response",
+      }), { data: { input: request.input, output, model: "test-model",
+        usage: { input_tokens: 7, output_tokens: 2 } } });
+    },
+    async *getStreamedResponse() { throw new Error("not used"); },
+  };
+  const result = await withTrace("latest-runner", () => new Runner().run(
+    new Agent({ name: "Current SDK", model }), "Verify",
+  ));
+  assert.equal(result.finalOutput, "Verified");
+  const spans = captureState.spans;
+  assert.equal(spans.length, 5);
+  const ids = new Set(spans.map(s => s.spanContext().spanId));
+  assert.equal(spans.filter(s => !s.parentSpanContext).length, 1);
+  for (const span of spans) {
+    if (span.parentSpanContext) assert.ok(ids.has(span.parentSpanContext.spanId));
+    assertNoOffContractAliases(span.attributes);
+  }
+  assert.equal(spans.reduce((sum, s) => sum + (s.attributes["gen_ai.usage.input_tokens"] ?? 0), 0), 7);
+  const task = spans.find(s => s.attributes[RespanSpanAttributes.RESPAN_LOG_TYPE] === "workflow" && s.parentSpanContext);
+  assert.equal(JSON.parse(task.attributes["respan.metadata.openai_agents.usage"]).total_tokens, 9);
+  instrumentor.deactivate();
+});
+
+test("native SDK voice spans preserve audio payloads and error messages", async () => {
+  const { Span } = await import("@openai/agents");
+  const processor = { onSpanStart() {}, onSpanEnd() {} };
+  for (const [type, input, output, logType] of [
+    ["transcription", { data: "YXVkaW8=", format: "pcm" }, "Hello", "transcription"],
+    ["speech", "Hello", { data: "YXVkaW8=", format: "pcm" }, "speech"],
+    ["speech_group", "Hello", undefined, "task"],
+  ]) {
+    const item = new Span({ traceId: "trace_voice", spanId: `span_${type}`,
+      data: { type, input, output }, startedAt: "2026-09-23T00:00:00Z", endedAt: "2026-09-23T00:00:01Z",
+    }, processor);
+    const attrs = emitAndCapture(item);
+    assert.equal(attrs[RespanSpanAttributes.RESPAN_LOG_TYPE], logType);
+    assert.deepEqual(JSON.parse(attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT]), input);
+    if (output !== undefined) assert.deepEqual(JSON.parse(attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]), output);
+  }
+  const item = new Span({ traceId: "trace_error", data: { type: "turn", turn: 1, agent_name: "Failure" } }, processor);
+  item.setError({ message: "Expected SDK error", data: { status_code: 429 } });
+  assert.equal(emitAndCaptureSpan(item).status.message, "Expected SDK error");
+});
+
+test("stream cancellation preserves context and overlapping instrumentor lifetime", async () => {
+  const { OpenAIChatCompletionsModel, withTrace, withCustomSpan } = await import('@openai/agents');
+  const { OpenAIAgentsInstrumentor } = await import('../dist/index.js');
+  const { isStreaming } = await import('../dist/_streaming.js');
+  const prototype = OpenAIChatCompletionsModel.prototype;
+  const original = prototype.getStreamedResponse;
+  let closed = false;
+  const source = async function* () {
+    try { assert.equal(isStreaming(), true); yield 'first'; }
+    finally { assert.equal(isStreaming(), true); closed = true; }
+  };
+  prototype.getStreamedResponse = source;
+  const first = new OpenAIAgentsInstrumentor();
+  const second = new OpenAIAgentsInstrumentor();
+  try {
+    first.activate(); first.activate(); second.activate(); first.deactivate();
+    assert.notEqual(prototype.getStreamedResponse, source);
+    const stream = prototype.getStreamedResponse.call({});
+    assert.deepEqual(await stream.next(), {value:'first', done:false});
+    assert.equal(isStreaming(), false);
+    await stream.return(); assert.equal(closed, true);
+    second.deactivate(); assert.equal(prototype.getStreamedResponse, source);
+    captureState.spans = [];
+    await withTrace('disabled', () => withCustomSpan(async()=>{}, {data:{name:'disabled',data:{}}}));
+    assert.equal(captureState.spans.length, 0);
+  } finally { first.deactivate(); second.deactivate(); prototype.getStreamedResponse = original; }
+});
+
+test("tool-only Chat Completions never become JSON assistant text", () => {
+  for (const content of [null, '']) {
+    const attrs = emitAndCapture(makeBaseSpanData({type:'generation', model:'gpt-4o-mini', output:[{
+      object:'chat.completion',choices:[{message:{role:'assistant',content,
+        tool_calls:[{id:'call_forecast',type:'function',function:{name:'forecast',arguments:'{"city":"Paris"}'}}]}}],
+    }]}));
+    assert.equal(attrs['gen_ai.completion.0.content'], '');
+    assert.equal(JSON.parse(attrs['gen_ai.completion.0.tool_calls'])[0].function.name,'forecast');
+  }
+});
+
+test('Respan content opt-out removes MCP, audio and LLM payloads', () => {
+  const previous = process.env.RESPAN_TRACE_CONTENT;
+  process.env.RESPAN_TRACE_CONTENT = 'false';
+  try {
+    for (const data of [
+      {type:'mcp_tools',server:'weather',result:['PRIVATE_CONTENT']},
+      {type:'speech',input:'PRIVATE_CONTENT',output:{data:'PRIVATE_CONTENT',format:'pcm'},model:'tts-1'},
+      {type:'generation',input:[{role:'user',content:'PRIVATE_CONTENT'}],output:[{role:'assistant',content:'PRIVATE_CONTENT'}],model:'test'},
+    ]) {
+      const attrs=emitAndCapture(makeBaseSpanData(data));
+      assert.ok(!JSON.stringify(attrs).includes('PRIVATE_CONTENT'));
+      assert.equal(attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT],undefined);
+      assert.equal(attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT],undefined);
+    }
+  } finally {
+    if(previous===undefined)delete process.env.RESPAN_TRACE_CONTENT;
+    else process.env.RESPAN_TRACE_CONTENT=previous;
+  }
+});
+
+test('raw Responses hosted calls survive output and conversation history', () => {
+  for(const type of ['web_search_call','file_search_call','image_generation_call','mcp_call']) {
+    const call={type,id:'hosted_123',action:{type:'search',query:'weather'}};
+    const attrs=emitAndCapture(makeBaseSpanData({type:'response',_input:[call],
+      _response:{model:'gpt-4o-mini',tools:[],output:[call]}}));
+    assert.equal(attrs['gen_ai.completion.0.content'],'');
+    const emitted=JSON.parse(attrs['gen_ai.completion.0.tool_calls'])[0];
+    assert.equal(emitted.id,'hosted_123');assert.equal(emitted.function.name,type);
+    assert.equal(JSON.parse(attrs['gen_ai.prompt.0.tool_calls'])[0].id,'hosted_123');
+  }
+});
+
+test('native Responses no-data tracing cannot export SDK private payload fields', async () => {
+  const { OpenAIResponsesModel, withTrace } = await import('@openai/agents');
+  const { OpenAIAgentsInstrumentor } = await import('../dist/index.js');
+  const inst = new OpenAIAgentsInstrumentor();inst.activate();captureState.spans=[];
+  try {
+    const model = new OpenAIResponsesModel({baseURL:'https://api.openai.com/v1'},'gpt-4o');
+    model._fetchResponse=async()=>({id:'response_private',object:'response',created_at:1,status:'completed',
+      model:'gpt-4o',output:[{id:'message',type:'message',role:'assistant',status:'completed',
+        content:[{type:'output_text',text:'PRIVATE_OUTPUT',annotations:[]}]}],
+      usage:{input_tokens:1,output_tokens:1,total_tokens:2,input_tokens_details:{cached_tokens:0},output_tokens_details:{reasoning_tokens:0}},
+    });
+    await withTrace('private-response',()=>model.getResponse({input:[{type:'message',role:'user',content:'PRIVATE_INPUT'}],
+      modelSettings:{},tools:[],handoffs:[],outputType:'text',tracing:'enabled_without_data'}));
+    const modelSpan=captureState.spans.find(s=>s.attributes[RespanSpanAttributes.RESPAN_LOG_TYPE]==='chat');
+    assert.ok(modelSpan);
+    assert.ok(!JSON.stringify(modelSpan.attributes).includes('PRIVATE_'));
+    assert.equal(modelSpan.attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT],undefined);
+    assert.equal(modelSpan.attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT],undefined);
+  } finally {inst.deactivate();}
+});
+
+test('hosted file search, interpreter, and image payloads retain arguments and results',()=>{
+  for(const [call,args,result] of [
+    [{type:'file_search_call',id:'fs',queries:['hello']},{queries:['hello']},undefined],
+    [{type:'code_interpreter_call',id:'ci',code:'print(42)',container_id:'c',outputs:[{type:'logs',logs:'42'}]},{code:'print(42)',container_id:'c'},[{type:'logs',logs:'42'}]],
+    [{type:'image_generation_call',id:'img',revised_prompt:'cat',result:'BASE64'},{revised_prompt:'cat'},'BASE64'],
+  ]) {
+    const attrs=emitAndCapture(makeBaseSpanData({type:'response',_response:{output:[call]}}));
+    const mapped=JSON.parse(attrs['gen_ai.completion.0.tool_calls'])[0];
+    assert.deepEqual(JSON.parse(mapped.function.arguments),args);
+    assert.deepEqual(mapped.output,result);
+  }
+});

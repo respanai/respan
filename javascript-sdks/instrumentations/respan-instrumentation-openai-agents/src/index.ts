@@ -29,12 +29,16 @@ import {
   registerSdkTrace,
 } from "./_otel_emitter.js";
 
+import { installStreamPatches, removeStreamPatches } from "./_streaming.js";
+
 class _RespanTracingProcessor implements TracingProcessor {
+  enabled = true;
   async onTraceStart(traceObj: Trace): Promise<void> {
-    registerSdkTrace(traceObj);
+    if (this.enabled) registerSdkTrace(traceObj);
   }
 
   async onTraceEnd(traceObj: Trace): Promise<void> {
+    if (!this.enabled) return;
     try {
       emitSdkItem(traceObj);
     } finally {
@@ -47,7 +51,7 @@ class _RespanTracingProcessor implements TracingProcessor {
   }
 
   async onSpanEnd(span: Span<any>): Promise<void> {
-    emitSdkItem(span);
+    if (this.enabled) emitSdkItem(span);
   }
 
   async shutdown(): Promise<void> {
@@ -59,17 +63,32 @@ class _RespanTracingProcessor implements TracingProcessor {
   }
 }
 
+let sharedProcessor: _RespanTracingProcessor | null = null;
+let activationCount = 0;
+
 export class OpenAIAgentsInstrumentor {
   public readonly name = "openai-agents";
   private _processor: _RespanTracingProcessor | null = null;
 
   activate(): void {
-    this._processor = new _RespanTracingProcessor();
-    setTraceProcessors([this._processor]);
+    if (this._processor) return;
+    if (!sharedProcessor) {
+      installStreamPatches();
+      sharedProcessor = new _RespanTracingProcessor();
+      setTraceProcessors([sharedProcessor]);
+    }
+    this._processor = sharedProcessor;
+    activationCount += 1;
   }
 
   deactivate(): void {
+    if (!this._processor) return;
     this._processor = null;
+    activationCount -= 1;
+    if (activationCount) return;
+    if (sharedProcessor) sharedProcessor.enabled = false;
+    sharedProcessor = null;
+    removeStreamPatches();
     clearSdkTraceContexts();
   }
 }

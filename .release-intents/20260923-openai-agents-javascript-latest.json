@@ -1,0 +1,4 @@
+{
+  "summary": "Preserve current Agents SDK task, turn and voice spans",
+  "packages": {"@respan/instrumentation-openai-agents": "none"}
+}

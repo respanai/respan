@@ -22,12 +22,16 @@ import {
 import { RespanLogType, RespanSpanAttributes } from "@respan/respan-sdk";
 import type { Span, Trace } from "@openai/agents";
 
+import { isStreaming, shouldCaptureContent } from "./_streaming.js";
+
 const packageRequire = createRequire(import.meta.url);
 const { version: PACKAGE_VERSION } = packageRequire("../package.json") as {
   version: string;
 };
 const GEN_AI_USAGE_INPUT_TOKENS = ATTR_GEN_AI_USAGE_INPUT_TOKENS;
 const GEN_AI_USAGE_OUTPUT_TOKENS = ATTR_GEN_AI_USAGE_OUTPUT_TOKENS;
+// Not exported by the JavaScript Traceloop semconv package.
+const LLM_IS_STREAMING = "llm.is_streaming";
 const LLM_USAGE_CACHE_READ_INPUT_TOKENS = "llm.usage.cache_read_input_tokens";
 const GEN_AI_COMPLETION_PREFIX = `${SpanAttributes.LLM_COMPLETIONS}.0`;
 const GEN_AI_COMPLETION_ROLE = `${GEN_AI_COMPLETION_PREFIX}.role`;
@@ -295,13 +299,16 @@ function normalizeToolCall(rawToolCall: any): Record<string, any> | null {
     (toolCall as any).toolName ??
     (toolCallType.endsWith("_call") ? toolCallType : "") ??
     "";
+  const hostedArguments = Object.fromEntries(Object.entries(toolCall).filter(
+    ([key]) => !["id", "call_id", "type", "name", "status", "result", "output", "outputs"].includes(key),
+  ));
   const functionArguments =
     (toolCall as any).arguments ??
     (toolCall as any).function?.arguments ??
     (toolCall as any).action ??
     (toolCall as any).actions ??
     (toolCall as any).operation ??
-    "";
+    hostedArguments;
 
   if (
     !functionName &&
@@ -325,6 +332,8 @@ function normalizeToolCall(rawToolCall: any): Record<string, any> | null {
       arguments: stringifyStructured(functionArguments),
     },
   };
+  const hostedOutput = (toolCall as any).result ?? (toolCall as any).output ?? (toolCall as any).outputs;
+  if (hostedOutput !== undefined) normalized.output = hostedOutput;
   if ((toolCall as any).namespace !== undefined) {
     normalized.function.namespace = (toolCall as any).namespace;
   }
@@ -362,7 +371,7 @@ function extractToolCalls(output: any): Record<string, any>[] {
 
     const itemType = (item as any).type ?? "";
     if (
-      itemType === "function_call" ||
+      itemType.endsWith("_call") ||
       itemType === "function" ||
       itemType === "hosted_tool_call" ||
       itemType === "tool_search_call" ||
@@ -476,7 +485,7 @@ function responsesApiItemToMessage(rawItem: any): Record<string, any> | null {
   }
 
   if (
-    itemType === "function_call" ||
+    itemType.endsWith("_call") ||
     itemType === "hosted_tool_call" ||
     itemType === "tool_search_call" ||
     itemType === "computer_call" ||
@@ -493,7 +502,7 @@ function responsesApiItemToMessage(rawItem: any): Record<string, any> | null {
   }
 
   if (
-    itemType === "function_call_output" ||
+    itemType.endsWith("_call_output") ||
     itemType === "function_call_result" ||
     itemType === "tool_search_output" ||
     itemType === "computer_call_result" ||
@@ -758,6 +767,15 @@ function buildReadableSpan(opts: BuildSpanOptions): ReadableSpan {
       ? { code: SpanStatusCode.ERROR, message: opts.errorMessage ?? "" }
       : { code: SpanStatusCode.OK, message: "" };
 
+  if (!shouldCaptureContent() || ["false", "0", "no", "off"].includes((process.env.RESPAN_TRACE_CONTENT ?? "true").trim().toLowerCase())) {
+    for (const key of Object.keys(opts.attributes)) {
+      if ([SpanAttributes.TRACELOOP_ENTITY_INPUT, SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+        SpanAttributes.LLM_REQUEST_FUNCTIONS].includes(key) ||
+        key.startsWith(`${SpanAttributes.LLM_PROMPTS}.`) || key.startsWith(`${SpanAttributes.LLM_COMPLETIONS}.`)) {
+        delete opts.attributes[key];
+      }
+    }
+  }
   applySdkTraceContext(opts.attributes, opts.traceId);
 
   return {
@@ -897,7 +915,7 @@ function formatOutput(output: any): string {
 
   if (typeof serialized === "object" && !Array.isArray(serialized)) {
     const chatCompletionText = formatChatCompletionOutput(serialized);
-    if (chatCompletionText) {
+    if (Array.isArray((serialized as any).choices)) {
       return chatCompletionText;
     }
     if ((serialized as any).content === undefined) {
@@ -915,14 +933,15 @@ function formatOutput(output: any): string {
       }
 
       const chatCompletionText = formatChatCompletionOutput(item);
-      if (chatCompletionText) {
-        textParts.push(chatCompletionText);
+      if (Array.isArray((item as any).choices)) {
+        if (chatCompletionText) textParts.push(chatCompletionText);
         continue;
       }
 
       const itemType = (item as any).type ?? "";
       if (
-        itemType === "function_call" ||
+        itemType.endsWith("_call") ||
+        itemType.endsWith("_call_output") ||
         itemType === "hosted_tool_call" ||
         itemType === "tool_search_call" ||
         itemType === "computer_call" ||
@@ -1034,7 +1053,7 @@ function emitAgent(item: Span<any>): void {
     endTimeHr,
     attributes: attrs,
     statusCode: item.error ? 400 : 200,
-    errorMessage: item.error ? String(item.error) : undefined,
+    errorMessage: item.error?.message,
   });
   injectSpan(span);
 }
@@ -1046,6 +1065,7 @@ function emitResponse(item: Span<any>): void {
   const attrs = baseAttrs("chat", "chat", RespanLogType.CHAT);
   attrs[SpanAttributes.LLM_REQUEST_TYPE] = LLMRequestTypeValues.CHAT;
   attrs[SpanAttributes.LLM_SYSTEM] = "openai";
+  attrs[LLM_IS_STREAMING] = isStreaming() || data.model_config?.stream === true;
 
   const inputMsgs = formatInputMessages(data._input);
   if (inputMsgs) {
@@ -1086,7 +1106,7 @@ function emitResponse(item: Span<any>): void {
     endTimeHr,
     attributes: attrs,
     statusCode: item.error ? 400 : 200,
-    errorMessage: item.error ? String(item.error) : undefined,
+    errorMessage: item.error?.message,
   });
   injectSpan(span);
 }
@@ -1119,7 +1139,7 @@ function emitFunction(item: Span<any>): void {
     endTimeHr,
     attributes: attrs,
     statusCode: item.error ? 400 : 200,
-    errorMessage: item.error ? String(item.error) : undefined,
+    errorMessage: item.error?.message,
   });
   injectSpan(span);
 }
@@ -1131,6 +1151,7 @@ function emitGeneration(item: Span<any>): void {
   const attrs = baseAttrs("chat", "chat", RespanLogType.CHAT);
   attrs[SpanAttributes.LLM_REQUEST_TYPE] = LLMRequestTypeValues.CHAT;
   attrs[SpanAttributes.LLM_SYSTEM] = "openai";
+  attrs[LLM_IS_STREAMING] = isStreaming() || data.model_config?.stream === true;
 
   const model = data.model ?? firstModelFromOutput(data.output);
   if (model) attrs[SpanAttributes.LLM_REQUEST_MODEL] = model;
@@ -1157,7 +1178,7 @@ function emitGeneration(item: Span<any>): void {
     endTimeHr,
     attributes: attrs,
     statusCode: item.error ? 400 : 200,
-    errorMessage: item.error ? String(item.error) : undefined,
+    errorMessage: item.error?.message,
   });
   injectSpan(span);
 }
@@ -1184,7 +1205,7 @@ function emitHandoff(item: Span<any>): void {
     endTimeHr,
     attributes: attrs,
     statusCode: item.error ? 400 : 200,
-    errorMessage: item.error ? String(item.error) : undefined,
+    errorMessage: item.error?.message,
   });
   injectSpan(span);
 }
@@ -1211,7 +1232,7 @@ function emitGuardrail(item: Span<any>): void {
     endTimeHr,
     attributes: attrs,
     statusCode: item.error ? 400 : 200,
-    errorMessage: item.error ? String(item.error) : undefined,
+    errorMessage: item.error?.message,
   });
   injectSpan(span);
 }
@@ -1256,7 +1277,7 @@ function emitCustom(item: Span<any>): void {
     endTimeHr,
     attributes: attrs,
     statusCode: item.error ? 400 : 200,
-    errorMessage: item.error ? String(item.error) : undefined,
+    errorMessage: item.error?.message,
   });
   injectSpan(span);
 }
@@ -1282,9 +1303,56 @@ function emitMcpTools(item: Span<any>): void {
     endTimeHr,
     attributes: attrs,
     statusCode: item.error ? 400 : 200,
-    errorMessage: item.error ? String(item.error) : undefined,
+    errorMessage: item.error?.message,
   });
   injectSpan(span);
+}
+
+function emitStructural(item: Span<any>): void {
+  const data = item.spanData as any;
+  const task = data.type === "task";
+  const name = task ? data.name || "agent-run" : `turn-${data.turn}`;
+  const attrs = baseAttrs(name, name, task ? RespanLogType.WORKFLOW : RespanLogType.TASK);
+  attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safeJson(
+    task ? { name } : { turn: data.turn, agent_name: data.agent_name },
+  );
+  if (data.agent_name) {
+    attrs[RespanSpanAttributes.RESPAN_METADATA_AGENT_NAME] = data.agent_name;
+  }
+  // These counts aggregate child LLM usage. Keep them out of billable totals.
+  if (data.usage !== undefined) {
+    setMetadataAttribute(attrs, "openai_agents.usage", data.usage);
+  }
+  const { startTimeHr, endTimeHr } = resolveSpanTimes(item);
+  injectSpan(buildReadableSpan({
+    name, traceId: item.traceId, spanId: item.spanId,
+    parentId: item.parentId || item.traceId, startTimeHr, endTimeHr,
+    attributes: attrs,
+    statusCode: item.error ? 400 : 200,
+    errorMessage: item.error?.message,
+  }));
+}
+
+function emitAudio(item: Span<any>): void {
+  const data = item.spanData as any;
+  const logType = data.type === "speech" ? RespanLogType.SPEECH
+    : data.type === "transcription" ? RespanLogType.TRANSCRIPTION : RespanLogType.TASK;
+  const attrs = baseAttrs(data.type, data.type, logType);
+  if (data.input !== undefined) {
+    attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safeJson(data.input);
+  }
+  if (data.output !== undefined) {
+    attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safeJson(data.output);
+  }
+  if (data.model) attrs[SpanAttributes.LLM_REQUEST_MODEL] = data.model;
+  const { startTimeHr, endTimeHr } = resolveSpanTimes(item);
+  injectSpan(buildReadableSpan({
+    name: data.type, traceId: item.traceId, spanId: item.spanId,
+    parentId: item.parentId || item.traceId, startTimeHr, endTimeHr,
+    attributes: attrs,
+    statusCode: item.error ? 400 : 200,
+    errorMessage: item.error?.message,
+  }));
 }
 
 export function emitSdkItem(item: Trace | Span<any>): void {
@@ -1306,6 +1374,8 @@ export function emitSdkItem(item: Trace | Span<any>): void {
     else if (type === "handoff") emitHandoff(item);
     else if (type === "custom") emitCustom(item);
     else if (type === "mcp_tools") emitMcpTools(item);
+    else if (type === "task" || type === "turn") emitStructural(item);
+    else if (["transcription", "speech", "speech_group"].includes(type)) emitAudio(item);
     else if (typeof spanData?.triggered === "boolean") emitGuardrail(item);
     else if (spanData?.name && spanData?.data) emitCustom(item);
     else {
