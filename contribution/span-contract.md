@@ -97,10 +97,13 @@ If you find these in existing code, that's debt to remove, not a pattern to copy
 | `traceloop.entity.name` | string | tool name |
 | `traceloop.entity.input` | string (JSON) | `{name, arguments}` |
 | `traceloop.entity.output` | string (JSON) | tool result |
+| `gen_ai.tool.call.id` | string | invocation ID, when available; matches the model's tool-call ID and identifies the execution/result |
 
 The span's existence + `respan.entity.log_type=tool` IS the tool call.
 Do NOT additionally set `tool_calls`, `respan.span.tool_calls`, or
-`gen_ai.tool.*` on tool execution spans.
+other `gen_ai.tool.*` attributes on tool execution spans. Preserve
+`gen_ai.tool.call.id` for correlation with the model call and tool result; it
+does not represent an additional tool call.
 
 "Was a tool used in this trace?" is answered by *"any
 `log_type=tool` child span exists?"* — not by summing tool_call fields

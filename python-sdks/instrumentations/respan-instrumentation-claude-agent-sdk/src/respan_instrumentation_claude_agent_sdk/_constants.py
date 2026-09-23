@@ -2,7 +2,6 @@
 
 from opentelemetry.semconv_ai import SpanAttributes
 
-
 CLAUDE_AGENT_SDK_AGENT_NAME_ATTR = "gen_ai.agent.name"
 CLAUDE_AGENT_SDK_OPERATION_NAME_ATTR = "gen_ai.operation.name"
 CLAUDE_AGENT_SDK_TOOL_NAME_ATTR = "gen_ai.tool.name"
@@ -26,9 +25,7 @@ RESPAN_OVERRIDE_MODEL_ATTR = "model"
 RESPAN_OVERRIDE_OUTPUT_ATTR = "output"
 RESPAN_OVERRIDE_TOOL_CALLS_ATTR = "tool_calls"
 RESPAN_OVERRIDE_TOOLS_ATTR = "tools"
-RESPAN_OVERRIDE_PROMPT_CACHE_CREATION_TOKENS_ATTR = (
-    "prompt_cache_creation_tokens"
-)
+RESPAN_OVERRIDE_PROMPT_CACHE_CREATION_TOKENS_ATTR = "prompt_cache_creation_tokens"
 RESPAN_OVERRIDE_PROMPT_CACHE_HIT_TOKENS_ATTR = "prompt_cache_hit_tokens"
 RESPAN_OVERRIDE_PROMPT_TOKENS_ATTR = "prompt_tokens"
 RESPAN_OVERRIDE_SPAN_TOOLS_ATTR = "span_tools"

@@ -3,11 +3,9 @@ import shutil
 
 import pytest
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-
 from respan import Respan
 from respan_instrumentation_claude_agent_sdk import ClaudeAgentSDKInstrumentor
 from respan_tracing.testing import InMemorySpanExporter
-
 
 pytestmark = pytest.mark.integration
 
@@ -18,14 +16,18 @@ async def test_real_gateway_query_exports_claude_agent_spans():
         pytest.skip("Set IS_REAL_GATEWAY_TESTING_ENABLED=1 to run.")
 
     if not shutil.which("claude"):
-        pytest.skip("Claude Code CLI is required for the real gateway integration test.")
+        pytest.skip(
+            "Claude Code CLI is required for the real gateway integration test."
+        )
 
     claude_agent_sdk = pytest.importorskip("claude_agent_sdk")
     respan_api_key = os.getenv("RESPAN_API_KEY")
     if not respan_api_key:
         pytest.skip("Set RESPAN_API_KEY for the real gateway integration test.")
 
-    respan_base_url = os.getenv("RESPAN_BASE_URL", "https://api.respan.ai/api").rstrip("/")
+    respan_base_url = os.getenv("RESPAN_BASE_URL", "https://api.respan.ai/api").rstrip(
+        "/"
+    )
     anthropic_base_url = f"{respan_base_url}/anthropic"
 
     os.environ["ANTHROPIC_API_KEY"] = respan_api_key
@@ -72,8 +74,6 @@ async def test_real_gateway_query_exports_claude_agent_spans():
 
     spans = span_exporter.get_finished_spans()
     assert spans, "Instrumentation did not emit any spans."
-    assert any(
-        "gen_ai" in key
-        for span in spans
-        for key in (span.attributes or {}).keys()
-    ), f"No gen_ai attributes found. Span names: {[span.name for span in spans]}"
+    assert any("gen_ai" in key for span in spans for key in (span.attributes or {})), (
+        f"No gen_ai attributes found. Span names: {[span.name for span in spans]}"
+    )
