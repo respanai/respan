@@ -1,0 +1,4 @@
+{
+  "summary": "Preserve native Claude Query controls and correlate terminal tool outcomes with the latest released SDK.",
+  "packages": {"@respan/instrumentation-claude-agent-sdk": "none"}
+}

@@ -81,9 +81,10 @@ export class ClaudeAgentSDKInstrumentor {
     this._originalQuery = query as (...args: unknown[]) => unknown;
     const instrumentor = this;
 
-    this._sdkModule.query = async function instrumentedQuery(
+    const originalQuery = this._originalQuery;
+    this._sdkModule.query = function instrumentedQuery(
       args: unknown,
-    ): Promise<unknown> {
+    ): unknown {
       const normalizedArgs =
         args && typeof args === "object" && !Array.isArray(args)
           ? ({ ...(args as Record<string, unknown>) } as Record<string, unknown>)
@@ -106,7 +107,7 @@ export class ClaudeAgentSDKInstrumentor {
 
       let originalResult: unknown;
       try {
-        originalResult = await instrumentor._originalQuery?.call(
+        originalResult = originalQuery.call(
           instrumentor._sdkModule,
           normalizedArgs,
         );
@@ -117,19 +118,24 @@ export class ClaudeAgentSDKInstrumentor {
         throw error;
       }
 
-      if (
-        !originalResult ||
-        typeof originalResult !== "object" ||
-        !(Symbol.asyncIterator in (originalResult as Record<string, unknown>))
-      ) {
-        emitAgentSpan(state);
-        return originalResult;
+      const wrapResult = (result: unknown): unknown => {
+        if (!result || typeof result !== "object" || !(Symbol.asyncIterator in result)) {
+          emitAgentSpan(state);
+          return result;
+        }
+        return instrumentor._wrapAsyncIterable(result as AsyncIterable<unknown>, state);
+      };
+      // Real SDK queries return Query immediately. Preserve Promise-returning
+      // adapters as well without making the native API asynchronous.
+      if (originalResult && typeof (originalResult as PromiseLike<unknown>).then === "function") {
+        return Promise.resolve(originalResult).then(wrapResult, (error) => {
+          state.statusCode = 500;
+          state.errorMessage = error instanceof Error ? error.message : String(error);
+          emitAgentSpan(state);
+          throw error;
+        });
       }
-
-      return instrumentor._wrapAsyncIterable(
-        originalResult as AsyncIterable<unknown>,
-        state,
-      );
+      return wrapResult(originalResult);
     };
 
     this._isInstrumented = true;
@@ -253,25 +259,57 @@ export class ClaudeAgentSDKInstrumentor {
     originalResult: AsyncIterable<unknown>,
     state: QueryState,
   ): AsyncIterable<unknown> {
-    return {
-      [Symbol.asyncIterator]: async function*() {
-        try {
-          for await (const message of originalResult) {
-            try {
-              trackClaudeMessage(state, message);
-            } catch (error) {
-              console.warn("[respan] ClaudeAgentSDKInstrumentor message tracking failed:", error);
-            }
-            yield message;
-          }
-        } catch (error) {
-          state.statusCode = 500;
-          state.errorMessage = error instanceof Error ? error.message : String(error);
-          throw error;
-        } finally {
-          emitAgentSpan(state);
-        }
-      },
+    const iterator = originalResult[Symbol.asyncIterator]();
+    let finished = false;
+    const finish = (error?: unknown): void => {
+      if (finished) return;
+      finished = true;
+      if (error !== undefined) {
+        state.statusCode = 500;
+        state.errorMessage = error instanceof Error ? error.message : String(error);
+      }
+      emitAgentSpan(state);
     };
+    const invoke = async (method: "next" | "return" | "throw", args: unknown[]) => {
+      try {
+        const operation = iterator[method];
+        if (!operation) {
+          if (method === "throw") throw args[0];
+          finish();
+          return { done: true, value: args[0] };
+        }
+        const result = await (operation as (...values: unknown[]) => Promise<IteratorResult<unknown>>).apply(iterator, args);
+        if (!result.done) {
+          try {
+            trackClaudeMessage(state, result.value);
+          } catch (error) {
+            console.warn("[respan] ClaudeAgentSDKInstrumentor message tracking failed:", error);
+          }
+        }
+        if (result.done || method === "return") finish();
+        return result;
+      } catch (error) {
+        finish(error);
+        throw error;
+      }
+    };
+    const proxy = new Proxy(originalResult, {
+      get(target, property) {
+        if (property === Symbol.asyncIterator) return () => proxy;
+        if (property === "next" || property === "return" || property === "throw") {
+          return (...args: unknown[]) => invoke(property, args);
+        }
+        const value = Reflect.get(target, property, target);
+        if (property === "close" && typeof value === "function") {
+          return (...args: unknown[]) => {
+            try { return value.apply(target, args); }
+            finally { finish(); }
+          };
+        }
+        // Query methods use private fields; their receiver must remain Query.
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    return proxy;
   }
 }

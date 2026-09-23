@@ -52,6 +52,8 @@ export interface QueryState {
   outputMessages: Record<string, unknown>[];
   parentSpanId?: string;
   pendingTools: Map<string, PendingToolState>;
+  completedTools: Set<string>;
+  taskTools: Map<string, string>;
   prompt: unknown;
   promptCacheCreationTokens?: number;
   promptCacheHitTokens?: number;
@@ -98,6 +100,8 @@ export function createQueryState({
     outputMessages: [],
     parentSpanId: activeSpanContext?.spanId,
     pendingTools: new Map(),
+    completedTools: new Set(),
+    taskTools: new Map(),
     prompt,
     startTime: hrTime(),
     statusCode: 200,
@@ -513,6 +517,23 @@ export function trackClaudeMessage(state: QueryState, message: unknown): void {
 }
 
 function handleSystemMessage(state: QueryState, message: Record<string, unknown>): void {
+  const taskId = stringValue(message.task_id);
+  const toolId = stringValue(message.tool_use_id);
+  if (taskId && toolId && message.subtype === "task_started") state.taskTools.set(taskId, toolId);
+  if (taskId && (message.subtype === "task_updated" || message.subtype === "task_notification")) {
+    const patch = message.patch as Record<string, unknown> | undefined;
+    const status = message.status ?? patch?.status;
+    if (typeof status === "string" && ["completed", "failed", "stopped", "killed"].includes(status)) {
+      const id = state.taskTools.get(taskId) ?? toolId;
+      state.taskTools.delete(taskId);
+      if (id && state.pendingTools.has(id)) {
+        emitCompletedTool(state, {
+          tool_response: { status, summary: message.summary },
+          ...(status === "completed" ? {} : { error: `Task ${status}` }),
+        }, id);
+      }
+    }
+  }
   const data =
     message.data && typeof message.data === "object" && !Array.isArray(message.data)
       ? (message.data as Record<string, unknown>)
@@ -541,6 +562,20 @@ function handleUserMessage(state: QueryState, message: Record<string, unknown>):
     message.message && typeof message.message === "object" && !Array.isArray(message.message)
       ? (message.message as Record<string, unknown>)
       : message;
+  if (Array.isArray(payload.content)) {
+    for (const block of payload.content) {
+      if (isToolResultBlock(block)) {
+        const result = block as Record<string, unknown>;
+        const id = stringValue(result.tool_use_id);
+        if (id && state.pendingTools.has(id)) {
+          emitCompletedTool(state, {
+            tool_response: result.content,
+            ...(result.is_error === true ? { error: "Tool execution failed" } : {}),
+          }, id);
+        }
+      }
+    }
+  }
   const normalizedMessages = normalizeConversationMessage(payload);
   if (normalizedMessages.length > 0) {
     state.inputMessages.push(...normalizedMessages);
@@ -818,6 +853,12 @@ function streamBlockToContent(
 }
 
 function handleResultMessage(state: QueryState, message: Record<string, unknown>): void {
+  if (Array.isArray(message.permission_denials)) {
+    for (const denial of message.permission_denials) {
+      const id = denial && typeof denial === "object" ? stringValue(denial.tool_use_id) : undefined;
+      if (id && state.pendingTools.has(id)) emitCompletedTool(state, { error: "Tool permission denied" }, id);
+    }
+  }
   updateUsageFromMessage(
     state,
     message.usage && typeof message.usage === "object" && !Array.isArray(message.usage)
@@ -844,8 +885,8 @@ function handleResultMessage(state: QueryState, message: Record<string, unknown>
   }
 
   const outputValue =
-    message.result ??
-    message.structured_output;
+    message.structured_output ??
+    message.result;
   if (
     outputValue !== undefined &&
     !hasRenderableAssistantOutput(state.outputMessages)
@@ -1230,6 +1271,8 @@ export function emitCompletedTool(
     toolUseId,
     state.pendingTools,
   );
+  if (state.completedTools.has(resolvedToolUseId)) return;
+  state.completedTools.add(resolvedToolUseId);
   const pendingTool =
     state.pendingTools.get(resolvedToolUseId) ?? {
       spanId: ensureSpanId(),
@@ -1245,12 +1288,12 @@ export function emitCompletedTool(
       ? input.error
       : undefined;
   const toolOutput =
-    toolError ??
     input.tool_response ??
     input.toolResponse ??
     input.tool_result ??
     input.toolResult ??
     input.output ??
+    toolError ??
     "";
   const attrs = baseAttrs(toolName, toolName, RespanLogType.TOOL);
   attrs[RespanSpanAttributes.RESPAN_LOG_METHOD] = RESPAN_LOG_METHOD_TS_TRACING;
@@ -1282,6 +1325,9 @@ export function emitCompletedTool(
 }
 
 export function emitAgentSpan(state: QueryState): void {
+  for (const id of state.pendingTools.keys()) {
+    emitCompletedTool(state, { error: "Tool did not report a terminal outcome" }, id);
+  }
   flushStreamBlocks(state);
   const endTime = hrTime();
   const agentAttrs = buildAgentAttributes(state);
