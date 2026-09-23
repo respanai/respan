@@ -2,11 +2,9 @@ import logging
 import sys
 from types import ModuleType, SimpleNamespace
 
-from opentelemetry.semconv_ai import LLMRequestTypeValues, SpanAttributes
 import pytest
-
-from respan_instrumentation_guardrails import GuardrailsInstrumentor
-from respan_instrumentation_guardrails import _instrumentation
+from opentelemetry.semconv_ai import LLMRequestTypeValues, SpanAttributes
+from respan_instrumentation_guardrails import GuardrailsInstrumentor, _instrumentation
 from respan_instrumentation_guardrails._instrumentation import (
     GUARDRAILS_RUNTIME_MODULE,
     GuardrailsSpanProcessor,
@@ -23,11 +21,12 @@ from respan_tracing.core.tracer import RespanTracer
 
 
 class FakeSpan:
-    def __init__(self, name):
+    def __init__(self, name, *, trace_id=None):
         self.name = name
         self.attributes = {}
         self.exceptions = []
         self.status = None
+        self._trace_id = trace_id
 
     def __enter__(self):
         return self
@@ -44,6 +43,9 @@ class FakeSpan:
     def set_status(self, status):
         self.status = status
 
+    def get_span_context(self):
+        return SimpleNamespace(trace_id=self._trace_id)
+
 
 class FakeTracer:
     def __init__(self):
@@ -56,9 +58,13 @@ class FakeTracer:
 
 
 class FakeReadableSpan:
-    def __init__(self, name, attributes):
+    def __init__(self, name, attributes, *, trace_id=None):
         self.name = name
         self._attributes = dict(attributes)
+        self._trace_id = trace_id
+
+    def get_span_context(self):
+        return SimpleNamespace(trace_id=self._trace_id)
 
 
 def _install_fake_guardrails(monkeypatch):
@@ -97,10 +103,9 @@ def reset_tracer():
     RespanTracer.reset_instance()
 
 
-def test_parse_emits_guardrail_span(monkeypatch):
+def test_activate_uses_native_guardrails_spans_without_wrapping(monkeypatch):
     fake_guard_class = _install_fake_guardrails(monkeypatch)
-    fake_tracer = FakeTracer()
-    monkeypatch.setattr(_instrumentation.trace, "get_tracer", lambda _: fake_tracer)
+    original_parse = fake_guard_class.parse
 
     instrumentor = GuardrailsInstrumentor()
     instrumentor.activate()
@@ -110,63 +115,81 @@ def test_parse_emits_guardrail_span(monkeypatch):
         num_reasks=0,
     )
 
-    span = fake_tracer.spans[0]
     assert result.validation_passed is True
-    assert span.name == "guardrails.parse"
-    assert span.attributes[RESPAN_LOG_TYPE] == LOG_TYPE_GUARDRAIL
-    assert span.attributes["traceloop.entity.name"] == "guardrails.parse"
-    assert '"method": "parse"' in span.attributes["traceloop.entity.input"]
-    assert '"validation_passed": true' in span.attributes["traceloop.entity.output"]
+    assert fake_guard_class.parse is original_parse
+    assert instrumentor.is_instrumented is True
 
 
-def test_call_and_validate_are_wrapped(monkeypatch):
+def test_call_and_validate_are_not_wrapped(monkeypatch):
     fake_guard_class = _install_fake_guardrails(monkeypatch)
-    fake_tracer = FakeTracer()
-    monkeypatch.setattr(_instrumentation.trace, "get_tracer", lambda _: fake_tracer)
+    original_call = fake_guard_class.__call__
+    original_validate = fake_guard_class.validate
 
     instrumentor = GuardrailsInstrumentor()
     instrumentor.activate()
 
-    fake_guard = fake_guard_class()
-    fake_guard(model="gpt-4o-mini", messages=[])
-    fake_guard.validate("known output")
-
-    assert [span.name for span in fake_tracer.spans] == [
-        "guardrails.call",
-        "guardrails.validate",
-    ]
+    assert fake_guard_class.__call__ is original_call
+    assert fake_guard_class.validate is original_validate
 
 
-def test_exception_records_span_error(monkeypatch):
-    class FailingGuard:
-        def parse(self, *args, **kwargs):
-            raise ValueError("invalid output")
+def test_span_processor_bridges_propagated_context_on_start(monkeypatch):
+    monkeypatch.setattr(
+        _instrumentation,
+        "read_propagated_attributes",
+        lambda: {
+            "respan.customer_params.customer_identifier": "customer-1",
+            "respan.threads.thread_identifier": "thread-1",
+            "respan.metadata.run_id": "marker-1",
+        },
+    )
+    span = FakeSpan("step")
 
-    guardrails_module = ModuleType(GUARDRAILS_RUNTIME_MODULE)
-    guardrails_module.Guard = FailingGuard
-    monkeypatch.setitem(sys.modules, GUARDRAILS_RUNTIME_MODULE, guardrails_module)
+    GuardrailsSpanProcessor().on_start(span)
 
-    fake_tracer = FakeTracer()
-    monkeypatch.setattr(_instrumentation.trace, "get_tracer", lambda _: fake_tracer)
-
-    instrumentor = GuardrailsInstrumentor()
-    instrumentor.activate()
-
-    with pytest.raises(ValueError, match="invalid output"):
-        FailingGuard().parse(llm_output="bad")
-
-    span = fake_tracer.spans[0]
-    assert isinstance(span.exceptions[0], ValueError)
-    assert '"error_type": "ValueError"' in span.attributes["traceloop.entity.output"]
+    assert span.attributes["respan.customer_params.customer_identifier"] == "customer-1"
+    assert span.attributes["respan.threads.thread_identifier"] == "thread-1"
+    assert span.attributes["respan.metadata.run_id"] == "marker-1"
 
 
-def test_deactivate_restores_original_methods(monkeypatch):
+def test_span_processor_reuses_trace_context_when_nested_runtime_loses_it(
+    monkeypatch,
+):
+    propagated = {
+        "respan.customer_params.customer_identifier": "customer-1",
+        "respan.threads.thread_identifier": "thread-1",
+        "respan.metadata.run_id": "marker-1",
+    }
+    current = {"value": propagated}
+    monkeypatch.setattr(
+        _instrumentation,
+        "read_propagated_attributes",
+        lambda: current["value"],
+    )
+    processor = GuardrailsSpanProcessor()
+    root = FakeSpan("workflow", trace_id=123)
+    child = FakeSpan("step", trace_id=123)
+
+    processor.on_start(root)
+    current["value"] = {}
+    processor.on_start(child)
+
+    assert child.attributes == propagated
+
+    processor.on_end(
+        FakeReadableSpan("step", {"type": "guardrails/guard/step"}, trace_id=123)
+    )
+    processor.on_end(FakeReadableSpan("workflow", {}, trace_id=123))
+    assert processor._propagated_by_trace == {}
+    assert processor._active_spans_by_trace == {}
+
+
+def test_deactivate_leaves_native_methods_unchanged(monkeypatch):
     fake_guard_class = _install_fake_guardrails(monkeypatch)
     original_parse = fake_guard_class.parse
 
     instrumentor = GuardrailsInstrumentor()
     instrumentor.activate()
-    assert fake_guard_class.parse is not original_parse
+    assert fake_guard_class.parse is original_parse
 
     instrumentor.deactivate()
     assert fake_guard_class.parse is original_parse
@@ -231,7 +254,7 @@ def test_span_processor_translates_guardrails_llm_call_span():
     GuardrailsSpanProcessor().on_end(span)
 
     assert span._attributes[RESPAN_LOG_TYPE] == LOG_TYPE_CHAT
-    assert span._attributes[SpanAttributes.TRACELOOP_SPAN_KIND] == LOG_TYPE_CHAT
+    assert SpanAttributes.TRACELOOP_SPAN_KIND not in span._attributes
     assert span._attributes[LLM_REQUEST_TYPE] == LLMRequestTypeValues.CHAT.value
     assert span._attributes[LLM_REQUEST_MODEL] == "gpt-4o"
     assert span._attributes[SpanAttributes.LLM_REQUEST_TEMPERATURE] == 0
@@ -244,7 +267,9 @@ def test_span_processor_translates_guardrails_llm_call_span():
     assert span._attributes["gen_ai.completion.0.content"] == '{"ok": true}'
     assert span._attributes["traceloop.entity.name"] == "guardrails.call"
     assert span._attributes["traceloop.entity.input"] == '{"messages": []}'
-    assert span._attributes["traceloop.entity.output"] == '{"output": "{\\"ok\\": true}"}'
+    assert (
+        span._attributes["traceloop.entity.output"] == '{"output": "{\\"ok\\": true}"}'
+    )
 
 
 def test_span_processor_marks_guardrails_non_llm_span_as_guardrail():
@@ -260,7 +285,7 @@ def test_span_processor_marks_guardrails_non_llm_span_as_guardrail():
     GuardrailsSpanProcessor().on_end(span)
 
     assert span._attributes[RESPAN_LOG_TYPE] == LOG_TYPE_GUARDRAIL
-    assert span._attributes[SpanAttributes.TRACELOOP_SPAN_KIND] == LOG_TYPE_GUARDRAIL
+    assert SpanAttributes.TRACELOOP_SPAN_KIND not in span._attributes
     assert span._attributes["traceloop.entity.name"] == "guardrails.guard"
     assert span._attributes["traceloop.entity.input"] == "input"
     assert span._attributes["traceloop.entity.output"] == "output"
@@ -279,10 +304,25 @@ def test_span_processor_keeps_local_validation_step_call_as_guardrail():
     GuardrailsSpanProcessor().on_end(span)
 
     assert span._attributes[RESPAN_LOG_TYPE] == LOG_TYPE_GUARDRAIL
-    assert span._attributes[SpanAttributes.TRACELOOP_SPAN_KIND] == LOG_TYPE_GUARDRAIL
+    assert SpanAttributes.TRACELOOP_SPAN_KIND not in span._attributes
     assert LLM_REQUEST_TYPE not in span._attributes
     assert LLM_USAGE_PROMPT_TOKENS not in span._attributes
     assert span._attributes["traceloop.entity.name"] == "guardrails.call"
+
+
+def test_span_processor_corrects_local_guard_llm_call_count() -> None:
+    span = FakeReadableSpan(
+        name="guard",
+        attributes={
+            "type": "guardrails/guard",
+            "token_consumption": 0,
+            "number_of_llm_calls": 1,
+        },
+    )
+
+    GuardrailsSpanProcessor().on_end(span)
+
+    assert span._attributes["number_of_llm_calls"] == 0
 
 
 def test_span_processor_ignores_unrelated_span():
