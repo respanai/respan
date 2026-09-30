@@ -19,7 +19,7 @@ import json
 import logging
 import time
 from contextlib import contextmanager
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, Optional
 
 from opentelemetry import trace
 from opentelemetry.sdk.trace import ReadableSpan
@@ -27,8 +27,8 @@ from opentelemetry.trace import SpanContext, SpanKind, TraceFlags
 from opentelemetry.trace.status import Status, StatusCode
 
 from respan_sdk.constants.span_attributes import (
-    RESPAN_PROMPT,
     RESPAN_METADATA,
+    RESPAN_PROMPT,
     RESPAN_SPAN_ATTRIBUTES_MAP,
 )
 from respan_sdk.utils.data_processing.id_processing import (
@@ -45,8 +45,8 @@ logger = logging.getLogger(__name__)
 # Context-propagated attributes
 # ---------------------------------------------------------------------------
 
-_PROPAGATED_ATTRIBUTES: contextvars.ContextVar[Dict[str, Any]] = contextvars.ContextVar(
-    "respan_propagated_attributes", default={}
+_PROPAGATED_ATTRIBUTES: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
+    "respan_propagated_attributes", default=None
 )
 
 # Keys accepted by propagate_attributes() — derived from the canonical
@@ -78,7 +78,7 @@ def propagate_attributes(**kwargs):
             result = await Runner.run(agent, "Hello")
     """
     # Merge with any already-active attributes (supports nesting)
-    parent = _PROPAGATED_ATTRIBUTES.get()
+    parent = _PROPAGATED_ATTRIBUTES.get() or {}
     merged = {**parent}
     for key, value in kwargs.items():
         if key not in _SUPPORTED_ATTRIBUTE_KEYS:
@@ -109,7 +109,7 @@ def read_propagated_attributes() -> Dict[str, Any]:
 
         {"respan.customer_params.customer_identifier": "user_123",
          "respan.threads.thread_identifier": "conv_abc",
-         "respan.metadata.plan": "pro"}
+         "respan.metadata": "{\"plan\":\"pro\"}"}
     """
     ctx_attrs = _PROPAGATED_ATTRIBUTES.get()
     if not ctx_attrs:
@@ -120,16 +120,52 @@ def read_propagated_attributes() -> Dict[str, Any]:
         if key not in RESPAN_SPAN_ATTRIBUTES_MAP:
             continue
         attr_key = RESPAN_SPAN_ATTRIBUTES_MAP[key]
-        if attr_key == RESPAN_METADATA and isinstance(value, dict):
-            # Metadata is stored as individual respan.metadata.<key> attributes
-            for mk, mv in value.items():
-                result[f"{RESPAN_METADATA}.{mk}"] = str(mv) if not isinstance(mv, str) else mv
+        if attr_key == RESPAN_METADATA:
+            # Structured metadata is one canonical JSON OTEL attribute. Never
+            # manufacture respan.metadata.<key> aliases here.
+            result[RESPAN_METADATA] = _metadata_json(value)
         elif attr_key == RESPAN_PROMPT and isinstance(value, dict):
             # Prompt config: store as JSON string for the exporter to pick up
             result[RESPAN_PROMPT] = json.dumps(value, default=str)
         else:
             result[attr_key] = value
     return result
+
+
+def merge_metadata_attributes(existing: Any, propagated: Any) -> str:
+    """Merge canonical metadata JSON while preserving instrumentation values.
+
+    Nested propagation has already applied its documented inner-scope-wins
+    policy before this function runs. When a vendor instrumentation supplies
+    the same key, its span-local value remains authoritative.
+    """
+
+    return _metadata_json(
+        {
+            **_metadata_mapping(propagated),
+            **_metadata_mapping(existing),
+        }
+    )
+
+
+def _metadata_mapping(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return {"value": value}
+        if isinstance(parsed, dict):
+            return parsed
+        return {"value": parsed}
+    if value is None:
+        return {}
+    return {"value": value}
+
+
+def _metadata_json(value: Any) -> str:
+    return json.dumps(value, default=str, ensure_ascii=False, separators=(",", ":"))
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +248,10 @@ def build_readable_span(
     if merge_propagated:
         propagated = read_propagated_attributes()
         for k, v in propagated.items():
-            attrs.setdefault(k, v)
+            if k == RESPAN_METADATA:
+                attrs[k] = merge_metadata_attributes(attrs.get(k), v)
+            else:
+                attrs.setdefault(k, v)
 
     # Determine status
     if error_message:

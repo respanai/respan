@@ -16,7 +16,7 @@ from opentelemetry.context import Context
 from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
 from opentelemetry.semconv_ai import SpanAttributes
 
-from respan_sdk.constants.span_attributes import RESPAN_TRACE_GROUP_ID
+from respan_sdk.constants.span_attributes import RESPAN_METADATA, RESPAN_TRACE_GROUP_ID
 from respan_sdk.respan_types.span_types import SpanLink
 from respan_sdk.utils.data_processing.id_processing import format_span_id
 from respan_tracing.contexts.span import span_link_to_otel
@@ -31,7 +31,10 @@ from respan_tracing.constants.context_constants import TRACE_GROUP_ID_KEY, PARAM
 from respan_tracing.filters import evaluate_export_filter
 from respan_tracing.utils.preprocessing.span_processing import is_processable_span
 from respan_tracing.utils.context import get_entity_path
-from respan_tracing.utils.span_factory import read_propagated_attributes
+from respan_tracing.utils.span_factory import (
+    merge_metadata_attributes,
+    read_propagated_attributes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +133,14 @@ class RespanSpanProcessor:
         try:
             propagated = read_propagated_attributes()
             for attr_key, attr_val in propagated.items():
-                if not span.attributes.get(attr_key):
+                if attr_key == RESPAN_METADATA:
+                    span.set_attribute(
+                        attr_key,
+                        merge_metadata_attributes(
+                            span.attributes.get(attr_key), attr_val
+                        ),
+                    )
+                elif not span.attributes.get(attr_key):
                     span.set_attribute(attr_key, attr_val)
         except Exception:
             logger.debug("Failed to bridge propagated attributes", exc_info=True)

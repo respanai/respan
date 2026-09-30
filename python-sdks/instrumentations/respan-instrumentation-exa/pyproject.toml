@@ -1,0 +1,29 @@
+[tool.poetry]
+name = "respan-instrumentation-exa"
+version = "0.1.0"
+description = "Respan instrumentation plugin for the Exa Python SDK"
+authors = ["Respan <team@respan.ai>"]
+license = "Apache 2.0"
+readme = "README.md"
+packages = [
+    { include = "respan_instrumentation_exa", from = "./src" },
+]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.14"
+respan-tracing = "^2.20.0"
+respan-sdk = ">=2.7.4"
+exa-py = ">=2.20.0,<3.0.0"
+opentelemetry-semantic-conventions-ai = ">=0.4.1"
+
+[tool.poetry.plugins."respan.instrumentations"]
+exa = "respan_instrumentation_exa:ExaInstrumentor"
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: live network tests (requires API keys)",
+]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

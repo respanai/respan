@@ -386,6 +386,12 @@
     },
     {
       "ecosystem": "python",
+      "name": "respan-instrumentation-exa",
+      "path": "python-sdks/instrumentations/respan-instrumentation-exa",
+      "registry": "pypi"
+    },
+    {
+      "ecosystem": "python",
       "name": "respan-instrumentation-dspy",
       "path": "python-sdks/instrumentations/respan-instrumentation-dspy",
       "registry": "pypi"
