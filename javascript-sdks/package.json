@@ -17,6 +17,7 @@
     "instrumentations/respan-instrumentation-cursor",
     "instrumentations/respan-instrumentation-pi",
     "instrumentations/respan-instrumentation-flue",
+    "instrumentations/respan-instrumentation-helicone",
     "instrumentations/respan-instrumentation-langchain",
     "instrumentations/respan-instrumentation-llama-index",
     "instrumentations/respan-instrumentation-google-adk",

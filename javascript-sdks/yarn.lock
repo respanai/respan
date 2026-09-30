@@ -2177,6 +2177,15 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@helicone/helpers@npm:1.8.3":
+  version: 1.8.3
+  resolution: "@helicone/helpers@npm:1.8.3"
+  peerDependencies:
+    openai: ^5.10.2
+  checksum: 10c0/13a674e6a819b81e285801db13e97d0e5c38630cd0eb6f5415d94670aa51a5cfc17fb128edcfbc537138bf1691b1d1f5ac157459d82232c8d7bb089523c700ae
+  languageName: node
+  linkType: hard
+
 "@hono/node-server@npm:2.1.0":
   version: 2.1.0
   resolution: "@hono/node-server@npm:2.1.0"
@@ -5168,6 +5177,29 @@ __metadata:
     "@google/adk": ">=1.2.0"
   peerDependenciesMeta:
     "@google/adk":
+      optional: false
+  languageName: unknown
+  linkType: soft
+
+"@respan/instrumentation-helicone@workspace:instrumentations/respan-instrumentation-helicone":
+  version: 0.0.0-use.local
+  resolution: "@respan/instrumentation-helicone@workspace:instrumentations/respan-instrumentation-helicone"
+  dependencies:
+    "@helicone/helpers": "npm:1.8.3"
+    "@opentelemetry/api": "npm:^1.9.0"
+    "@opentelemetry/context-async-hooks": "npm:^2.10.0"
+    "@opentelemetry/sdk-trace-base": "npm:^2.10.0"
+    "@opentelemetry/semantic-conventions": "npm:^1.43.0"
+    "@respan/respan-sdk": "npm:^1.1.7"
+    "@respan/tracing": "npm:^1.1.6"
+    "@traceloop/ai-semantic-conventions": "npm:^0.13.0"
+    "@types/node": "npm:^22.15.29"
+    openai: "npm:^5.10.2"
+    typescript: "npm:^5.7.3"
+  peerDependencies:
+    "@helicone/helpers": ">=1.8.3 <1.9.0"
+  peerDependenciesMeta:
+    "@helicone/helpers":
       optional: false
   languageName: unknown
   linkType: soft
@@ -11440,6 +11472,23 @@ __metadata:
   bin:
     openai: bin/cli
   checksum: 10c0/c4f2e837684ed96b8cec58c65a584646d667c69918f29052775e2e8c05ff5c860d8b58214a7770bc6895ca8602480420c1db6a5392dd250179eb0b91c2b19a2f
+  languageName: node
+  linkType: hard
+
+"openai@npm:^5.10.2":
+  version: 5.23.2
+  resolution: "openai@npm:5.23.2"
+  peerDependencies:
+    ws: ^8.18.0
+    zod: ^3.23.8
+  peerDependenciesMeta:
+    ws:
+      optional: true
+    zod:
+      optional: true
+  bin:
+    openai: bin/cli
+  checksum: 10c0/8ee37f37c64fd04a61622c4782d231e8f0245e2d85956d833e43d30946edbf07d5276cd74e09aa5d23006de8da43dad312246a9dd7ca6ca6d65d983fc976ffa6
   languageName: node
   linkType: hard
 
