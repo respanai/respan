@@ -30,5 +30,8 @@
   "devDependencies": {
     "tsx": "^4.20.3",
     "typescript": "^5.9.2"
+  },
+  "resolutions": {
+    "hono": "4.13.2"
   }
 }
