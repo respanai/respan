@@ -1,0 +1,10 @@
+{
+  "summary": "Record the manually bootstrapped Exa instrumentation and combined tracing 1.6.1 compatibility release without republishing packages or facade on merge",
+  "packages": {
+    "@respan/instrumentation-exa": "none",
+    "@respan/respan": "none",
+    "@respan/tracing": "none",
+    "@respan/instrumentation-anthropic": "none",
+    "@respan/instrumentation-pi": "none"
+  }
+}

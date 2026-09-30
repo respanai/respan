@@ -10,7 +10,8 @@ import {
 } from "@respan/respan-sdk";
 import { MultiProcessorManager } from "./manager.js";
 import { getEntityPath, getPropagatedAttributes } from "../utils/context.js";
-import { metadataAttributeKey, LOG_PREFIX, LOG_PREFIX_DEBUG, LOG_PREFIX_ERROR } from "../constants/index.js";
+import { LOG_PREFIX, LOG_PREFIX_DEBUG, LOG_PREFIX_ERROR } from "../constants/index.js";
+import { mergeCanonicalMetadataAttributes } from "../utils/metadata.js";
 import {
   acquireSpanTransformerHost,
   releaseSpanTransformerHost,
@@ -82,13 +83,14 @@ export class RespanCompositeProcessor implements SpanProcessor {
         const attrKey = RESPAN_SPAN_ATTRIBUTES_MAP[key];
         if (!attrKey) continue;
 
-        if (key === "metadata" && typeof value === "object") {
-          for (const [mk, mv] of Object.entries(value as Record<string, any>)) {
-            span.setAttribute(
-              metadataAttributeKey(mk),
-              typeof mv === "string" ? mv : JSON.stringify(mv)
-            );
-          }
+        if (key === "metadata") {
+          span.setAttribute(
+            attrKey,
+            mergeCanonicalMetadataAttributes(
+              readableSpan.attributes as Record<string, unknown>,
+              value,
+            ),
+          );
         } else if (key === "prompt" && typeof value === "object") {
           span.setAttribute(attrKey, JSON.stringify(value));
         } else {

@@ -1,11 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { transformReadableSpanBatch } from "../dist/index.js";
 import {
   resolveSpanNameStyle,
   semanticSpanNameForSpan,
   SpanNameTransformingExporter,
-  transformReadableSpanBatch,
   transformReadableSpanName,
 } from "../dist/processor/spanName.js";
 

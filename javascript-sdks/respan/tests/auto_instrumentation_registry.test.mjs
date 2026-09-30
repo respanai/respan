@@ -64,6 +64,7 @@ test("clean committed framework packages stay explicit-only", () => {
     pi: "agent-framework",
     livekit: "agent-framework",
     flue: "app-framework",
+    exa: "protocol-or-tooling",
   };
 
   for (const [id, category] of Object.entries(expected)) {

@@ -127,7 +127,7 @@ jobs:
         run: |
           corepack enable
           cd javascript-sdks
-          yarn install
+          python3 ../scripts/ci_yarn_install.py
           if [ "${{ matrix.has_build }}" = "true" ]; then
             python3 ../scripts/release_inventory.py --build-order-for "${{ matrix.name }}" --format paths | while IFS= read -r package_path; do
               [ -n "${package_path}" ] || continue
