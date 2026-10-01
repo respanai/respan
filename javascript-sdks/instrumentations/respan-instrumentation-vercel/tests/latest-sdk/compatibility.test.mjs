@@ -20,7 +20,7 @@ const response = {
   finishReason, usage, warnings: [],
 };
 
-test("real AI SDK 7.0.112 and @ai-sdk/otel 1.0.112 emit compatible spans", async (t) => {
+test("real AI SDK 7.0.126 and @ai-sdk/otel 1.0.126 emit compatible spans", async (t) => {
   const exporter = new InMemorySpanExporter();
   const translator = new VercelAITranslator();
   const provider = new BasicTracerProvider({ spanProcessors: [

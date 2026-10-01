@@ -66,6 +66,9 @@ const MODERN_OPERATION_LOG_TYPES: Record<string, string> = {
   agent_step: RespanLogType.TASK,
   rerank: RespanLogType.TASK,
   evaluate: RespanLogType.TASK,
+  "ai.generateSpeech": RespanLogType.TASK,
+  "ai.transcribe": RespanLogType.TASK,
+  "ai.streamTranscribe": RespanLogType.TASK,
   "ai.workflowAgent.stream": RespanLogType.AGENT,
   "ai.harness": RespanLogType.AGENT,
 };

@@ -1,0 +1,4 @@
+{
+  "summary": "Capture AI SDK 7 speech and transcription telemetry",
+  "packages": { "@respan/instrumentation-vercel": "patch" }
+}

@@ -537,3 +537,39 @@ test("a user-registered OpenTelemetry integration is never leased", async () => 
     assert.deepEqual(imports, ["ai"]);
   });
 });
+
+for (const style of ["semantic", "legacy"]) {
+  test(`${style} audio spans keep their content and exported names`, async () => {
+    const harness = createOTel2Harness(style);
+    const instrumentor = new VercelAIInstrumentor({ autoRegisterAISDKTelemetry: false });
+    try {
+      await instrumentor.activate();
+      for (const [operation, semantic] of [["ai.generateSpeech", "speech"], ["ai.transcribe", "transcribe"], ["ai.streamTranscribe", "transcribe"]]) {
+        const name = `${operation} audio-model`;
+        const span = harness.tracer.startSpan(name, { attributes: {
+          "gen_ai.operation.name": operation,
+          "gen_ai.request.model": "audio-model",
+          "gen_ai.provider.name": "test",
+          "gen_ai.usage.input_tokens": 3,
+          "ai.request.audio.size": 12,
+          "ai.response.audio.size": 24,
+          "gen_ai.output.messages": JSON.stringify([{ role: "assistant", parts: [{ type: "text", content: "hello" }] }]),
+        } });
+        span.end();
+        await harness.provider.forceFlush();
+        const exported = harness.exporter.getFinishedSpans().at(-1);
+        assert.equal(exported.name, style === "semantic" ? semantic : name);
+        assert.equal(exported.attributes["respan.entity.log_type"], "task");
+        const metadata = JSON.parse(exported.attributes["respan.metadata"]);
+        assert.equal(metadata.model, "audio-model");
+        assert.equal(metadata.provider, "test");
+        assert.deepEqual(metadata.usage, { input_tokens: 3 });
+        assert.ok(exported.attributes["traceloop.entity.output"]);
+        assert.ok(!Object.keys(exported.attributes).some(key => key.startsWith("respan.internal.")));
+      }
+    } finally {
+      instrumentor.deactivate();
+      await harness.provider.shutdown();
+    }
+  });
+}

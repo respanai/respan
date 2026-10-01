@@ -14,6 +14,7 @@ import type { Context } from "@opentelemetry/api";
 import type { ReadableSpan, Span } from "@opentelemetry/sdk-trace-base";
 import { shouldSendTraces, type RespanSpanTransformer } from "@respan/tracing";
 import { stripContentAttributes } from "./_translator/content.js";
+import { enrichAudio } from "./_translator/audio.js";
 import {
   ATTR_GEN_AI_AGENT_ID,
   ATTR_GEN_AI_AGENT_NAME,
@@ -248,6 +249,8 @@ export class VercelAITranslator implements RespanSpanTransformer {
           safeJsonStr(parseJsonish(attrs[AI_EVALUATION_ANSWERS])));
       }
     }
+
+    enrichAudio(attrs, modernOperationName(name, attrs));
 
     const entityName =
       logType === RespanLogType.AGENT

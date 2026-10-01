@@ -28,7 +28,9 @@ const CONTENT_KEYS = new Set([
 
 export function stripContentAttributes(attrs: Attributes): void {
   for (const key of Object.keys(attrs)) {
-    if (CONTENT_KEYS.has(key) || key.startsWith(`${SpanAttributes.LLM_PROMPTS}.`) ||
+    if (CONTENT_KEYS.has(key) || key === "ai.request.text" ||
+        key.startsWith("ai.request.audio.") || key.startsWith("ai.response.audio.") ||
+        key.startsWith(`${SpanAttributes.LLM_PROMPTS}.`) ||
         key.startsWith(`${SpanAttributes.LLM_COMPLETIONS}.`)) {
       delete attrs[key];
     }

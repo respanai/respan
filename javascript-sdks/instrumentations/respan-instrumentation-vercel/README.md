@@ -90,6 +90,7 @@ The instrumentor translates those emitted spans; it does not turn on `experiment
 - Embedding inputs and vectors
 - Tool execution input/output without duplicate tool-call aliases
 - Agent, task, and workflow structure
+- Speech generation, transcription, and streaming transcription with `ai >=7.0.124` and `@ai-sdk/otel >=1.0.124`: text, audio size/format descriptors, provider usage, and semantic `speech`/`transcribe` span names. The native adapter does not emit audio bytes; these spans record descriptors only.
 - Customer, session, thread, trace-group, and JSON metadata fields
 
 ## License
