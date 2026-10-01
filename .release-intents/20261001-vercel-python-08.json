@@ -1,0 +1,6 @@
+{
+  "summary": "Support Vercel Python AI SDK 0.8 evaluation namespaces and typed answers",
+  "packages": {
+    "respan-instrumentation-vercel": "patch"
+  }
+}
