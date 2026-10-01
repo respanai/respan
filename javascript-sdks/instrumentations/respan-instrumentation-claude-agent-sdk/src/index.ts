@@ -59,6 +59,7 @@ export class ClaudeAgentSDKInstrumentor {
   private readonly _agentName?: string;
   private readonly _sdkModule: Record<string, unknown>;
   private _isInstrumented = false;
+  private _originalPrewarm: ((...args: unknown[]) => unknown) | null = null;
   private _originalQuery: ((...args: unknown[]) => unknown) | null = null;
 
   constructor({ sdkModule, agentName }: ClaudeAgentSDKInstrumentorOptions) {
@@ -138,6 +139,76 @@ export class ClaudeAgentSDKInstrumentor {
       return wrapResult(originalResult);
     };
 
+    const prewarm = this._sdkModule.prewarm;
+    if (typeof prewarm === "function") {
+      this._originalPrewarm = prewarm as (...args: unknown[]) => unknown;
+      this._sdkModule.prewarm = async function instrumentedPrewarm(
+        args: { options?: Record<string, unknown> } = {},
+      ): Promise<unknown> {
+        // Hooks are fixed during prewarm, but tracing starts only when the spare
+        // is claimed so idle parking time and the prewarm context are excluded.
+        const options = { ...args.options };
+        let state: QueryState | undefined;
+        let finish: (() => void) | undefined;
+        const spare = await prewarm.call(instrumentor._sdkModule, {
+          ...args,
+          options: instrumentor._buildHooks(options, () => state),
+        }) as Record<PropertyKey, unknown>;
+        // A host may handle claim rejection and close the spare without reading
+        // the Query's error result. Retain that failure on the session span.
+        if (spare.claimed && typeof (spare.claimed as PromiseLike<unknown>).then === "function") {
+          Promise.resolve(spare.claimed).catch((error: unknown) => {
+            if (state) {
+              state.statusCode = 500;
+              state.errorMessage = error instanceof Error ? error.message : String(error);
+            }
+          });
+        }
+        return new Proxy(spare, {
+          get(target, property) {
+            const value = Reflect.get(target, property, target);
+            if (property === "claim" && typeof value === "function") {
+              return (claimArgs: { prompt?: unknown; options?: Record<string, unknown> }) => {
+                // Let the SDK reject repeat claims without replacing the first
+                // session's state or changing its synchronous API.
+                if (state) return value.call(target, claimArgs);
+                const claimState = createQueryState({
+                  prompt: claimArgs?.prompt,
+                  options: { ...options, ...claimArgs?.options },
+                  agentName: instrumentor._agentName,
+                });
+                state = claimState;
+                let query: AsyncIterable<unknown>;
+                try {
+                  // ClaimOptions cannot contain hooks: they were registered above.
+                  query = value.call(target, claimArgs);
+                } catch (error) {
+                  state = undefined;
+                  throw error;
+                }
+                return instrumentor._wrapAsyncIterable(query, claimState, (finalize) => {
+                  finish = finalize;
+                });
+              };
+            }
+            if (property === "close" && typeof value === "function") {
+              return (...args: unknown[]) => {
+                try { return value.apply(target, args); }
+                finally { finish?.(); }
+              };
+            }
+            if (property === Symbol.asyncDispose && typeof value === "function") {
+              return async (...args: unknown[]) => {
+                try { return await value.apply(target, args); }
+                finally { finish?.(); }
+              };
+            }
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      };
+    }
+
     this._isInstrumented = true;
   }
 
@@ -148,27 +219,37 @@ export class ClaudeAgentSDKInstrumentor {
 
     this._sdkModule.query = this._originalQuery;
     this._originalQuery = null;
+    if (this._originalPrewarm) {
+      this._sdkModule.prewarm = this._originalPrewarm;
+      this._originalPrewarm = null;
+    }
     this._isInstrumented = false;
   }
 
   private _buildHooks(
     options: Record<string, unknown>,
-    state: QueryState,
+    stateOrGetter: QueryState | (() => QueryState | undefined),
   ): Record<string, unknown> {
     const hooks =
       options.hooks && typeof options.hooks === "object" && !Array.isArray(options.hooks)
         ? ({ ...(options.hooks as Record<string, unknown>) } as Record<string, unknown>)
         : {};
 
-    const appendHook = (eventName: string, callback: HookCallback): void => {
+    const appendHook = (
+      eventName: string,
+      callback: (state: QueryState, ...args: Parameters<HookCallback>) => ReturnType<HookCallback>,
+    ): void => {
       const existingHooks = Array.isArray(hooks[eventName])
         ? ([...(hooks[eventName] as HookGroup[])] as HookGroup[])
         : [];
-      existingHooks.push({ hooks: [callback] });
+      existingHooks.push({ hooks: [async (input, toolUseId) => {
+        const state = typeof stateOrGetter === "function" ? stateOrGetter() : stateOrGetter;
+        return state ? callback(state, input, toolUseId) : {};
+      }] });
       hooks[eventName] = existingHooks;
     };
 
-    appendHook(HOOK_EVENT_USER_PROMPT_SUBMIT, async (input) => {
+    appendHook(HOOK_EVENT_USER_PROMPT_SUBMIT, async (state, input) => {
       try {
         registerPromptSubmit(state, input);
       } catch (error) {
@@ -180,7 +261,7 @@ export class ClaudeAgentSDKInstrumentor {
       return {};
     });
 
-    appendHook(HOOK_EVENT_PRE_TOOL_USE, async (input, toolUseId) => {
+    appendHook(HOOK_EVENT_PRE_TOOL_USE, async (state, input, toolUseId) => {
       try {
         registerPendingTool(state, input, toolUseId);
       } catch (error) {
@@ -192,7 +273,7 @@ export class ClaudeAgentSDKInstrumentor {
       return {};
     });
 
-    appendHook(HOOK_EVENT_POST_TOOL_USE, async (input, toolUseId) => {
+    appendHook(HOOK_EVENT_POST_TOOL_USE, async (state, input, toolUseId) => {
       try {
         emitCompletedTool(state, input, toolUseId);
       } catch (error) {
@@ -204,7 +285,7 @@ export class ClaudeAgentSDKInstrumentor {
       return {};
     });
 
-    appendHook(HOOK_EVENT_POST_TOOL_USE_FAILURE, async (input, toolUseId) => {
+    appendHook(HOOK_EVENT_POST_TOOL_USE_FAILURE, async (state, input, toolUseId) => {
       try {
         emitCompletedTool(state, input, toolUseId);
       } catch (error) {
@@ -216,7 +297,7 @@ export class ClaudeAgentSDKInstrumentor {
       return {};
     });
 
-    appendHook(HOOK_EVENT_POST_TOOL_BATCH, async (input) => {
+    appendHook(HOOK_EVENT_POST_TOOL_BATCH, async (state, input) => {
       try {
         const toolCalls = Array.isArray(input.tool_calls) ? input.tool_calls : [];
         for (const toolCall of toolCalls) {
@@ -258,6 +339,7 @@ export class ClaudeAgentSDKInstrumentor {
   private _wrapAsyncIterable(
     originalResult: AsyncIterable<unknown>,
     state: QueryState,
+    onFinalize?: (finish: () => void) => void,
   ): AsyncIterable<unknown> {
     const iterator = originalResult[Symbol.asyncIterator]();
     let finished = false;
@@ -270,6 +352,7 @@ export class ClaudeAgentSDKInstrumentor {
       }
       emitAgentSpan(state);
     };
+    onFinalize?.(finish);
     const invoke = async (method: "next" | "return" | "throw", args: unknown[]) => {
       try {
         const operation = iterator[method];
@@ -303,6 +386,12 @@ export class ClaudeAgentSDKInstrumentor {
         if (property === "close" && typeof value === "function") {
           return (...args: unknown[]) => {
             try { return value.apply(target, args); }
+            finally { finish(); }
+          };
+        }
+        if (property === Symbol.asyncDispose && typeof value === "function") {
+          return async (...args: unknown[]) => {
+            try { return await value.apply(target, args); }
             finally { finish(); }
           };
         }

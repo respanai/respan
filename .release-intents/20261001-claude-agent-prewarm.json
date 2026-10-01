@@ -1,0 +1,6 @@
+{
+  "summary": "Trace Claude Agent SDK prewarmed sessions when claimed",
+  "packages": {
+    "@respan/instrumentation-claude-agent-sdk": "minor"
+  }
+}
