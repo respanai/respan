@@ -1,0 +1,6 @@
+{
+  "summary": "Add Python instrumentation for Helicone Manual Logger workflows; version 0.1.0 was published manually before this PR",
+  "packages": {
+    "respan-instrumentation-helicone": "none"
+  }
+}
