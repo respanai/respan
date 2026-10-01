@@ -17,3 +17,4 @@ export type {
   RespanSpanTransformer,
   SpanTransformerRegistration,
 } from "./processor/transformers.js";
+export { transformReadableSpanBatch } from "./processor/spanName.js";

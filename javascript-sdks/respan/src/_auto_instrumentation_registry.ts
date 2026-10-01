@@ -328,6 +328,17 @@ export const AUTO_INSTRUMENTATION_REGISTRY: AutoInstrumentationEntry[] = [
     autoDisabledReason: FRAMEWORK_DISABLED_REASON,
   },
   {
+    id: "n8n",
+    category: "app-framework",
+    sdkPackage: "n8n",
+    instrumentationPackage: "@respan/instrumentation-n8n",
+    instrumentorClass: "N8nInstrumentor",
+    enabledByDefault: false,
+    priority: 40,
+    aliases: ["N8nInstrumentor"],
+    autoDisabledReason: FRAMEWORK_DISABLED_REASON,
+  },
+  {
     id: "mcp",
     category: "protocol-or-tooling",
     sdkPackage: "@modelcontextprotocol/sdk",
