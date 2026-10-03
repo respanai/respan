@@ -2,23 +2,25 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import time
+from dataclasses import dataclass, field
 from typing import Any
 
 from opentelemetry import context as context_api
 from opentelemetry import trace
 from opentelemetry.semconv_ai import SpanAttributes
-
-from respan_instrumentation_dify._context import read_respan_params
-from respan_instrumentation_dify._translator import build_dify_span_data
 from respan_sdk.utils.data_processing.id_processing import (
     format_span_id,
     format_trace_id,
 )
-from respan_tracing.utils.span_factory import build_readable_span
-from respan_tracing.utils.span_factory import inject_span
-from respan_tracing.utils.span_factory import read_propagated_attributes
+from respan_tracing.utils.span_factory import (
+    build_readable_span,
+    inject_span,
+    read_propagated_attributes,
+)
+
+from respan_instrumentation_dify._context import read_respan_params
+from respan_instrumentation_dify._translator import _response_json, build_dify_span_data
 
 
 @dataclass
@@ -42,7 +44,7 @@ def _current_otel_parent() -> tuple[str | None, str | None]:
     current_span = trace.get_current_span()
     try:
         span_context = current_span.get_span_context()
-    except Exception:
+    except Exception:  # noqa: BLE001 -- defensive OTEL provider boundary
         return None, None
 
     trace_id = getattr(span_context, "trace_id", 0)
@@ -87,9 +89,29 @@ def emit_dify_span(
     call_context: DifyCallContext,
     response: Any = None,
     stream_events: list[Any] | None = None,
-    error: Exception | None = None,
+    error: BaseException | None = None,
     include_content: bool = True,
 ) -> None:
+    # Dify communicates workflow and SSE failures inside successful HTTP responses.
+    if error is None:
+        payloads = [*(stream_events or []), _response_json(response)]
+        for payload in payloads:
+            if not isinstance(payload, dict):
+                continue
+            data = payload.get("data")
+            if not isinstance(data, dict):
+                data = payload
+            if payload.get("event") == "error" or (
+                isinstance(data, dict) and data.get("status") in ("failed", "error")
+            ):
+                error = RuntimeError(
+                    str(
+                        data.get("error")
+                        or data.get("message")
+                        or "Dify operation failed"
+                    )
+                )
+                break
     span_name, attributes = build_dify_span_data(
         method=call_context.method,
         endpoint=call_context.endpoint,
@@ -104,12 +126,18 @@ def emit_dify_span(
         respan_params=call_context.respan_params,
         propagated_attributes=call_context.propagated_attributes,
         current_workflow_name=call_context.workflow_name,
+        parent_id=call_context.parent_id,
     )
     status_code = getattr(response, "status_code", 200)
     if not isinstance(status_code, int):
         status_code = 200
     if error is not None:
-        status_code = 500
+        candidate = getattr(error, "status_code", None)
+        status_code = (
+            candidate
+            if isinstance(candidate, int) and candidate >= 400
+            else max(status_code, 500)
+        )
     span = build_readable_span(
         name=span_name,
         trace_id=call_context.trace_id,
@@ -118,7 +146,9 @@ def emit_dify_span(
         end_time_ns=time.time_ns(),
         attributes=attributes,
         status_code=status_code,
-        error_message=str(error) if error is not None else None,
+        error_message=(str(error) or type(error).__name__)
+        if error is not None
+        else None,
         merge_propagated=False,
     )
     inject_span(span=span)

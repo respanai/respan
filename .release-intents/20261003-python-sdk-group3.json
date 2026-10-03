@@ -1,0 +1,10 @@
+{
+  "summary": "Support current Groq inference, Guardrails, Haystack and Dify SDK tracing",
+  "packages": {
+    "respan-instrumentation-groq": "minor",
+    "respan-instrumentation-guardrails": "patch",
+    "respan-instrumentation-haystack": "minor",
+    "respan-instrumentation-dify": "minor",
+    "respan-ai": "patch"
+  }
+}

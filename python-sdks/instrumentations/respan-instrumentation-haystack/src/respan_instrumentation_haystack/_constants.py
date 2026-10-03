@@ -3,7 +3,6 @@
 from opentelemetry.semconv_ai import SpanAttributes
 from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
 
-
 HAYSTACK_INSTRUMENTATION_NAME = "haystack"
 
 HAYSTACK_ASYNC_PIPELINE_MODULE = "haystack.core.pipeline.async_pipeline"
@@ -45,10 +44,15 @@ HAYSTACK_PIPELINE_SPAN_NAMES = frozenset(
         HAYSTACK_ASYNC_PIPELINE_RUN_ASYNC_METHOD_SPAN_NAME,
         HAYSTACK_ASYNC_PIPELINE_RUN_ASYNC_GENERATOR_METHOD_SPAN_NAME,
         HAYSTACK_PIPELINE_RUN_METHOD_SPAN_NAME,
+        "Pipeline.run_async",
+        "Pipeline.run_async_generator",
     }
 )
 
 OPENINFERENCE_HAYSTACK_MODULE = "openinference.instrumentation.haystack"
+OPENINFERENCE_HAYSTACK_WRAPPERS_MODULE = (
+    "openinference.instrumentation.haystack._wrappers"
+)
 OPENINFERENCE_HAYSTACK_INSTRUMENTOR_CLASS_NAME = "HaystackInstrumentor"
 OPENINFERENCE_TRANSLATOR_CLASS_NAME = "OpenInferenceTranslator"
 

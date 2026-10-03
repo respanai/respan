@@ -8,6 +8,7 @@ from respan_sdk.constants.span_attributes import (
 
 DIFY_INSTRUMENTATION_NAME = "dify"
 DIFY_CLIENT_MODULE = "dify_client.client"
+DIFY_ASYNC_CLIENT_MODULE = "dify_client.async_client"
 DIFY_CHAT_SPAN_NAME = "dify.chat"
 DIFY_COMPLETION_SPAN_NAME = "dify.completion"
 DIFY_WORKFLOW_SPAN_NAME = "dify.workflow"
