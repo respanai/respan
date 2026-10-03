@@ -10,7 +10,18 @@ streaming content and usage, request tool definitions, current-turn tool calls,
 precise provider error status, and interrupted-stream finalization. Duplicate
 native Mistral SDK spans are suppressed only for the SDK's own instrumentation
 scope. Tested dependency support starts at `mistralai==2.9.3` and
-`openinference-instrumentation-mistralai==2.0.6`.
+`openinference-instrumentation-mistralai==2.0.6`. The compatibility suite covers
+Mistral 2.9.3 and 3.0.0, including the HTTPX-to-HTTPX2 transport change in v3.
+Custom clients supplied to Mistral 3 must use `httpx2.Client` or
+`httpx2.AsyncClient`.
+
+Structured chat through `chat.parse()` / `parse_async()` and agent completions
+through `agents.complete()`, `complete_async()`, `stream()`, and `stream_async()`
+also produce canonical LLM spans. This adapter does not instrument embeddings,
+OCR, Conversations, connector calls, or administrative endpoints.
+
+The [Mistral examples](https://github.com/respanai/respan-example-projects/tree/main/python/tracing/mistralai)
+exercise these APIs, tools, streaming, and expected failures with the released SDK.
 
 ## Install
 

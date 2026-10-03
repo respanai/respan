@@ -8,6 +8,12 @@ Respan instrumentation plugin for the Cohere Python SDK. It activates `opentelem
 pip install respan-ai respan-instrumentation-cohere cohere python-dotenv
 ```
 
+## Supported SDK versions
+
+Supports Cohere `>=5.0.0,<8`: V1 clients in 5.0 and V2 clients where the SDK provides them. Compatibility is checked with Cohere 5.0.0 / OpenTelemetry Cohere 0.60.0 and Cohere 7.2.0 / OpenTelemetry Cohere 0.62.4. The wrapper updates the upstream dependency check to this range; dependency validation remains enabled.
+
+Chat, streaming chat, embeddings, and rerank work with synchronous and asynchronous clients. Embedding spans preserve text, image, or structured inputs and returned vectors. Streaming spans end on completion, transport failure, cancellation, or explicit early close. Content capture follows `TRACELOOP_TRACE_CONTENT` and the upstream context override.
+
 ## Environment
 
 | Variable | Required | Description |
@@ -62,3 +68,7 @@ The upstream Cohere OpenTelemetry instrumentor emits Cohere SDK spans. This pack
 - publishes both modern and legacy token usage attributes
 - converts indexed tool definitions and tool calls into JSON string attributes
 - strips off-contract shortcut aliases before export
+
+## Examples
+
+The companion [Cohere examples](https://github.com/respanai/respan-example-projects/tree/main/python/tracing/cohere) cover chat, sync/async streaming, tools, embeddings, rerank, and controlled failures with released SDK HTTP transports. Use the paired examples update and its local adapter installation instructions before this instrumentation change is released.

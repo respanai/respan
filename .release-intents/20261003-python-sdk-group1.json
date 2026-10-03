@@ -1,0 +1,9 @@
+{
+  "summary": "Support current Cohere, Mistral, Pinecone and Google Gen AI SDKs with canonical embedding and lazy-stream tracing",
+  "packages": {
+    "respan-instrumentation-cohere": "patch",
+    "respan-instrumentation-mistralai": "patch",
+    "respan-instrumentation-pinecone": "minor",
+    "respan-instrumentation-google-genai": "minor"
+  }
+}

@@ -122,6 +122,22 @@ def _trusted_pinecone_mapping(value: Any) -> Any | None:
                 return method()
             except Exception:  # noqa: BLE001, S112 - malformed provider models
                 continue
+    # Pinecone 10 exposes msgspec response structs without to_dict/model_dump.
+    if (
+        value_type.__module__ == "pinecone.models.pagination"
+        and value_type.__name__ == "Page"
+    ):
+        return {"items": value.items, "pagination_token": value.pagination_token}
+    fields = getattr(value_type, "__struct_fields__", ())
+    if (
+        fields
+        and isinstance(fields, tuple)
+        and all(isinstance(name, str) for name in fields)
+    ):
+        try:
+            return {name: getattr(value, name) for name in fields[:MAX_ITEMS]}
+        except Exception:  # noqa: BLE001 - malformed provider models
+            return None
     return None
 
 
@@ -221,6 +237,24 @@ def exception_message(exc: BaseException) -> str:
             return safe_text(str(argument))
         if isinstance(argument, float) and math.isfinite(argument):
             return safe_text(str(argument))
+    # Legacy generated Pinecone exceptions leave args empty. Read only the
+    # bounded provider message, never __str__, which includes response headers.
+    if type(exc).__module__.startswith("pinecone."):
+        try:
+            body = getattr(exc, "body", None)
+            if isinstance(body, bytes):
+                body = body[:MAX_ATTRIBUTE_BYTES].decode("utf-8", errors="replace")
+            if isinstance(body, str) and len(body) <= MAX_ATTRIBUTE_BYTES:
+                payload = json.loads(body)
+                if isinstance(payload, Mapping) and isinstance(
+                    payload.get("message"), str
+                ):
+                    return safe_text(payload["message"])
+            reason = getattr(exc, "reason", None)
+            if isinstance(reason, str):
+                return safe_text(reason)
+        except Exception:  # noqa: BLE001, S110 - malformed provider errors are non-fatal
+            pass
     return safe_type_name(exc)
 
 

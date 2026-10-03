@@ -8,6 +8,7 @@ GOOGLE_GENAI_MODELS_MODULE = "google.genai.models"
 MODELS_CLASS_NAME = "Models"
 ASYNC_MODELS_CLASS_NAME = "AsyncModels"
 GENERATE_CONTENT_METHOD_NAME = "generate_content"
+EMBED_CONTENT_METHOD_NAME = "embed_content"
 GENERATE_CONTENT_STREAM_METHOD_NAME = "generate_content_stream"
 
 ASSISTANT_ROLE = "assistant"
@@ -46,17 +47,10 @@ THOUGHTS_TOKEN_COUNT_KEY = "thoughts_token_count"
 PROMPT_TOKEN_COUNT_KEY = "prompt_token_count"
 TOTAL_TOKEN_COUNT_KEY = "total_token_count"
 
-GEN_AI_COMPLETION_CONTENT_ATTR = "gen_ai.completion.0.content"
-GEN_AI_COMPLETION_ROLE_ATTR = "gen_ai.completion.0.role"
-GEN_AI_COMPLETION_TOOL_CALLS_ATTR = "gen_ai.completion.0.tool_calls"
-GEN_AI_PROMPT_CONTENT_ATTR_TEMPLATE = "gen_ai.prompt.{index}.content"
-GEN_AI_PROMPT_ROLE_ATTR_TEMPLATE = "gen_ai.prompt.{index}.role"
-LLM_REQUEST_FUNCTIONS_ATTR = "llm.request.functions"
-TOOLS_OVERRIDE_ATTR = "tools"
-TOOL_CALLS_OVERRIDE_ATTR = "tool_calls"
-
 BUILTIN_TOOL_FIELDS = (
     "google_search",
+    "google_search_retrieval",
+    "exa_ai_search",
     "google_maps",
     "code_execution",
     "url_context",
