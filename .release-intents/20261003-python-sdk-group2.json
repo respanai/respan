@@ -1,0 +1,9 @@
+{
+  "summary": "Support current Langfuse, MCP, Agno and Pydantic AI SDK tracing and lifecycle semantics",
+  "packages": {
+    "respan-instrumentation-langfuse": "patch",
+    "respan-instrumentation-mcp": "minor",
+    "respan-instrumentation-agno": "patch",
+    "respan-instrumentation-pydantic-ai": "minor"
+  }
+}

@@ -7,6 +7,9 @@ from collections.abc import Mapping
 from typing import Any
 
 from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor
+from opentelemetry.semconv._incubating.attributes import (
+    gen_ai_attributes as GenAIAttributes,
+)
 from opentelemetry.semconv_ai import LLMRequestTypeValues, SpanAttributes
 from respan_sdk.constants.llm_logging import (
     LOG_TYPE_AGENT,
@@ -26,26 +29,17 @@ from respan_sdk.constants.span_attributes import (
 from respan_instrumentation_pydantic_ai._constants import (
     FINAL_RESULT_ATTR,
     MODEL_NAME_ATTR,
-    PYDANTIC_AI_AGENT_NAME_ATTR,
     PYDANTIC_AI_AGGREGATED_USAGE_INPUT_TOKENS_ATTR,
     PYDANTIC_AI_AGGREGATED_USAGE_OUTPUT_TOKENS_ATTR,
     PYDANTIC_AI_AGGREGATED_USAGE_TOTAL_TOKENS_ATTR,
-    PYDANTIC_AI_INPUT_MESSAGES_ATTR,
     PYDANTIC_AI_LEGACY_AGENT_NAME_ATTR,
     PYDANTIC_AI_LEGACY_TOOL_ARGUMENTS_ATTR,
     PYDANTIC_AI_LEGACY_TOOL_RESULT_ATTR,
-    PYDANTIC_AI_OPERATION_NAME_ATTR,
-    PYDANTIC_AI_OUTPUT_MESSAGES_ATTR,
+    PYDANTIC_AI_REASONING_TOKENS_ATTR,
     PYDANTIC_AI_REQUEST_PARAMETERS_ATTR,
     PYDANTIC_AI_RUNNING_TOOLS_SPAN_NAME,
     PYDANTIC_AI_STRIP_ATTRS,
-    PYDANTIC_AI_TOOL_CALL_ARGUMENTS_ATTR,
-    PYDANTIC_AI_TOOL_CALL_RESULT_ATTR,
-    PYDANTIC_AI_TOOL_DEFINITIONS_ATTR,
-    PYDANTIC_AI_TOOL_NAME_ATTR,
     PYDANTIC_AI_TOOLS_ATTR,
-    PYDANTIC_AI_USAGE_INPUT_TOKENS_ATTR,
-    PYDANTIC_AI_USAGE_OUTPUT_TOKENS_ATTR,
     RESPAN_OVERRIDE_MODEL_ATTR,
     RESPAN_RESPONSE_FORMAT_ATTR,
 )
@@ -61,6 +55,7 @@ logger = logging.getLogger(__name__)
 _PYDANTIC_AI_OPERATION_TO_LOG_TYPE = {
     "chat": LOG_TYPE_CHAT,
     "embedding": LOG_TYPE_EMBEDDING,
+    "embeddings": LOG_TYPE_EMBEDDING,
     "response": LOG_TYPE_CHAT,
     "speech": LOG_TYPE_SPEECH,
     "transcription": LOG_TYPE_TRANSCRIPTION,
@@ -76,8 +71,8 @@ _USAGE_LOG_TYPES = frozenset(
 _NESTED_PROVIDER_USAGE_SUPPRESSIBLE_LOG_TYPES = frozenset(_USAGE_LOG_TYPES)
 _RAW_USAGE_ATTRIBUTE_NAMES = frozenset(
     {
-        PYDANTIC_AI_USAGE_INPUT_TOKENS_ATTR,
-        PYDANTIC_AI_USAGE_OUTPUT_TOKENS_ATTR,
+        GenAIAttributes.GEN_AI_USAGE_INPUT_TOKENS,
+        GenAIAttributes.GEN_AI_USAGE_OUTPUT_TOKENS,
         SpanAttributes.GEN_AI_USAGE_TOTAL_TOKENS,
         SpanAttributes.LLM_USAGE_PROMPT_TOKENS,
         SpanAttributes.LLM_USAGE_COMPLETION_TOKENS,
@@ -167,11 +162,16 @@ def _content_to_text(value: Any) -> str:
             nested = value.get(key)
             if nested not in (None, "", (), []):
                 return _content_to_text(nested)
+        if value.get("type") in {"text", "thinking", "reasoning"}:
+            # Native include_content=False retains only the part type.
+            return ""
         return json_string(value)
     return safe_text(value)
 
 
 def _normalize_tool_call(part: Mapping[str, Any]) -> dict[str, Any] | None:
+    if "arguments" not in part and "args" not in part:
+        return None
     name = part.get("name") or part.get("tool_name")
     if not isinstance(name, str) or not name:
         return None
@@ -247,6 +247,8 @@ def _messages_from_parts(
             "tool-return",
             "tool_return",
         }:
+            if "result" not in part:
+                continue
             messages.append(
                 {"role": "tool", "content": json_string(_normalize_tool_result(part))}
             )
@@ -377,7 +379,9 @@ def _normalize_tool_definition(
 
 
 def _extract_tools(attrs: Mapping[str, Any]) -> list[dict[str, Any]] | None:
-    tool_definitions = _safe_json_loads(attrs.get(PYDANTIC_AI_TOOL_DEFINITIONS_ATTR))
+    tool_definitions = _safe_json_loads(
+        attrs.get(GenAIAttributes.GEN_AI_TOOL_DEFINITIONS)
+    )
     if not isinstance(tool_definitions, list):
         request_parameters = _extract_request_parameters(attrs)
         if request_parameters is None:
@@ -447,7 +451,7 @@ def _extract_model(attrs: Mapping[str, Any]) -> str | None:
 def _get_int_attr(attrs: Mapping[str, Any], *keys: str) -> int | None:
     for key in keys:
         value = attrs.get(key)
-        if isinstance(value, int):
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
             return value
     return None
 
@@ -457,12 +461,12 @@ def _extract_usage(
 ) -> tuple[int | None, int | None, int | None]:
     prompt_tokens = _get_int_attr(
         attrs,
-        PYDANTIC_AI_USAGE_INPUT_TOKENS_ATTR,
+        GenAIAttributes.GEN_AI_USAGE_INPUT_TOKENS,
         PYDANTIC_AI_AGGREGATED_USAGE_INPUT_TOKENS_ATTR,
     )
     completion_tokens = _get_int_attr(
         attrs,
-        PYDANTIC_AI_USAGE_OUTPUT_TOKENS_ATTR,
+        GenAIAttributes.GEN_AI_USAGE_OUTPUT_TOKENS,
         PYDANTIC_AI_AGGREGATED_USAGE_OUTPUT_TOKENS_ATTR,
     )
     total_tokens = _get_int_attr(
@@ -583,22 +587,22 @@ def _enrich_nested_provider_span(
     if total_tokens is not None:
         _set_if_missing(attrs, SpanAttributes.LLM_USAGE_TOTAL_TOKENS, total_tokens)
 
-    output_messages = attrs.get(PYDANTIC_AI_OUTPUT_MESSAGES_ATTR)
+    output_messages = attrs.get(GenAIAttributes.GEN_AI_OUTPUT_MESSAGES)
     if output_messages is not None:
         _set_if_missing(attrs, SpanAttributes.TRACELOOP_ENTITY_OUTPUT, output_messages)
 
 
 def _extract_log_type(span: ReadableSpan, attrs: Mapping[str, Any]) -> str | None:
-    if isinstance(attrs.get(PYDANTIC_AI_TOOL_NAME_ATTR), str):
+    if isinstance(attrs.get(GenAIAttributes.GEN_AI_TOOL_NAME), str):
         return LOG_TYPE_TOOL
 
-    operation_name = attrs.get(PYDANTIC_AI_OPERATION_NAME_ATTR)
+    operation_name = attrs.get(GenAIAttributes.GEN_AI_OPERATION_NAME)
     if isinstance(operation_name, str):
         operation_log_type = _PYDANTIC_AI_OPERATION_TO_LOG_TYPE.get(operation_name)
         if operation_log_type is not None:
             return operation_log_type
 
-    if isinstance(attrs.get(PYDANTIC_AI_AGENT_NAME_ATTR), str) or isinstance(
+    if isinstance(attrs.get(GenAIAttributes.GEN_AI_AGENT_NAME), str) or isinstance(
         attrs.get(PYDANTIC_AI_LEGACY_AGENT_NAME_ATTR), str
     ):
         return LOG_TYPE_AGENT
@@ -609,15 +613,18 @@ def _extract_log_type(span: ReadableSpan, attrs: Mapping[str, Any]) -> str | Non
 
 
 def is_pydantic_ai_span(span: ReadableSpan, attrs: Mapping[str, Any]) -> bool:
+    scope = getattr(getattr(span, "instrumentation_scope", None), "name", None)
+    if scope:
+        return scope == "pydantic-ai" or scope.startswith("pydantic-ai.")
     return (
         bool(attrs.get(SpanAttributes.LLM_SYSTEM))
         or PYDANTIC_AI_REQUEST_PARAMETERS_ATTR in attrs
-        or PYDANTIC_AI_TOOL_DEFINITIONS_ATTR in attrs
-        or bool(attrs.get(PYDANTIC_AI_TOOL_NAME_ATTR))
-        or bool(attrs.get(PYDANTIC_AI_AGENT_NAME_ATTR))
+        or GenAIAttributes.GEN_AI_TOOL_DEFINITIONS in attrs
+        or bool(attrs.get(GenAIAttributes.GEN_AI_TOOL_NAME))
+        or bool(attrs.get(GenAIAttributes.GEN_AI_AGENT_NAME))
         or bool(attrs.get(PYDANTIC_AI_LEGACY_AGENT_NAME_ATTR))
-        or bool(attrs.get(PYDANTIC_AI_TOOL_CALL_ARGUMENTS_ATTR))
-        or bool(attrs.get(PYDANTIC_AI_TOOL_CALL_RESULT_ATTR))
+        or bool(attrs.get(GenAIAttributes.GEN_AI_TOOL_CALL_ARGUMENTS))
+        or bool(attrs.get(GenAIAttributes.GEN_AI_TOOL_CALL_RESULT))
         or bool(attrs.get(PYDANTIC_AI_LEGACY_TOOL_ARGUMENTS_ATTR))
         or bool(attrs.get(PYDANTIC_AI_LEGACY_TOOL_RESULT_ATTR))
         or span.name == PYDANTIC_AI_RUNNING_TOOLS_SPAN_NAME
@@ -655,6 +662,9 @@ def enrich_pydantic_ai_span(
     _set_if_missing(attrs, RESPAN_LOG_TYPE, log_type)
 
     if log_type in _USAGE_LOG_TYPES:
+        provider = attrs.get(GenAIAttributes.GEN_AI_PROVIDER_NAME)
+        if provider:
+            _set_if_missing(attrs, SpanAttributes.LLM_SYSTEM, provider)
         model = _extract_model(attrs)
         if model is not None:
             _set_if_missing(attrs, SpanAttributes.LLM_REQUEST_MODEL, model)
@@ -665,14 +675,16 @@ def enrich_pydantic_ai_span(
     ):
         prompt_tokens, completion_tokens, total_tokens = _extract_usage(attrs)
         if prompt_tokens is not None:
-            _set_if_missing(attrs, PYDANTIC_AI_USAGE_INPUT_TOKENS_ATTR, prompt_tokens)
+            _set_if_missing(
+                attrs, GenAIAttributes.GEN_AI_USAGE_INPUT_TOKENS, prompt_tokens
+            )
             _set_if_missing(
                 attrs, SpanAttributes.LLM_USAGE_PROMPT_TOKENS, prompt_tokens
             )
         if completion_tokens is not None:
             _set_if_missing(
                 attrs,
-                PYDANTIC_AI_USAGE_OUTPUT_TOKENS_ATTR,
+                GenAIAttributes.GEN_AI_USAGE_OUTPUT_TOKENS,
                 completion_tokens,
             )
             _set_if_missing(
@@ -680,6 +692,57 @@ def enrich_pydantic_ai_span(
             )
         if total_tokens is not None:
             _set_if_missing(attrs, SpanAttributes.LLM_USAGE_TOTAL_TOKENS, total_tokens)
+        for source, destination in (
+            (
+                GenAIAttributes.GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
+                SpanAttributes.LLM_USAGE_CACHE_READ_INPUT_TOKENS,
+            ),
+            (
+                GenAIAttributes.GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
+                SpanAttributes.LLM_USAGE_CACHE_CREATION_INPUT_TOKENS,
+            ),
+            (
+                GenAIAttributes.GEN_AI_USAGE_REASONING_OUTPUT_TOKENS,
+                SpanAttributes.LLM_USAGE_REASONING_TOKENS,
+            ),
+        ):
+            value = _get_int_attr(attrs, source)
+            if (
+                source == GenAIAttributes.GEN_AI_USAGE_REASONING_OUTPUT_TOKENS
+                and value is None
+            ):
+                value = _get_int_attr(attrs, PYDANTIC_AI_REASONING_TOKENS_ATTR)
+            if value is not None:
+                _set_if_missing(attrs, destination, value)
+
+    if log_type == LOG_TYPE_EMBEDDING:
+        _set_if_missing(
+            attrs, SpanAttributes.LLM_REQUEST_TYPE, LLMRequestTypeValues.EMBEDDING.value
+        )
+        _set_if_missing(
+            attrs, SpanAttributes.TRACELOOP_ENTITY_NAME, "pydantic_ai.embeddings"
+        )
+        _set_if_missing(
+            attrs,
+            SpanAttributes.TRACELOOP_ENTITY_PATH,
+            _entity_path(span, "pydantic_ai.embeddings"),
+        )
+        if attrs.get("inputs") is not None:
+            _set_if_missing(
+                attrs, SpanAttributes.TRACELOOP_ENTITY_INPUT, attrs["inputs"]
+            )
+        if attrs.get("embeddings") is not None:
+            _set_if_missing(
+                attrs, SpanAttributes.TRACELOOP_ENTITY_OUTPUT, attrs["embeddings"]
+            )
+        for key in (
+            "inputs",
+            "embeddings",
+            "embedding_settings",
+            "inputs_count",
+            "input_type",
+        ):
+            attrs.pop(key, None)
 
     if log_type == LOG_TYPE_CHAT:
         response_format = _extract_response_format(attrs)
@@ -694,22 +757,22 @@ def enrich_pydantic_ai_span(
                 json_string(tools),
             )
 
-    tool_name = attrs.get(PYDANTIC_AI_TOOL_NAME_ATTR)
+    tool_name = attrs.get(GenAIAttributes.GEN_AI_TOOL_NAME)
     tool_name = tool_name if isinstance(tool_name, str) else None
-    agent_name = attrs.get(PYDANTIC_AI_AGENT_NAME_ATTR)
+    agent_name = attrs.get(GenAIAttributes.GEN_AI_AGENT_NAME)
     if not isinstance(agent_name, str):
         legacy_agent_name = attrs.get(PYDANTIC_AI_LEGACY_AGENT_NAME_ATTR)
         agent_name = legacy_agent_name if isinstance(legacy_agent_name, str) else None
 
     tool_input = _json_string(
         attrs.get(
-            PYDANTIC_AI_TOOL_CALL_ARGUMENTS_ATTR,
+            GenAIAttributes.GEN_AI_TOOL_CALL_ARGUMENTS,
             attrs.get(PYDANTIC_AI_LEGACY_TOOL_ARGUMENTS_ATTR),
         )
     )
     tool_output = _json_string(
         attrs.get(
-            PYDANTIC_AI_TOOL_CALL_RESULT_ATTR,
+            GenAIAttributes.GEN_AI_TOOL_CALL_RESULT,
             attrs.get(PYDANTIC_AI_LEGACY_TOOL_RESULT_ATTR),
         )
     )
@@ -722,12 +785,22 @@ def enrich_pydantic_ai_span(
             SpanAttributes.LLM_USAGE_PROMPT_TOKENS,
             SpanAttributes.LLM_USAGE_COMPLETION_TOKENS,
             SpanAttributes.LLM_USAGE_TOTAL_TOKENS,
-            PYDANTIC_AI_USAGE_INPUT_TOKENS_ATTR,
-            PYDANTIC_AI_USAGE_OUTPUT_TOKENS_ATTR,
             RESPAN_RESPONSE_FORMAT_ATTR,
-            "gen_ai.system_instructions",
+            GenAIAttributes.GEN_AI_SYSTEM_INSTRUCTIONS,
         ):
             attrs.pop(key, None)
+        for key in list(attrs):
+            if key.startswith(
+                ("gen_ai.usage.", "gen_ai.aggregated_usage.", "llm.usage.")
+            ):
+                attrs.pop(key, None)
+
+    if suppress_nested_provider_usage and log_type in _USAGE_LOG_TYPES:
+        for key in list(attrs):
+            if key in _RAW_USAGE_ATTRIBUTE_NAMES or key.startswith(
+                ("gen_ai.usage.", "llm.usage.")
+            ):
+                attrs.pop(key, None)
 
     if log_type == LOG_TYPE_TOOL and tool_name is not None:
         _set_if_missing(attrs, SpanAttributes.TRACELOOP_ENTITY_NAME, tool_name)
@@ -736,16 +809,12 @@ def enrich_pydantic_ai_span(
             SpanAttributes.TRACELOOP_ENTITY_PATH,
             _entity_path(span, tool_name),
         )
-        _set_if_missing(
-            attrs,
-            SpanAttributes.TRACELOOP_ENTITY_INPUT,
-            json_string(
-                {
-                    "name": tool_name,
-                    "arguments": parse_json(tool_input),
-                }
-            ),
-        )
+        if tool_input is not None:
+            _set_if_missing(
+                attrs,
+                SpanAttributes.TRACELOOP_ENTITY_INPUT,
+                json_string({"name": tool_name, "arguments": parse_json(tool_input)}),
+            )
         _set_if_missing(attrs, SpanAttributes.TRACELOOP_ENTITY_OUTPUT, tool_output)
 
     if log_type == LOG_TYPE_CHAT:
@@ -762,11 +831,11 @@ def enrich_pydantic_ai_span(
             LLMRequestTypeValues.CHAT.value,
         )
         input_messages = _normalize_chat_messages(
-            _extract_messages(attrs, PYDANTIC_AI_INPUT_MESSAGES_ATTR),
+            _extract_messages(attrs, GenAIAttributes.GEN_AI_INPUT_MESSAGES),
             "user",
         )
         output_messages = _normalize_chat_messages(
-            _extract_messages(attrs, PYDANTIC_AI_OUTPUT_MESSAGES_ATTR),
+            _extract_messages(attrs, GenAIAttributes.GEN_AI_OUTPUT_MESSAGES),
             "assistant",
         )
         if input_messages is not None:
@@ -826,20 +895,26 @@ class PydanticAISpanProcessor(SpanProcessor):
 
     def __init__(self) -> None:
         self._nested_provider_usage_parent_keys: set[tuple[int, int]] = set()
+        self._active_pydantic_span_keys: set[tuple[int, int]] = set()
 
     def on_start(self, span: Any, parent_context: Any = None) -> None:
-        pass
+        if is_pydantic_ai_span(span, dict(getattr(span, "attributes", None) or {})):
+            key = _get_span_key(span)
+            if key is not None:
+                self._active_pydantic_span_keys.add(key)
 
     def on_end(self, span: ReadableSpan) -> None:
         attrs = dict(getattr(span, "_attributes", None) or {})
-        _enrich_nested_provider_span(span, attrs)
-        span._attributes = attrs
-        if not is_pydantic_ai_span(span, attrs) and _span_has_raw_usage_attributes(
-            attrs
-        ):
+        if not is_pydantic_ai_span(span, attrs):
             parent_span_key = _get_parent_span_key(span)
-            if parent_span_key is not None:
+            if (
+                parent_span_key in self._active_pydantic_span_keys
+                and _span_has_raw_usage_attributes(attrs)
+            ):
+                _enrich_nested_provider_span(span, attrs)
+                span._attributes = attrs
                 self._nested_provider_usage_parent_keys.add(parent_span_key)
+            return
 
         span_key = _get_span_key(span)
         try:
@@ -854,6 +929,7 @@ class PydanticAISpanProcessor(SpanProcessor):
         finally:
             if span_key is not None:
                 self._nested_provider_usage_parent_keys.discard(span_key)
+                self._active_pydantic_span_keys.discard(span_key)
 
     def shutdown(self) -> None:
         pass

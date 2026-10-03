@@ -6,8 +6,12 @@ import inspect
 import logging
 import time
 from collections.abc import AsyncIterator, Iterator, Mapping
+from dataclasses import replace
+from threading import RLock
 from types import MethodType
 from typing import Any
+
+from respan_tracing.core.tracer import RespanTracer
 
 from respan_instrumentation_agno._constants import (
     AGNO_AGENT_CLASS_NAME,
@@ -22,8 +26,8 @@ from respan_instrumentation_agno._constants import (
     INPUT_KEY,
     RESPAN_AGNO_ORIGINALS_ATTR,
     RESPAN_AGNO_WRAPPED_ATTR,
-    RUN_OUTPUT_MARKER_KEYS,
     RUN_METHOD_NAME,
+    RUN_OUTPUT_MARKER_KEYS,
 )
 from respan_instrumentation_agno._otel_emitter import (
     create_agno_run_context,
@@ -31,9 +35,11 @@ from respan_instrumentation_agno._otel_emitter import (
     emit_agno_run,
     use_agno_run_context,
 )
-from respan_tracing.core.tracer import RespanTracer
+from respan_instrumentation_agno._serialization import MAX_ITEMS
 
 logger = logging.getLogger(__name__)
+_PATCH_LOCK = RLock()
+_PATCH_OWNERS: dict[int, dict[str, Any]] = {}
 
 
 def _is_respan_tracing_enabled() -> bool:
@@ -110,7 +116,7 @@ def _emit_failed_run(
     target: Any,
     target_kind: str,
     input_value: Any,
-    exception: Exception,
+    exception: BaseException,
     started_at_ns: int,
 ) -> None:
     try:
@@ -126,6 +132,72 @@ def _emit_failed_run(
         logger.exception("Failed to emit failed Agno run span")
 
 
+def _message_ids(output: Any) -> frozenset[str]:
+    return frozenset(
+        str(_object_value(message, "id"))
+        for message in (_object_value(output, "messages") or [])
+        if _object_value(message, "id")
+    )
+
+
+def _prior_message_ids(
+    original_method: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    target: Any = None,
+) -> frozenset[str]:
+    if "continue_run" not in getattr(original_method, "__name__", ""):
+        return frozenset()
+    previous = args[0] if args else kwargs.get("run_response")
+    if previous is None and target is not None and kwargs.get("run_id"):
+        try:
+            previous = target.get_run_output(
+                run_id=kwargs["run_id"], session_id=kwargs.get("session_id")
+            )
+        except Exception:  # noqa: BLE001 - telemetry lookup must not alter the native call
+            logger.debug("Could not read prior Agno run messages")
+    return _message_ids(previous)
+
+
+async def _async_prior_context(
+    target: Any,
+    original_method: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    run_context: Any,
+) -> Any:
+    if (
+        run_context.prior_message_ids
+        or "continue_run" not in getattr(original_method, "__name__", "")
+        or not kwargs.get("run_id")
+    ):
+        return run_context
+    try:
+        previous = await target.aget_run_output(
+            run_id=kwargs["run_id"], session_id=kwargs.get("session_id")
+        )
+    except Exception:  # noqa: BLE001 - telemetry lookup must not alter the native call
+        logger.debug("Could not read prior async Agno run messages")
+        return run_context
+    return replace(run_context, prior_message_ids=_message_ids(previous))
+
+
+def _stream_options(original_method: Any, target: Any, kwargs: dict[str, Any]):
+    options = dict(kwargs)
+    hide_final = False
+    if kwargs.get("stream", getattr(target, "stream", False)):
+        try:
+            supports_final = (
+                "yield_run_output" in inspect.signature(original_method).parameters
+            )
+        except (ValueError, TypeError):
+            supports_final = False
+        if supports_final and not kwargs.get("yield_run_output"):
+            options["yield_run_output"] = True
+            hide_final = True
+    return options, hide_final
+
+
 def _wrap_sync_stream(
     *,
     iterator: Iterator[Any],
@@ -134,14 +206,29 @@ def _wrap_sync_stream(
     input_value: Any,
     started_at_ns: int,
     run_context: Any,
+    hide_final: bool = False,
 ) -> Iterator[Any]:
     items: list[Any] = []
-    with use_agno_run_context(run_context=run_context):
-        try:
-            for item in iterator:
+    failed = False
+    try:
+        while True:
+            with use_agno_run_context(run_context=run_context):
+                item = next(iterator)
+            if len(items) < MAX_ITEMS:
                 items.append(item)
+            elif _is_run_output(item) or str(
+                _object_value(item, EVENT_KEY, "")
+            ).endswith("Completed"):
+                items[-1] = item
+            if not (hide_final and _is_run_output(item)):
                 yield item
-        except Exception as exception:
+    except StopIteration:
+        pass
+    except GeneratorExit:
+        raise
+    except BaseException as exception:
+        failed = True
+        with use_agno_run_context(run_context=run_context):
             _emit_failed_run(
                 target=target,
                 target_kind=target_kind,
@@ -149,16 +236,35 @@ def _wrap_sync_stream(
                 exception=exception,
                 started_at_ns=started_at_ns,
             )
-            raise
-        else:
-            _emit_completed_run(
-                target=target,
-                target_kind=target_kind,
-                input_value=input_value,
-                output=_last_run_output(items=items),
-                events=items,
-                started_at_ns=started_at_ns,
-            )
+        raise
+    finally:
+        try:
+            close = getattr(iterator, "close", None)
+            if callable(close):
+                close()
+        except BaseException as exception:
+            if not failed:
+                failed = True
+                with use_agno_run_context(run_context=run_context):
+                    _emit_failed_run(
+                        target=target,
+                        target_kind=target_kind,
+                        input_value=input_value,
+                        exception=exception,
+                        started_at_ns=started_at_ns,
+                    )
+                raise
+        finally:
+            if not failed:
+                with use_agno_run_context(run_context=run_context):
+                    _emit_completed_run(
+                        target=target,
+                        target_kind=target_kind,
+                        input_value=input_value,
+                        output=_last_run_output(items),
+                        events=items,
+                        started_at_ns=started_at_ns,
+                    )
 
 
 async def _wrap_async_stream(
@@ -169,14 +275,32 @@ async def _wrap_async_stream(
     input_value: Any,
     started_at_ns: int,
     run_context: Any,
+    hide_final: bool = False,
+    context_loader: Any = None,
 ) -> AsyncIterator[Any]:
+    if context_loader is not None:
+        run_context = await context_loader()
     items: list[Any] = []
-    with use_agno_run_context(run_context=run_context):
-        try:
-            async for item in async_iterator:
+    failed = False
+    try:
+        while True:
+            with use_agno_run_context(run_context=run_context):
+                item = await anext(async_iterator)
+            if len(items) < MAX_ITEMS:
                 items.append(item)
+            elif _is_run_output(item) or str(
+                _object_value(item, EVENT_KEY, "")
+            ).endswith("Completed"):
+                items[-1] = item
+            if not (hide_final and _is_run_output(item)):
                 yield item
-        except Exception as exception:
+    except StopAsyncIteration:
+        pass
+    except GeneratorExit:
+        raise
+    except BaseException as exception:
+        failed = True
+        with use_agno_run_context(run_context=run_context):
             _emit_failed_run(
                 target=target,
                 target_kind=target_kind,
@@ -184,16 +308,35 @@ async def _wrap_async_stream(
                 exception=exception,
                 started_at_ns=started_at_ns,
             )
-            raise
-        else:
-            _emit_completed_run(
-                target=target,
-                target_kind=target_kind,
-                input_value=input_value,
-                output=_last_run_output(items=items),
-                events=items,
-                started_at_ns=started_at_ns,
-            )
+        raise
+    finally:
+        try:
+            close = getattr(async_iterator, "aclose", None)
+            if callable(close):
+                await close()
+        except BaseException as exception:
+            if not failed:
+                failed = True
+                with use_agno_run_context(run_context=run_context):
+                    _emit_failed_run(
+                        target=target,
+                        target_kind=target_kind,
+                        input_value=input_value,
+                        exception=exception,
+                        started_at_ns=started_at_ns,
+                    )
+                raise
+        finally:
+            if not failed:
+                with use_agno_run_context(run_context=run_context):
+                    _emit_completed_run(
+                        target=target,
+                        target_kind=target_kind,
+                        input_value=input_value,
+                        output=_last_run_output(items),
+                        events=items,
+                        started_at_ns=started_at_ns,
+                    )
 
 
 def _wrap_sync_method(
@@ -201,23 +344,30 @@ def _wrap_sync_method(
     original_method: Any,
     target_kind: str,
     is_bound_method: bool,
+    owner_target: Any = None,
 ) -> Any:
     @functools.wraps(original_method)
     def wrapped_sync_method(*args: Any, **kwargs: Any) -> Any:
         target = args[0]
         call_args = args[1:] if is_bound_method else args
-        input_args = args[1:] if is_bound_method else args[1:]
+        if owner_target is not None and id(owner_target) not in _PATCH_OWNERS:
+            return original_method(*call_args, **kwargs)
+        input_args = args[1:]
         input_value = _extract_input_value(args=input_args, kwargs=kwargs)
         started_at_ns = time.time_ns()
         run_context = create_agno_run_context(
             target=target,
             target_kind=target_kind,
             started_at_ns=started_at_ns,
+            prior_message_ids=_prior_message_ids(
+                original_method, input_args, kwargs, target
+            ),
         )
 
+        call_kwargs, hide_final = _stream_options(original_method, target, kwargs)
         with use_agno_run_context(run_context=run_context):
             try:
-                result = original_method(*call_args, **kwargs)
+                result = original_method(*call_args, **call_kwargs)
             except Exception as exception:
                 _emit_failed_run(
                     target=target,
@@ -236,6 +386,7 @@ def _wrap_sync_method(
                     input_value=input_value,
                     started_at_ns=started_at_ns,
                     run_context=run_context,
+                    hide_final=hide_final,
                 )
 
             _emit_completed_run(
@@ -257,23 +408,28 @@ def _wrap_async_method(
     original_method: Any,
     target_kind: str,
     is_bound_method: bool,
+    owner_target: Any = None,
 ) -> Any:
     @functools.wraps(original_method)
     def wrapped_async_method(*args: Any, **kwargs: Any) -> Any:
         target = args[0]
         call_args = args[1:] if is_bound_method else args
-        input_args = args[1:] if is_bound_method else args[1:]
+        if owner_target is not None and id(owner_target) not in _PATCH_OWNERS:
+            return original_method(*call_args, **kwargs)
+        input_args = args[1:]
         input_value = _extract_input_value(args=input_args, kwargs=kwargs)
         started_at_ns = time.time_ns()
         run_context = create_agno_run_context(
             target=target,
             target_kind=target_kind,
             started_at_ns=started_at_ns,
+            prior_message_ids=_prior_message_ids(original_method, input_args, kwargs),
         )
 
+        call_kwargs, hide_final = _stream_options(original_method, target, kwargs)
         with use_agno_run_context(run_context=run_context):
             try:
-                result = original_method(*call_args, **kwargs)
+                result = original_method(*call_args, **call_kwargs)
             except Exception as exception:
                 _emit_failed_run(
                     target=target,
@@ -292,15 +448,22 @@ def _wrap_async_method(
                     input_value=input_value,
                     started_at_ns=started_at_ns,
                     run_context=run_context,
+                    hide_final=hide_final,
+                    context_loader=lambda: _async_prior_context(
+                        target, original_method, input_args, kwargs, run_context
+                    ),
                 )
 
             if inspect.isawaitable(result):
 
                 async def await_and_emit() -> Any:
-                    with use_agno_run_context(run_context=run_context):
+                    resolved_context = await _async_prior_context(
+                        target, original_method, input_args, kwargs, run_context
+                    )
+                    with use_agno_run_context(run_context=resolved_context):
                         try:
                             output = await result
-                        except Exception as exception:
+                        except BaseException as exception:
                             _emit_failed_run(
                                 target=target,
                                 target_kind=target_kind,
@@ -364,33 +527,38 @@ class AgnoInstrumentor:
         target_kind: str,
         is_bound_method: bool,
     ) -> bool:
-        if getattr(target, RESPAN_AGNO_WRAPPED_ATTR, False):
+        shared = _PATCH_OWNERS.get(id(target))
+        if shared is not None:
+            shared["owners"] += 1
+            self._patches.append((target, shared["originals"]))
+            return True
+        if vars(target).get(RESPAN_AGNO_WRAPPED_ATTR, False):
             return False
 
+        owned_methods = set(vars(target))
         originals: dict[str, Any] = {}
-        if hasattr(target, RUN_METHOD_NAME):
-            original_run = getattr(target, RUN_METHOD_NAME)
-            originals[RUN_METHOD_NAME] = original_run
-            wrapped_run = _wrap_sync_method(
-                original_method=original_run,
+        for method_name, wrap in (
+            (RUN_METHOD_NAME, _wrap_sync_method),
+            (ARUN_METHOD_NAME, _wrap_async_method),
+            ("continue_run", _wrap_sync_method),
+            ("acontinue_run", _wrap_async_method),
+        ):
+            original = getattr(target, method_name, None)
+            if not callable(original):
+                continue
+            originals[method_name] = original
+            call_original = original
+            if is_bound_method and getattr(original, RESPAN_AGNO_WRAPPED_ATTR, False):
+                call_original = MethodType(inspect.unwrap(original), target)
+            replacement = wrap(
+                original_method=call_original,
                 target_kind=target_kind,
                 is_bound_method=is_bound_method,
+                owner_target=target,
             )
             if is_bound_method:
-                wrapped_run = MethodType(wrapped_run, target)
-            setattr(target, RUN_METHOD_NAME, wrapped_run)
-
-        if hasattr(target, ARUN_METHOD_NAME):
-            original_arun = getattr(target, ARUN_METHOD_NAME)
-            originals[ARUN_METHOD_NAME] = original_arun
-            wrapped_arun = _wrap_async_method(
-                original_method=original_arun,
-                target_kind=target_kind,
-                is_bound_method=is_bound_method,
-            )
-            if is_bound_method:
-                wrapped_arun = MethodType(wrapped_arun, target)
-            setattr(target, ARUN_METHOD_NAME, wrapped_arun)
+                replacement = MethodType(replacement, target)
+            setattr(target, method_name, replacement)
 
         if not originals:
             return False
@@ -398,6 +566,14 @@ class AgnoInstrumentor:
         setattr(target, RESPAN_AGNO_ORIGINALS_ATTR, originals)
         setattr(target, RESPAN_AGNO_WRAPPED_ATTR, True)
         self._patches.append((target, originals))
+        _PATCH_OWNERS[id(target)] = {
+            "target": target,
+            "owners": 1,
+            "originals": originals,
+            "owned_methods": owned_methods,
+            "is_bound_method": is_bound_method,
+            "installed": {name: getattr(target, name) for name in originals},
+        }
         return True
 
     @staticmethod
@@ -411,7 +587,11 @@ class AgnoInstrumentor:
         return getattr(team_module, AGNO_TEAM_CLASS_NAME)
 
     def activate(self) -> None:
-        """Activate Agno instrumentation."""
+        """Activate Agno instrumentation with shared patch ownership."""
+        with _PATCH_LOCK:
+            self._activate()
+
+    def _activate(self) -> None:
         if self._is_instrumented:
             return
 
@@ -422,9 +602,14 @@ class AgnoInstrumentor:
             return
 
         if self._agent is not None:
+            target_kind = (
+                AGNO_TARGET_TEAM
+                if type(self._agent).__module__.startswith("agno.team")
+                else AGNO_TARGET_AGENT
+            )
             self._patch_target(
                 target=self._agent,
-                target_kind=AGNO_TARGET_AGENT,
+                target_kind=target_kind,
                 is_bound_method=True,
             )
             self._is_instrumented = bool(self._patches)
@@ -463,10 +648,28 @@ class AgnoInstrumentor:
             logger.info("Agno instrumentation activated")
 
     def deactivate(self) -> None:
-        """Restore patched Agno run methods."""
+        """Restore patches after the final owner deactivates."""
+        with _PATCH_LOCK:
+            self._deactivate()
+
+    def _deactivate(self) -> None:
         for target, originals in reversed(self._patches):
+            shared = _PATCH_OWNERS.get(id(target))
+            if shared is None:
+                continue
+            shared["owners"] -= 1
+            if shared["owners"]:
+                continue
+            _PATCH_OWNERS.pop(id(target), None)
             for method_name, original_method in originals.items():
-                setattr(target, method_name, original_method)
+                if getattr(target, method_name) is shared["installed"][method_name]:
+                    if (
+                        shared["is_bound_method"]
+                        and method_name not in shared["owned_methods"]
+                    ):
+                        delattr(target, method_name)
+                    else:
+                        setattr(target, method_name, original_method)
             if hasattr(target, RESPAN_AGNO_ORIGINALS_ATTR):
                 delattr(target, RESPAN_AGNO_ORIGINALS_ATTR)
             if hasattr(target, RESPAN_AGNO_WRAPPED_ATTR):

@@ -68,3 +68,33 @@ After running the script, traces appear on your [Respan dashboard](https://platf
 - [Agno examples in respan-example-projects](https://github.com/respanai/respan-example-projects/tree/main/python/tracing/agno)
 - [Respan example projects](https://github.com/respanai/respan-example-projects)
 - [Agno documentation](https://docs.agno.com/)
+
+## SDK compatibility and emitted spans
+
+The adapter is tested with Agno 2.6.5 and 3.1.1. It supports sync/async
+`Agent` and `Team` runs, content streams, tools, team delegation, and
+`continue_run` / `acontinue_run` after confirmation. Continuations accept a
+RunOutput or a persisted run ID; the adapter reads that exact prior run through
+the SDK to avoid reporting historical assistant turns again.
+
+Every current assistant message with a recorded model response becomes a chat
+span, with that message's usage and tool calls. A tool waiting for confirmation
+has no execution span until it runs. Team member runs remain children of their
+team. Outputs without message records retain the aggregate fallback behavior.
+Spans are reconstructed when a run or consumed stream finishes, so individual
+model/tool timing uses the enclosing run's interval.
+
+Streaming captures the SDK's final RunOutput internally without exposing an
+extra item unless the caller requested `yield_run_output=True`. Early close
+emits available partial content; cancellation and failures finalize error spans.
+No usage is invented when an interrupted stream has not supplied metrics.
+
+Multiple instrumentors share patch ownership. Explicit Agent/Team instances
+remain independently instrumented after a global instrumentor is deactivated.
+Inputs and outputs use bounded JSON serialization, and credential-shaped keys
+are redacted. The adapter retains at most 64 stream events plus the final output.
+
+The compatibility tests use released Agno and OpenAI clients with deterministic
+HTTP responses. Install `openai` to run those tests; the live gateway test remains
+opt-in. The [Agno examples](https://github.com/respanai/respan-example-projects/tree/main/python/tracing/agno)
+include fixture mode for the complete sync/async, tool, team, and continuation suite.

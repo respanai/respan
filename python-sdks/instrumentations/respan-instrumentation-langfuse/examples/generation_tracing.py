@@ -1,28 +1,36 @@
-"""
-Example: Tracing LLM generations with @observe(as_type="generation")
-"""
+"""Export deterministic Langfuse observations through an initialized Respan runtime."""
+
 import os
-from respan_instrumentation_langfuse import LangfuseInstrumentor
-
-os.environ["RESPAN_API_KEY"] = "your-api-key"
-
-# Instrument first
-instrumentor = LangfuseInstrumentor()
-instrumentor.instrument(api_key=os.environ["RESPAN_API_KEY"])
 
 from langfuse import Langfuse, observe
+from respan import Respan
+from respan_instrumentation_langfuse import LangfuseInstrumentor
 
-langfuse = Langfuse(
-    public_key="pk-lf-...",
-    secret_key="sk-lf-..."
+respan = Respan(
+    api_key=os.environ["RESPAN_API_KEY"],
+    base_url=os.getenv("RESPAN_BASE_URL", "https://api.respan.ai/api"),
+    instrumentations=[],
 )
+instrumentor = LangfuseInstrumentor()
+instrumentor.instrument()
+langfuse = Langfuse(public_key="pk-lf-local-example", secret_key="sk-lf-local-example")
+
 
 @observe(as_type="generation")
 def generate_response(prompt: str):
-    """Marked as a generation for better tracking."""
-    return f"Generated: {prompt}"
+    """Create a generation observation without calling a model provider."""
+    result = f"Generated: {prompt}"
+    langfuse.update_current_generation(
+        model="example-model", input=prompt, output=result
+    )
+    return result
 
-result = generate_response("Write a poem")
-print(result)
 
-langfuse.flush()
+try:
+    print(generate_response("Write a poem"))
+    langfuse.flush()
+    respan.flush()
+finally:
+    langfuse.shutdown()
+    instrumentor.uninstrument()
+    respan.shutdown()
