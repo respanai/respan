@@ -13,11 +13,18 @@ from opentelemetry import trace
 from opentelemetry.context import Context
 from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor
 from opentelemetry.semconv._incubating.attributes import (
+    error_attributes as incubating_error,
+)
+from opentelemetry.semconv._incubating.attributes import event_attributes
+from opentelemetry.semconv._incubating.attributes import (
     gen_ai_attributes as GenAIAttributes,
 )
+from opentelemetry.semconv.attributes import error_attributes, exception_attributes
 from opentelemetry.semconv_ai import LLMRequestTypeValues, SpanAttributes
 from respan_sdk.constants.llm_logging import (
+    LOG_TYPE_AGENT,
     LOG_TYPE_CHAT,
+    LOG_TYPE_EMBEDDING,
     LOG_TYPE_TASK,
     LOG_TYPE_TEXT,
     LOG_TYPE_TOOL,
@@ -30,21 +37,23 @@ from respan_sdk.constants.span_attributes import (
     RESPAN_SPAN_TOOL_CALLS,
     RESPAN_SPAN_TOOLS,
 )
+from semantic_kernel.utils.telemetry.agent_diagnostics import (
+    gen_ai_attributes as SKAgentAttributes,
+)
 
 from respan_instrumentation_semantic_kernel._constants import (
     SEMANTIC_KERNEL_SCOPE_PREFIX,
     SK_ASSISTANT_MESSAGE_EVENT,
+    SK_AUTO_FUNCTION_INVOCATION_SPAN_NAME,
     SK_AVAILABLE_FUNCTIONS_ATTR,
     SK_CHAT_COMPLETION_OPERATION,
     SK_CHAT_MESSAGE_INDEX_ATTR,
     SK_CHAT_OPERATION,
     SK_CHAT_STREAMING_COMPLETION_OPERATION,
     SK_CHOICE_EVENT,
-    SK_COMPLETION_ATTR,
+    SK_CONTENT_CAPTURE_ATTRIBUTE,
     SK_CONTENT_COMPLETION_EVENT,
     SK_CONTENT_PROMPT_EVENT,
-    SK_EVENT_NAME_ATTR,
-    SK_PROMPT_ATTR,
     SK_PROMPT_EVENT,
     SK_RESPONSE_COMPLETION_TOKENS_ATTR,
     SK_RESPONSE_PROMPT_TOKENS_ATTR,
@@ -54,6 +63,9 @@ from respan_instrumentation_semantic_kernel._constants import (
     SK_TOOL_MESSAGE_EVENT,
     SK_TOOL_OPERATION,
     SK_USER_MESSAGE_EVENT,
+)
+from respan_instrumentation_semantic_kernel._native import (
+    capture_content as content_allowed,
 )
 from respan_instrumentation_semantic_kernel._serialization import (
     json_string,
@@ -116,7 +128,7 @@ def _json_string(value: Any) -> str | None:
 def _as_int(value: Any) -> int | None:
     if isinstance(value, bool):
         return None
-    if isinstance(value, int):
+    if isinstance(value, int) and value >= 0:
         return value
     return None
 
@@ -139,7 +151,10 @@ def _span_attrs(span: Any) -> dict[str, Any]:
 
 
 def _is_semantic_kernel_span(span: ReadableSpan) -> bool:
-    return _scope_name(span).startswith(SEMANTIC_KERNEL_SCOPE_PREFIX)
+    name = _scope_name(span)
+    return name == SEMANTIC_KERNEL_SCOPE_PREFIX or name.startswith(
+        SEMANTIC_KERNEL_SCOPE_PREFIX + "."
+    )
 
 
 def _normalize_role(role: Any, fallback: str = "user") -> str:
@@ -156,6 +171,8 @@ def _normalize_role(role: Any, fallback: str = "user") -> str:
 def _message_content(message: Mapping[str, Any]) -> Any:
     content = message.get("content")
     if content is not None:
+        if message.get("tool_call_id") is not None:
+            return {"result": content, "tool_call_id": message["tool_call_id"]}
         return content
 
     items = message.get("items")
@@ -184,6 +201,8 @@ def _message_tool_calls(message: Mapping[str, Any]) -> Any:
     calls: list[dict[str, Any]] = []
     for item in items:
         if not isinstance(item, Mapping):
+            continue
+        if "result" in item:
             continue
         name = item.get("name")
         arguments = item.get("arguments")
@@ -254,21 +273,24 @@ def _promote_legacy_event_payloads(span: ReadableSpan, attrs: dict[str, Any]) ->
     for event in getattr(span, "events", ()) or ():
         event_attrs = dict(getattr(event, "attributes", None) or {})
         event_name = getattr(event, "name", "")
-        if event_name == SK_CONTENT_PROMPT_EVENT and SK_PROMPT_ATTR in event_attrs:
+        if (
+            event_name == SK_CONTENT_PROMPT_EVENT
+            and GenAIAttributes.GEN_AI_PROMPT in event_attrs
+        ):
             _promote_messages(
                 attrs,
                 prefix=SpanAttributes.LLM_PROMPTS,
-                messages=event_attrs[SK_PROMPT_ATTR],
+                messages=event_attrs[GenAIAttributes.GEN_AI_PROMPT],
                 fallback_role="user",
             )
         if (
             event_name == SK_CONTENT_COMPLETION_EVENT
-            and SK_COMPLETION_ATTR in event_attrs
+            and GenAIAttributes.GEN_AI_COMPLETION in event_attrs
         ):
             _promote_messages(
                 attrs,
                 prefix=SpanAttributes.LLM_COMPLETIONS,
-                messages=event_attrs[SK_COMPLETION_ATTR],
+                messages=event_attrs[GenAIAttributes.GEN_AI_COMPLETION],
                 fallback_role="assistant",
             )
 
@@ -325,15 +347,29 @@ def _normalize_available_functions(value: Any) -> list[dict[str, Any]] | None:
 
 
 def _map_usage(attrs: dict[str, Any]) -> None:
-    input_tokens = (
-        _as_int(attrs.get(GenAIAttributes.GEN_AI_USAGE_INPUT_TOKENS))
-        or _as_int(attrs.get(SK_RESPONSE_PROMPT_TOKENS_ATTR))
-        or _as_int(attrs.get(SpanAttributes.LLM_USAGE_PROMPT_TOKENS))
+    input_tokens = next(
+        (
+            value
+            for key in (
+                GenAIAttributes.GEN_AI_USAGE_INPUT_TOKENS,
+                SK_RESPONSE_PROMPT_TOKENS_ATTR,
+                SpanAttributes.LLM_USAGE_PROMPT_TOKENS,
+            )
+            if (value := _as_int(attrs.get(key))) is not None
+        ),
+        None,
     )
-    output_tokens = (
-        _as_int(attrs.get(GenAIAttributes.GEN_AI_USAGE_OUTPUT_TOKENS))
-        or _as_int(attrs.get(SK_RESPONSE_COMPLETION_TOKENS_ATTR))
-        or _as_int(attrs.get(SpanAttributes.LLM_USAGE_COMPLETION_TOKENS))
+    output_tokens = next(
+        (
+            value
+            for key in (
+                GenAIAttributes.GEN_AI_USAGE_OUTPUT_TOKENS,
+                SK_RESPONSE_COMPLETION_TOKENS_ATTR,
+                SpanAttributes.LLM_USAGE_COMPLETION_TOKENS,
+            )
+            if (value := _as_int(attrs.get(key))) is not None
+        ),
+        None,
     )
 
     if input_tokens is not None:
@@ -357,18 +393,18 @@ def _map_completion_span(
     log_type: str,
     request_type: str,
 ) -> None:
-    if SK_PROMPT_ATTR in attrs:
+    if GenAIAttributes.GEN_AI_PROMPT in attrs:
         _promote_messages(
             attrs,
             prefix=SpanAttributes.LLM_PROMPTS,
-            messages=attrs[SK_PROMPT_ATTR],
+            messages=attrs[GenAIAttributes.GEN_AI_PROMPT],
             fallback_role="user",
         )
-    if SK_COMPLETION_ATTR in attrs:
+    if GenAIAttributes.GEN_AI_COMPLETION in attrs:
         _promote_messages(
             attrs,
             prefix=SpanAttributes.LLM_COMPLETIONS,
-            messages=attrs[SK_COMPLETION_ATTR],
+            messages=attrs[GenAIAttributes.GEN_AI_COMPLETION],
             fallback_role="assistant",
         )
     _promote_legacy_event_payloads(span, attrs)
@@ -446,7 +482,6 @@ def _map_tool_span(span: ReadableSpan, attrs: dict[str, Any]) -> None:
 
     for key in (
         GenAIAttributes.GEN_AI_TOOL_CALL_ARGUMENTS,
-        GenAIAttributes.GEN_AI_TOOL_CALL_ID,
         GenAIAttributes.GEN_AI_TOOL_CALL_RESULT,
         GenAIAttributes.GEN_AI_TOOL_DESCRIPTION,
         GenAIAttributes.GEN_AI_TOOL_NAME,
@@ -514,25 +549,29 @@ def _map_error(span: ReadableSpan, attrs: dict[str, Any]) -> None:
     error_message = getattr(status, "description", None)
     for event in getattr(span, "events", ()) or ():
         event_attrs = dict(getattr(event, "attributes", None) or {})
-        event_type = event_attrs.get("exception.type")
-        event_message = event_attrs.get("exception.message")
+        event_type = event_attrs.get(exception_attributes.EXCEPTION_TYPE)
+        event_message = event_attrs.get(exception_attributes.EXCEPTION_MESSAGE)
         if isinstance(event_type, str) and event_type:
             error_type = redact_text(event_type, limit=256)
         if isinstance(event_message, str) and event_message:
             error_message = event_message
             break
-    attrs["error.type"] = error_type
-    attrs["error.message"] = redact_text(error_message or error_type)
-    attrs["http.response.status_code"] = 500
-    attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = _json_string(
-        {"error": {"type": error_type, "message": error_message or error_type}}
-    )
+    attrs[error_attributes.ERROR_TYPE] = error_type
+    attrs[incubating_error.ERROR_MESSAGE] = redact_text(error_message or error_type)
+    if attrs.get(RESPAN_LOG_TYPE) not in {
+        LOG_TYPE_CHAT,
+        LOG_TYPE_TEXT,
+        LOG_TYPE_EMBEDDING,
+    }:
+        attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = _json_string(
+            {"error": {"type": error_type, "message": error_message or error_type}}
+        )
 
 
 def _cleanup_attrs(attrs: dict[str, Any]) -> None:
     attrs.pop(SpanAttributes.TRACELOOP_SPAN_KIND, None)
-    attrs.pop(SK_PROMPT_ATTR, None)
-    attrs.pop(SK_COMPLETION_ATTR, None)
+    attrs.pop(GenAIAttributes.GEN_AI_PROMPT, None)
+    attrs.pop(GenAIAttributes.GEN_AI_COMPLETION, None)
     attrs.pop(SK_RESPONSE_PROMPT_TOKENS_ATTR, None)
     attrs.pop(SK_RESPONSE_COMPLETION_TOKENS_ATTR, None)
     attrs.pop(SK_AVAILABLE_FUNCTIONS_ATTR, None)
@@ -555,8 +594,6 @@ def _sanitize_contract_attrs(attrs: dict[str, Any]) -> None:
 
 def _strip_content(attrs: dict[str, Any]) -> None:
     for key in (
-        SK_PROMPT_ATTR,
-        SK_COMPLETION_ATTR,
         SK_AVAILABLE_FUNCTIONS_ATTR,
         GenAIAttributes.GEN_AI_TOOL_CALL_ARGUMENTS,
         GenAIAttributes.GEN_AI_TOOL_CALL_RESULT,
@@ -600,9 +637,52 @@ def enrich_semantic_kernel_span(
             log_type=LOG_TYPE_TEXT,
             request_type=LLMRequestTypeValues.COMPLETION.value,
         )
+    elif operation == "embeddings":
+        attrs[RESPAN_LOG_TYPE] = LOG_TYPE_EMBEDDING
+        attrs[SpanAttributes.LLM_REQUEST_TYPE] = LLMRequestTypeValues.EMBEDDING.value
+        attrs.setdefault(
+            SpanAttributes.TRACELOOP_ENTITY_NAME, "semantic_kernel.embeddings"
+        )
+        attrs.setdefault(SpanAttributes.TRACELOOP_ENTITY_PATH, "")
+        _map_usage(attrs)
+    elif operation == "invoke_agent":
+        attrs[RESPAN_LOG_TYPE] = LOG_TYPE_AGENT
+        attrs[SpanAttributes.TRACELOOP_ENTITY_NAME] = attrs.get(
+            GenAIAttributes.GEN_AI_AGENT_NAME, "agent"
+        )
+        attrs.setdefault(SpanAttributes.TRACELOOP_ENTITY_PATH, "")
+        for source, destination in (
+            (
+                GenAIAttributes.GEN_AI_INPUT_MESSAGES,
+                SpanAttributes.TRACELOOP_ENTITY_INPUT,
+            ),
+            (
+                GenAIAttributes.GEN_AI_OUTPUT_MESSAGES,
+                SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+            ),
+            (
+                getattr(SKAgentAttributes, "AGENT_INVOCATION_INPUT", None),
+                SpanAttributes.TRACELOOP_ENTITY_INPUT,
+            ),
+            (
+                getattr(SKAgentAttributes, "AGENT_INVOCATION_OUTPUT", None),
+                SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+            ),
+        ):
+            if source in attrs:
+                attrs[destination] = _json_string(_safe_json_loads(attrs.pop(source)))
+        attrs.pop(GenAIAttributes.GEN_AI_TOOL_DEFINITIONS, None)
+    elif getattr(span, "name", None) == SK_AUTO_FUNCTION_INVOCATION_SPAN_NAME:
+        attrs[RESPAN_LOG_TYPE] = LOG_TYPE_TASK
+        attrs[SpanAttributes.TRACELOOP_ENTITY_NAME] = (
+            "semantic_kernel.auto_function_invocation"
+        )
+        attrs.setdefault(SpanAttributes.TRACELOOP_ENTITY_PATH, "")
     elif operation == SK_TOOL_OPERATION:
         tool_name = _tool_name_from_span(span, attrs)
-        if _is_generated_prompt_wrapper(tool_name):
+        if attrs.get(RESPAN_LOG_TYPE) == LOG_TYPE_TASK or (
+            RESPAN_LOG_TYPE not in attrs and _is_generated_prompt_wrapper(tool_name)
+        ):
             _map_prompt_wrapper(span, attrs)
         else:
             _map_tool_span(span, attrs)
@@ -612,7 +692,7 @@ def enrich_semantic_kernel_span(
     _cleanup_attrs(attrs)
     _map_error(span, attrs)
     _sanitize_contract_attrs(attrs)
-    if not capture_content:
+    if not content_allowed(capture_content):
         _strip_content(attrs)
     span._attributes = attrs
     if hasattr(span, "_events"):
@@ -625,12 +705,18 @@ class SemanticKernelLogRecordHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            event_name = record.__dict__.get(SK_EVENT_NAME_ATTR)
+            if not content_allowed(True):
+                return
+            event_name = record.__dict__.get(event_attributes.EVENT_NAME)
             if not isinstance(event_name, str):
                 return
 
             span = trace.get_current_span()
-            if span is None or not hasattr(span, "set_attribute"):
+            if (
+                span is None
+                or not hasattr(span, "set_attribute")
+                or not _is_semantic_kernel_span(span)
+            ):
                 return
             is_recording = getattr(span, "is_recording", None)
             if callable(is_recording) and not is_recording():
@@ -708,12 +794,23 @@ class SemanticKernelSpanProcessor(SpanProcessor):
 
     def __init__(self, *, capture_content: bool = True) -> None:
         self.capture_content = capture_content
+        self._content_policy: dict[tuple[int, int], bool] = {}
 
     def on_start(
         self,
         span: Span,
         parent_context: Context | None = None,
     ) -> None:
+        if not _is_semantic_kernel_span(span):
+            return
+        get_context = getattr(span, "get_span_context", None)
+        span_context = get_context() if get_context else None
+        allowed = content_allowed(self.capture_content)
+        setattr(span, SK_CONTENT_CAPTURE_ATTRIBUTE, allowed)
+        if span_context is not None:
+            self._content_policy[(span_context.trace_id, span_context.span_id)] = (
+                allowed
+            )
         parent = trace.get_current_span(parent_context)
         parent_attrs = getattr(parent, "attributes", None) or {}
         available_functions = parent_attrs.get(SK_AVAILABLE_FUNCTIONS_ATTR)
@@ -721,10 +818,19 @@ class SemanticKernelSpanProcessor(SpanProcessor):
             span.set_attribute(SK_AVAILABLE_FUNCTIONS_ATTR, available_functions)
 
     def on_end(self, span: ReadableSpan) -> None:
-        enrich_semantic_kernel_span(span, capture_content=self.capture_content)
+        get_context = getattr(span, "get_span_context", None)
+        span_context = get_context() if get_context else None
+        allowed = (
+            self._content_policy.pop(
+                (span_context.trace_id, span_context.span_id), self.capture_content
+            )
+            if span_context
+            else self.capture_content
+        )
+        enrich_semantic_kernel_span(span, capture_content=allowed)
 
     def shutdown(self) -> None:
-        return None
+        self._content_policy.clear()
 
     def force_flush(self, timeout_millis: int = 30000) -> bool:
         return True

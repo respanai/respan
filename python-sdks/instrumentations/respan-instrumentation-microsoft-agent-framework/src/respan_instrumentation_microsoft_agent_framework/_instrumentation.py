@@ -13,6 +13,7 @@ from typing import Any
 from opentelemetry import trace
 from respan_tracing.core.tracer import RespanTracer
 
+from respan_instrumentation_microsoft_agent_framework import _policy
 from respan_instrumentation_microsoft_agent_framework._constants import (
     AGENT_FRAMEWORK_INSTRUMENTATION_NAME,
 )
@@ -89,6 +90,11 @@ def _patch_chat_tool_capture(observability: Any) -> bool:
 
         @wraps(original)
         def get_response_with_tool_capture(self: Any, *args: Any, **kwargs: Any) -> Any:
+            if (
+                not _chat_telemetry_patch_users
+                or _patched_chat_get_response is not get_response_with_tool_capture
+            ):
+                return original(self, *args, **kwargs)
             options = kwargs.get("options")
             tools = options.get("tools") if isinstance(options, Mapping) else None
             token = _chat_tool_definitions.set(tools)
@@ -99,7 +105,13 @@ def _patch_chat_tool_capture(observability: Any) -> bool:
 
         @wraps(get_span_attributes)
         def get_span_attributes_with_tool_capture(*args: Any, **kwargs: Any) -> Any:
-            tools = _chat_tool_definitions.get()
+            if (
+                not _chat_telemetry_patch_users
+                or _patched_get_span_attributes
+                is not get_span_attributes_with_tool_capture
+            ):
+                return get_span_attributes(*args, **kwargs)
+            tools = _chat_tool_definitions.get() if _policy.capture_content() else None
             if tools not in (None, (), []) and kwargs.get("tools") in (None, (), []):
                 kwargs = {**kwargs, "tools": tools}
             return get_span_attributes(*args, **kwargs)
@@ -170,7 +182,10 @@ def _register_processor(
     if active_span_processor is None or processors is None:
         if hasattr(tracer_provider, "add_span_processor"):
             tracer_provider.add_span_processor(processor)
-        return
+            return
+        raise RuntimeError(
+            "Initialize an OpenTelemetry tracer provider before activating Agent Framework instrumentation"
+        )
 
     remaining_processors = tuple(
         existing_processor
@@ -246,6 +261,7 @@ def _release_shared_processor(
                 processor=processor,
             )
         finally:
+            processor.shutdown()
             _shared_processor_provider = None
             _shared_processor = None
 
@@ -261,6 +277,7 @@ class MicrosoftAgentFrameworkInstrumentor:
         self._tracer_provider: Any = None
         self._is_instrumented = False
         self._chat_tool_capture_patched = False
+        self._policy_acquired = False
 
     @staticmethod
     def _is_respan_tracing_enabled() -> bool:
@@ -288,25 +305,8 @@ class MicrosoftAgentFrameworkInstrumentor:
             )
             return None
 
-        enable_instrumentation = getattr(observability, "enable_instrumentation", None)
-        if callable(enable_instrumentation):
-            try:
-                enable_instrumentation(enable_sensitive_data=self._capture_content)
-                return observability
-            except TypeError:
-                enable_instrumentation()
-
-        if self._capture_content:
-            enable_sensitive_telemetry = getattr(
-                observability,
-                "enable_sensitive_telemetry",
-                None,
-            )
-            if callable(enable_sensitive_telemetry):
-                enable_sensitive_telemetry()
-            elif settings is not None and hasattr(settings, "enable_sensitive_data"):
-                settings.enable_sensitive_data = True
-        return observability
+        self._policy_acquired = _policy.acquire(observability, self._capture_content)
+        return observability if self._policy_acquired else None
 
     def activate(self) -> None:
         """Activate Respan normalization for Microsoft Agent Framework spans."""
@@ -324,16 +324,18 @@ class MicrosoftAgentFrameworkInstrumentor:
         if observability is None:
             return
 
-        self._chat_tool_capture_patched = _patch_chat_tool_capture(observability)
-
         tracer_provider = trace.get_tracer_provider()
         try:
+            self._chat_tool_capture_patched = _patch_chat_tool_capture(observability)
             self._processor = _acquire_shared_processor(tracer_provider)
             self._tracer_provider = tracer_provider
         except Exception:
             if self._chat_tool_capture_patched:
                 _unpatch_chat_tool_capture()
                 self._chat_tool_capture_patched = False
+            if self._policy_acquired:
+                _policy.release()
+                self._policy_acquired = False
             raise
         self._is_instrumented = True
         logger.info("Microsoft Agent Framework instrumentation activated")
@@ -355,6 +357,9 @@ class MicrosoftAgentFrameworkInstrumentor:
                     _unpatch_chat_tool_capture()
                     self._chat_tool_capture_patched = False
             finally:
+                if self._policy_acquired:
+                    _policy.release()
+                    self._policy_acquired = False
                 self._processor = None
                 self._tracer_provider = None
                 self._is_instrumented = False

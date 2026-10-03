@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from collections.abc import Callable
 from contextvars import ContextVar, copy_context
 from functools import wraps
 from importlib.metadata import version
-from typing import Any, Callable
+from typing import Any
 
 from packaging.version import Version
+from respan_tracing.decorators.base import _should_send_prompts
+
+from ._processor import _content_policy_override
 
 _owned_llm_generators: ContextVar[list | None] = ContextVar(
     "respan_adk_owned_llm_generators", default=None
@@ -26,7 +31,7 @@ async def _drive_iterator(source, requests):
             method, args, result = await requests.get()
             try:
                 value = await getattr(iterator, method)(*args)
-            except BaseException as exc:
+            except BaseException as exc:  # noqa: BLE001 -- relay cancellation and generator termination unchanged
                 if not result.done():
                     result.set_exception(exc)
                 return
@@ -55,6 +60,11 @@ class _ContextPreservingIterator:
     def __init__(self, source: Any) -> None:
         self._source = source
         self._context = copy_context()
+        policy = _content_policy_override.get()
+        self._context.run(
+            _content_policy_override.set,
+            _should_send_prompts() if policy is None else policy,
+        )
         self._requests: asyncio.Queue | None = None
         self._worker: asyncio.Task | None = None
         self._closed = False
@@ -91,7 +101,12 @@ class _ContextPreservingIterator:
         try:
             return await result
         except BaseException:
-            await self.aclose()
+            try:
+                await self.aclose()
+            except BaseException as cleanup_error:  # noqa: BLE001 -- preserve the original SDK error/cancellation
+                logging.getLogger(__name__).debug(
+                    "Iterator cleanup failed with %s", type(cleanup_error).__name__
+                )
             raise
         finally:
             self._advancing = False
@@ -101,7 +116,12 @@ class _ContextPreservingIterator:
         if self._worker is not None:
             if not self._worker.done():
                 self._worker.cancel()
-            await asyncio.gather(self._worker, return_exceptions=True)
+            results = await asyncio.gather(self._worker, return_exceptions=True)
+            result = results[0]
+            if isinstance(result, BaseException) and not isinstance(
+                result, asyncio.CancelledError
+            ):
+                raise result
         else:
             await self._source.aclose()
 
@@ -119,12 +139,10 @@ class _ContextPreservingIterator:
 
 def patch_legacy_agent_iterator() -> Callable[[], None] | None:
     """Return an undo callback; modern ADK keeps its existing upstream path."""
-    if Version(version("google-adk")) >= Version("1.17.0"):
-        return None
+    legacy = Version(version("google-adk")) < Version("1.17.0")
 
     from google.adk import Runner
     from google.adk.agents import BaseAgent
-    from google.adk.flows.llm_flows.base_llm_flow import BaseLlmFlow
 
     originals = []
 
@@ -142,19 +160,22 @@ def patch_legacy_agent_iterator() -> Callable[[], None] | None:
         cls.run_async = replacement
         originals.append((cls, "run_async", original, replacement))
 
-    original_llm_call = BaseLlmFlow._call_llm_async
+    if legacy:
+        from google.adk.flows.llm_flows.base_llm_flow import BaseLlmFlow
 
-    @wraps(original_llm_call)
-    def call_llm_async(self, *args, **kwargs):
-        generator = original_llm_call(self, *args, **kwargs)
-        if (owned := _owned_llm_generators.get()) is not None:
-            owned.append(generator)
-        return generator
+        original_llm_call = BaseLlmFlow._call_llm_async
 
-    BaseLlmFlow._call_llm_async = call_llm_async
-    originals.append(
-        (BaseLlmFlow, "_call_llm_async", original_llm_call, call_llm_async)
-    )
+        @wraps(original_llm_call)
+        def call_llm_async(self, *args, **kwargs):
+            generator = original_llm_call(self, *args, **kwargs)
+            if (owned := _owned_llm_generators.get()) is not None:
+                owned.append(generator)
+            return generator
+
+        BaseLlmFlow._call_llm_async = call_llm_async
+        originals.append(
+            (BaseLlmFlow, "_call_llm_async", original_llm_call, call_llm_async)
+        )
 
     def undo():
         for cls, name, original, replacement in reversed(originals):

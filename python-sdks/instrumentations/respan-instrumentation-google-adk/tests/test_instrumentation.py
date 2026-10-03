@@ -2,11 +2,10 @@ import json
 import logging
 import sys
 from types import ModuleType, SimpleNamespace
+from typing import ClassVar
 
 import pytest
-
-from respan_instrumentation_google_adk import GoogleADKInstrumentor
-from respan_instrumentation_google_adk import _instrumentation
+from respan_instrumentation_google_adk import GoogleADKInstrumentor, _instrumentation
 from respan_instrumentation_google_adk._instrumentation import (
     OPENINFERENCE_GOOGLE_ADK_MODULE,
 )
@@ -49,7 +48,7 @@ def _install_fake_modules(monkeypatch):
     monkeypatch.setattr(_instrumentation, "patch_legacy_agent_iterator", lambda: None)
 
     class FakeGoogleADKInstrumentor:
-        created = []
+        created: ClassVar[list] = []
 
         def __init__(self):
             self.instrument_kwargs = None
@@ -91,6 +90,11 @@ def _install_fake_modules(monkeypatch):
 def reset_tracer():
     RespanTracer.reset_instance()
     yield
+    owner = GoogleADKInstrumentor._owner
+    if owner is not None:
+        owner._deactivate()
+        GoogleADKInstrumentor._owner = None
+        GoogleADKInstrumentor._owner_count = 0
     RespanTracer.reset_instance()
 
 

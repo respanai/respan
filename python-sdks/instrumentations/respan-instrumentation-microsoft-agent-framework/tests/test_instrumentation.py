@@ -6,22 +6,25 @@ from collections import Counter, deque
 from types import ModuleType, SimpleNamespace
 
 import pytest
+from opentelemetry.semconv._incubating.attributes import (
+    gen_ai_attributes as GenAIAttributes,
+)
+from opentelemetry.semconv._incubating.attributes.error_attributes import ERROR_MESSAGE
+from opentelemetry.semconv._incubating.attributes.http_attributes import (
+    HTTP_STATUS_CODE,
+)
+from opentelemetry.semconv.attributes.http_attributes import HTTP_RESPONSE_STATUS_CODE
 from opentelemetry.semconv_ai import SpanAttributes
 from respan_instrumentation_microsoft_agent_framework import (
     MicrosoftAgentFrameworkInstrumentor,
     _instrumentation,
 )
 from respan_instrumentation_microsoft_agent_framework._constants import (
-    ATTR_GEN_AI_INPUT_MESSAGES,
-    ATTR_GEN_AI_OUTPUT_MESSAGES,
-    ATTR_GEN_AI_SYSTEM_INSTRUCTIONS,
-    ATTR_GEN_AI_TOOL_DEFINITIONS,
     TOP_LEVEL_ALIAS_ATTRS,
 )
 from respan_instrumentation_microsoft_agent_framework._processor import (
     AgentFrameworkSpanProcessor,
 )
-from respan_sdk.constants import ERROR_MESSAGE_ATTR
 from respan_sdk.constants.llm_logging import (
     LOG_TYPE_AGENT,
     LOG_TYPE_CHAT,
@@ -346,13 +349,13 @@ def test_processor_maps_chat_span_and_removes_aliases():
             SpanAttributes.LLM_REQUEST_MODEL: "gpt-4.1-nano",
             "gen_ai.usage.input_tokens": 12,
             "gen_ai.usage.output_tokens": 7,
-            ATTR_GEN_AI_SYSTEM_INSTRUCTIONS: json.dumps(
+            GenAIAttributes.GEN_AI_SYSTEM_INSTRUCTIONS: json.dumps(
                 [{"type": "text", "content": "Use concise answers."}]
             ),
-            ATTR_GEN_AI_INPUT_MESSAGES: json.dumps(
+            GenAIAttributes.GEN_AI_INPUT_MESSAGES: json.dumps(
                 [{"role": "user", "content": "Use the weather tool for Seattle."}]
             ),
-            ATTR_GEN_AI_OUTPUT_MESSAGES: json.dumps(
+            GenAIAttributes.GEN_AI_OUTPUT_MESSAGES: json.dumps(
                 [
                     {
                         "role": "assistant",
@@ -367,7 +370,7 @@ def test_processor_maps_chat_span_and_removes_aliases():
                     }
                 ]
             ),
-            ATTR_GEN_AI_TOOL_DEFINITIONS: json.dumps(
+            GenAIAttributes.GEN_AI_TOOL_DEFINITIONS: json.dumps(
                 [{"name": "lookup_weather", "description": "Return weather."}]
             ),
             "model": "bad-alias",
@@ -408,10 +411,10 @@ def test_processor_maps_chat_span_and_removes_aliases():
     assert functions[0]["function"]["name"] == "lookup_weather"
 
     for raw_key in (
-        ATTR_GEN_AI_SYSTEM_INSTRUCTIONS,
-        ATTR_GEN_AI_INPUT_MESSAGES,
-        ATTR_GEN_AI_OUTPUT_MESSAGES,
-        ATTR_GEN_AI_TOOL_DEFINITIONS,
+        GenAIAttributes.GEN_AI_SYSTEM_INSTRUCTIONS,
+        GenAIAttributes.GEN_AI_INPUT_MESSAGES,
+        GenAIAttributes.GEN_AI_OUTPUT_MESSAGES,
+        GenAIAttributes.GEN_AI_TOOL_DEFINITIONS,
     ):
         assert raw_key not in attrs
     assert SpanAttributes.TRACELOOP_SPAN_KIND not in attrs
@@ -443,11 +446,15 @@ def test_processor_maps_tool_span_and_strips_gen_ai_tool_attrs():
         "id": "call_1",
     }
     assert attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] == "Sunny and 72F."
-    assert not any(key.startswith("gen_ai.tool.") for key in attrs)
+    assert attrs[GenAIAttributes.GEN_AI_TOOL_CALL_ID] == "call_1"
+    assert not any(
+        key.startswith("gen_ai.tool.") and key != GenAIAttributes.GEN_AI_TOOL_CALL_ID
+        for key in attrs
+    )
     _assert_no_off_contract_aliases(attrs)
 
 
-def test_processor_marks_error_type_as_backend_error_status():
+def test_processor_keeps_error_type_without_inventing_http_status():
     span = FakeSpan(
         {
             "gen_ai.operation.name": "execute_tool",
@@ -461,11 +468,12 @@ def test_processor_marks_error_type_as_backend_error_status():
     attrs = span._attributes
 
     assert attrs[RESPAN_LOG_TYPE] == LOG_TYPE_TOOL
-    assert attrs["status_code"] == 500
-    assert attrs[ERROR_MESSAGE_ATTR] == "RuntimeError"
+    assert "status_code" not in attrs
+    assert HTTP_RESPONSE_STATUS_CODE not in attrs
+    assert attrs[ERROR_MESSAGE] == "RuntimeError"
 
 
-def test_processor_preserves_explicit_provider_http_status():
+def test_processor_does_not_infer_http_status_from_provider_error_text():
     span = FakeSpan(
         {
             "gen_ai.operation.name": "chat",
@@ -484,8 +492,9 @@ def test_processor_preserves_explicit_provider_http_status():
 
     AgentFrameworkSpanProcessor().on_end(span)
 
-    assert span._attributes["status_code"] == 401
-    assert "Error code: 401" in span._attributes[ERROR_MESSAGE_ATTR]
+    assert "status_code" not in span._attributes
+    assert HTTP_RESPONSE_STATUS_CODE not in span._attributes
+    assert "Error code: 401" in span._attributes[ERROR_MESSAGE]
 
 
 def test_processor_does_not_treat_unlabelled_number_as_http_status():
@@ -504,7 +513,8 @@ def test_processor_does_not_treat_unlabelled_number_as_http_status():
 
     AgentFrameworkSpanProcessor().on_end(span)
 
-    assert span._attributes["status_code"] == 500
+    assert "status_code" not in span._attributes
+    assert HTTP_RESPONSE_STATUS_CODE not in span._attributes
 
 
 def test_processor_does_not_parse_application_status_text_as_http_status():
@@ -523,7 +533,8 @@ def test_processor_does_not_parse_application_status_text_as_http_status():
 
     AgentFrameworkSpanProcessor().on_end(span)
 
-    assert span._attributes["status_code"] == 500
+    assert "status_code" not in span._attributes
+    assert HTTP_RESPONSE_STATUS_CODE not in span._attributes
 
 
 def test_processor_maps_agent_and_workflow_spans():
@@ -534,8 +545,10 @@ def test_processor_maps_agent_and_workflow_spans():
             "gen_ai.provider.name": "microsoft.agent_framework",
             SpanAttributes.LLM_REQUEST_MODEL: "gpt-4.1-nano",
             "gen_ai.usage.input_tokens": 12,
-            ATTR_GEN_AI_INPUT_MESSAGES: json.dumps([{"role": "user", "content": "Hi"}]),
-            ATTR_GEN_AI_OUTPUT_MESSAGES: json.dumps(
+            GenAIAttributes.GEN_AI_INPUT_MESSAGES: json.dumps(
+                [{"role": "user", "content": "Hi"}]
+            ),
+            GenAIAttributes.GEN_AI_OUTPUT_MESSAGES: json.dumps(
                 [{"role": "assistant", "content": "Hello"}]
             ),
         },
@@ -769,7 +782,7 @@ def test_real_framework_agent_exports_canonical_tool_contract(monkeypatch):
     for span in spans:
         assert SpanAttributes.TRACELOOP_SPAN_KIND not in span.attributes
         _assert_no_off_contract_aliases(span.attributes)
-        assert ATTR_GEN_AI_TOOL_DEFINITIONS not in span.attributes
+        assert GenAIAttributes.GEN_AI_TOOL_DEFINITIONS not in span.attributes
 
 
 def test_real_framework_provider_failure_propagates_typed_http_status(monkeypatch):
@@ -861,10 +874,11 @@ def test_real_framework_provider_failure_propagates_typed_http_status(monkeypatc
         instrumentor.deactivate()
         provider.shutdown()
 
-    assert Counter(span.name for span in spans) == Counter(
+    assert Counter(
+        span.name for span in spans if not span.name.startswith("edge_group.process")
+    ) == Counter(
         {
             "chat gpt-4.1-nano": 1,
-            "edge_group.process InternalEdgeGroup": 1,
             "executor.process failing_executor": 1,
             "invoke_agent failing_agent": 1,
             "workflow.run": 1,
@@ -882,8 +896,61 @@ def test_real_framework_provider_failure_propagates_typed_http_status(monkeypatc
             LOG_TYPE_WORKFLOW: 1,
         }
     )
-    assert all(span.attributes["status_code"] == 401 for span in failed_spans)
+    assert all("status_code" not in span.attributes for span in failed_spans)
     assert all(
-        "ChatClientInvalidAuthException" in span.attributes[ERROR_MESSAGE_ATTR]
+        HTTP_RESPONSE_STATUS_CODE not in span.attributes for span in failed_spans
+    )
+    assert all(
+        "ChatClientInvalidAuthException" in span.attributes[ERROR_MESSAGE]
         for span in failed_spans
     )
+
+
+@pytest.mark.parametrize("result", [False, 0])
+def test_tool_result_history_is_content_not_another_tool_call(result):
+    span = FakeSpan(
+        {
+            "gen_ai.operation.name": "chat",
+            GenAIAttributes.GEN_AI_INPUT_MESSAGES: json.dumps(
+                [
+                    {
+                        "role": "tool",
+                        "parts": [
+                            {
+                                "type": "tool_call_response",
+                                "name": "lookup",
+                                "id": "past-call",
+                                "response": result,
+                            }
+                        ],
+                    }
+                ]
+            ),
+        }
+    )
+    AgentFrameworkSpanProcessor().on_end(span)
+    assert span._attributes["gen_ai.prompt.0.content"] == json.dumps(result)
+    assert "gen_ai.prompt.0.tool_calls" not in span._attributes
+    assert "gen_ai.completion.0.tool_calls" not in span._attributes
+
+
+@pytest.mark.parametrize("native_key", [HTTP_RESPONSE_STATUS_CODE, HTTP_STATUS_CODE])
+def test_processor_preserves_reported_http_status_canonically(native_key):
+    span = FakeSpan(
+        {
+            GenAIAttributes.GEN_AI_OPERATION_NAME: "chat",
+            native_key: 429,
+            "error.type": "ChatClientException",
+            "status_code": 500,
+        },
+        status=SimpleNamespace(
+            status_code=SimpleNamespace(name="ERROR"),
+            description="Provider reported HTTP 429",
+        ),
+    )
+    AgentFrameworkSpanProcessor().on_end(span)
+    assert span._attributes[HTTP_RESPONSE_STATUS_CODE] == 429
+    assert HTTP_STATUS_CODE not in span._attributes
+    assert "status_code" not in span._attributes
+    assert span.status.status_code.name == "ERROR"
+    assert span._attributes[ERROR_MESSAGE] == "Provider reported HTTP 429"

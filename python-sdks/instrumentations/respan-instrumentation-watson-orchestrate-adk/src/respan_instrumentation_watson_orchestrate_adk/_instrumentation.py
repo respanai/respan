@@ -6,18 +6,27 @@ import functools
 import importlib
 import inspect
 import logging
+import os
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import RLock
 from typing import Any
 
+from opentelemetry import context as context_api
 from opentelemetry import trace
+from opentelemetry.context import _SUPPRESS_INSTRUMENTATION_KEY
 from respan_sdk.utils.data_processing.id_processing import (
     format_span_id,
     format_trace_id,
 )
+from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
 from respan_tracing.core.tracer import RespanTracer
+from respan_tracing.utils.span_factory import (
+    build_readable_span,
+    read_propagated_attributes,
+)
 
 from respan_instrumentation_watson_orchestrate_adk import _otel_emitter
 from respan_instrumentation_watson_orchestrate_adk._constants import (
@@ -36,6 +45,9 @@ from respan_instrumentation_watson_orchestrate_adk._constants import (
     RUN_METHODS,
     TOOL_CALL_METHOD,
     WATSON_ORCHESTRATE_ADK_INSTRUMENTATION_NAME,
+    WATSON_ORCHESTRATE_CHAT_SPAN_NAME,
+    WATSON_ORCHESTRATE_RUN_SPAN_NAME,
+    WATSON_ORCHESTRATE_TOOL_SPAN_NAME,
     WATSONX_AI_CLIENT_CLASS,
     WATSONX_AI_CLIENT_MODULE,
 )
@@ -49,6 +61,7 @@ logger = logging.getLogger(__name__)
 
 _LOCK = RLock()
 _ACTIVATION_COUNT = 0
+_PATCH_EPOCH = 0
 
 
 @dataclass(frozen=True)
@@ -136,144 +149,150 @@ def _emit_error_kwargs(exc: BaseException) -> dict[str, Any]:
     }
 
 
-def _wrap_tool_call(original: Callable[..., Any]) -> Callable[..., Any]:
-    @functools.wraps(original)
-    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        start_ns = time.time_ns()
-        trace_id, parent_id = _current_trace_parent_ids()
-        tool_name = _tool_name(self)
-        try:
-            response = original(self, *args, **kwargs)
-        except BaseException as exc:
-            _otel_emitter.emit_tool_span(
-                tool_name=tool_name,
-                args=args,
-                kwargs=kwargs,
-                start_ns=start_ns,
-                trace_id=trace_id,
-                parent_id=parent_id,
-                **_emit_error_kwargs(exc),
-            )
-            raise
-        _otel_emitter.emit_tool_span(
-            tool_name=tool_name,
-            args=args,
-            kwargs=kwargs,
-            start_ns=start_ns,
-            response=response,
-            trace_id=trace_id,
-            parent_id=parent_id,
+@contextmanager
+def _operation(kind):
+    name = {
+        "chat": WATSON_ORCHESTRATE_CHAT_SPAN_NAME,
+        "tool": WATSON_ORCHESTRATE_TOOL_SPAN_NAME,
+    }.get(kind, WATSON_ORCHESTRATE_RUN_SPAN_NAME)
+    # Snapshot policy and attribution before provider callbacks can change context.
+    include_content = context_api.get_value(
+        ENABLE_CONTENT_TRACING_KEY
+    ) is not False and os.getenv(
+        "TRACELOOP_TRACE_CONTENT", "true"
+    ).strip().lower() not in {"false", "0", "no", "off"}
+    trace_id, parent_id = _current_trace_parent_ids()
+    skeleton = build_readable_span(
+        name=name,
+        trace_id=trace_id,
+        parent_id=parent_id,
+        merge_propagated=False,
+    )
+    sampler = getattr(trace.get_tracer_provider(), "sampler", None)
+    if (
+        sampler is not None
+        and not sampler.should_sample(
+            context_api.get_current(), skeleton.context.trace_id, name
+        ).decision.is_sampled()
+    ):
+        dropped = trace.SpanContext(
+            skeleton.context.trace_id,
+            skeleton.context.span_id,
+            False,
+            trace.TraceFlags(0),
         )
-        return response
+        with trace.use_span(trace.NonRecordingSpan(dropped), end_on_exit=False):
+            yield None
+        return
+    snapshot = {
+        "trace_id": format_trace_id(skeleton.context.trace_id),
+        "parent_id": parent_id,
+        "span_id": format_span_id(skeleton.context.span_id),
+        "propagated": read_propagated_attributes(),
+        "include_content": include_content,
+    }
+    with trace.use_span(trace.NonRecordingSpan(skeleton.context), end_on_exit=False):
+        yield snapshot
 
-    return wrapper
+
+def _enabled(epoch: int) -> bool:
+    parent = trace.get_current_span().get_span_context()
+    if parent.is_valid and not parent.trace_flags.sampled:
+        return False
+    return (
+        _ACTIVATION_COUNT > 0
+        and epoch == _PATCH_EPOCH
+        and WatsonOrchestrateADKInstrumentor._is_respan_tracing_enabled()
+        and not context_api.get_value(_SUPPRESS_INSTRUMENTATION_KEY)
+    )
 
 
-def _wrap_agent_run(
-    method_name: str, original: Callable[..., Any]
-) -> Callable[..., Any]:
-    @functools.wraps(original)
-    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        start_ns = time.time_ns()
-        trace_id, parent_id = _current_trace_parent_ids()
-        call_kwargs = _call_kwargs(
-            original=original, instance=self, args=args, kwargs=kwargs
-        )
-        try:
-            response = original(self, *args, **kwargs)
-        except BaseException as exc:
-            _otel_emitter.emit_agent_run_span(
-                method_name=method_name,
-                call_kwargs=call_kwargs,
-                start_ns=start_ns,
-                trace_id=trace_id,
-                parent_id=parent_id,
-                **_emit_error_kwargs(exc),
-            )
-            raise
-        _otel_emitter.emit_agent_run_span(
+def _emit(emitter, values, snapshot, response=None, error=None):
+    if snapshot is None:
+        return
+    try:
+        error_kwargs = _emit_error_kwargs(error) if error is not None else {}
+        if error is not None and not snapshot["include_content"]:
+            error_kwargs["error_message"] = type(error).__name__
+        emitter(response=response, **values, **snapshot, **error_kwargs)
+    except Exception:
+        logger.debug("Failed to capture Watson call", exc_info=True)
+
+
+def _wrap_method(method_name, original, kind):
+    epoch = _PATCH_EPOCH
+
+    def values(instance, args, kwargs):
+        common = {"start_ns": time.time_ns()}
+        if kind == "tool":
+            return _otel_emitter.emit_tool_span, {
+                **common,
+                "tool_name": _tool_name(instance),
+                "args": args,
+                "kwargs": kwargs,
+            }
+        common.update(
             method_name=method_name,
-            call_kwargs=call_kwargs,
-            start_ns=start_ns,
-            response=response,
-            trace_id=trace_id,
-            parent_id=parent_id,
+            call_kwargs=_call_kwargs(
+                original=original, instance=instance, args=args, kwargs=kwargs
+            ),
         )
-        return response
+        if kind == "chat":
+            if method_name == "generate_response":
+                common["call_kwargs"] = {
+                    key: value
+                    for key, value in common["call_kwargs"].items()
+                    if key in {"input", "instructions", "model"}
+                }
+            common["instance"] = instance
+            return _otel_emitter.emit_chat_span, common
+        return _otel_emitter.emit_agent_run_span, common
 
-    return wrapper
-
-
-def _wrap_async_agent_run(
-    method_name: str, original: Callable[..., Any]
-) -> Callable[..., Any]:
     @functools.wraps(original)
-    async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        start_ns = time.time_ns()
-        trace_id, parent_id = _current_trace_parent_ids()
-        call_kwargs = _call_kwargs(
-            original=original, instance=self, args=args, kwargs=kwargs
-        )
-        try:
-            response = await original(self, *args, **kwargs)
-        except BaseException as exc:
-            _otel_emitter.emit_agent_run_span(
-                method_name=method_name,
-                call_kwargs=call_kwargs,
-                start_ns=start_ns,
-                trace_id=trace_id,
-                parent_id=parent_id,
-                **_emit_error_kwargs(exc),
-            )
-            raise
-        _otel_emitter.emit_agent_run_span(
-            method_name=method_name,
-            call_kwargs=call_kwargs,
-            start_ns=start_ns,
-            response=response,
-            trace_id=trace_id,
-            parent_id=parent_id,
-        )
-        return response
+    def wrapper(self, *args, **kwargs):
+        if not _enabled(epoch):
+            return original(self, *args, **kwargs)
+        emitter, call = values(self, args, kwargs)
+        with _operation(kind) as snapshot:
+            try:
+                response = original(self, *args, **kwargs)
+            except BaseException as exc:
+                _emit(emitter, call, snapshot, error=exc)
+                raise
+            _emit(emitter, call, snapshot, response=response)
+            return response
 
-    return wrapper
-
-
-def _wrap_chat_method(
-    method_name: str, original: Callable[..., Any]
-) -> Callable[..., Any]:
     @functools.wraps(original)
-    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        start_ns = time.time_ns()
-        trace_id, parent_id = _current_trace_parent_ids()
-        call_kwargs = _call_kwargs(
-            original=original, instance=self, args=args, kwargs=kwargs
-        )
-        try:
-            response = original(self, *args, **kwargs)
-        except BaseException as exc:
-            _otel_emitter.emit_chat_span(
-                method_name=method_name,
-                call_kwargs=call_kwargs,
-                start_ns=start_ns,
-                instance=self,
-                trace_id=trace_id,
-                parent_id=parent_id,
-                **_emit_error_kwargs(exc),
-            )
-            raise
-        _otel_emitter.emit_chat_span(
-            method_name=method_name,
-            call_kwargs=call_kwargs,
-            start_ns=start_ns,
-            response=response,
-            instance=self,
-            trace_id=trace_id,
-            parent_id=parent_id,
-        )
-        return response
+    async def async_wrapper(self, *args, **kwargs):
+        if not _enabled(epoch):
+            return await original(self, *args, **kwargs)
+        emitter, call = values(self, args, kwargs)
+        with _operation(kind) as snapshot:
+            try:
+                response = await original(self, *args, **kwargs)
+            except BaseException as exc:
+                _emit(emitter, call, snapshot, error=exc)
+                raise
+            _emit(emitter, call, snapshot, response=response)
+            return response
 
-    return wrapper
+    return async_wrapper if inspect.iscoroutinefunction(original) else wrapper
+
+
+def _wrap_tool_call(original):
+    return _wrap_method("__call__", original, "tool")
+
+
+def _wrap_agent_run(method_name, original):
+    return _wrap_method(method_name, original, "agent")
+
+
+def _wrap_async_agent_run(method_name, original):
+    return _wrap_method(method_name, original, "agent")
+
+
+def _wrap_chat_method(method_name, original):
+    return _wrap_method(method_name, original, "chat")
 
 
 def _install(
@@ -317,7 +336,7 @@ class WatsonOrchestrateADKInstrumentor:
         return tracer is None or bool(getattr(tracer, "is_enabled", True))
 
     def activate(self) -> None:
-        global _ACTIVATION_COUNT
+        global _ACTIVATION_COUNT, _PATCH_EPOCH
         with _LOCK:
             if self._is_instrumented:
                 return
@@ -327,6 +346,7 @@ class WatsonOrchestrateADKInstrumentor:
                 _ACTIVATION_COUNT += 1
                 self._is_instrumented = True
                 return
+            _PATCH_EPOCH += 1
             installed: list[_Patch] = []
             try:
                 tool = _optional_class(PYTHON_TOOL_MODULE, PYTHON_TOOL_CLASS)
@@ -352,6 +372,20 @@ class WatsonOrchestrateADKInstrumentor:
                                 name, original
                             ),
                         )
+                flow_client = _optional_class(
+                    "ibm_watsonx_orchestrate_clients.tools.tempus_client",
+                    "TempusClient",
+                )
+                if flow_client is not None:
+                    for method_name in ("run_flow", "arun_flow"):
+                        _install(
+                            installed,
+                            flow_client,
+                            method_name,
+                            lambda original, name=method_name: _wrap_agent_run(
+                                name, original
+                            ),
+                        )
                 for module_name, class_name, methods in (
                     (
                         AGENT_BUILDER_CLIENT_MODULE,
@@ -362,6 +396,16 @@ class WatsonOrchestrateADKInstrumentor:
                         CPE_CLIENT_MODULE,
                         CPE_CLIENT_CLASS,
                         (*CHAT_METHODS, *CHAT_REFINEMENT_METHODS),
+                    ),
+                    (
+                        "ibm_watsonx_orchestrate.client.autodiscover.groq.groq_client",
+                        "GroqClient",
+                        LLM_CHAT_METHODS,
+                    ),
+                    (
+                        "ibm_watsonx_orchestrate.client.autodiscover.ai_gateway.ai_gateway_client",
+                        "AIGatewayClient",
+                        LLM_CHAT_METHODS,
                     ),
                     (
                         WATSONX_AI_CLIENT_MODULE,

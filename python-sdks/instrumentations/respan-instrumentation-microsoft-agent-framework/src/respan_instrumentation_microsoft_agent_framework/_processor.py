@@ -5,22 +5,33 @@ from __future__ import annotations
 import ast
 import json
 import logging
-import re
 from collections.abc import Mapping, Sequence
+from threading import RLock
 from typing import Any
 
 from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor
+from opentelemetry.semconv._incubating.attributes import (
+    gen_ai_attributes as GenAIAttributes,
+)
+from opentelemetry.semconv._incubating.attributes.error_attributes import (
+    ERROR_MESSAGE,
+    ERROR_TYPE,
+)
 from opentelemetry.semconv._incubating.attributes.http_attributes import (
     HTTP_STATUS_CODE,
+)
+from opentelemetry.semconv.attributes.exception_attributes import (
+    EXCEPTION_MESSAGE,
+    EXCEPTION_TYPE,
 )
 from opentelemetry.semconv.attributes.http_attributes import (
     HTTP_RESPONSE_STATUS_CODE,
 )
 from opentelemetry.semconv_ai import LLMRequestTypeValues, SpanAttributes
-from respan_sdk.constants import ERROR_MESSAGE_ATTR
 from respan_sdk.constants.llm_logging import (
     LOG_TYPE_AGENT,
     LOG_TYPE_CHAT,
+    LOG_TYPE_EMBEDDING,
     LOG_TYPE_TASK,
     LOG_TYPE_TOOL,
     LOG_TYPE_WORKFLOW,
@@ -33,24 +44,10 @@ from respan_sdk.constants.span_attributes import (
     RESPAN_SPAN_TOOLS,
 )
 
+from respan_instrumentation_microsoft_agent_framework import _policy
 from respan_instrumentation_microsoft_agent_framework._constants import (
     AGENT_FRAMEWORK_SCOPE_PREFIX,
     AGENT_FRAMEWORK_SYSTEM,
-    ATTR_GEN_AI_AGENT_NAME,
-    ATTR_GEN_AI_CONVERSATION_ID,
-    ATTR_GEN_AI_INPUT_MESSAGES,
-    ATTR_GEN_AI_OPERATION_NAME,
-    ATTR_GEN_AI_OUTPUT_MESSAGES,
-    ATTR_GEN_AI_PROVIDER_NAME,
-    ATTR_GEN_AI_RESPONSE_MODEL,
-    ATTR_GEN_AI_SYSTEM_INSTRUCTIONS,
-    ATTR_GEN_AI_TOOL_CALL_ARGUMENTS,
-    ATTR_GEN_AI_TOOL_CALL_ID,
-    ATTR_GEN_AI_TOOL_CALL_RESULT,
-    ATTR_GEN_AI_TOOL_DEFINITIONS,
-    ATTR_GEN_AI_TOOL_NAME,
-    ATTR_GEN_AI_USAGE_INPUT_TOKENS,
-    ATTR_GEN_AI_USAGE_OUTPUT_TOKENS,
     ATTR_WORKFLOW_EDGE_GROUP_ID,
     ATTR_WORKFLOW_EXECUTOR_ID,
     ATTR_WORKFLOW_ID,
@@ -72,34 +69,19 @@ _OFF_CONTRACT_ALIASES = TOP_LEVEL_ALIAS_ATTRS | frozenset(
         RESPAN_SPAN_TOOLS,
         RESPAN_SPAN_TOOL_CALLS,
         RESPAN_SPAN_HANDOFFS,
+        "status_code",
     }
 )
 
 _RAW_ATTRS_TO_STRIP = frozenset(
     {
-        ATTR_GEN_AI_INPUT_MESSAGES,
-        ATTR_GEN_AI_OUTPUT_MESSAGES,
-        ATTR_GEN_AI_SYSTEM_INSTRUCTIONS,
-        ATTR_GEN_AI_TOOL_DEFINITIONS,
+        GenAIAttributes.GEN_AI_INPUT_MESSAGES,
+        GenAIAttributes.GEN_AI_OUTPUT_MESSAGES,
+        GenAIAttributes.GEN_AI_SYSTEM_INSTRUCTIONS,
+        GenAIAttributes.GEN_AI_TOOL_DEFINITIONS,
     }
 )
 
-_ERROR_TYPE_ATTR = "error.type"
-_EXCEPTION_TYPE_ATTR = "exception.type"
-_EXCEPTION_MESSAGE_ATTR = "exception.message"
-_STATUS_CODE_ATTR = "status_code"
-_HTTP_STATUS_ATTRS = (
-    _STATUS_CODE_ATTR,
-    HTTP_RESPONSE_STATUS_CODE,
-    HTTP_STATUS_CODE,
-)
-_HTTP_STATUS_PATTERNS = (
-    re.compile(r"\b(?:error|status)\s*(?:code)?\s*[:=]\s*([45]\d{2})\b", re.IGNORECASE),
-    re.compile(r"\bHTTP(?:/\d(?:\.\d)?)?\s+([45]\d{2})\b", re.IGNORECASE),
-    re.compile(
-        r"""["'](?:status|status_code|code)["']\s*:\s*([45]\d{2})""", re.IGNORECASE
-    ),
-)
 _COMMON_SPAN_RAW_PREFIXES = (
     "agent_framework.",
     "edge_group.",
@@ -115,36 +97,6 @@ _COMMON_SPAN_RAW_ATTRS = frozenset(
         "server.address",
         "server.port",
     }
-)
-_PROVIDER_EXCEPTION_TYPE_PREFIX = "ChatClient"
-
-
-def _span_attr(name: str, fallback: str) -> str:
-    return str(getattr(SpanAttributes, name, fallback))
-
-
-_GEN_AI_SYSTEM = SpanAttributes.LLM_SYSTEM
-_GEN_AI_OPERATION_NAME = _span_attr("GEN_AI_OPERATION_NAME", ATTR_GEN_AI_OPERATION_NAME)
-_GEN_AI_PROVIDER_NAME = _span_attr("GEN_AI_PROVIDER_NAME", ATTR_GEN_AI_PROVIDER_NAME)
-_GEN_AI_RESPONSE_MODEL = ATTR_GEN_AI_RESPONSE_MODEL
-_GEN_AI_AGENT_NAME = _span_attr("GEN_AI_AGENT_NAME", ATTR_GEN_AI_AGENT_NAME)
-_GEN_AI_TOOL_NAME = _span_attr("GEN_AI_TOOL_NAME", ATTR_GEN_AI_TOOL_NAME)
-_GEN_AI_TOOL_PREFIX = f"{ATTR_GEN_AI_TOOL_NAME.rsplit('.', 1)[0]}."
-_GEN_AI_TOOL_CALL_ARGUMENTS = _span_attr(
-    "GEN_AI_TOOL_CALL_ARGUMENTS",
-    ATTR_GEN_AI_TOOL_CALL_ARGUMENTS,
-)
-_GEN_AI_TOOL_CALL_RESULT = _span_attr(
-    "GEN_AI_TOOL_CALL_RESULT",
-    ATTR_GEN_AI_TOOL_CALL_RESULT,
-)
-_GEN_AI_USAGE_INPUT_TOKENS = _span_attr(
-    "GEN_AI_USAGE_INPUT_TOKENS",
-    ATTR_GEN_AI_USAGE_INPUT_TOKENS,
-)
-_GEN_AI_USAGE_OUTPUT_TOKENS = _span_attr(
-    "GEN_AI_USAGE_OUTPUT_TOKENS",
-    ATTR_GEN_AI_USAGE_OUTPUT_TOKENS,
 )
 
 
@@ -226,8 +178,8 @@ def _int_value(value: Any) -> int | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        return value
-    if isinstance(value, float) and value.is_integer():
+        return value if value >= 0 else None
+    if isinstance(value, float) and value.is_integer() and value >= 0:
         return int(value)
     if isinstance(value, str) and value.isdigit():
         return int(value)
@@ -253,17 +205,13 @@ def is_agent_framework_span(span: ReadableSpan, attrs: Mapping[str, Any]) -> boo
     scope_name = _scope_name(span)
     if scope_name.startswith(AGENT_FRAMEWORK_SCOPE_PREFIX):
         return True
-    if attrs.get(_GEN_AI_SYSTEM) == AGENT_FRAMEWORK_SYSTEM:
+    if attrs.get(SpanAttributes.LLM_SYSTEM) == AGENT_FRAMEWORK_SYSTEM:
         return True
-    if any(key.startswith("agent_framework.") for key in attrs):
-        return True
-    return ATTR_WORKFLOW_NAME in attrs or ATTR_WORKFLOW_ID in attrs
+    return any(key.startswith("agent_framework.") for key in attrs)
 
 
 def _operation_name(attrs: Mapping[str, Any]) -> str | None:
-    operation = attrs.get(_GEN_AI_OPERATION_NAME) or attrs.get(
-        ATTR_GEN_AI_OPERATION_NAME
-    )
+    operation = attrs.get(GenAIAttributes.GEN_AI_OPERATION_NAME)
     return str(operation) if operation else None
 
 
@@ -277,9 +225,13 @@ def _log_type(span: ReadableSpan, attrs: Mapping[str, Any]) -> str | None:
     operation = _operation_name(attrs)
     span_name = _span_name(span)
 
+    if operation == "embeddings":
+        return LOG_TYPE_EMBEDDING
     if operation == OPERATION_CHAT:
         return LOG_TYPE_CHAT
-    if operation == OPERATION_EXECUTE_TOOL or attrs.get(_GEN_AI_TOOL_NAME):
+    if operation == OPERATION_EXECUTE_TOOL or attrs.get(
+        GenAIAttributes.GEN_AI_TOOL_NAME
+    ):
         return LOG_TYPE_TOOL
     if operation in {OPERATION_INVOKE_AGENT, OPERATION_CREATE_AGENT}:
         return LOG_TYPE_AGENT
@@ -290,9 +242,11 @@ def _log_type(span: ReadableSpan, attrs: Mapping[str, Any]) -> str | None:
         return LOG_TYPE_WORKFLOW
     if _has_any_prefix(span_name, TASK_SPAN_PREFIXES):
         return LOG_TYPE_TASK
-    if attrs.get(_GEN_AI_AGENT_NAME):
+    if attrs.get(GenAIAttributes.GEN_AI_AGENT_NAME):
         return LOG_TYPE_AGENT
-    if attrs.get(SpanAttributes.LLM_REQUEST_MODEL) or attrs.get(_GEN_AI_PROVIDER_NAME):
+    if attrs.get(SpanAttributes.LLM_REQUEST_MODEL) or attrs.get(
+        GenAIAttributes.GEN_AI_PROVIDER_NAME
+    ):
         return LOG_TYPE_CHAT
     return None
 
@@ -312,12 +266,12 @@ def _entity_name_for_log_type(
 ) -> str:
     span_name = _span_name(span)
     if log_type == LOG_TYPE_AGENT:
-        agent_name = attrs.get(_GEN_AI_AGENT_NAME) or attrs.get(ATTR_GEN_AI_AGENT_NAME)
+        agent_name = attrs.get(GenAIAttributes.GEN_AI_AGENT_NAME)
         if agent_name:
             return str(agent_name)
         return _suffix_name(span_name, OPERATION_INVOKE_AGENT, span_name or "agent")
     if log_type == LOG_TYPE_TOOL:
-        tool_name = attrs.get(_GEN_AI_TOOL_NAME) or attrs.get(ATTR_GEN_AI_TOOL_NAME)
+        tool_name = attrs.get(GenAIAttributes.GEN_AI_TOOL_NAME)
         if tool_name:
             return str(tool_name)
         return _suffix_name(span_name, OPERATION_EXECUTE_TOOL, span_name or "tool")
@@ -371,8 +325,17 @@ def _tool_call_from_part(part: Mapping[str, Any]) -> dict[str, Any] | None:
         arguments = function_payload.get("arguments")
     else:
         name = part.get("name") or part.get("tool_name")
-        arguments = part.get("arguments") or part.get("args") or part.get("input")
+        arguments = next(
+            (
+                part[key]
+                for key in ("arguments", "args", "input")
+                if part.get(key) is not None
+            ),
+            None,
+        )
 
+    if part_type not in {None, "tool_call", "function_call", "function"}:
+        return None
     if not name and part_type not in {"tool_call", "function_call"}:
         return None
     if not name:
@@ -412,9 +375,11 @@ def _message_content_and_tool_calls(
             tool_call = _tool_call_from_part(part)
             if tool_call is not None:
                 tool_calls.append(tool_call)
-            tool_response = part.get("response") or part.get("result")
+            tool_response = (
+                part.get("response") if "response" in part else part.get("result")
+            )
             if tool_response is not None and not text:
-                text_parts.append(str(tool_response))
+                text_parts.append(_json_string(tool_response) or "")
 
     direct_tool_calls = message.get("tool_calls")
     parsed_tool_calls = _safe_json_loads(direct_tool_calls)
@@ -536,41 +501,47 @@ def _apply_chat_attrs(
     attrs[RESPAN_LOG_TYPE] = LOG_TYPE_CHAT
     attrs.setdefault(SpanAttributes.LLM_REQUEST_TYPE, LLMRequestTypeValues.CHAT.value)
 
-    provider = raw_attrs.get(_GEN_AI_PROVIDER_NAME) or raw_attrs.get(
-        ATTR_GEN_AI_PROVIDER_NAME
-    )
-    if attrs.get(_GEN_AI_SYSTEM) in (None, "", AGENT_FRAMEWORK_SYSTEM):
-        attrs[_GEN_AI_SYSTEM] = (
+    provider = raw_attrs.get(GenAIAttributes.GEN_AI_PROVIDER_NAME)
+    if attrs.get(SpanAttributes.LLM_SYSTEM) in (None, "", AGENT_FRAMEWORK_SYSTEM):
+        attrs[SpanAttributes.LLM_SYSTEM] = (
             str(provider).lower() if provider else AGENT_FRAMEWORK_SYSTEM
         )
 
     model = raw_attrs.get(SpanAttributes.LLM_REQUEST_MODEL) or raw_attrs.get(
-        _GEN_AI_RESPONSE_MODEL
+        GenAIAttributes.GEN_AI_RESPONSE_MODEL
     )
     _set_if_missing(attrs, SpanAttributes.LLM_REQUEST_MODEL, model)
 
-    input_tokens = _int_value(raw_attrs.get(_GEN_AI_USAGE_INPUT_TOKENS))
-    output_tokens = _int_value(raw_attrs.get(_GEN_AI_USAGE_OUTPUT_TOKENS))
+    input_tokens = _int_value(raw_attrs.get(GenAIAttributes.GEN_AI_USAGE_INPUT_TOKENS))
+    output_tokens = _int_value(
+        raw_attrs.get(GenAIAttributes.GEN_AI_USAGE_OUTPUT_TOKENS)
+    )
+    if input_tokens is None:
+        attrs.pop(GenAIAttributes.GEN_AI_USAGE_INPUT_TOKENS, None)
+    if output_tokens is None:
+        attrs.pop(GenAIAttributes.GEN_AI_USAGE_OUTPUT_TOKENS, None)
     if input_tokens is not None:
-        attrs.setdefault(_GEN_AI_USAGE_INPUT_TOKENS, input_tokens)
+        attrs[GenAIAttributes.GEN_AI_USAGE_INPUT_TOKENS] = input_tokens
         attrs.setdefault(SpanAttributes.LLM_USAGE_PROMPT_TOKENS, input_tokens)
     if output_tokens is not None:
-        attrs.setdefault(_GEN_AI_USAGE_OUTPUT_TOKENS, output_tokens)
+        attrs[GenAIAttributes.GEN_AI_USAGE_OUTPUT_TOKENS] = output_tokens
         attrs.setdefault(SpanAttributes.LLM_USAGE_COMPLETION_TOKENS, output_tokens)
-    if input_tokens is not None or output_tokens is not None:
+    if input_tokens is not None and output_tokens is not None:
         attrs.setdefault(
             SpanAttributes.LLM_USAGE_TOTAL_TOKENS,
             (input_tokens or 0) + (output_tokens or 0),
         )
 
     system_messages = _system_instruction_messages(
-        raw_attrs.get(ATTR_GEN_AI_SYSTEM_INSTRUCTIONS)
+        raw_attrs.get(GenAIAttributes.GEN_AI_SYSTEM_INSTRUCTIONS)
     )
     prompt_messages = [
         *system_messages,
-        *_message_list(raw_attrs.get(ATTR_GEN_AI_INPUT_MESSAGES)),
+        *_message_list(raw_attrs.get(GenAIAttributes.GEN_AI_INPUT_MESSAGES)),
     ]
-    completion_messages = _message_list(raw_attrs.get(ATTR_GEN_AI_OUTPUT_MESSAGES))
+    completion_messages = _message_list(
+        raw_attrs.get(GenAIAttributes.GEN_AI_OUTPUT_MESSAGES)
+    )
     _apply_messages(
         attrs,
         source_messages=prompt_messages,
@@ -594,7 +565,9 @@ def _apply_chat_attrs(
             _json_string(completion_messages),
         )
 
-    tool_definitions = _tool_definitions(raw_attrs.get(ATTR_GEN_AI_TOOL_DEFINITIONS))
+    tool_definitions = _tool_definitions(
+        raw_attrs.get(GenAIAttributes.GEN_AI_TOOL_DEFINITIONS)
+    )
     if tool_definitions:
         attrs.setdefault(
             SpanAttributes.LLM_REQUEST_FUNCTIONS,
@@ -621,32 +594,35 @@ def _apply_tool_attrs(
     attrs.setdefault(SpanAttributes.TRACELOOP_ENTITY_NAME, tool_name)
     attrs.setdefault(SpanAttributes.TRACELOOP_ENTITY_PATH, tool_name)
 
-    arguments = raw_attrs.get(_GEN_AI_TOOL_CALL_ARGUMENTS) or raw_attrs.get(
-        ATTR_GEN_AI_TOOL_CALL_ARGUMENTS
-    )
+    arguments = raw_attrs.get(GenAIAttributes.GEN_AI_TOOL_CALL_ARGUMENTS)
+    if arguments == "None":
+        arguments = None
     input_payload = {
         "name": tool_name,
         "arguments": _safe_json_loads(arguments),
     }
-    call_id = raw_attrs.get(ATTR_GEN_AI_TOOL_CALL_ID)
-    if call_id:
+    call_id = raw_attrs.get(GenAIAttributes.GEN_AI_TOOL_CALL_ID)
+    if call_id and call_id != "unknown":
         input_payload["id"] = str(call_id)
+    else:
+        attrs.pop(GenAIAttributes.GEN_AI_TOOL_CALL_ID, None)
     attrs.setdefault(SpanAttributes.TRACELOOP_ENTITY_INPUT, _json_string(input_payload))
 
-    result = raw_attrs.get(_GEN_AI_TOOL_CALL_RESULT) or raw_attrs.get(
-        ATTR_GEN_AI_TOOL_CALL_RESULT
-    )
+    result = raw_attrs.get(GenAIAttributes.GEN_AI_TOOL_CALL_RESULT)
     if result is not None:
         attrs.setdefault(SpanAttributes.TRACELOOP_ENTITY_OUTPUT, _json_string(result))
 
     for key in list(attrs):
-        if key.startswith(_GEN_AI_TOOL_PREFIX):
+        if (
+            key.startswith(GenAIAttributes.GEN_AI_TOOL_NAME.rsplit(".", 1)[0] + ".")
+            and key != GenAIAttributes.GEN_AI_TOOL_CALL_ID
+        ):
             attrs.pop(key, None)
     for key in (
         SpanAttributes.LLM_REQUEST_TYPE,
         SpanAttributes.LLM_REQUEST_MODEL,
         SpanAttributes.LLM_REQUEST_FUNCTIONS,
-        _GEN_AI_SYSTEM,
+        SpanAttributes.LLM_SYSTEM,
     ):
         attrs.pop(key, None)
 
@@ -667,8 +643,8 @@ def _apply_common_span_attrs(
         "" if is_root else entity_name,
     )
 
-    input_value = raw_attrs.get(ATTR_GEN_AI_INPUT_MESSAGES)
-    output_value = raw_attrs.get(ATTR_GEN_AI_OUTPUT_MESSAGES)
+    input_value = raw_attrs.get(GenAIAttributes.GEN_AI_INPUT_MESSAGES)
+    output_value = raw_attrs.get(GenAIAttributes.GEN_AI_OUTPUT_MESSAGES)
     if input_value is not None:
         attrs.setdefault(
             SpanAttributes.TRACELOOP_ENTITY_INPUT,
@@ -680,7 +656,7 @@ def _apply_common_span_attrs(
             _json_string(_safe_json_loads(output_value)),
         )
 
-    conversation_id = raw_attrs.get(ATTR_GEN_AI_CONVERSATION_ID)
+    conversation_id = raw_attrs.get(GenAIAttributes.GEN_AI_CONVERSATION_ID)
     if conversation_id and attrs.get(RESPAN_SESSION_ID) in (None, ""):
         attrs[RESPAN_SESSION_ID] = str(conversation_id)
 
@@ -700,7 +676,7 @@ def _span_status_is_error(span: ReadableSpan) -> bool:
 
 
 def _error_message(span: ReadableSpan, raw_attrs: Mapping[str, Any]) -> str | None:
-    for key in (ERROR_MESSAGE_ATTR, _EXCEPTION_MESSAGE_ATTR):
+    for key in (ERROR_MESSAGE, EXCEPTION_MESSAGE):
         value = raw_attrs.get(key)
         if value not in (None, ""):
             return str(value)
@@ -709,74 +685,11 @@ def _error_message(span: ReadableSpan, raw_attrs: Mapping[str, Any]) -> str | No
     if status_description not in (None, ""):
         return str(status_description)
 
-    for key in (_ERROR_TYPE_ATTR, _EXCEPTION_TYPE_ATTR):
+    for key in (ERROR_TYPE, EXCEPTION_TYPE):
         value = raw_attrs.get(key)
         if value not in (None, ""):
             return str(value)
     return None
-
-
-def _provider_http_status(
-    span: ReadableSpan,
-    raw_attrs: Mapping[str, Any],
-    *,
-    allow_text_extraction: bool,
-) -> int | None:
-    for key in _HTTP_STATUS_ATTRS:
-        value = _int_value(raw_attrs.get(key))
-        if value is not None and 400 <= value <= 599:
-            return value
-
-    if not allow_text_extraction:
-        return None
-
-    messages: list[str] = []
-    message = _error_message(span=span, raw_attrs=raw_attrs)
-    if message:
-        messages.append(message)
-    for event in getattr(span, "events", None) or ():
-        event_attrs = getattr(event, "attributes", None)
-        if not isinstance(event_attrs, Mapping):
-            continue
-        for key in (_EXCEPTION_MESSAGE_ATTR, ERROR_MESSAGE_ATTR):
-            value = event_attrs.get(key)
-            if value not in (None, ""):
-                messages.append(str(value))
-
-    for candidate in messages:
-        for pattern in _HTTP_STATUS_PATTERNS:
-            match = pattern.search(candidate)
-            if match:
-                return int(match.group(1))
-    return None
-
-
-def _has_provider_exception_type(
-    span: ReadableSpan,
-    raw_attrs: Mapping[str, Any],
-) -> bool:
-    """Return whether Agent Framework identified a chat-provider exception."""
-    exception_types = [
-        raw_attrs.get(_ERROR_TYPE_ATTR),
-        raw_attrs.get(_EXCEPTION_TYPE_ATTR),
-    ]
-    for event in getattr(span, "events", None) or ():
-        event_attrs = getattr(event, "attributes", None)
-        if isinstance(event_attrs, Mapping):
-            exception_types.extend(
-                (
-                    event_attrs.get(_ERROR_TYPE_ATTR),
-                    event_attrs.get(_EXCEPTION_TYPE_ATTR),
-                )
-            )
-
-    return any(
-        str(exception_type)
-        .rsplit(".", 1)[-1]
-        .startswith(_PROVIDER_EXCEPTION_TYPE_PREFIX)
-        for exception_type in exception_types
-        if exception_type not in (None, "")
-    )
 
 
 def _apply_error_attrs(
@@ -784,23 +697,26 @@ def _apply_error_attrs(
     attrs: dict[str, Any],
     raw_attrs: Mapping[str, Any],
 ) -> None:
-    provider_status = _provider_http_status(
-        span=span,
-        raw_attrs=raw_attrs,
-        allow_text_extraction=(
-            attrs.get(RESPAN_LOG_TYPE) == LOG_TYPE_CHAT
-            or _has_provider_exception_type(span=span, raw_attrs=raw_attrs)
-        ),
-    )
+    # Error text is not an HTTP response. Preserve only status attributes
+    # explicitly supplied by the provider; never invent HTTP 500 for a tool,
+    # agent or workflow failure.
+    provider_status = None
+    for key in (HTTP_RESPONSE_STATUS_CODE, HTTP_STATUS_CODE):
+        value = _int_value(raw_attrs.get(key))
+        if value is not None and 100 <= value <= 599:
+            provider_status = value
+            attrs[HTTP_RESPONSE_STATUS_CODE] = value
+            break
+    attrs.pop(HTTP_STATUS_CODE, None)
     is_error = (
-        provider_status is not None
+        (provider_status is not None and provider_status >= 400)
         or any(
             raw_attrs.get(key) not in (None, "")
             for key in (
-                ERROR_MESSAGE_ATTR,
-                _EXCEPTION_MESSAGE_ATTR,
-                _ERROR_TYPE_ATTR,
-                _EXCEPTION_TYPE_ATTR,
+                ERROR_MESSAGE,
+                EXCEPTION_MESSAGE,
+                ERROR_TYPE,
+                EXCEPTION_TYPE,
             )
         )
         or _span_status_is_error(span)
@@ -808,15 +724,9 @@ def _apply_error_attrs(
     if not is_error:
         return
 
-    status_code = provider_status or _int_value(attrs.get(_STATUS_CODE_ATTR))
-    if status_code is not None and status_code >= 400:
-        attrs[_STATUS_CODE_ATTR] = status_code
-    else:
-        attrs[_STATUS_CODE_ATTR] = 500
-
     message = _error_message(span=span, raw_attrs=raw_attrs)
     if message:
-        attrs.setdefault(ERROR_MESSAGE_ATTR, message)
+        attrs.setdefault(ERROR_MESSAGE, message)
 
 
 def _cleanup_attrs(attrs: dict[str, Any]) -> None:
@@ -828,10 +738,35 @@ def _cleanup_attrs(attrs: dict[str, Any]) -> None:
 class AgentFrameworkSpanProcessor(SpanProcessor):
     """Translate Microsoft Agent Framework spans before Respan export."""
 
+    def __init__(self) -> None:
+        self._enabled = True
+        self._lock = RLock()
+        self._content = {}
+
     def on_start(self, span: Any, parent_context: Any = None) -> None:
-        return None
+        if not self._enabled or not is_agent_framework_span(
+            span, getattr(span, "attributes", None) or {}
+        ):
+            return
+        span_context = span.get_span_context()
+        with self._lock:
+            self._content[(span_context.trace_id, span_context.span_id)] = (
+                _policy.capture_content(parent_context)
+            )
 
     def on_end(self, span: ReadableSpan) -> None:
+        if not self._enabled:
+            return
+        getter = getattr(span, "get_span_context", None)
+        span_context = getter() if callable(getter) else None
+        with self._lock:
+            include_content = self._content.pop(
+                (
+                    getattr(span_context, "trace_id", None),
+                    getattr(span_context, "span_id", None),
+                ),
+                _policy.capture_content(),
+            )
         raw_attrs = dict(getattr(span, "attributes", None) or {})
         if not is_agent_framework_span(span, raw_attrs):
             return
@@ -841,7 +776,29 @@ class AgentFrameworkSpanProcessor(SpanProcessor):
         if log_type is None:
             return
 
-        if log_type == LOG_TYPE_CHAT:
+        if log_type == LOG_TYPE_EMBEDDING:
+            attrs[RESPAN_LOG_TYPE] = LOG_TYPE_EMBEDDING
+            attrs[SpanAttributes.LLM_REQUEST_TYPE] = (
+                LLMRequestTypeValues.EMBEDDING.value
+            )
+            attrs.setdefault(
+                SpanAttributes.TRACELOOP_ENTITY_NAME, "agent_framework.embeddings"
+            )
+            attrs.setdefault(SpanAttributes.TRACELOOP_ENTITY_PATH, "")
+            if (
+                tokens := _int_value(
+                    raw_attrs.get(GenAIAttributes.GEN_AI_USAGE_INPUT_TOKENS)
+                )
+            ) is not None:
+                attrs[SpanAttributes.LLM_USAGE_PROMPT_TOKENS] = tokens
+                attrs[GenAIAttributes.GEN_AI_USAGE_INPUT_TOKENS] = tokens
+            else:
+                attrs.pop(GenAIAttributes.GEN_AI_USAGE_INPUT_TOKENS, None)
+            if raw_attrs.get(GenAIAttributes.GEN_AI_PROVIDER_NAME):
+                attrs[SpanAttributes.LLM_SYSTEM] = str(
+                    raw_attrs[GenAIAttributes.GEN_AI_PROVIDER_NAME]
+                ).lower()
+        elif log_type == LOG_TYPE_CHAT:
             _apply_chat_attrs(span=span, attrs=attrs, raw_attrs=raw_attrs)
         elif log_type == LOG_TYPE_TOOL:
             _apply_tool_attrs(span=span, attrs=attrs, raw_attrs=raw_attrs)
@@ -855,10 +812,27 @@ class AgentFrameworkSpanProcessor(SpanProcessor):
 
         _apply_error_attrs(span=span, attrs=attrs, raw_attrs=raw_attrs)
         _cleanup_attrs(attrs)
+        if not include_content:
+            for key in list(attrs):
+                if key in {
+                    SpanAttributes.TRACELOOP_ENTITY_INPUT,
+                    SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+                    SpanAttributes.LLM_REQUEST_FUNCTIONS,
+                    GenAIAttributes.GEN_AI_TOOL_CALL_ARGUMENTS,
+                    GenAIAttributes.GEN_AI_TOOL_CALL_RESULT,
+                } or key.startswith(
+                    (
+                        SpanAttributes.LLM_PROMPTS + ".",
+                        SpanAttributes.LLM_COMPLETIONS + ".",
+                    )
+                ):
+                    attrs.pop(key, None)
         span._attributes = attrs
 
     def shutdown(self) -> None:
-        return None
+        self._enabled = False
+        with self._lock:
+            self._content.clear()
 
     def force_flush(self, timeout_millis: int = 30000) -> bool:
         return True
