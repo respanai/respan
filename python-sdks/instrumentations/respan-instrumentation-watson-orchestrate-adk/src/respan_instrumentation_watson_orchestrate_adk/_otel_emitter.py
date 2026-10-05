@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections.abc import Mapping, Sequence
 from itertools import islice
@@ -15,16 +16,18 @@ from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import (
     GEN_AI_USAGE_INPUT_TOKENS,
     GEN_AI_USAGE_OUTPUT_TOKENS,
 )
+from opentelemetry.semconv.attributes.error_attributes import ERROR_TYPE
+from opentelemetry.semconv.attributes.http_attributes import HTTP_RESPONSE_STATUS_CODE
 from opentelemetry.semconv_ai import LLMRequestTypeValues
 from opentelemetry.semconv_ai import SpanAttributes as TLSpanAttributes
 from respan_sdk.constants.llm_logging import (
     LOG_TYPE_AGENT,
     LOG_TYPE_CHAT,
     LOG_TYPE_TOOL,
+    LOG_TYPE_WORKFLOW,
     LogMethodChoices,
 )
 from respan_sdk.constants.span_attributes import (
-    RESPAN_LOG_ID,
     RESPAN_LOG_METHOD,
     RESPAN_LOG_TYPE,
     RESPAN_THREADS_ID,
@@ -59,7 +62,6 @@ from respan_instrumentation_watson_orchestrate_adk._constants import (
     OUTPUT_TOKENS_KEY,
     PROMPT_TOKENS_KEY,
     ROLE_KEY,
-    RUN_ID_KEY,
     TEXT_KEY,
     THREAD_ID_KEY,
     TOKEN_USAGE_KEY,
@@ -132,27 +134,16 @@ def _message(role: str, content: Any) -> dict[str, Any]:
 
 
 def _normalize_messages(value: Any) -> list[dict[str, Any]]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [_message(USER_ROLE, value)]
-    if isinstance(value, Mapping):
-        return [
-            {
-                ROLE_KEY: safe_text(value.get(ROLE_KEY) or USER_ROLE, max_bytes=128),
-                CONTENT_KEY: _dump_value(value.get(CONTENT_KEY, value)),
-            }
-        ]
-
-    messages: list[dict[str, Any]] = []
+    messages = []
     for item in _as_sequence(value):
         if isinstance(item, Mapping):
-            messages.append(
-                {
-                    ROLE_KEY: safe_text(item.get(ROLE_KEY) or USER_ROLE, max_bytes=128),
-                    CONTENT_KEY: _dump_value(item.get(CONTENT_KEY, item)),
-                }
-            )
+            message = {
+                ROLE_KEY: safe_text(item.get(ROLE_KEY) or USER_ROLE, max_bytes=128)
+            }
+            for key in (CONTENT_KEY, "tool_calls", "tool_call_id", NAME_KEY):
+                if item.get(key) is not None:
+                    message[key] = _dump_value(item[key])
+            messages.append(message)
         else:
             messages.append(_message(USER_ROLE, item))
     return messages
@@ -169,7 +160,10 @@ def _messages_from_call(call_kwargs: Mapping[str, Any]) -> list[dict[str, Any]]:
     for key in (USER_MESSAGE_KEY, INPUT_KEY):
         value = call_kwargs.get(key)
         if value is not None:
-            return [_message(USER_ROLE, value)]
+            messages = [_message(USER_ROLE, value)]
+            if call_kwargs.get("instructions") is not None:
+                messages.insert(0, _message("system", call_kwargs["instructions"]))
+            return messages
 
     instruction = call_kwargs.get(INSTRUCTION_KEY)
     if instruction is not None:
@@ -186,6 +180,9 @@ def _set_prompt_attrs(attrs: dict[str, Any], messages: list[dict[str, Any]]) -> 
             attrs[f"{_PROMPT_PREFIX}{index}.role"] = safe_text(role, max_bytes=128)
         if content is not None:
             attrs[f"{_PROMPT_PREFIX}{index}.content"] = _to_string(content)
+        for key in ("tool_calls", "tool_call_id", NAME_KEY):
+            if message.get(key) is not None:
+                attrs[f"{_PROMPT_PREFIX}{index}.{key}"] = _to_string(message[key])
 
 
 def _set_completion_attrs(attrs: dict[str, Any], text: str) -> None:
@@ -197,9 +194,9 @@ def _model_from_call(
     call_kwargs: Mapping[str, Any], instance: Any = None
 ) -> str | None:
     for key in (
+        CHAT_LLM_KEY,
         MODEL_KEY,
         MODEL_ID_KEY,
-        CHAT_LLM_KEY,
         CHAT_MODEL_NAME_KEY,
         "llm",
         "selected_model",
@@ -281,12 +278,17 @@ def _coerce_int(value: Any) -> int | None:
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, int):
-        return value
+        return value if value >= 0 else None
     if isinstance(value, float):
-        return int(value)
+        return (
+            int(value)
+            if math.isfinite(value) and value >= 0 and value.is_integer()
+            else None
+        )
     if isinstance(value, str):
         try:
-            return int(value)
+            parsed = int(value)
+            return parsed if parsed >= 0 else None
         except ValueError:
             return None
     return None
@@ -373,7 +375,7 @@ def _base_attrs(*, span_name: str, log_type: str) -> dict[str, Any]:
         RESPAN_LOG_METHOD: LogMethodChoices.TRACING_INTEGRATION.value,
         RESPAN_LOG_TYPE: log_type,
         TLSpanAttributes.TRACELOOP_ENTITY_NAME: span_name,
-        TLSpanAttributes.TRACELOOP_ENTITY_PATH: span_name,
+        TLSpanAttributes.TRACELOOP_ENTITY_PATH: "",
     }
     workflow_name = context_api.get_value(TLSpanAttributes.TRACELOOP_ENTITY_NAME)
     if workflow_name:
@@ -445,19 +447,22 @@ def build_agent_run_attrs(
         {"method": method_name, "request": dict(call_kwargs)}
     )
 
-    thread_id = call_kwargs.get(THREAD_ID_KEY) or _field(response, THREAD_ID_KEY)
+    if method_name in {"run_flow", "arun_flow"}:
+        attrs[RESPAN_LOG_TYPE] = LOG_TYPE_WORKFLOW
+        attrs[TLSpanAttributes.TRACELOOP_ENTITY_NAME] = safe_text(
+            call_kwargs.get("flow_id") or method_name
+        )
+
+    thread_id = _field(response, THREAD_ID_KEY) or call_kwargs.get(THREAD_ID_KEY)
     if thread_id:
         attrs[RESPAN_THREADS_ID] = safe_text(thread_id, max_bytes=512)
-    run_id = _field(response, RUN_ID_KEY)
-    if run_id:
-        attrs[RESPAN_LOG_ID] = safe_text(run_id, max_bytes=512)
 
-    if error_message is not None:
+    if response is not None:
+        attrs[TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safe_json(response)
+    elif error_message is not None:
         attrs[TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safe_json(
             {"error": {"message": error_message}}
         )
-    elif response is not None:
-        attrs[TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safe_json(response)
     return _clean_attrs(attrs)
 
 
@@ -476,9 +481,19 @@ def build_chat_attrs(
     attrs[GEN_AI_PROVIDER_NAME] = WATSON_ORCHESTRATE_ADK_SYSTEM_NAME
     attrs[TLSpanAttributes.LLM_REQUEST_TYPE] = _request_type_value("CHAT", "chat")
 
+    provider = {"GroqClient": "groq", "AIGatewayClient": "watsonx_orchestrate"}.get(
+        type(instance).__name__, WATSON_ORCHESTRATE_ADK_SYSTEM_NAME
+    )
+    attrs[TLSpanAttributes.LLM_SYSTEM] = provider
+    attrs[GEN_AI_PROVIDER_NAME] = provider
     model = _model_from_call(call_kwargs=call_kwargs, instance=instance)
     if model:
         attrs[TLSpanAttributes.LLM_REQUEST_MODEL] = model
+    response_model = _field(response, MODEL_KEY) or _field(response, MODEL_ID_KEY)
+    if response_model:
+        attrs[TLSpanAttributes.LLM_RESPONSE_MODEL] = safe_text(
+            response_model, max_bytes=512
+        )
 
     messages = _messages_from_call(call_kwargs)
     if messages:
@@ -492,17 +507,29 @@ def build_chat_attrs(
         {"method": method_name, "request": dict(call_kwargs)}
     )
 
-    if error_message is not None:
-        attrs[TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safe_json(
-            {"error": {"message": error_message}}
-        )
-    elif response is not None:
+    if error_message is None and response is not None:
         response_text = _response_text(response)
         attrs[TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT] = (
             response_text if response_text else safe_json(response)
         )
-        if response_text:
+        choice = _first_choice(response)
+        message = _field(choice, MESSAGE_KEY) or _field(choice, DELTA_KEY)
+        calls = _field(message, "tool_calls")
+        if response_text or _field(message, CONTENT_KEY) == "":
             _set_completion_attrs(attrs=attrs, text=response_text)
+        if calls:
+            attrs[f"{_COMPLETION_PREFIX}0.role"] = ASSISTANT_ROLE
+            attrs[f"{_COMPLETION_PREFIX}0.tool_calls"] = safe_json(calls)
+            attrs[TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safe_json(
+                {
+                    "role": ASSISTANT_ROLE,
+                    "content": _field(message, CONTENT_KEY),
+                    "tool_calls": calls,
+                }
+            )
+        finish = _field(choice, "finish_reason")
+        if finish is not None:
+            attrs[TLSpanAttributes.LLM_RESPONSE_FINISH_REASON] = safe_text(finish)
         _set_usage_attrs(attrs=attrs, response=response)
     return _clean_attrs(attrs)
 
@@ -513,31 +540,45 @@ def emit_span(
     attrs: dict[str, Any],
     start_ns: int,
     error_message: str | None = None,
-    status_code: int = 200,
+    status_code: int | None = None,
     trace_id: str | None = None,
     parent_id: str | None = None,
+    span_id: str | None = None,
+    propagated: dict[str, Any] | None = None,
+    include_content: bool = True,
 ) -> None:
     try:
-        clean_attrs = _clean_attrs(attrs)
+        clean_attrs = {**(propagated or {}), **_clean_attrs(attrs)}
+        if not include_content:
+            for key in list(clean_attrs):
+                if key in {
+                    TLSpanAttributes.TRACELOOP_ENTITY_INPUT,
+                    TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+                    TLSpanAttributes.LLM_REQUEST_FUNCTIONS,
+                } or key.startswith((_PROMPT_PREFIX, _COMPLETION_PREFIX)):
+                    clean_attrs.pop(key)
+            if error_message is not None:
+                error_message = error_message.split(":", 1)[0]
         if error_message is not None:
-            clean_attrs["error.message"] = error_message
-            clean_attrs["http.response.status_code"] = (
-                status_code if status_code >= 400 else 500
-            )
+            clean_attrs[ERROR_TYPE] = error_message.split(":", 1)[0]
+            if status_code is not None and status_code >= 400:
+                clean_attrs[HTTP_RESPONSE_STATUS_CODE] = status_code
 
-        if trace_id is None or parent_id is None:
+        if span_id is None and (trace_id is None or parent_id is None):
             current_trace_id, current_parent_id = _current_trace_parent_ids()
             trace_id = trace_id or current_trace_id
             parent_id = parent_id or current_parent_id
         span = build_readable_span(
             name=span_name,
+            span_id=span_id,
+            merge_propagated=propagated is None,
             trace_id=trace_id,
             parent_id=parent_id,
             start_time_ns=start_ns,
             end_time_ns=time.time_ns(),
             attributes=clean_attrs,
             error_message=error_message,
-            status_code=status_code,
+            status_code=status_code if status_code is not None else 200,
         )
         inject_span(span=span)
     except Exception:
@@ -552,9 +593,12 @@ def emit_tool_span(
     start_ns: int,
     response: Any = None,
     error_message: str | None = None,
-    status_code: int = 500,
+    status_code: int | None = None,
     trace_id: str | None = None,
     parent_id: str | None = None,
+    span_id: str | None = None,
+    propagated: dict[str, Any] | None = None,
+    include_content: bool = True,
 ) -> None:
     emit_span(
         span_name=WATSON_ORCHESTRATE_TOOL_SPAN_NAME,
@@ -567,9 +611,12 @@ def emit_tool_span(
         ),
         start_ns=start_ns,
         error_message=error_message,
-        status_code=status_code if error_message else 200,
+        status_code=status_code,
         trace_id=trace_id,
         parent_id=parent_id,
+        span_id=span_id,
+        propagated=propagated,
+        include_content=include_content,
     )
 
 
@@ -580,10 +627,20 @@ def emit_agent_run_span(
     start_ns: int,
     response: Any = None,
     error_message: str | None = None,
-    status_code: int = 500,
+    status_code: int | None = None,
     trace_id: str | None = None,
     parent_id: str | None = None,
+    span_id: str | None = None,
+    propagated: dict[str, Any] | None = None,
+    include_content: bool = True,
 ) -> None:
+    state = _field(response, "status")
+    if (
+        error_message is None
+        and isinstance(state, str)
+        and state.lower() in {"failed", "cancelled", "canceled", "error"}
+    ):
+        error_message = "RunFailure: " + safe_text(_field(response, "error") or state)
     emit_span(
         span_name=WATSON_ORCHESTRATE_RUN_SPAN_NAME,
         attrs=build_agent_run_attrs(
@@ -594,9 +651,12 @@ def emit_agent_run_span(
         ),
         start_ns=start_ns,
         error_message=error_message,
-        status_code=status_code if error_message else 200,
+        status_code=status_code,
         trace_id=trace_id,
         parent_id=parent_id,
+        span_id=span_id,
+        propagated=propagated,
+        include_content=include_content,
     )
 
 
@@ -608,9 +668,12 @@ def emit_chat_span(
     response: Any = None,
     error_message: str | None = None,
     instance: Any = None,
-    status_code: int = 500,
+    status_code: int | None = None,
     trace_id: str | None = None,
     parent_id: str | None = None,
+    span_id: str | None = None,
+    propagated: dict[str, Any] | None = None,
+    include_content: bool = True,
 ) -> None:
     emit_span(
         span_name=WATSON_ORCHESTRATE_CHAT_SPAN_NAME,
@@ -623,7 +686,10 @@ def emit_chat_span(
         ),
         start_ns=start_ns,
         error_message=error_message,
-        status_code=status_code if error_message else 200,
+        status_code=status_code,
         trace_id=trace_id,
         parent_id=parent_id,
+        span_id=span_id,
+        propagated=propagated,
+        include_content=include_content,
     )

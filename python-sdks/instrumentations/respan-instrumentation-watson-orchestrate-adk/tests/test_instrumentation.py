@@ -251,7 +251,7 @@ def test_chat_client_failure_emits_error_span(monkeypatch):
     assert emitted[0]["method_name"] == "generate_response"
     assert emitted[0]["call_kwargs"] == {"input": "hello"}
     assert emitted[0]["error_message"] == "RuntimeError: provider unavailable"
-    assert emitted[0]["status_code"] == 500
+    assert emitted[0]["status_code"] is None
 
 
 def test_activate_is_idempotent(monkeypatch):

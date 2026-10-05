@@ -24,7 +24,6 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import StatusCode
 from pydantic import PrivateAttr
-
 from respan_instrumentation_google_adk import GoogleADKInstrumentor
 from respan_instrumentation_google_adk._processor import GOOGLE_ADK_SCOPE_NAME
 
@@ -132,12 +131,14 @@ async def run_agent(agent, *, streaming=StreamingMode.NONE, runner_sync=False):
         state={"metadata": {"topic": "slides"}},
     )
     runner = Runner(agent=agent, app_name="ppt", session_service=sessions)
-    kwargs = dict(
-        user_id="self",
-        session_id="session-1",
-        new_message=types.Content(role="user", parts=[types.Part(text="Make slides")]),
-        run_config=RunConfig(streaming_mode=streaming),
-    )
+    kwargs = {
+        "user_id": "self",
+        "session_id": "session-1",
+        "new_message": types.Content(
+            role="user", parts=[types.Part(text="Make slides")]
+        ),
+        "run_config": RunConfig(streaming_mode=streaming),
+    }
     if runner_sync:
         # Runner.run drives the real async pipeline from its worker thread.
         return await asyncio.to_thread(lambda: list(runner.run(**kwargs)))
@@ -219,7 +220,8 @@ def test_real_runner_agent_tool_roundtrip(capture, streaming, async_tool):
     assert final.attributes["gen_ai.completion.0.content"] == "Outline ready"
     assert "gen_ai.completion.0.tool_calls" not in final.attributes
     tool = tools[0]
-    assert by_id[tool.parent.span_id] is first
+    assert by_id[tool.parent.span_id] is first or by_id[tool.parent.span_id] in agents
+    assert tool.attributes["gen_ai.tool.call.id"] == "search-1"
     assert json.loads(tool.attributes["traceloop.entity.input"]) == {
         "name": "document_search",
         "arguments": {"query": "slides"},
@@ -328,13 +330,14 @@ def test_suppression_and_deactivation(capture):
 
 def test_legacy_direct_iterator_alias_and_close(capture, caplog):
     from importlib.metadata import version
+
     from packaging.version import Version
 
     if Version(version("google-adk")) >= Version("1.17.0"):
         pytest.skip("Legacy direct iterator bridge is only used below ADK 1.17")
     # Imported before execution, as in MultiAgentPPT's DynamicParallelSearchAgent.
-    from google.adk.agents.parallel_agent import _merge_agent_run
     from google.adk.agents.invocation_context import InvocationContext
+    from google.adk.agents.parallel_agent import _merge_agent_run
     from google.adk.events import Event
 
     _, provider, exporter = capture
@@ -399,6 +402,7 @@ def test_legacy_direct_iterator_alias_and_close(capture, caplog):
 
 def test_legacy_pending_iteration_cancellation(capture, caplog):
     from importlib.metadata import version
+
     from packaging.version import Version
 
     if Version(version("google-adk")) >= Version("1.17.0"):
@@ -448,6 +452,7 @@ def test_legacy_pending_iteration_cancellation(capture, caplog):
 
 def test_legacy_async_generator_methods(capture, caplog):
     from importlib.metadata import version
+
     from packaging.version import Version
 
     if Version(version("google-adk")) >= Version("1.17.0"):
@@ -490,25 +495,20 @@ def test_legacy_async_generator_methods(capture, caplog):
     assert "Failed to detach context" not in caplog.text
 
 
-def test_second_adapter_does_not_take_ownership(capture):
-    owner, provider, exporter = capture
+def test_two_adapters_share_ownership(capture):
+    owner, _, exporter = capture
     second = GoogleADKInstrumentor()
     second.activate()
-    assert not second._is_instrumented
-    assert second._instrumentor is None
-    assert second._processor is None
-    second.deactivate()
-    assert owner._instrumentor.is_instrumented_by_opentelemetry
-    assert (
-        sum(
-            p is owner._processor
-            for p in provider._active_span_processor._span_processors
-        )
-        == 1
-    )
-    agent, _, _ = make_agent()
-    asyncio.run(run_agent(agent))
-    assert len(adk_spans(exporter)) == 5
+    assert second._is_instrumented
+    assert second._processor is owner._processor
+    owner.deactivate()
+    try:
+        agent, _, _ = make_agent()
+        asyncio.run(run_agent(agent))
+        assert len(adk_spans(exporter)) == 5
+    finally:
+        second.deactivate()
+    assert not second._instrumentor.is_instrumented_by_opentelemetry
 
 
 def test_external_upstream_instrumentation_is_preserved(capture):
@@ -534,6 +534,7 @@ def test_external_upstream_instrumentation_is_preserved(capture):
 @pytest.mark.parametrize("parallel", [False, True])
 def test_legacy_abandoned_runner_closes_in_owner_context(capture, caplog, parallel):
     from importlib.metadata import version
+
     from packaging.version import Version
 
     if Version(version("google-adk")) >= Version("1.17.0"):

@@ -35,50 +35,52 @@ Respan.
 
 ## Compatibility
 
-Requires Python 3.11–3.13, Google ADK 1.5.0 or newer, and OpenInference Google
-ADK instrumentation 0.1.12 or newer. Existing projects can keep their ADK pin:
+Python 3.11–3.13 is supported. Validation uses released core dependencies with
+only this adapter installed from the local checkout.
 
-```bash
-pip install respan-instrumentation-google-adk "google-adk==1.5.0"
-```
-
-ADK versions below 1.17 use an iterator bridge around the upstream runner and
-agent hooks. This enters OpenInference's async iterator when legacy parallel
-agents advance it directly. Each iterator runs in its own task, advancing only
-when the consumer requests an event and closing in its original context. It also
-works with custom agents that imported ADK's legacy `_merge_agent_run` helper
-before activation. Deactivation restores the upstream methods.
-
-Activate one Respan Google ADK adapter per process. If another adapter or an
-independently activated OpenInference Google ADK instrumentor already owns the
-hooks, activation logs a warning and leaves that owner in control.
-
-The processor normalizes actual response usage into both modern and legacy
-token fields. This corrects ADK 1.5's native output-token field, which contains
-the total token count. Tool execution stays tool content, including results
-carried into the next model request.
-
-The offline runtime tests exercise installed ADK and OpenInference packages:
-`Runner.run`/`run_async`, session state and model callbacks, sequential and
-parallel agents, custom `BaseAgent` subclasses, sync/async tools, SSE response
-events, errors, suppression, deactivation, and legacy generator cleanup. Model
-responses are deterministic fixtures; no provider credentials are needed.
-
-| Google ADK | OpenInference Google ADK | Validation |
+| Google ADK | OpenInference Google ADK | Coverage |
 | --- | --- | --- |
-| 1.5.0 | 0.1.12 and 0.1.25 | Legacy and common runtime tests |
-| 1.17.0 | 0.1.25 | Common runtime tests; legacy-only tests skipped |
-| 2.8.0 | 0.1.25 | Common runtime tests; legacy-only tests skipped |
+| 1.5.0 | 0.1.12 | Legacy runner, agents, tools, streaming and cleanup |
+| 2.11.0 | 1.0.2 | Common APIs, Workflow nodes, confirmation, abort and ModelConsultTool |
 
-The legacy fixtures follow the APIs used by
-[MultiAgentPPT](https://github.com/johnson7788/MultiAgentPPT/tree/ce8185cee83092290bdb913a528c6e3a72ee879e)
-and its `google-adk==1.5.0` pin. They cover the ADK execution path; they do not
-validate that application's external services or presentation rendering.
-
-Run the package tests from this directory in an environment with the desired
-ADK version:
+OpenInference 1.x requires ADK 2.10 or newer. For a legacy ADK application,
+install a compatible pair in one resolver operation:
 
 ```bash
-pip install -e . pytest "google-adk==1.5.0"
-python -m pytest tests -q
+pip install respan-instrumentation-google-adk "google-adk==1.5.0" "openinference-instrumentation-google-adk==0.1.12"
 ```
+
+Supported paths include sync/async runners, session state and callbacks,
+sequential/parallel/custom agents, sync/async tools, SSE events, errors and
+suppression. The adapter preserves current-turn tool calls, tool-result history,
+execution IDs and actual provider usage. An error or response without reported
+usage does not gain fabricated usage fields.
+
+ADK 2.11 Workflow nodes use the SDK's native node tracing scope, enriched as
+workflow/task spans. Tool confirmation records the paused node without claiming
+that its tool executed; the tool span starts after confirmation permits execution.
+ModelConsultTool advisor attempts emit model spans from ADK's actual request,
+responses and elapsed time, including adviser errors. Advisor usage is taken
+from provider response metadata, not ADK's synthesized usage summary.
+
+Runner/agent iterators advance on demand in their own task context. Yielding an
+event does not leave the SDK span active in the caller, and close/cancellation
+finishes the iterator in its original context. The legacy bridge also closes
+suspended ADK 1.5 model iterators.
+
+Multiple adapter instances with matching settings share one registration.
+A conflicting configuration raises `ValueError`, including content/privacy changes.
+The last owner restores patches and removes the processor from its original
+provider. Later wrappers remain installed; retained inner method guards bypass
+instrumentation after deactivation. An independently activated upstream ADK
+instrumentor remains externally owned and is not replaced.
+
+Content controls honor OpenInference `TraceConfig`, `TRACELOOP_TRACE_CONTENT`
+and Respan's content-disable context. ModelConsult captures privacy and parent
+context at call start, so changing policy during the model await cannot reveal
+content that started hidden. Token usage remains observable with content disabled.
+
+The companion [Python examples](https://github.com/respanai/respan-example-projects/tree/main/python/tracing/google-adk)
+run deterministic models through the actual SDK. They verify tracing behavior;
+they do not verify live Google credentials, audio/live connections, hosted
+services or the availability of specific model features.

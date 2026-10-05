@@ -75,6 +75,7 @@ class FakeSpan:
 class FakeRecordingSpan:
     def __init__(self):
         self.attributes = {}
+        self.instrumentation_scope = SimpleNamespace(name="semantic_kernel.fixture")
 
     def set_attribute(self, key, value):
         self.attributes[key] = value
@@ -84,6 +85,7 @@ class FakeRecordingSpan:
 
 
 def _install_fake_semantic_kernel(monkeypatch):
+    monkeypatch.setattr(_instrumentation, "install_native_hooks", lambda enabled: [])
     semantic_kernel_module = ModuleType(SEMANTIC_KERNEL_ROOT_MODULE)
 
     decorators_module = ModuleType(
@@ -538,7 +540,7 @@ def test_failed_tool_retains_error_contract_and_safe_output():
     enrich_semantic_kernel_span(span)
     attrs = span._attributes
     assert attrs["error.type"] == "RuntimeError"
-    assert attrs["http.response.status_code"] == 500
+    assert "http.response.status_code" not in attrs
     assert json.loads(attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]) == {
         "error": {
             "message": "semantic-kernel deterministic failure",
@@ -633,7 +635,7 @@ def test_on_start_copies_parent_available_functions_to_chat(monkeypatch):
     )
     monkeypatch.setattr(
         "respan_instrumentation_semantic_kernel._processor.trace.get_current_span",
-        lambda context: parent,
+        lambda context=None: parent,
     )
     child = FakeRecordingSpan()
 
@@ -648,7 +650,7 @@ def test_current_semantic_kernel_chat_operation_maps_parent_functions(monkeypatc
     )
     monkeypatch.setattr(
         "respan_instrumentation_semantic_kernel._processor.trace.get_current_span",
-        lambda context: parent,
+        lambda context=None: parent,
     )
     recording_span = FakeRecordingSpan()
     processor = SemanticKernelSpanProcessor()
@@ -673,3 +675,26 @@ def test_current_semantic_kernel_chat_operation_maps_parent_functions(monkeypatc
         }
     ]
     assert "sk.available_functions" not in attrs
+
+
+@pytest.mark.parametrize("operation", ["chat", "text.completions", "embeddings"])
+def test_failed_model_preserves_real_partial_output(operation):
+    span = FakeSpan(
+        {
+            GenAIAttributes.GEN_AI_OPERATION_NAME: operation,
+            SpanAttributes.TRACELOOP_ENTITY_OUTPUT: '"partial fixture answer"',
+        },
+        status=SimpleNamespace(
+            status_code=SimpleNamespace(name="ERROR"),
+            description="controlled interrupted request",
+        ),
+    )
+    assert enrich_semantic_kernel_span(span)
+    assert (
+        span._attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]
+        == '"partial fixture answer"'
+    )
+    assert span._attributes["error.message"] == "controlled interrupted request"
+    assert not any(
+        key.startswith(("gen_ai.usage", "llm.usage")) for key in span._attributes
+    )

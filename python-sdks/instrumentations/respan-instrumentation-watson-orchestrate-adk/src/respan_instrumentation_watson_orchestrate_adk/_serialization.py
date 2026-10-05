@@ -89,7 +89,7 @@ def safe_exception_message(exc: BaseException) -> str:
     return safe_text(f"{name}: {detail}" if detail else name)
 
 
-def provider_status_code(exc: BaseException) -> int:
+def provider_status_code(exc: BaseException) -> int | None:
     candidates: list[Any] = []
     for name in ("status_code", "status"):
         try:
@@ -113,7 +113,7 @@ def provider_status_code(exc: BaseException) -> int:
             and 400 <= value <= 599
         ):
             return value
-    return 500
+    return None
 
 
 def _safe_key(value: Any) -> str:
@@ -130,6 +130,8 @@ def to_jsonable(value: Any, *, depth: int = 0) -> Any:
     if isinstance(value, float):
         return value if math.isfinite(value) else safe_text(value)
     if isinstance(value, str):
+        if value.startswith(("https://", "http://")):
+            value = sanitize_url(value) or "[invalid URL]"
         return redact_text(value)
     if isinstance(value, (bytes, bytearray, memoryview)):
         try:

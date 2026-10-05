@@ -1,0 +1,9 @@
+{
+  "summary": "Support current Python agent framework SDKs and canonical telemetry",
+  "packages": {
+    "respan-instrumentation-google-adk": "minor",
+    "respan-instrumentation-microsoft-agent-framework": "minor",
+    "respan-instrumentation-semantic-kernel": "minor",
+    "respan-instrumentation-watson-orchestrate-adk": "minor"
+  }
+}

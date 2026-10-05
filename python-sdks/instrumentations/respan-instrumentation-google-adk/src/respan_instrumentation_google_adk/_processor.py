@@ -6,20 +6,31 @@ import json
 import logging
 import threading
 from collections import defaultdict
+from contextvars import ContextVar
 from typing import Any
 
+from openinference.instrumentation import TraceConfig
 from openinference.semconv.trace import (
     MessageAttributes as OIMessageAttributes,
+)
+from openinference.semconv.trace import (
     MessageContentAttributes as OIMessageContentAttributes,
+)
+from openinference.semconv.trace import (
     SpanAttributes as OISpanAttributes,
+)
+from openinference.semconv.trace import (
     ToolCallAttributes as OIToolCallAttributes,
 )
 from opentelemetry.context import Context
-from opentelemetry.sdk.trace import ReadableSpan, Span
-from opentelemetry.sdk.trace import SpanProcessor
+from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import (
+    GEN_AI_CONVERSATION_ID,
+    GEN_AI_INPUT_MESSAGES,
+    GEN_AI_OUTPUT_MESSAGES,
     GEN_AI_PROVIDER_NAME,
     GEN_AI_SYSTEM,
+    GEN_AI_TOOL_CALL_ID,
     GEN_AI_TOOL_NAME,
     GEN_AI_USAGE_INPUT_TOKENS,
     GEN_AI_USAGE_OUTPUT_TOKENS,
@@ -39,8 +50,13 @@ from respan_sdk.constants.span_attributes import (
     RESPAN_SPAN_TOOL_CALLS,
     RESPAN_SPAN_TOOLS,
 )
+from respan_tracing.decorators.base import _should_send_prompts
 
 logger = logging.getLogger(__name__)
+
+_content_policy_override: ContextVar[bool | None] = ContextVar(
+    "respan_adk_content_policy", default=None
+)
 
 GOOGLE_ADK_SCOPE_NAME = "openinference.instrumentation.google_adk"
 
@@ -68,8 +84,8 @@ _GOOGLE_ADK_LLM_RESPONSE = "gcp.vertex.agent.llm_response"
 _GOOGLE_ADK_TOOL_CALL_ARGS = "gcp.vertex.agent.tool_call_args"
 _GOOGLE_ADK_TOOL_RESPONSE = "gcp.vertex.agent.tool_response"
 _SESSION_ID_ATTRS = (
-    "session.id",
-    "gen_ai.conversation.id",
+    OISpanAttributes.SESSION_ID,
+    GEN_AI_CONVERSATION_ID,
 )
 
 _OFF_CONTRACT_ALIASES = {
@@ -113,7 +129,7 @@ def _first_user_prompt(attrs: dict[str, Any]) -> str | None:
             int(parts[0])
             for key in attrs
             if key.startswith(prefix)
-            and len((parts := key[len(prefix) :].split(".", 1))) == 2
+            and len(parts := key[len(prefix) :].split(".", 1)) == 2
             and parts[0].isdigit()
         }
     )
@@ -230,8 +246,7 @@ def _extract_tool_calls_from_message(
         if not parts[0].isdigit() or len(parts) == 1:
             continue
         tc_field = parts[1]
-        if tc_field.startswith(_OI_TOOL_CALL_PREFIX):
-            tc_field = tc_field[len(_OI_TOOL_CALL_PREFIX) :]
+        tc_field = tc_field.removeprefix(_OI_TOOL_CALL_PREFIX)
         tool_call_buckets[int(parts[0])][tc_field] = field_val
 
     result: list[dict[str, Any]] = []
@@ -287,11 +302,16 @@ def _extract_message_content(raw: dict[str, Any]) -> Any:
         if not parts[0].isdigit() or len(parts) == 1:
             continue
         block_field = parts[1]
-        if block_field.startswith(_OI_MESSAGE_CONTENT_BLOCK_PREFIX):
-            block_field = block_field[len(_OI_MESSAGE_CONTENT_BLOCK_PREFIX) :]
+        block_field = block_field.removeprefix(_OI_MESSAGE_CONTENT_BLOCK_PREFIX)
         _set_nested_value(content_blocks[int(parts[0])], block_field, field_val)
 
     if content_blocks:
+        if any(
+            block.get("type") not in (None, "text") for block in content_blocks.values()
+        ):
+            return _safe_json_str(
+                [block for _, block in sorted(content_blocks.items())]
+            )
         text_blocks = [
             block.get("text")
             for _, block in sorted(content_blocks.items())
@@ -515,7 +535,9 @@ def _apply_google_adk_payload_fallbacks(
                         completion_tokens += thoughts_tokens
                     # ADK 1.5 writes total_token_count into the modern output
                     # field. The response usage is authoritative, including 0.
-                    attrs[TLSpanAttributes.LLM_USAGE_COMPLETION_TOKENS] = completion_tokens
+                    attrs[TLSpanAttributes.LLM_USAGE_COMPLETION_TOKENS] = (
+                        completion_tokens
+                    )
                     attrs[GEN_AI_USAGE_OUTPUT_TOKENS] = completion_tokens
 
                 total_tokens = usage.get("total_token_count")
@@ -563,8 +585,12 @@ def _is_indexed_structured_message_attr(key: str) -> bool:
 def _stringify_structured_message_values(attrs: dict[str, Any]) -> None:
     for key, value in list(attrs.items()):
         if (
-            key.startswith(f"{TLSpanAttributes.LLM_PROMPTS}.")
-            or key.startswith(f"{TLSpanAttributes.LLM_COMPLETIONS}.")
+            key.startswith(
+                (
+                    f"{TLSpanAttributes.LLM_PROMPTS}.",
+                    f"{TLSpanAttributes.LLM_COMPLETIONS}.",
+                )
+            )
         ) and key.endswith(".tool_calls"):
             attrs[key] = _safe_json_str(value)
         if key.endswith(".role") and value == "model":
@@ -580,7 +606,12 @@ def _cleanup_google_adk_attrs(attrs: dict[str, Any], *, is_chat_span: bool) -> N
 
     _stringify_structured_message_values(attrs)
 
-    for key in (TLSpanAttributes.TRACELOOP_SPAN_KIND, *_OFF_CONTRACT_ALIASES):
+    for key in (
+        TLSpanAttributes.TRACELOOP_SPAN_KIND,
+        GEN_AI_INPUT_MESSAGES,
+        GEN_AI_OUTPUT_MESSAGES,
+        *_OFF_CONTRACT_ALIASES,
+    ):
         attrs.pop(key, None)
     for key in _SESSION_ID_ATTRS:
         attrs.pop(key, None)
@@ -595,7 +626,9 @@ def _cleanup_google_adk_attrs(attrs: dict[str, Any], *, is_chat_span: bool) -> N
         _OI_TOOLS_PREFIX,
     )
     for key in list(attrs.keys()):
-        if any(key.startswith(prefix) for prefix in prefixes_to_remove):
+        if key != GEN_AI_TOOL_CALL_ID and any(
+            key.startswith(prefix) for prefix in prefixes_to_remove
+        ):
             attrs.pop(key, None)
             continue
         if _is_indexed_structured_message_attr(key):
@@ -624,13 +657,21 @@ def _normalize_google_adk_attrs(
     session_id = _session_id(raw_attrs)
     if session_id is not None:
         attrs.setdefault(RESPAN_SESSION_ID, session_id)
+    if oi_kind == "TOOL" or attrs.get(RESPAN_LOG_TYPE) == LOG_TYPE_TOOL:
+        tool_id = raw_attrs.get(OISpanAttributes.TOOL_ID) or raw_attrs.get(
+            GEN_AI_TOOL_CALL_ID
+        )
+        if tool_id is not None:
+            attrs[GEN_AI_TOOL_CALL_ID] = str(tool_id)
     _cleanup_google_adk_attrs(attrs, is_chat_span=is_chat_span)
 
 
 class GoogleADKSpanProcessor(SpanProcessor):
     """Translate and clean up spans emitted by the Google ADK OpenInference hook."""
 
-    def __init__(self) -> None:
+    def __init__(self, config=None) -> None:
+        self._config = config or TraceConfig()
+        self._policy: dict[int, bool] = {}
         self._translator = OpenInferenceTranslator()
         self._trace_context: dict[int, dict[str, str]] = {}
         self._context_lock = threading.Lock()
@@ -640,20 +681,87 @@ class GoogleADKSpanProcessor(SpanProcessor):
         span: Span,
         parent_context: Context | None = None,
     ) -> None:
-        return None
+        if _scope_name(span) == GOOGLE_ADK_SCOPE_NAME:
+            policy = _content_policy_override.get()
+            self._policy[span.get_span_context().span_id] = (
+                _should_send_prompts() if policy is None else policy
+            )
 
     def on_end(self, span: ReadableSpan) -> None:
         raw_attrs = dict(getattr(span, "attributes", None) or {})
         if not _is_google_adk_span(span, raw_attrs):
             return
 
+        span_id = getattr(getattr(span, "context", None), "span_id", None)
+        content_allowed = self._policy.pop(span_id, _should_send_prompts())
+        hidden_input = not content_allowed or any(
+            getattr(self._config, key, False)
+            for key in (
+                "hide_inputs",
+                "hide_input_messages",
+                "hide_input_text",
+                "hide_input_images",
+                "hide_prompts",
+            )
+        )
+        hidden_output = not content_allowed or any(
+            getattr(self._config, key, False)
+            for key in (
+                "hide_outputs",
+                "hide_output_messages",
+                "hide_output_text",
+                "hide_choices",
+            )
+        )
+        # Native ADK writes raw payload attributes directly onto the OI span.
+        # Remove content before fallbacks can reconstruct data hidden by OI.
+        if hidden_input:
+            for key in tuple(raw_attrs):
+                if key in {
+                    _GOOGLE_ADK_LLM_REQUEST,
+                    _GOOGLE_ADK_TOOL_CALL_ARGS,
+                    OISpanAttributes.INPUT_VALUE,
+                } or key.startswith(_OI_INPUT_MESSAGES_PREFIX):
+                    raw_attrs.pop(key, None)
+        if hidden_output:
+            response = _parse_json(raw_attrs.get(_GOOGLE_ADK_LLM_RESPONSE))
+            for key in tuple(raw_attrs):
+                if key in {
+                    _GOOGLE_ADK_LLM_RESPONSE,
+                    _GOOGLE_ADK_TOOL_RESPONSE,
+                    OISpanAttributes.OUTPUT_VALUE,
+                } or key.startswith(_OI_OUTPUT_MESSAGES_PREFIX):
+                    raw_attrs.pop(key, None)
+            if isinstance(response, dict) and "usage_metadata" in response:
+                raw_attrs[_GOOGLE_ADK_LLM_RESPONSE] = _safe_json_str(
+                    {"usage_metadata": response["usage_metadata"]}
+                )
+        span._attributes = raw_attrs
+        if (
+            not raw_attrs.get(OISpanAttributes.OPENINFERENCE_SPAN_KIND)
+            and getattr(span, "name", "") == "call_llm"
+        ):
+            raw_attrs[OISpanAttributes.OPENINFERENCE_SPAN_KIND] = "LLM"
+            span._attributes = raw_attrs
         self._translator.on_end(span)
         translated_attrs = dict(getattr(span, "_attributes", None) or {})
         _normalize_google_adk_attrs(raw_attrs, translated_attrs)
 
+        for key in tuple(translated_attrs):
+            if hidden_input and (
+                key == TLSpanAttributes.TRACELOOP_ENTITY_INPUT
+                or key == TLSpanAttributes.LLM_REQUEST_FUNCTIONS
+                or key.startswith(TLSpanAttributes.LLM_PROMPTS + ".")
+            ):
+                translated_attrs.pop(key, None)
+            if hidden_output and (
+                key == TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT
+                or key.startswith(TLSpanAttributes.LLM_COMPLETIONS + ".")
+            ):
+                translated_attrs.pop(key, None)
         trace_id = _span_trace_id(span)
         log_type = translated_attrs.get(RESPAN_LOG_TYPE)
-        if trace_id is not None and log_type == LOG_TYPE_CHAT:
+        if trace_id is not None and log_type == LOG_TYPE_CHAT and not hidden_input:
             prompt = _first_user_prompt(translated_attrs)
             session_id = translated_attrs.get(RESPAN_SESSION_ID)
             if prompt is not None or session_id not in (None, ""):
@@ -666,10 +774,17 @@ class GoogleADKSpanProcessor(SpanProcessor):
         elif trace_id is not None and log_type in (LOG_TYPE_AGENT, LOG_TYPE_WORKFLOW):
             with self._context_lock:
                 context = self._trace_context.pop(trace_id, {})
-            if _parse_json(translated_attrs.get(TLSpanAttributes.TRACELOOP_ENTITY_INPUT)) in (
-                None,
-                "",
-            ) and context.get("prompt"):
+            if (
+                _parse_json(
+                    translated_attrs.get(TLSpanAttributes.TRACELOOP_ENTITY_INPUT)
+                )
+                in (
+                    None,
+                    "",
+                )
+                and context.get("prompt")
+                and not hidden_input
+            ):
                 translated_attrs[TLSpanAttributes.TRACELOOP_ENTITY_INPUT] = (
                     _safe_json_str({"prompt": context["prompt"]})
                 )
@@ -682,7 +797,7 @@ class GoogleADKSpanProcessor(SpanProcessor):
     def shutdown(self) -> None:
         with self._context_lock:
             self._trace_context.clear()
-        return None
+            self._policy.clear()
 
     def force_flush(self, timeout_millis: int = 30000) -> bool:
         return True
