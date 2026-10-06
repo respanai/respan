@@ -1,5 +1,6 @@
-import tomllib
 from pathlib import Path
+
+import tomllib
 
 
 def test_package_does_not_depend_on_openinference_agno():

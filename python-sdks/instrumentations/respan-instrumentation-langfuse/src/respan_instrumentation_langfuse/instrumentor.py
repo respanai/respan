@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 from collections.abc import Collection, Mapping, Sequence
@@ -14,18 +15,19 @@ from opentelemetry.sdk.trace.export import SpanExportResult
 from opentelemetry.semconv._incubating.attributes import (
     gen_ai_attributes as GenAIAttributes,
 )
+from opentelemetry.semconv._incubating.attributes.error_attributes import ERROR_MESSAGE
 from opentelemetry.semconv_ai import LLMRequestTypeValues, SpanAttributes
 from opentelemetry.trace.status import StatusCode
 from respan_sdk.constants.llm_logging import (
     LOG_TYPE_AGENT,
     LOG_TYPE_CHAT,
     LOG_TYPE_EMBEDDING,
+    LOG_TYPE_GUARDRAIL,
     LOG_TYPE_TASK,
     LOG_TYPE_TOOL,
     LOG_TYPE_WORKFLOW,
     LogMethodChoices,
 )
-from respan_sdk.constants.otlp_constants import ERROR_MESSAGE_ATTR
 from respan_sdk.constants.span_attributes import (
     RESPAN_CUSTOMER_PARAMS_ID,
     RESPAN_LOG_METHOD,
@@ -38,7 +40,7 @@ from respan_tracing.utils.span_factory import build_readable_span, inject_span
 
 logger = logging.getLogger(__name__)
 
-_instruments = ("langfuse >= 3.12.0",)
+_instruments = ("langfuse >= 3.12.0, <5.0.0",)
 
 _OBSERVATION_TYPE = "langfuse.observation.type"
 _OBSERVATION_INPUT = "langfuse.observation.input"
@@ -46,6 +48,7 @@ _OBSERVATION_OUTPUT = "langfuse.observation.output"
 _OBSERVATION_MODEL = "langfuse.observation.model.name"
 _LEGACY_OBSERVATION_MODEL = "langfuse.observation.model"
 _OBSERVATION_USAGE = "langfuse.observation.usage_details"
+_OBSERVATION_MODEL_PARAMETERS = "langfuse.observation.model.parameters"
 _OBSERVATION_LEVEL = "langfuse.observation.level"
 _OBSERVATION_STATUS_MESSAGE = "langfuse.observation.status_message"
 _TRACE_NAME = "langfuse.trace.name"
@@ -85,15 +88,25 @@ def _content(value: Any) -> str:
 
 def _messages(value: Any, *, default_role: str) -> list[dict[str, Any]]:
     parsed = _json_value(value)
+    if parsed is None:
+        return []
     if isinstance(parsed, Mapping) and isinstance(parsed.get("messages"), list):
         parsed = parsed["messages"]
+    elif isinstance(parsed, Mapping) and any(
+        key in parsed for key in ("role", "content", "tool_calls")
+    ):
+        parsed = [parsed]
     if isinstance(parsed, Sequence) and not isinstance(parsed, (str, bytes)):
         messages = []
         for item in parsed:
             if not isinstance(item, Mapping):
                 continue
             role = item.get("role") or item.get("type") or default_role
-            content = item.get("content", item)
+            content = item.get(
+                "content", "" if "role" in item or "tool_calls" in item else item
+            )
+            if content is None:
+                content = ""
             message = {"role": str(role), "content": _content(content)}
             if isinstance(item.get("tool_calls"), list):
                 message["tool_calls"] = item["tool_calls"]
@@ -145,6 +158,8 @@ def _log_type(observation_type: str, *, is_root: bool) -> str:
         return LOG_TYPE_AGENT
     if observation_type == "tool":
         return LOG_TYPE_TOOL
+    if observation_type == "guardrail":
+        return LOG_TYPE_GUARDRAIL
     return LOG_TYPE_WORKFLOW if is_root else LOG_TYPE_TASK
 
 
@@ -181,11 +196,23 @@ def _translate_span(source_span: Any) -> tuple[dict[str, Any], int, str | None]:
                 attributes[f"{RESPAN_METADATA}.{key.removeprefix(prefix)}"] = value
                 break
 
-    if log_type == LOG_TYPE_CHAT:
-        attributes[SpanAttributes.LLM_REQUEST_TYPE] = LLMRequestTypeValues.CHAT.value
+    if log_type in (LOG_TYPE_CHAT, LOG_TYPE_EMBEDDING):
+        attributes[SpanAttributes.LLM_REQUEST_TYPE] = (
+            LLMRequestTypeValues.EMBEDDING.value
+            if log_type == LOG_TYPE_EMBEDDING
+            else LLMRequestTypeValues.CHAT.value
+        )
         model = source.get(_OBSERVATION_MODEL) or source.get(_LEGACY_OBSERVATION_MODEL)
         if model:
             attributes[SpanAttributes.LLM_REQUEST_MODEL] = str(model)
+    if log_type == LOG_TYPE_CHAT:
+        parameters = _json_value(source.get(_OBSERVATION_MODEL_PARAMETERS))
+        if isinstance(parameters, Mapping) and isinstance(
+            parameters.get("tools"), list
+        ):
+            attributes[SpanAttributes.LLM_REQUEST_FUNCTIONS] = _json_string(
+                parameters["tools"]
+            )
         for index, message in enumerate(_messages(input_value, default_role="user")):
             prefix = f"{SpanAttributes.LLM_PROMPTS}.{index}"
             attributes[f"{prefix}.role"] = message["role"]
@@ -201,6 +228,7 @@ def _translate_span(source_span: Any) -> tuple[dict[str, Any], int, str | None]:
             if message.get("tool_calls"):
                 attributes[f"{prefix}.tool_calls"] = _json_string(message["tool_calls"])
 
+    if log_type in (LOG_TYPE_CHAT, LOG_TYPE_EMBEDDING):
         usage = _usage(source)
         if "prompt" in usage:
             attributes[GenAIAttributes.GEN_AI_USAGE_INPUT_TOKENS] = usage["prompt"]
@@ -221,7 +249,7 @@ def _translate_span(source_span: Any) -> tuple[dict[str, Any], int, str | None]:
             _OBSERVATION_STATUS_MESSAGE
         )
     if error_message:
-        attributes[ERROR_MESSAGE_ATTR] = str(error_message)
+        attributes[ERROR_MESSAGE] = str(error_message)
     return (
         attributes,
         HTTPStatus.INTERNAL_SERVER_ERROR if is_error else HTTPStatus.OK,
@@ -255,6 +283,8 @@ class LangfuseInstrumentor(BaseInstrumentor):
 
     _exporter_class: type | None = None
     _original_export: Any = None
+    _installed_export: Any = None
+    _export_enabled = False
     _exported_span_count = 0
 
     @property
@@ -273,10 +303,17 @@ class LangfuseInstrumentor(BaseInstrumentor):
 
     def _uninstrument(self, **kwargs: Any) -> None:
         del kwargs
-        if self._exporter_class is not None and self._original_export is not None:
+        self._export_enabled = False
+        if (
+            self._exporter_class is not None
+            and self._original_export is not None
+            and inspect.getattr_static(self._exporter_class, "export")
+            is self._installed_export
+        ):
             self._exporter_class.export = self._original_export
         self._exporter_class = None
         self._original_export = None
+        self._installed_export = None
         logger.info("Langfuse instrumentation disabled")
 
     @staticmethod
@@ -311,10 +348,10 @@ class LangfuseInstrumentor(BaseInstrumentor):
         )
 
         self._exporter_class = OTLPSpanExporter
-        self._original_export = OTLPSpanExporter.export
+        self._original_export = inspect.getattr_static(OTLPSpanExporter, "export")
 
         def export_wrapper(wrapped: Any, instance: Any, args: Any, kwargs: Any) -> Any:
-            if not self._is_langfuse_exporter(instance):
+            if not self._export_enabled or not self._is_langfuse_exporter(instance):
                 return wrapped(*args, **kwargs)
             spans = args[0] if args else kwargs.get("spans", ())
             return self._export_spans(spans)
@@ -324,6 +361,8 @@ class LangfuseInstrumentor(BaseInstrumentor):
             "OTLPSpanExporter.export",
             export_wrapper,
         )
+        self._installed_export = inspect.getattr_static(OTLPSpanExporter, "export")
+        self._export_enabled = True
 
 
 __all__ = ["LangfuseInstrumentor"]

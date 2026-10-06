@@ -8,6 +8,10 @@ from typing import Any, ClassVar
 
 from opentelemetry import trace
 
+from respan_instrumentation_pydantic_ai._embeddings import (
+    install_embedding_capture,
+    load_embedder_class,
+)
 from respan_instrumentation_pydantic_ai._processor import PydanticAISpanProcessor
 
 logger = logging.getLogger(__name__)
@@ -27,17 +31,23 @@ class PydanticAIInstrumentor:
     _global_config: ClassVar[tuple[bool, bool, int] | None] = None
     _global_agent_class: ClassVar[Any | None] = None
     _global_previous: ClassVar[Any] = _UNSET
+    _global_embedder_class: ClassVar[Any | None] = None
+    _global_embedder_previous: ClassVar[Any] = _UNSET
+    _embedding_capture_restore: ClassVar[Any] = None
     _specific_agents: ClassVar[dict[int, dict[str, Any]]] = {}
 
     def __init__(
         self,
         agent: Any | None = None,
         *,
+        embedder: Any | None = None,
         include_content: bool = True,
         include_binary_content: bool = True,
         version: int = 5,
     ) -> None:
-        self._agent = agent
+        if agent is not None and embedder is not None:
+            raise ValueError("Pass either agent or embedder, not both")
+        self._agent = agent if agent is not None else embedder
         self._include_content = include_content
         self._include_binary_content = include_binary_content
         self._version = version
@@ -100,7 +110,13 @@ class PydanticAIInstrumentor:
             return
 
         processor = PydanticAISpanProcessor()
-        cls._register_processor(tracer_provider, processor)
+        restore_capture = install_embedding_capture()
+        try:
+            cls._register_processor(tracer_provider, processor)
+        except Exception:
+            restore_capture()
+            raise
+        cls._embedding_capture_restore = restore_capture
         cls._shared_processor = processor
         cls._shared_provider = tracer_provider
         cls._processor_refcount = 1
@@ -116,6 +132,9 @@ class PydanticAIInstrumentor:
             cls._unregister_processor(cls._shared_provider, cls._shared_processor)
         cls._shared_processor = None
         cls._shared_provider = None
+        if cls._embedding_capture_restore is not None:
+            cls._embedding_capture_restore()
+            cls._embedding_capture_restore = None
 
     def activate(self) -> None:
         if self._is_instrumented:
@@ -154,6 +173,20 @@ class PydanticAIInstrumentor:
                     else:
                         previous = getattr(Agent, "_instrument_default", _UNSET)
                         Agent.instrument_all(instrument=settings)
+                        embedder_class = load_embedder_class()
+                        try:
+                            if embedder_class is not None:
+                                cls._global_embedder_previous = (
+                                    embedder_class._instrument_default
+                                )
+                                embedder_class.instrument_all(instrument=settings)
+                                cls._global_embedder_class = embedder_class
+                        except Exception:
+                            Agent.instrument_all(
+                                instrument=False if previous is _UNSET else previous
+                            )
+                            cls._global_embedder_previous = _UNSET
+                            raise
                         cls._global_previous = previous
                         cls._global_agent_class = Agent
                         cls._global_config = self._config
@@ -204,6 +237,17 @@ class PydanticAIInstrumentor:
                             else cls._global_previous
                         )
                         cls._global_agent_class.instrument_all(instrument=previous)
+                        if cls._global_embedder_class is not None:
+                            previous_embedding = (
+                                False
+                                if cls._global_embedder_previous is _UNSET
+                                else cls._global_embedder_previous
+                            )
+                            cls._global_embedder_class.instrument_all(
+                                instrument=previous_embedding
+                            )
+                            cls._global_embedder_class = None
+                            cls._global_embedder_previous = _UNSET
                         cls._global_agent_class = None
                         cls._global_previous = _UNSET
                         cls._global_config = None

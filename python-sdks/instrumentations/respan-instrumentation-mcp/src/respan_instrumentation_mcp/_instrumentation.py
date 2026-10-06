@@ -1,14 +1,18 @@
 """MCP instrumentation plugin for Respan."""
 
+import asyncio
 import importlib
 import json
 import logging
+import os
 from collections.abc import Callable, Mapping, Sequence
 from threading import RLock
 from typing import Any, ClassVar, NamedTuple
 
+from opentelemetry import context as context_api
 from opentelemetry import trace
-from opentelemetry.instrumentation.utils import unwrap
+from opentelemetry.instrumentation.utils import is_instrumentation_enabled, unwrap
+from opentelemetry.semconv._incubating.attributes.error_attributes import ERROR_MESSAGE
 from opentelemetry.semconv_ai import SpanAttributes
 from opentelemetry.trace import Status, StatusCode
 from respan_instrumentation_openinference import OpenInferenceInstrumentor
@@ -16,6 +20,12 @@ from respan_sdk.constants.llm_logging import LOG_TYPE_TASK, LOG_TYPE_TOOL
 from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
 from respan_tracing.core.tracer import RespanTracer
 from wrapt import wrap_function_wrapper
+
+from respan_instrumentation_mcp._native import (
+    owned_operation,
+    patch_native_spans,
+    restore_native_spans,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +159,7 @@ def _to_jsonable(
     if callable(model_dump):
         try:
             return _to_jsonable(
-                model_dump(mode="json", exclude_none=True),
+                model_dump(mode="json", exclude_none=True, by_alias=True),
                 depth=depth + 1,
                 in_json_schema=in_json_schema,
             )
@@ -243,6 +253,12 @@ def _arg_or_kw(
     return None
 
 
+def _capture_content() -> bool:
+    return (os.getenv("TRACELOOP_TRACE_CONTENT") or "true").lower() == "true" or bool(
+        context_api.get_value("override_enable_content_tracing")
+    )
+
+
 def _method_input(
     method_name: str, args: tuple[Any, ...], kwargs: dict[str, Any]
 ) -> dict[str, Any]:
@@ -251,28 +267,29 @@ def _method_input(
             "name": _arg_or_kw(args, kwargs, 0, "name"),
             "arguments": _arg_or_kw(args, kwargs, 1, "arguments"),
         }
-        timeout = kwargs.get("read_timeout_seconds")
+        timeout = _arg_or_kw(args, kwargs, 2, "read_timeout_seconds")
         if timeout is not None:
             payload["read_timeout_seconds"] = timeout
-        return payload
-
-    if method_name == "read_resource":
-        return {"uri": _arg_or_kw(args, kwargs, 0, "uri")}
-
-    if method_name == "get_prompt":
-        return {
+    elif method_name == "read_resource":
+        payload = {"uri": _arg_or_kw(args, kwargs, 0, "uri")}
+    elif method_name == "get_prompt":
+        payload = {
             "name": _arg_or_kw(args, kwargs, 0, "name"),
             "arguments": _arg_or_kw(args, kwargs, 1, "arguments"),
         }
-
-    payload: dict[str, Any] = {"method": method_name}
-    if args:
-        payload["args"] = args
-    filtered_kwargs = {
-        key: value for key, value in kwargs.items() if not callable(value)
-    }
-    if filtered_kwargs:
-        payload["kwargs"] = filtered_kwargs
+    else:
+        payload = {"method": method_name}
+        if args:
+            payload["args"] = args
+        filtered_kwargs = {
+            key: value for key, value in kwargs.items() if not callable(value)
+        }
+        if filtered_kwargs:
+            payload["kwargs"] = filtered_kwargs
+        return payload
+    for key in ("input_responses", "request_state"):
+        if kwargs.get(key) is not None:
+            payload[key] = kwargs[key]
     return payload
 
 
@@ -283,8 +300,7 @@ def _entity_name(
         name = _arg_or_kw(args, kwargs, 0, "name")
         return str(name) if name else _CLIENT_METHODS[method_name].entity_name
     if method_name == "read_resource":
-        uri = _arg_or_kw(args, kwargs, 0, "uri")
-        return str(uri) if uri else _CLIENT_METHODS[method_name].entity_name
+        return _CLIENT_METHODS[method_name].entity_name
     if method_name == "get_prompt":
         name = _arg_or_kw(args, kwargs, 0, "name")
         return str(name) if name else _CLIENT_METHODS[method_name].entity_name
@@ -315,6 +331,7 @@ class MCPInstrumentor:
     _shared_delegate: ClassVar[object | None] = None
     _shared_patched_methods: ClassVar[list[str]] = []
     _state_lock: ClassVar[RLock] = RLock()
+    _native_patches: ClassVar[list[tuple[Any, Any, Any]]] = []
 
     def __init__(self, **instrumentor_kwargs: Any) -> None:
         self._instrumentor_kwargs = instrumentor_kwargs
@@ -404,6 +421,9 @@ class MCPInstrumentor:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> Any:
+        if not is_instrumentation_enabled():
+            return await wrapped(*args, **kwargs)
+        include_content = _capture_content()
         config = _CLIENT_METHODS[method_name]
         entity_name = _entity_name(method_name, args, kwargs)
         tracer = trace.get_tracer(__name__)
@@ -412,32 +432,59 @@ class MCPInstrumentor:
             span.set_attribute(RESPAN_LOG_TYPE, config.log_type)
             span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_NAME, entity_name)
             span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_PATH, entity_name)
-            span.set_attribute(
-                SpanAttributes.TRACELOOP_ENTITY_INPUT,
-                _json_dumps(_method_input(method_name, args, kwargs)),
-            )
+            if include_content:
+                span.set_attribute(
+                    SpanAttributes.TRACELOOP_ENTITY_INPUT,
+                    _json_dumps(_method_input(method_name, args, kwargs)),
+                )
 
             try:
-                result = await wrapped(*args, **kwargs)
-            except Exception as exc:
+                with owned_operation(method_name, entity_name):
+                    result = await wrapped(*args, **kwargs)
+            except (Exception, asyncio.CancelledError) as exc:
+                message = str(exc) or type(exc).__name__
                 span.record_exception(exc)
-                span.set_status(Status(StatusCode.ERROR, str(exc)))
-                span.set_attribute(
-                    SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
-                    _json_dumps(
-                        {
-                            "error": type(exc).__name__,
-                            "message": str(exc),
-                        }
-                    ),
-                )
+                span.set_status(Status(StatusCode.ERROR, message))
+                span.set_attribute(ERROR_MESSAGE, message)
+                if include_content:
+                    span.set_attribute(
+                        SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+                        _json_dumps({"error": type(exc).__name__, "message": message}),
+                    )
                 raise
 
-            span.set_attribute(
-                SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
-                _json_dumps(result),
-            )
+            if include_content:
+                span.set_attribute(
+                    SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+                    _json_dumps(result),
+                )
+            # Tool errors are valid JSON-RPC results, rather than exceptions.
+            if method_name == "call_tool" and (
+                getattr(result, "is_error", False) or getattr(result, "isError", False)
+            ):
+                message = "MCP tool returned an error"
+                span.set_status(Status(StatusCode.ERROR, message))
+                span.set_attribute(ERROR_MESSAGE, message)
             return result
+
+    @classmethod
+    def _unpatch_client_session(cls) -> None:
+        restore_native_spans(cls._native_patches)
+        cls._native_patches.clear()
+        for method_name in reversed(cls._shared_patched_methods):
+            try:
+                unwrap(
+                    f"{MCP_CLIENT_SESSION_MODULE}.ClientSession",
+                    method_name,
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to unwrap MCP ClientSession.%s",
+                    method_name,
+                    exc_info=True,
+                )
+        cls._shared_patched_methods.clear()
+        cls._patches_applied = False
 
     def activate(self) -> None:
         """Activate MCP context propagation and native client spans."""
@@ -460,7 +507,15 @@ class MCPInstrumentor:
                 return
 
             delegate = self._activate_context_propagation()
-            patches_applied = cls._patch_client_session()
+            try:
+                patches_applied = cls._patch_client_session()
+                cls._native_patches = patch_native_spans()
+            except Exception:
+                logger.exception("Failed to patch MCP client operations")
+                cls._unpatch_client_session()
+                if delegate is not None:
+                    delegate.deactivate()
+                return
 
             if delegate is None and not patches_applied:
                 return
@@ -485,20 +540,7 @@ class MCPInstrumentor:
                 logger.info("MCP instrumentation remains active for another owner")
                 return
 
-            for method_name in reversed(cls._shared_patched_methods):
-                try:
-                    unwrap(
-                        f"{MCP_CLIENT_SESSION_MODULE}.ClientSession",
-                        method_name,
-                    )
-                except Exception:
-                    logger.debug(
-                        "Failed to unwrap MCP ClientSession.%s",
-                        method_name,
-                        exc_info=True,
-                    )
-            cls._shared_patched_methods.clear()
-            cls._patches_applied = False
+            cls._unpatch_client_session()
 
             delegate = cls._shared_delegate
             cls._shared_delegate = None

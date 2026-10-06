@@ -1,16 +1,17 @@
 import asyncio
 import json
 import sys
-from types import ModuleType
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from typing import ClassVar
 
 import pytest
 from opentelemetry import context as context_api
 from opentelemetry.semconv_ai import SpanAttributes
-
-from respan_instrumentation_agno import AgnoInstrumentor
-from respan_instrumentation_agno import _instrumentation
-from respan_instrumentation_agno import _otel_emitter
+from respan_instrumentation_agno import (
+    AgnoInstrumentor,
+    _instrumentation,
+    _otel_emitter,
+)
 from respan_instrumentation_agno._constants import (
     AGNO_AGENT_MODULE,
     AGNO_RUN_ID_ATTR,
@@ -42,7 +43,7 @@ class FakeModel:
 class FakeToolExecution:
     tool_call_id = "call_1"
     tool_name = "lookup_weather"
-    tool_args = {"city": "Tokyo"}
+    tool_args: ClassVar[dict] = {"city": "Tokyo"}
     result = "sunny"
     tool_call_error = False
 
@@ -58,8 +59,8 @@ class FakeRunOutput:
     model = "gpt-4o-mini"
     model_provider = "OpenAI"
     metrics = FakeMetrics()
-    tools = [FakeToolExecution()]
-    metadata = {"plan": "pro"}
+    tools: ClassVar[list] = [FakeToolExecution()]
+    metadata: ClassVar[dict] = {"plan": "pro"}
     status = "completed"
 
 
@@ -72,7 +73,7 @@ class FakeAgent:
     id = "agent_123"
     name = "Weather Agent"
     model = FakeModel()
-    tools = []
+    tools: ClassVar[list] = []
 
     def run(self, input, **kwargs):
         return FakeRunOutput()
@@ -106,7 +107,7 @@ class FakeTeam:
     id = "team_123"
     name = "Research Team"
     model = FakeModel()
-    tools = []
+    tools: ClassVar[list] = []
 
     def run(self, input, **kwargs):
         return SimpleNamespace(
@@ -303,9 +304,12 @@ def test_sync_run_emits_agent_chat_and_tool_spans(captured_spans):
     assert chat_attributes[f"{AGNO_COMPLETION_PREFIX}0.role"] == "assistant"
     assert chat_attributes[f"{AGNO_COMPLETION_PREFIX}0.content"] == "It is sunny."
     assert "gen_ai.completion.0.tool_calls" in chat_attributes
-    assert json.loads(chat_attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT])[
-        "tool_calls"
-    ][0]["function"]["name"] == "lookup_weather"
+    assert (
+        json.loads(chat_attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT])[
+            "tool_calls"
+        ][0]["function"]["name"]
+        == "lookup_weather"
+    )
     assert "tool_calls" not in chat_attributes
     assert "tools" not in chat_attributes
 

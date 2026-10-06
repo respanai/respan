@@ -401,6 +401,7 @@ def test_real_mcp_pydantic_export_and_connection_failure(monkeypatch):
             assert [tool.name for tool in tools.tools] == [
                 "summarize_city",
                 "current_trace_id",
+                "fail",
             ]
             result = await session.call_tool(
                 "summarize_city",
@@ -408,6 +409,10 @@ def test_real_mcp_pydantic_export_and_connection_failure(monkeypatch):
             )
             assert result.content[0].text == "Paris: ready"
             trace_result = await session.call_tool("current_trace_id")
+            failure = await session.call_tool("fail")
+            assert getattr(failure, "is_error", None) or getattr(
+                failure, "isError", None
+            )
             return trace_result.content[0].text
 
     async def exercise() -> tuple[str, ExceptionGroup]:
@@ -450,6 +455,7 @@ def test_real_mcp_pydantic_export_and_connection_failure(monkeypatch):
             "mcp.list_tools": 1,
             "mcp.tool.summarize_city": 1,
             "mcp.tool.current_trace_id": 1,
+            "mcp.tool.fail": 1,
             "mcp.real.failure": 1,
         }
     )
@@ -461,6 +467,14 @@ def test_real_mcp_pydantic_export_and_connection_failure(monkeypatch):
     assert failure_root.attributes["test.run_id"] == failure_marker
     assert server_trace_id == f"{success_root.context.trace_id:032x}"
 
+    tool_failure = next(span for span in spans if span.name == "mcp.tool.fail")
+    assert tool_failure.status.status_code is StatusCode.ERROR
+    assert (
+        json.loads(tool_failure.attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT])[
+            "isError"
+        ]
+        is True
+    )
     list_tools_span = next(span for span in spans if span.name == "mcp.list_tools")
     list_tools_output = json.loads(
         list_tools_span.attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]
@@ -482,11 +496,63 @@ def test_real_mcp_pydantic_export_and_connection_failure(monkeypatch):
         span for span in initialize_spans if span.status.status_code is StatusCode.ERROR
     )
     assert failed_initialize.parent.span_id == failure_root.context.span_id
-    assert json.loads(
+    failure_output = json.loads(
         failed_initialize.attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]
-    ) == {"error": "McpError", "message": "Connection closed"}
+    )
+    assert failure_output["error"] in {"McpError", "MCPError"}
+    assert failure_output["message"] == "Connection closed"
     assert failure_root.status.status_code is StatusCode.ERROR
     assert all(span.name != "MCP send initialize" for span in spans)
     assert MCPInstrumentor._patches_applied is False
     assert MCPInstrumentor._activation_count == 0
     assert MCPInstrumentor._shared_patched_methods == []
+
+
+def test_cancellation_is_recorded_and_propagated(monkeypatch):
+    fake_tracer = FakeTracer()
+    monkeypatch.setattr(_instrumentation.trace, "get_tracer", lambda _name: fake_tracer)
+
+    async def cancelled():
+        raise asyncio.CancelledError("cancelled MCP operation")
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(MCPInstrumentor._trace_async_method("call_tool", cancelled, (), {}))
+    assert fake_tracer.spans[0].status.status_code is StatusCode.ERROR
+
+
+def test_disabled_content_hides_resource_uri(monkeypatch):
+    fake_tracer = FakeTracer()
+    monkeypatch.setattr(_instrumentation.trace, "get_tracer", lambda _name: fake_tracer)
+    monkeypatch.setenv("TRACELOOP_TRACE_CONTENT", "false")
+
+    async def read(*args):
+        return {"contents": "private resource text"}
+
+    asyncio.run(
+        MCPInstrumentor._trace_async_method(
+            "read_resource", read, ("private://secret",), {}
+        )
+    )
+    assert "private" not in str(fake_tracer.spans[0].attributes)
+    assert SpanAttributes.TRACELOOP_ENTITY_INPUT not in fake_tracer.spans[0].attributes
+    assert SpanAttributes.TRACELOOP_ENTITY_OUTPUT not in fake_tracer.spans[0].attributes
+
+
+def test_partial_activation_restores_patches_and_delegate(monkeypatch):
+    fake = _install_fake_modules(monkeypatch)
+    original = fake.client_session_class.list_tools
+    wrap = _instrumentation.wrap_function_wrapper
+
+    def fail_second(module, target, wrapper):
+        if target.endswith("call_tool"):
+            raise RuntimeError("patch rejected")
+        return wrap(module, target, wrapper)
+
+    monkeypatch.setattr(_instrumentation, "wrap_function_wrapper", fail_second)
+    instrumentor = MCPInstrumentor()
+    instrumentor.activate()
+    assert not instrumentor._is_instrumented
+    assert MCPInstrumentor._activation_count == 0
+    assert MCPInstrumentor._shared_patched_methods == []
+    assert fake.client_session_class.list_tools is original
+    assert fake.delegate_class.created[0].is_deactivated

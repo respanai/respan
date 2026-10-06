@@ -1,21 +1,38 @@
 """Emit Agno runs as Respan-compatible OTEL spans."""
 
-import json
+import inspect
 import logging
 from collections.abc import Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-import inspect
-from typing import Any
-from typing import Union
-from typing import get_args
-from typing import get_origin
+from typing import Any, Union, get_args, get_origin
 
 from opentelemetry import context as context_api
 from opentelemetry import trace
-from opentelemetry.semconv_ai import LLMRequestTypeValues
-from opentelemetry.semconv_ai import SpanAttributes
+from opentelemetry.semconv._incubating.attributes import (
+    gen_ai_attributes as GenAIAttributes,
+)
+from opentelemetry.semconv_ai import LLMRequestTypeValues, SpanAttributes
+from respan_sdk.constants.llm_logging import (
+    LOG_TYPE_AGENT,
+    LOG_TYPE_CHAT,
+    LOG_TYPE_TOOL,
+    LOG_TYPE_WORKFLOW,
+    LogMethodChoices,
+)
+from respan_sdk.constants.span_attributes import (
+    RESPAN_LOG_METHOD,
+    RESPAN_LOG_TYPE,
+    RESPAN_METADATA,
+)
+from respan_sdk.utils.data_processing.id_processing import (
+    ensure_span_id,
+    ensure_trace_id,
+    format_span_id,
+    format_trace_id,
+)
+from respan_tracing.utils.span_factory import build_readable_span, inject_span
 
 from respan_instrumentation_agno._constants import (
     AGENT_ID_KEY,
@@ -32,11 +49,8 @@ from respan_instrumentation_agno._constants import (
     AGNO_TARGET_AGENT,
     AGNO_TEAM_ID_ATTR,
     AGNO_TEAM_NAME_ATTR,
-    AGNO_TOOL_CALL_ID_ATTR,
-    AGNO_TOOL_SPAN_NAME,
     AGNO_TOOL_NAME_ATTR,
-    AGNO_USAGE_INPUT_TOKENS_ATTR,
-    AGNO_USAGE_OUTPUT_TOKENS_ATTR,
+    AGNO_TOOL_SPAN_NAME,
     AGNO_USER_ID_ATTR,
     ARGUMENTS_KEY,
     ASSISTANT_ROLE,
@@ -45,10 +59,10 @@ from respan_instrumentation_agno._constants import (
     CHAT_SPAN_SEED_PART,
     COMPLETED_EVENT_SUFFIX,
     COMPLETED_STATUS,
-    CONTENT_KEY,
     CONTENT_EVENT_SUFFIX,
-    DEFAULT_AGNO_EVENT_NAME,
+    CONTENT_KEY,
     DEFAULT_AGENT_NAME,
+    DEFAULT_AGNO_EVENT_NAME,
     DEFAULT_EVENT_NAME,
     DEFAULT_TEAM_NAME,
     DEFAULT_TOOL_NAME,
@@ -96,26 +110,8 @@ from respan_instrumentation_agno._constants import (
     USER_ROLE,
     VALUE_KEY,
 )
-from respan_sdk.constants.llm_logging import (
-    LOG_TYPE_AGENT,
-    LOG_TYPE_CHAT,
-    LOG_TYPE_TOOL,
-    LOG_TYPE_WORKFLOW,
-    LogMethodChoices,
-)
-from respan_sdk.constants.span_attributes import (
-    RESPAN_LOG_METHOD,
-    RESPAN_LOG_TYPE,
-    RESPAN_METADATA,
-)
-from respan_sdk.utils.data_processing.id_processing import (
-    ensure_span_id,
-    ensure_trace_id,
-    format_span_id,
-    format_trace_id,
-)
-from respan_sdk.utils.serialization import serialize_value
-from respan_tracing.utils.span_factory import build_readable_span, inject_span
+from respan_instrumentation_agno._serialization import exception_text, safe_text
+from respan_instrumentation_agno._serialization import json_string as _json_string
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +125,7 @@ class _AgnoRunContext:
     root_span_id: str
     parent_span_id: str | None
     workflow_name: str
+    prior_message_ids: frozenset[str] = frozenset()
 
 
 _CURRENT_RUN_CONTEXT: ContextVar[_AgnoRunContext | None] = ContextVar(
@@ -142,6 +139,7 @@ def create_agno_run_context(
     target: Any,
     target_kind: str,
     started_at_ns: int,
+    prior_message_ids: frozenset[str] = frozenset(),
 ) -> _AgnoRunContext:
     current_context = _CURRENT_RUN_CONTEXT.get()
     trace_seed = f"{AGNO_INSTRUMENTATION_NAME}:{target_kind}:{started_at_ns}"
@@ -155,6 +153,7 @@ def create_agno_run_context(
             root_span_id=root_span_id,
             parent_span_id=current_context.root_span_id,
             workflow_name=current_context.workflow_name,
+            prior_message_ids=prior_message_ids,
         )
 
     parent_trace_id, parent_span_id = _current_parent_ids()
@@ -168,6 +167,7 @@ def create_agno_run_context(
         root_span_id=root_span_id,
         parent_span_id=parent_span_id,
         workflow_name=workflow_name,
+        prior_message_ids=prior_message_ids,
     )
 
 
@@ -211,19 +211,11 @@ def _object_to_dict(value: Any) -> dict[str, Any]:
     return {VALUE_KEY: value}
 
 
-def _json_string(value: Any) -> str:
-    try:
-        serialized_value = serialize_value(value=value)
-        return json.dumps(obj=serialized_value, default=str, separators=(",", ":"))
-    except Exception:
-        return json.dumps(obj=str(value), separators=(",", ":"))
-
-
 def _attribute_string(value: Any) -> str | None:
     if value is None:
         return None
     if isinstance(value, str):
-        return value
+        return safe_text(value)
     return _json_string(value=value)
 
 
@@ -282,7 +274,8 @@ def _normalize_provider(provider: Any) -> str | None:
     provider_name = str(provider).strip().lower()
     if not provider_name:
         return None
-    return provider_name.replace(" ", "_")
+    normalized = provider_name.replace(" ", "_")
+    return "openai" if normalized == "openai_chat" else normalized
 
 
 def _target_name(target: Any, output: Any, target_kind: str) -> str:
@@ -606,9 +599,7 @@ def _extract_usage(
 def _completed_event(events: list[Any]) -> Any | None:
     for event in reversed(events):
         event_name = str(_object_value(value=event, key=EVENT_KEY, default=""))
-        if event_name.endswith(COMPLETED_EVENT_SUFFIX) or event_name.endswith(
-            RUN_COMPLETED_EVENT_SUFFIX
-        ):
+        if event_name.endswith((COMPLETED_EVENT_SUFFIX, RUN_COMPLETED_EVENT_SUFFIX)):
             return event
     return None
 
@@ -740,12 +731,12 @@ def _chat_attributes(
     )
     _set_if_present(
         attributes=attributes,
-        key=AGNO_USAGE_INPUT_TOKENS_ATTR,
+        key=GenAIAttributes.GEN_AI_USAGE_INPUT_TOKENS,
         value=prompt_tokens,
     )
     _set_if_present(
         attributes=attributes,
-        key=AGNO_USAGE_OUTPUT_TOKENS_ATTR,
+        key=GenAIAttributes.GEN_AI_USAGE_OUTPUT_TOKENS,
         value=completion_tokens,
     )
     _set_if_present(
@@ -834,7 +825,7 @@ def _tool_attributes(
     }
     _set_if_present(
         attributes=attributes,
-        key=AGNO_TOOL_CALL_ID_ATTR,
+        key=GenAIAttributes.GEN_AI_TOOL_CALL_ID,
         value=tool_call_id,
     )
     return attributes
@@ -881,7 +872,16 @@ def emit_agno_run(
     safe_events = list(events or [])
     selected_output = output or _completed_event(events=safe_events)
     if selected_output is None:
-        selected_output = {CONTENT_KEY: "", STATUS_KEY: COMPLETED_STATUS}
+        selected_output = {
+            CONTENT_KEY: "".join(
+                str(_object_value(event, CONTENT_KEY, "") or "")
+                for event in safe_events
+                if str(_object_value(event, EVENT_KEY, "")).endswith(
+                    CONTENT_EVENT_SUFFIX
+                )
+            ),
+            STATUS_KEY: COMPLETED_STATUS,
+        }
 
     trace_id, root_span_id, parent_span_id = _span_ids(
         output=selected_output,
@@ -907,30 +907,75 @@ def emit_agno_run(
     )
     inject_span(span=root_span)
 
-    chat_span_id = format_span_id(
-        ensure_span_id(val=f"{root_span_id}:{CHAT_SPAN_SEED_PART}")
-    )
-    chat_span = build_readable_span(
-        name=AGNO_MODEL_REQUEST_SPAN_NAME,
-        trace_id=trace_id,
-        span_id=chat_span_id,
-        parent_id=root_span_id,
-        start_time_ns=started_at_ns,
-        end_time_ns=ended_at_ns,
-        attributes=_chat_attributes(
-            target=target,
-            target_kind=target_kind,
-            input_value=input_value,
-            output=selected_output,
-            events=safe_events,
-        ),
-        status_code=root_status_code,
-    )
-    inject_span(span=chat_span)
+    messages = _object_value(selected_output, MESSAGES_KEY) or []
+    current_context = _CURRENT_RUN_CONTEXT.get()
+    prior_ids = current_context.prior_message_ids if current_context else frozenset()
+    turns = []
+    for index, message in enumerate(messages):
+        if _object_value(message, ROLE_KEY) != ASSISTANT_ROLE or _object_value(
+            message, "from_history", False
+        ):
+            continue
+        if _object_value(message, ID_KEY) in prior_ids:
+            continue
+        calls = _object_value(message, TOOL_CALLS_KEY) or []
+        call_ids = {_object_value(call, ID_KEY) for call in calls}
+        turn = {
+            CONTENT_KEY: _object_value(message, CONTENT_KEY),
+            MESSAGES_KEY: messages[: index + 1],
+            METRICS_KEY: _object_value(message, METRICS_KEY),
+            MODEL_KEY: _object_value(selected_output, MODEL_KEY),
+            MODEL_PROVIDER_KEY: _object_value(selected_output, MODEL_PROVIDER_KEY),
+            TOOLS_KEY: [
+                tool
+                for tool in _extract_tool_executions(selected_output)
+                if _object_value(tool, TOOL_CALL_ID_KEY) in call_ids
+            ],
+        }
+        turns.append(turn)
+    # Older/custom Agno outputs may omit their message records.
+    if not messages:
+        turns = [selected_output]
+    for turn_index, turn in enumerate(turns):
+        chat_span_id = format_span_id(
+            ensure_span_id(val=f"{root_span_id}:{CHAT_SPAN_SEED_PART}:{turn_index}")
+        )
+        chat_span = build_readable_span(
+            name=AGNO_MODEL_REQUEST_SPAN_NAME,
+            trace_id=trace_id,
+            span_id=chat_span_id,
+            parent_id=root_span_id,
+            start_time_ns=started_at_ns,
+            end_time_ns=ended_at_ns,
+            attributes=_chat_attributes(
+                target=target,
+                target_kind=target_kind,
+                input_value=input_value,
+                output=turn,
+                events=[] if messages else safe_events,
+            ),
+            status_code=root_status_code,
+        )
+        inject_span(span=chat_span)
 
     for tool_index, tool_execution in enumerate(
         _extract_tool_executions(output=selected_output)
     ):
+        if (
+            (
+                _object_value(tool_execution, "requires_confirmation")
+                and not _object_value(tool_execution, "confirmed")
+            )
+            or (
+                _object_value(tool_execution, "requires_user_input")
+                and not _object_value(tool_execution, "answered")
+            )
+            or (
+                _object_value(tool_execution, "external_execution_required")
+                and _object_value(tool_execution, RESULT_KEY) is None
+            )
+        ):
+            continue
         tool_span_id = format_span_id(
             ensure_span_id(val=f"{root_span_id}:{TOOL_SPAN_SEED_PART}:{tool_index}"),
         )
@@ -959,9 +1004,7 @@ def emit_agno_run(
             event_name = str(
                 _object_value(value=event, key=EVENT_KEY, default=DEFAULT_EVENT_NAME)
             )
-            if event_name.endswith(COMPLETED_EVENT_SUFFIX) or event_name.endswith(
-                CONTENT_EVENT_SUFFIX
-            ):
+            if event_name.endswith((COMPLETED_EVENT_SUFFIX, CONTENT_EVENT_SUFFIX)):
                 continue
             event_span = build_readable_span(
                 name=AGNO_EVENT_SPAN_NAME,
@@ -989,13 +1032,13 @@ def emit_agno_error(
     target: Any,
     target_kind: str,
     input_value: Any,
-    exception: Exception,
+    exception: BaseException,
     started_at_ns: int,
     ended_at_ns: int,
 ) -> None:
     """Emit a failed Agno root span when the wrapped run raises."""
     output = {
-        CONTENT_KEY: str(exception),
+        CONTENT_KEY: exception_text(exception),
         STATUS_KEY: ERROR_STATUS,
         RUN_ID_KEY: None,
     }
@@ -1019,6 +1062,6 @@ def emit_agno_error(
         end_time_ns=ended_at_ns,
         attributes=attributes,
         status_code=500,
-        error_message=str(exception),
+        error_message=exception_text(exception),
     )
     inject_span(span=error_span)

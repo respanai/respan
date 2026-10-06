@@ -1,33 +1,38 @@
-"""
-Example: Nested traces with parent-child relationships
-"""
+"""Export deterministic Langfuse observations through an initialized Respan runtime."""
+
 import os
-from respan_instrumentation_langfuse import LangfuseInstrumentor
-
-os.environ["RESPAN_API_KEY"] = "your-api-key"
-
-instrumentor = LangfuseInstrumentor()
-instrumentor.instrument(api_key=os.environ["RESPAN_API_KEY"])
 
 from langfuse import Langfuse, observe
+from respan import Respan
+from respan_instrumentation_langfuse import LangfuseInstrumentor
 
-langfuse = Langfuse(
-    public_key="pk-lf-...",
-    secret_key="sk-lf-..."
+respan = Respan(
+    api_key=os.environ["RESPAN_API_KEY"],
+    base_url=os.getenv("RESPAN_BASE_URL", "https://api.respan.ai/api"),
+    instrumentations=[],
 )
+instrumentor = LangfuseInstrumentor()
+instrumentor.instrument()
+langfuse = Langfuse(public_key="pk-lf-local-example", secret_key="sk-lf-local-example")
+
 
 @observe()
 def subtask(name: str):
     return f"Completed: {name}"
 
+
 @observe()
 def main_workflow(task: str):
-    """Parent trace that calls child traces."""
-    result1 = subtask("step 1")
-    result2 = subtask("step 2")
+    subtask("step 1")
+    subtask("step 2")
     return f"Workflow done: {task}"
 
-result = main_workflow("Process request")
-print(result)
 
-langfuse.flush()
+try:
+    print(main_workflow("Process request"))
+    langfuse.flush()
+    respan.flush()
+finally:
+    langfuse.shutdown()
+    instrumentor.uninstrument()
+    respan.shutdown()

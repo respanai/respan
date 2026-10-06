@@ -3,14 +3,12 @@ import os
 import pytest
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.semconv_ai import SpanAttributes
-
 from respan_instrumentation_agno import AgnoInstrumentor
 from respan_sdk.constants.llm_logging import LOG_TYPE_AGENT, LOG_TYPE_CHAT
 from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
 from respan_tracing import RespanTelemetry
 from respan_tracing.core.tracer import RespanTracer
 from respan_tracing.testing import InMemorySpanExporter
-
 
 pytestmark = pytest.mark.integration
 agno_agent_module = pytest.importorskip(modname="agno.agent")

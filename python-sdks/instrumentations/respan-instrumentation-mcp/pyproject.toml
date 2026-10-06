@@ -13,10 +13,11 @@ packages = [
 python = ">=3.11,<3.14"
 respan-tracing = "^2.16.1"
 respan-sdk = ">=2.5.0"
-respan-instrumentation-openinference = ">=1.2.2"
-mcp = ">=1.27.0,<2.0.0"
-openinference-instrumentation-mcp = ">=2.0.0"
+respan-instrumentation-openinference = ">=1.2.5"
+mcp = ">=1.27.0,<3.0.0"
+openinference-instrumentation-mcp = ">=2.0.12"
 opentelemetry-semantic-conventions-ai = ">=0.4.1"
+opentelemetry-semantic-conventions = ">=0.65b0"
 wrapt = ">=1.16.0"
 
 [tool.poetry.plugins."respan.instrumentations"]

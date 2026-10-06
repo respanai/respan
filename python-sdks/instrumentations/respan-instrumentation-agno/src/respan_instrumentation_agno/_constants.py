@@ -109,8 +109,3 @@ AGNO_EVENT_NAME_ATTR = "agno.event.name"
 AGNO_TOOL_CALL_ID_ATTR = "agno.tool.call.id"
 AGNO_TOOL_NAME_ATTR = "agno.tool.name"
 AGNO_STATUS_ATTR = "agno.status"
-
-# These modern usage keys are part of the Respan span contract but are not
-# exposed by opentelemetry-semantic-conventions-ai 0.5.1 yet.
-AGNO_USAGE_INPUT_TOKENS_ATTR = "gen_ai.usage.input_tokens"
-AGNO_USAGE_OUTPUT_TOKENS_ATTR = "gen_ai.usage.output_tokens"

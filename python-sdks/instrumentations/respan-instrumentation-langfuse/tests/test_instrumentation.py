@@ -238,3 +238,36 @@ def test_exporter_detection_is_scoped_to_langfuse_endpoints():
     assert not LangfuseInstrumentor._is_langfuse_exporter(
         SimpleNamespace(_endpoint="https://collector.example.com/v1/traces")
     )
+
+
+def test_uninstrument_preserves_a_later_exporter_wrapper(monkeypatch):
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+    calls = []
+
+    def original(self, spans):
+        calls.append("original")
+        return SpanExportResult.SUCCESS
+
+    monkeypatch.setattr(OTLPSpanExporter, "export", original)
+    instrumentor = LangfuseInstrumentor()
+    instrumentor.instrument()
+    owned = OTLPSpanExporter.export
+
+    def later_wrapper(self, spans):
+        calls.append("later")
+        return owned(self, spans)
+
+    monkeypatch.setattr(OTLPSpanExporter, "export", later_wrapper)
+    instrumentor.uninstrument()
+    assert OTLPSpanExporter.export is later_wrapper
+    exporter = OTLPSpanExporter(
+        endpoint="https://cloud.langfuse.com/api/public/otel/v1/traces"
+    )
+    try:
+        exporter.export(
+            [_source_span(attributes={"langfuse.observation.type": "span"})]
+        )
+        assert calls == ["later", "original"]
+    finally:
+        exporter.shutdown()

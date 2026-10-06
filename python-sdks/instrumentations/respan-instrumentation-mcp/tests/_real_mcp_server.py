@@ -1,4 +1,4 @@
-"""Real MCP 1.x stdio server for instrumentation integration tests."""
+"""Real MCP 1.x/2.x stdio server for instrumentation integration tests."""
 
 from __future__ import annotations
 
@@ -7,23 +7,25 @@ import sys
 if "--exit-immediately" in sys.argv:
     raise SystemExit(3)
 
+if "--without-openinference" not in sys.argv:
+    try:
+        from openinference.instrumentation.mcp import (
+            MCPInstrumentor as OpenInferenceMCPInstrumentor,
+        )
+    except ImportError:
+        OpenInferenceMCPInstrumentor = None
+    else:
+        OpenInferenceMCPInstrumentor().instrument()
+
 try:
-    from openinference.instrumentation.mcp import (
-        MCPInstrumentor as OpenInferenceMCPInstrumentor,
-    )
+    from mcp.server.mcpserver import MCPServer
 except ImportError:
-    OpenInferenceMCPInstrumentor = None
-else:
-    OpenInferenceMCPInstrumentor().instrument()
+    from mcp.server.fastmcp import FastMCP as MCPServer
+    from mcp.server.fastmcp.server import Settings
 
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.server import Settings
+    Settings.model_rebuild(force=True)
 
-# MCP 1.x with current Pydantic otherwise warns while resolving the generic
-# lifespan annotation. Rebuild before FastMCP constructs its Settings instance.
-Settings.model_rebuild(force=True)
-
-server = FastMCP("respan-mcp-instrumentation-test")
+server = MCPServer("respan-mcp-instrumentation-test")
 
 
 @server.tool()
@@ -42,6 +44,11 @@ def current_trace_id() -> str:
     if not span_context.is_valid:
         return ""
     return f"{span_context.trace_id:032x}"
+
+
+@server.tool()
+def fail() -> str:
+    raise ValueError("controlled MCP server error")
 
 
 if __name__ == "__main__":
