@@ -687,7 +687,7 @@ const anthropic = new Anthropic({
 // Use with decorators
 await kai.withTask({ name: 'generate_text' }, async () => {
     const response = await anthropic.messages.create({
-        model: 'claude-3-haiku-20240307',
+        model: 'claude-haiku-4-5-20251001',
         max_tokens: 1024,
         messages: [{ role: 'user', content: 'Hello, Claude!' }]
     });
@@ -698,7 +698,7 @@ await kai.withTask({ name: 'generate_text' }, async () => {
 // Streaming example
 await kai.withTask({ name: 'stream_text' }, async () => {
     const stream = await anthropic.messages.create({
-        model: 'claude-3-haiku-20240307',
+        model: 'claude-haiku-4-5-20251001',
         max_tokens: 1024,
         messages: [{ role: 'user', content: 'Count to 10' }],
         stream: true

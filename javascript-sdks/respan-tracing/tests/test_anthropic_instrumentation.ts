@@ -69,7 +69,7 @@ async function summarizeContent(text: string): Promise<string> {
         { name: 'summarize_workflow', version: 1 },
         async () => {
             const response = await anthropic.messages.create({
-                model: 'claude-3-haiku-20240307',
+                model: 'claude-haiku-4-5-20251001',
                 max_tokens: 200,
                 messages: [{
                     role: 'user',
@@ -91,7 +91,7 @@ async function generateIdeas(topic: string): Promise<string[]> {
         { name: 'ideas_workflow', version: 1 },
         async () => {
             const response = await anthropic.messages.create({
-                model: 'claude-3-haiku-20240307',
+                model: 'claude-haiku-4-5-20251001',
                 max_tokens: 300,
                 messages: [{
                     role: 'user',

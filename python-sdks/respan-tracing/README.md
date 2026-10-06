@@ -585,7 +585,7 @@ anthropic = Anthropic()
 @task(name="ask_for_comments")
 def ask_for_comments(joke: str):
     completion = anthropic.messages.create(
-        model="claude-3-5-sonnet-20240620",
+        model="claude-sonnet-4-6",
         messages=[{"role": "user", "content": f"What do you think about this joke: {joke}"}],
         max_tokens=100,
     )

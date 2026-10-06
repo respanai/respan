@@ -217,7 +217,7 @@ def extract_validated_user(text: str) -> ValidatedUser:
 ```python
 # Different providers
 openai_client = instructor.from_provider("openai/gpt-4o-mini")
-anthropic_client = instructor.from_provider("anthropic/claude-3-5-haiku-20241022")
+anthropic_client = instructor.from_provider("anthropic/claude-haiku-4-5-20251001")
 
 # Same model, different providers
 @task(name="openai_extraction")

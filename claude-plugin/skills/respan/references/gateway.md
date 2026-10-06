@@ -250,7 +250,7 @@ The gateway supports 250+ models across providers. Use any model name:
 response = client.chat.completions.create(model="gpt-4o", ...)
 
 # Anthropic models (via OpenAI SDK!)
-response = client.chat.completions.create(model="claude-sonnet-4-20250514", ...)
+response = client.chat.completions.create(model="claude-sonnet-4-6", ...)
 
 # Google models
 response = client.chat.completions.create(model="gemini-2.0-flash", ...)
@@ -272,7 +272,7 @@ response = client.chat.completions.create(
     model="gpt-4o",
     messages=[...],
     extra_body={
-        "fallback_models": ["claude-sonnet-4-20250514", "gemini-2.0-flash"],
+        "fallback_models": ["claude-sonnet-4-6", "gemini-2.0-flash"],
     },
 )
 ```

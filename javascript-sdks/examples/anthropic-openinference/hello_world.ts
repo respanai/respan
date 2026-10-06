@@ -18,7 +18,7 @@ await respan.initialize();
 const client = new Anthropic();
 
 const message = await client.messages.create({
-  model: "claude-sonnet-4-20250514",
+  model: "claude-sonnet-4-6",
   max_tokens: 100,
   messages: [
     { role: "user", content: "Write a haiku about recursion in programming." },
