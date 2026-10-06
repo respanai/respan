@@ -1,0 +1,8 @@
+{
+  "summary": "Repair Groq streaming, Guardrails native span semantics, and Haystack activation compatibility",
+  "packages": {
+    "respan-instrumentation-groq": "patch",
+    "respan-instrumentation-guardrails": "patch",
+    "respan-instrumentation-haystack": "patch"
+  }
+}
