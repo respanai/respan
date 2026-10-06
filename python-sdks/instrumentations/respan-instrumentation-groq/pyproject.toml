@@ -12,9 +12,10 @@ packages = [
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
 respan-tracing = "^2.17.0"
-respan-instrumentation-openinference = ">=1.2.2"
+respan-sdk = ">=2.7.6"
+respan-instrumentation-openinference = ">=1.2.5"
 groq = ">=0.9.0"
-openinference-instrumentation-groq = ">=0.1.0"
+openinference-instrumentation-groq = ">=0.1.31"
 
 [tool.poetry.plugins."respan.instrumentations"]
 groq = "respan_instrumentation_groq:GroqInstrumentor"

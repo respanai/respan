@@ -10,15 +10,16 @@ Prerequisites:
 
 Environment variables:
     RESPAN_API_KEY   - Your Respan API key (used for both tracing and gateway)
-    RESPAN_BASE_URL  - Respan API endpoint (default: https://api.respan.ai)
+    RESPAN_BASE_URL  - Respan API endpoint (default: https://api.respan.ai/api)
 """
 
 import os
 
 from haystack import Document, Pipeline
-from haystack.components.builders import PromptBuilder
-from haystack.components.generators import OpenAIGenerator
+from haystack.components.builders import ChatPromptBuilder
+from haystack.components.generators.chat import OpenAIChatGenerator
 from haystack.components.retrievers.in_memory import InMemoryBM25Retriever
+from haystack.dataclasses import ChatMessage
 from haystack.document_stores.in_memory import InMemoryDocumentStore
 from respan import Respan
 from respan_instrumentation_haystack import HaystackInstrumentor
@@ -28,12 +29,12 @@ def run_rag_pipeline() -> None:
     respan_api_key = os.environ["RESPAN_API_KEY"]
     respan_base_url = os.getenv(
         "RESPAN_BASE_URL",
-        "https://api.respan.ai",
+        "https://api.respan.ai/api",
     ).rstrip("/")
 
     os.environ.setdefault("HAYSTACK_CONTENT_TRACING_ENABLED", "true")
     os.environ["OPENAI_API_KEY"] = respan_api_key
-    os.environ["OPENAI_BASE_URL"] = f"{respan_base_url}/api/openai"
+    os.environ["OPENAI_BASE_URL"] = respan_base_url
 
     respan = Respan(
         api_key=respan_api_key,
@@ -46,8 +47,7 @@ def run_rag_pipeline() -> None:
         [
             Document(
                 content=(
-                    "Python was created by Guido van Rossum and first released in "
-                    "1991."
+                    "Python was created by Guido van Rossum and first released in 1991."
                 )
             ),
             Document(
@@ -82,10 +82,12 @@ Answer:
         "retriever",
         InMemoryBM25Retriever(document_store=document_store, top_k=2),
     )
-    pipeline.add_component("prompt_builder", PromptBuilder(template=template))
+    pipeline.add_component(
+        "prompt_builder", ChatPromptBuilder(template=[ChatMessage.from_user(template)])
+    )
     pipeline.add_component(
         "generator",
-        OpenAIGenerator(model="gpt-4o-mini"),
+        OpenAIChatGenerator(model="gpt-4o-mini"),
     )
     pipeline.connect("retriever.documents", "prompt_builder.documents")
     pipeline.connect("prompt_builder", "generator")
@@ -96,7 +98,7 @@ Answer:
             "prompt_builder": {"question": "Who created Python?"},
         }
     )
-    print(result["generator"]["replies"][0])
+    print(result["generator"]["replies"][0].text)
 
     respan.flush()
 

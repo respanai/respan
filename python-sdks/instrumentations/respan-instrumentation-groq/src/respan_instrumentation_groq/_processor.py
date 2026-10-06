@@ -6,14 +6,29 @@ import json
 from collections import defaultdict
 from typing import Any
 
+from openinference.semconv.trace import ImageAttributes, MessageContentAttributes
+from openinference.semconv.trace import (
+    MessageAttributes as OIMessageAttributes,
+)
+from openinference.semconv.trace import (
+    SpanAttributes as OISpanAttributes,
+)
 from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor
 from opentelemetry.semconv_ai import SpanAttributes as TLSpanAttributes
+from respan_sdk.constants.span_attributes import (
+    RESPAN_SPAN_HANDOFFS,
+    RESPAN_SPAN_TOOL_CALLS,
+    RESPAN_SPAN_TOOLS,
+)
+
+from ._privacy import content_enabled
 
 GROQ_OPENINFERENCE_SCOPE_NAME = "openinference.instrumentation.groq"
 GEN_AI_PROMPT_PREFIX = f"{TLSpanAttributes.LLM_PROMPTS}."
 GEN_AI_COMPLETION_PREFIX = f"{TLSpanAttributes.LLM_COMPLETIONS}."
 GEN_AI_TOOL_CALLS_SUFFIX = ".tool_calls"
 GEN_AI_TOOL_CALLS_INDEX_FRAGMENT = ".tool_calls."
+OI_INPUT_MESSAGES_PREFIX = f"{OISpanAttributes.LLM_INPUT_MESSAGES}."
 
 _OFF_CONTRACT_ALIAS_ATTRIBUTES = frozenset(
     {
@@ -26,9 +41,9 @@ _OFF_CONTRACT_ALIAS_ATTRIBUTES = frozenset(
         "span_tools",
         "has_tool_calls",
         "parallel_tool_calls",
-        "respan.span.tools",
-        "respan.span.tool_calls",
-        "respan.span.handoffs",
+        RESPAN_SPAN_TOOLS,
+        RESPAN_SPAN_TOOL_CALLS,
+        RESPAN_SPAN_HANDOFFS,
     }
 )
 
@@ -46,9 +61,7 @@ def _is_groq_omit(value: Any) -> bool:
     if isinstance(value, str) and value.startswith("<groq.Omit object at "):
         return True
     value_type = type(value)
-    if value_type.__module__.startswith("groq") and value_type.__name__ == "Omit":
-        return True
-    return repr(value).startswith("<groq.Omit object at ")
+    return value_type.__module__.startswith("groq") and value_type.__name__ == "Omit"
 
 
 def _drop_attribute(attrs: Any, key: str) -> None:
@@ -81,10 +94,9 @@ def _is_gen_ai_message_tool_call_key(key: str) -> bool:
 
 
 def _is_gen_ai_message_tool_call_aggregate_key(key: str) -> bool:
-    return (
-        key.startswith((GEN_AI_PROMPT_PREFIX, GEN_AI_COMPLETION_PREFIX))
-        and key.endswith(GEN_AI_TOOL_CALLS_SUFFIX)
-    )
+    return key.startswith(
+        (GEN_AI_PROMPT_PREFIX, GEN_AI_COMPLETION_PREFIX)
+    ) and key.endswith(GEN_AI_TOOL_CALLS_SUFFIX)
 
 
 def _structured_tool_calls(value: Any) -> Any:
@@ -94,35 +106,6 @@ def _structured_tool_calls(value: Any) -> Any:
         except (TypeError, json.JSONDecodeError):
             return value
     return value
-
-
-def _tool_calls_content(value: Any) -> str | None:
-    tool_calls = _structured_tool_calls(value)
-    if not isinstance(tool_calls, list) or not tool_calls:
-        return None
-
-    descriptions: list[str] = []
-    for tool_call in tool_calls:
-        if not isinstance(tool_call, dict):
-            continue
-        function = tool_call.get("function")
-        if not isinstance(function, dict):
-            continue
-        name = function.get("name")
-        if not isinstance(name, str) or not name:
-            continue
-        arguments = function.get("arguments")
-        if arguments in {None, ""}:
-            descriptions.append(name)
-        elif isinstance(arguments, str):
-            descriptions.append(f"{name}({arguments})")
-        else:
-            descriptions.append(f"{name}({json.dumps(arguments, default=str)})")
-
-    if not descriptions:
-        return None
-    prefix = "Tool call" if len(descriptions) == 1 else "Tool calls"
-    return f"{prefix}: {', '.join(descriptions)}"
 
 
 def _normalize_gen_ai_tool_calls(attrs: Any) -> None:
@@ -143,31 +126,87 @@ def _normalize_gen_ai_tool_calls(attrs: Any) -> None:
 
     for aggregate_key, tool_calls_by_index in indexed_calls.items():
         if aggregate_key not in attrs:
-            attrs[aggregate_key] = [
-                tool_calls_by_index[index] for index in sorted(tool_calls_by_index)
-            ]
+            attrs[aggregate_key] = json.dumps(
+                [tool_calls_by_index[index] for index in sorted(tool_calls_by_index)],
+                default=str,
+                separators=(",", ":"),
+            )
 
     for key in tuple(attrs):
         if _is_gen_ai_message_tool_call_aggregate_key(key):
-            attrs[key] = _structured_tool_calls(attrs[key])
+            structured_tool_calls = _structured_tool_calls(attrs[key])
             message_key = key[: -len(GEN_AI_TOOL_CALLS_SUFFIX)]
             content_key = f"{message_key}.content"
             if attrs.get(content_key) in {None, ""}:
-                attrs[content_key] = _tool_calls_content(attrs[key]) or ""
+                attrs[content_key] = ""
             role_key = f"{message_key}.role"
             if attrs.get(role_key) is None:
                 attrs[role_key] = "assistant"
+            attrs[key] = json.dumps(
+                structured_tool_calls,
+                default=str,
+                separators=(",", ":"),
+            )
         elif _is_gen_ai_message_tool_call_key(key):
             _drop_attribute(attrs, key)
 
 
+def _promote_tool_result_identity(attrs: Any) -> None:
+    """Retain OI tool-result identity before the shared translator strips it."""
+    for key, value in tuple(attrs.items()):
+        if not key.startswith(OI_INPUT_MESSAGES_PREFIX):
+            continue
+        suffix = key[len(OI_INPUT_MESSAGES_PREFIX) :]
+        index, separator, message_field = suffix.partition(".")
+        if separator != "." or not index.isdigit():
+            continue
+        target = f"{GEN_AI_PROMPT_PREFIX}{index}"
+        if message_field == OIMessageAttributes.MESSAGE_TOOL_CALL_ID:
+            attrs.setdefault(f"{target}.tool_call_id", value)
+        elif message_field == OIMessageAttributes.MESSAGE_NAME:
+            attrs.setdefault(f"{target}.name", value)
+
+
+def _promote_message_contents(attrs: dict) -> None:
+    """Translate structured OI content after its privacy filters have run."""
+    for source, target in (
+        (OISpanAttributes.LLM_INPUT_MESSAGES, TLSpanAttributes.LLM_PROMPTS),
+        (OISpanAttributes.LLM_OUTPUT_MESSAGES, TLSpanAttributes.LLM_COMPLETIONS),
+    ):
+        buckets: dict[str, dict[int, dict]] = defaultdict(lambda: defaultdict(dict))
+        for key, value in tuple(attrs.items()):
+            if not key.startswith(source + "."):
+                continue
+            index, _, tail = key[len(source) + 1 :].partition(".")
+            prefix = OIMessageAttributes.MESSAGE_CONTENTS + "."
+            if not index.isdigit() or not tail.startswith(prefix):
+                continue
+            part, _, field = tail[len(prefix) :].partition(".")
+            if part.isdigit():
+                buckets[index][int(part)][field] = value
+        for index, parts in buckets.items():
+            content = []
+            for _, fields in sorted(parts.items()):
+                kind = fields.get(MessageContentAttributes.MESSAGE_CONTENT_TYPE)
+                if kind in {"text", "reasoning"}:
+                    text = fields.get(MessageContentAttributes.MESSAGE_CONTENT_TEXT)
+                    if text is not None:
+                        content.append({"type": kind, "text": text})
+                elif kind == "image":
+                    url = fields.get(
+                        f"{MessageContentAttributes.MESSAGE_CONTENT_IMAGE}.{ImageAttributes.IMAGE_URL}"
+                    )
+                    if url is not None:
+                        content.append({"type": "image_url", "image_url": {"url": url}})
+            if content:
+                attrs.setdefault(
+                    f"{target}.{index}.content",
+                    json.dumps(content, separators=(",", ":")),
+                )
+
+
 def _is_groq_span(span: ReadableSpan, attrs: Any) -> bool:
-    if _span_scope_name(span) == GROQ_OPENINFERENCE_SCOPE_NAME:
-        return True
-    if any(_is_groq_omit(value) for value in attrs.values()):
-        return True
-    system = attrs.get("gen_ai.system") or attrs.get("llm.system")
-    return isinstance(system, str) and system.lower() == "groq"
+    return _span_scope_name(span) == GROQ_OPENINFERENCE_SCOPE_NAME
 
 
 class GroqSpanProcessor(SpanProcessor):
@@ -183,7 +222,72 @@ class GroqSpanProcessor(SpanProcessor):
         if not _is_groq_span(span, attrs):
             return
 
+        attrs = dict(attrs)
+        span._attributes = attrs
         _normalize_gen_ai_tool_calls(attrs)
         for key in tuple(attrs):
             if key in _OFF_CONTRACT_ALIAS_ATTRIBUTES or _is_groq_omit(attrs[key]):
                 _drop_attribute(attrs, key)
+
+
+class GroqInputSpanProcessor(SpanProcessor):
+    """Promote Groq message fields after privacy and before OI translation."""
+
+    def __init__(self):
+        self._hidden: set[int] = set()
+
+    def on_start(self, span, parent_context=None) -> None:
+        if _span_scope_name(
+            span
+        ) == GROQ_OPENINFERENCE_SCOPE_NAME and not content_enabled(parent_context):
+            self._hidden.add(span.get_span_context().span_id)
+
+    def on_end(self, span: ReadableSpan) -> None:
+        original_attrs = getattr(span, "_attributes", None)
+        if original_attrs is None or not _is_groq_span(span, original_attrs):
+            return
+        attrs = dict(original_attrs)
+        span_id = span.context.span_id if getattr(span, "context", None) else None
+        if span_id in self._hidden:
+            self._hidden.discard(span_id)
+            for key in tuple(attrs):
+                if key in {
+                    OISpanAttributes.INPUT_VALUE,
+                    OISpanAttributes.OUTPUT_VALUE,
+                    OISpanAttributes.INPUT_MIME_TYPE,
+                    OISpanAttributes.OUTPUT_MIME_TYPE,
+                } or key.startswith(
+                    (
+                        OISpanAttributes.LLM_INPUT_MESSAGES,
+                        OISpanAttributes.LLM_OUTPUT_MESSAGES,
+                        OISpanAttributes.LLM_TOOLS,
+                        TLSpanAttributes.LLM_PROMPTS,
+                        TLSpanAttributes.LLM_COMPLETIONS,
+                    )
+                ):
+                    attrs.pop(key, None)
+            invocation = attrs.get(OISpanAttributes.LLM_INVOCATION_PARAMETERS)
+            if invocation:
+                try:
+                    parameters = json.loads(invocation)
+                    allowed = {
+                        "model",
+                        "temperature",
+                        "max_tokens",
+                        "max_completion_tokens",
+                        "top_p",
+                        "stream",
+                        "reasoning_effort",
+                    }
+                    attrs[OISpanAttributes.LLM_INVOCATION_PARAMETERS] = json.dumps(
+                        {
+                            key: value
+                            for key, value in parameters.items()
+                            if key in allowed
+                        }
+                    )
+                except (TypeError, ValueError):
+                    attrs.pop(OISpanAttributes.LLM_INVOCATION_PARAMETERS, None)
+        _promote_tool_result_identity(attrs)
+        _promote_message_contents(attrs)
+        span._attributes = attrs
