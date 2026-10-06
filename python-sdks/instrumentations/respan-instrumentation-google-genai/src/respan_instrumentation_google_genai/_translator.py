@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import inspect
 import json
-from typing import Any, Iterable
+import logging
+import os
+from collections.abc import Iterable
+from typing import Any
+
+from opentelemetry import context as context_api
+from respan_sdk.utils.serialization import serialize_value
 
 from respan_instrumentation_google_genai._constants import (
     ARGS_KEY,
+    ASSISTANT_ROLE,
     AUTOMATIC_FUNCTION_CALLING_HISTORY_KEY,
     BUILTIN_TOOL_FIELDS,
     CANDIDATES_KEY,
@@ -34,13 +41,34 @@ from respan_instrumentation_google_genai._constants import (
     SYSTEM_ROLE,
     TEXT_KEY,
     THOUGHTS_TOKEN_COUNT_KEY,
+    TOOL_ROLE,
     TOOLS_KEY,
     TOTAL_TOKEN_COUNT_KEY,
     TYPE_KEY,
     USAGE_METADATA_KEY,
     USER_ROLE,
 )
-from respan_sdk.utils.serialization import serialize_value
+
+logger = logging.getLogger(__name__)
+
+
+def capture_content() -> bool:
+    return (os.getenv("TRACELOOP_TRACE_CONTENT") or "true").lower() == "true" or bool(
+        context_api.get_value("override_enable_content_tracing")
+    )
+
+
+def contents_with_history(contents: Any, response_or_chunks: Any) -> Any:
+    responses = (
+        response_or_chunks
+        if isinstance(response_or_chunks, list)
+        else [response_or_chunks]
+    )
+    for response in reversed(responses):
+        history = _field(response, AUTOMATIC_FUNCTION_CALLING_HISTORY_KEY)
+        if history:
+            return history
+    return contents
 
 
 def safe_json(value: Any) -> str:
@@ -48,6 +76,7 @@ def safe_json(value: Any) -> str:
     try:
         return json.dumps(serialize_value(value=value), default=str)
     except Exception:
+        logger.debug("Unable to serialize Google Gen AI value", exc_info=True)
         return str(value)
 
 
@@ -206,8 +235,25 @@ def _normalize_content(
         return {ROLE_KEY: default_role, CONTENT_KEY: _normalize_part(content)}
 
     role = _field(content, ROLE_KEY, default_role) or default_role
-    parts = _field(content, PARTS_KEY)
-    return {ROLE_KEY: role, CONTENT_KEY: _normalize_parts(parts)}
+    parts = _field(content, PARTS_KEY) or []
+    if role == MODEL_ROLE:
+        role = ASSISTANT_ROLE
+    calls = [
+        _normalize_function_call(call)
+        for part in parts
+        if (call := _field(part, FUNCTION_CALL_KEY)) is not None
+    ]
+    if parts and all(_field(part, FUNCTION_RESPONSE_KEY) is not None for part in parts):
+        role = TOOL_ROLE
+    message = {
+        ROLE_KEY: role,
+        CONTENT_KEY: _normalize_parts(
+            [part for part in parts if _field(part, FUNCTION_CALL_KEY) is None]
+        ),
+    }
+    if calls:
+        message["tool_calls"] = calls
+    return message
 
 
 def normalize_input_messages(contents: Any, config: Any = None) -> list[dict[str, Any]]:
@@ -327,9 +373,6 @@ def _iter_response_contents(response_or_chunks: Any) -> Iterable[Any]:
         if response is None:
             continue
         yield from _candidate_contents(response)
-        history = _field(response, AUTOMATIC_FUNCTION_CALLING_HISTORY_KEY, []) or []
-        for content in history:
-            yield content
 
 
 def extract_tool_calls(response_or_chunks: Any) -> list[dict[str, Any]]:

@@ -13,7 +13,7 @@ packages = [
 python = ">=3.11,<3.14"
 respan-tracing = "^2.17.0"
 respan-sdk = ">=2.6.1"
-cohere = ">=5.0.0,<6"
+cohere = ">=5.0.0,<8"
 opentelemetry-instrumentation-cohere = ">=0.60.0"
 opentelemetry-semantic-conventions-ai = ">=0.5.1,<0.6.0"
 

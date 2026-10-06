@@ -5,17 +5,19 @@ import json
 from collections.abc import Callable
 from typing import Any
 
-import httpx
 import pytest
 import respan_instrumentation_mistralai._instrumentation as instrumentation
 from mistralai.client import Mistral
+from mistralai.client.httpclient import httpx
 from opentelemetry import trace
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.semconv_ai import SpanAttributes
+from pydantic import BaseModel
 from respan_instrumentation_mistralai import MistralAIInstrumentor
 from respan_instrumentation_openinference import OpenInferenceInstrumentor
+from respan_instrumentation_openinference._translator import OpenInferenceTranslator
 from respan_tracing.constants.tracing import SAMPLE_RATE_ATTR
 
 MODEL = "mistral-small-latest"
@@ -148,13 +150,133 @@ def _mistral_spans(spans: tuple[ReadableSpan, ...]) -> list[ReadableSpan]:
     ]
 
 
+@pytest.mark.parametrize(
+    ("resource", "method"),
+    [
+        ("chat", "parse"),
+        ("chat", "parse_async"),
+        ("agents", "complete"),
+        ("agents", "complete_async"),
+        ("agents", "stream"),
+        ("agents", "stream_async"),
+    ],
+)
+def test_released_sdk_helpers_and_agent_completions(monkeypatch, resource, method):
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(trace, "_TRACER_PROVIDER", provider)
+    monkeypatch.setattr(OpenInferenceInstrumentor, "_translator_registered", False)
+    monkeypatch.setattr(
+        OpenInferenceInstrumentor, "_translator", OpenInferenceTranslator()
+    )
+    monkeypatch.setattr(OpenInferenceInstrumentor, "_active_span_processors", [])
+    for name in (
+        "_SHARED_DELEGATE",
+        "_SHARED_CLEANUP_PROCESSOR",
+        "_SHARED_STREAM_GUARD_PATCH",
+        "_SHARED_INSTRUMENTOR_KWARGS",
+    ):
+        monkeypatch.setattr(instrumentation, name, None)
+    monkeypatch.setattr(instrumentation, "_SHARED_REFCOUNT", 0)
+
+    class Answer(BaseModel):
+        answer: int
+
+    def handler(request):
+        body = json.loads(request.content)
+        assert body["messages"][0]["content"] == "Return the answer"
+        if resource == "agents":
+            assert body["agent_id"] == "fixture-agent"
+        else:
+            assert body["response_format"]["type"] == "json_schema"
+        if "stream" in method:
+            return httpx.Response(
+                200,
+                content=_stream_body(
+                    first='{"answer":',
+                    second="42}",
+                    prompt_tokens=7,
+                    completion_tokens=4,
+                ),
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(
+            200,
+            json=_completion_response(
+                content='{"answer":42}', prompt_tokens=7, completion_tokens=4
+            ),
+        )
+
+    kwargs = {"messages": [{"role": "user", "content": "Return the answer"}]}
+    kwargs.update(
+        {"agent_id": "fixture-agent"}
+        if resource == "agents"
+        else {"model": MODEL, "response_format": Answer}
+    )
+    instrumentor = MistralAIInstrumentor()
+    instrumentor.activate()
+    try:
+        with provider.get_tracer("test.helpers").start_as_current_span(
+            "parent"
+        ) as parent:
+            if method.endswith("_async"):
+
+                async def run():
+                    async with _async_client(handler) as client:
+                        result = await getattr(getattr(client, resource), method)(
+                            **kwargs
+                        )
+                        if "stream" in method:
+                            return "".join(
+                                [
+                                    event.data.choices[0].delta.content or ""
+                                    async for event in result
+                                ]
+                            )
+                        if resource == "chat":
+                            assert result.choices[0].message.parsed.answer == 42
+                        return result.choices[0].message.content
+
+                output = asyncio.run(run())
+            else:
+                with _sync_client(handler) as client:
+                    result = getattr(getattr(client, resource), method)(**kwargs)
+                    if "stream" in method:
+                        output = "".join(
+                            event.data.choices[0].delta.content or ""
+                            for event in result
+                        )
+                    else:
+                        if resource == "chat":
+                            assert result.choices[0].message.parsed.answer == 42
+                        output = result.choices[0].message.content
+            assert output == '{"answer":42}'
+        spans = _mistral_spans(exporter.get_finished_spans())
+        assert len(spans) == 1
+        assert spans[0].parent.span_id == parent.get_span_context().span_id
+        attrs = spans[0].attributes
+        assert attrs[SpanAttributes.LLM_REQUEST_MODEL] == MODEL
+        assert attrs[SpanAttributes.LLM_USAGE_PROMPT_TOKENS] == 7
+        assert attrs[SpanAttributes.LLM_USAGE_COMPLETION_TOKENS] == 4
+        assert json.loads(attrs[f"{SpanAttributes.LLM_COMPLETIONS}.0.content"]) == {
+            "answer": 42
+        }
+        assert OFF_CONTRACT_ALIASES.isdisjoint(attrs)
+    finally:
+        instrumentor.deactivate()
+        provider.shutdown()
+
+
 def test_current_sdk_exports_complete_canonical_spans(monkeypatch) -> None:
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     monkeypatch.setattr(trace, "_TRACER_PROVIDER", provider)
     monkeypatch.setattr(OpenInferenceInstrumentor, "_translator_registered", False)
-    monkeypatch.setattr(OpenInferenceInstrumentor, "_translator", None)
+    monkeypatch.setattr(
+        OpenInferenceInstrumentor, "_translator", OpenInferenceTranslator()
+    )
     monkeypatch.setattr(OpenInferenceInstrumentor, "_active_span_processors", [])
     monkeypatch.setattr(instrumentation, "_SHARED_DELEGATE", None)
     monkeypatch.setattr(instrumentation, "_SHARED_CLEANUP_PROCESSOR", None)
@@ -407,7 +529,9 @@ def test_current_sdk_finalizes_interrupted_streams(monkeypatch) -> None:
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     monkeypatch.setattr(trace, "_TRACER_PROVIDER", provider)
     monkeypatch.setattr(OpenInferenceInstrumentor, "_translator_registered", False)
-    monkeypatch.setattr(OpenInferenceInstrumentor, "_translator", None)
+    monkeypatch.setattr(
+        OpenInferenceInstrumentor, "_translator", OpenInferenceTranslator()
+    )
     monkeypatch.setattr(OpenInferenceInstrumentor, "_active_span_processors", [])
     monkeypatch.setattr(instrumentation, "_SHARED_DELEGATE", None)
     monkeypatch.setattr(instrumentation, "_SHARED_CLEANUP_PROCESSOR", None)
@@ -506,6 +630,23 @@ def test_current_sdk_finalizes_interrupted_streams(monkeypatch) -> None:
             assert first.data.choices[0].delta.content == "partial "
             await early_stream.aclose()
 
+            # HTTPX2 closes the source during cancellation; a failing source
+            # cleanup can replace the cancellation message before Respan sees it.
+            # Compare with the same released SDK without instrumentation.
+            instrumentor.deactivate()
+            bare_stream = await client.chat.stream_async(
+                model=MODEL,
+                messages=[{"role": "user", "content": "async cancellation"}],
+            )
+            await anext(bare_stream)
+            bare_pending = asyncio.create_task(anext(bare_stream))
+            await asyncio.sleep(0)
+            bare_pending.cancel("original stream cancellation")
+            with pytest.raises(asyncio.CancelledError) as bare_error:
+                await bare_pending
+            expected_cancellation = str(bare_error.value)
+            instrumentor.activate()
+
             cancelled_stream = await client.chat.stream_async(
                 model=MODEL,
                 messages=[{"role": "user", "content": "async cancellation"}],
@@ -515,11 +656,9 @@ def test_current_sdk_finalizes_interrupted_streams(monkeypatch) -> None:
             pending = asyncio.create_task(anext(cancelled_stream))
             await asyncio.sleep(0)
             pending.cancel("original stream cancellation")
-            with pytest.raises(
-                asyncio.CancelledError,
-                match="original stream cancellation",
-            ):
+            with pytest.raises(asyncio.CancelledError) as instrumented_error:
                 await pending
+            assert str(instrumented_error.value) == expected_cancellation
 
     asyncio.run(run_async_interruptions())
     instrumentor.deactivate()

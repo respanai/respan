@@ -7,6 +7,7 @@ import inspect
 import logging
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from functools import wraps
 from threading import RLock
 from typing import Any, ClassVar
 
@@ -23,6 +24,7 @@ from respan_tracing.core.tracer import RespanTracer
 from wrapt import wrap_function_wrapper
 
 from respan_instrumentation_pinecone._serialization import (
+    MAX_ITEMS,
     exception_message,
     exception_status_code,
     is_sensitive_key,
@@ -42,6 +44,7 @@ class PatchSpec:
     class_name: str
     methods: tuple[str, ...] | None = None
     is_async: bool = False
+    is_paginator: bool = False
     label: str = "client"
     exclude: frozenset[str] = field(default_factory=frozenset)
 
@@ -229,6 +232,143 @@ class NativeClientInstrumentor:
         finally:
             active_call.reset(token)
 
+    def _trace_async_generator(
+        self,
+        operation: str,
+        wrapped: Any,
+        instance: Any,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> Any:
+        """Trace a lazy async generator without leaking span context to callers."""
+        source = wrapped(*args, **kwargs)
+
+        async def iterate():
+            active_call = type(self)._active_call
+            if active_call.get() or not type(self)._patches_applied:
+                try:
+                    async for item in source:
+                        yield item
+                finally:
+                    await source.aclose()
+                return
+            span = trace.get_tracer(self.name, "0.1.0").start_span(
+                self._span_name(operation), kind=SpanKind.CLIENT
+            )
+            self._set_start_attributes(span, operation, instance, wrapped, args, kwargs)
+            captured = []
+            count = 0
+            failed = False
+            try:
+                while True:
+                    with trace.use_span(
+                        span,
+                        end_on_exit=False,
+                        record_exception=False,
+                        set_status_on_exception=False,
+                    ):
+                        token = active_call.set(True)
+                        try:
+                            item = await anext(source)
+                        finally:
+                            active_call.reset(token)
+                    count += 1
+                    if self._capture_content and len(captured) < MAX_ITEMS:
+                        captured.append(item)
+                    yield item
+            except StopAsyncIteration:
+                pass
+            except GeneratorExit:
+                raise
+            except BaseException as exception:
+                failed = True
+                self._set_error(span, exception)
+                raise
+            finally:
+                try:
+                    await source.aclose()
+                except BaseException as exception:
+                    if not failed:
+                        failed = True
+                        self._set_error(span, exception)
+                        raise
+                finally:
+                    if not failed:
+                        span.set_status(Status(StatusCode.OK))
+                        if self._capture_content:
+                            span.set_attribute(
+                                SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+                                json_dumps(
+                                    {
+                                        "items": captured,
+                                        "count": count,
+                                        "truncated": count > len(captured),
+                                    }
+                                ),
+                            )
+                    span.end()
+
+        return iterate()
+
+    def _trace_paginator(
+        self,
+        operation: str,
+        wrapped: Any,
+        instance: Any,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> Any:
+        """Keep the native paginator and trace only pages actually requested."""
+        try:
+            paginator = wrapped(*args, **kwargs)
+        except Exception as exception:  # noqa: BLE001 - preserve SDK validation errors
+
+            def failed_call(
+                *_args: Any, _error: Exception = exception, **_kwargs: Any
+            ) -> Any:
+                raise _error
+
+            return self._trace_sync(operation, failed_call, instance, args, kwargs)
+        fetch_page = paginator._fetch_page
+
+        if inspect.iscoroutinefunction(fetch_page):
+
+            async def traced_page(token: str | None) -> Any:
+                if not type(self)._patches_applied:
+                    return await fetch_page(token)
+
+                @wraps(wrapped)
+                async def call(*_args: Any, **_kwargs: Any) -> Any:
+                    return await fetch_page(token)
+
+                return await self._trace_async(
+                    operation,
+                    call,
+                    instance,
+                    args,
+                    {**kwargs, "pagination_token": token},
+                )
+        else:
+
+            def traced_page(token: str | None) -> Any:
+                if not type(self)._patches_applied:
+                    return fetch_page(token)
+
+                @wraps(wrapped)
+                def call(*_args: Any, **_kwargs: Any) -> Any:
+                    return fetch_page(token)
+
+                return self._trace_sync(
+                    operation,
+                    call,
+                    instance,
+                    args,
+                    {**kwargs, "pagination_token": token},
+                )
+
+        paginator._fetch_page = traced_page
+        return paginator
+
     async def _trace_async(
         self,
         operation: str,
@@ -358,7 +498,24 @@ class NativeClientInstrumentor:
                     for method in self._methods_for(target_class, patch):
                         if not callable(getattr(target_class, method, None)):
                             continue
+                        if any(
+                            item.target is target_class and item.attribute == method
+                            for item in patched_targets
+                        ):
+                            continue
                         operation = self._operation_name(patch, method)
+                        target_method = getattr(target_class, method)
+                        try:
+                            annotation = inspect.signature(
+                                target_method
+                            ).return_annotation
+                        except (TypeError, ValueError):
+                            # Optional extension-backed clients may not expose a
+                            # signature. Retain their existing wrapper path.
+                            annotation = None
+                        is_paginator = patch.is_paginator or (
+                            isinstance(annotation, str) and "Paginator" in annotation
+                        )
 
                         def traced(
                             wrapped: Any,
@@ -368,6 +525,10 @@ class NativeClientInstrumentor:
                             *,
                             _operation: str = operation,
                             _async: bool = patch.is_async,
+                            _paginator: bool = is_paginator,
+                            _async_generator: bool = inspect.isasyncgenfunction(
+                                inspect.unwrap(target_method)
+                            ),
                         ) -> Any:
                             instrumentor_class = type(self)
                             if (
@@ -375,6 +536,14 @@ class NativeClientInstrumentor:
                                 or not instrumentor_class._activation_count
                             ):
                                 return wrapped(*args, **kwargs)
+                            if _async_generator:
+                                return self._trace_async_generator(
+                                    _operation, wrapped, instance, args, kwargs
+                                )
+                            if _paginator:
+                                return self._trace_paginator(
+                                    _operation, wrapped, instance, args, kwargs
+                                )
                             if _async:
                                 return self._trace_async(
                                     _operation, wrapped, instance, args, kwargs

@@ -48,6 +48,12 @@ class PineconeInstrumentor(NativeClientInstrumentor):
     )
     patches = (
         PatchSpec(
+            "pinecone.data.index",
+            "Index",
+            _INDEX_OPERATIONS,
+            label="index",
+        ),
+        PatchSpec(
             "pinecone.index",
             "Index",
             _INDEX_OPERATIONS,
@@ -65,6 +71,33 @@ class PineconeInstrumentor(NativeClientInstrumentor):
             "GrpcIndex",
             _INDEX_OPERATIONS,
             label="index",
+        ),
+        PatchSpec(
+            "pinecone.client.documents",
+            "Documents",
+            ("upsert", "batch_upsert", "search", "fetch", "delete", "update"),
+            label="documents",
+        ),
+        PatchSpec(
+            "pinecone.async_client.documents",
+            "AsyncDocuments",
+            ("upsert", "batch_upsert", "search", "fetch", "delete", "update"),
+            is_async=True,
+            label="documents",
+        ),
+        PatchSpec(
+            "pinecone.client.documents",
+            "Documents",
+            ("list",),
+            is_paginator=True,
+            label="documents",
+        ),
+        PatchSpec(
+            "pinecone.async_client.documents",
+            "AsyncDocuments",
+            ("list",),
+            is_paginator=True,
+            label="documents",
         ),
         PatchSpec(
             "pinecone.client.indexes",

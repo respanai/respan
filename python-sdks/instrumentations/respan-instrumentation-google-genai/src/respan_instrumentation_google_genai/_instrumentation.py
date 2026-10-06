@@ -6,21 +6,26 @@ import importlib
 import logging
 import time
 from collections.abc import AsyncIterator, Iterator
-from typing import Any
+from functools import wraps
+from threading import RLock
+from typing import Any, ClassVar
+
+from respan_tracing.core.tracer import RespanTracer
 
 from respan_instrumentation_google_genai._constants import (
     ASYNC_MODELS_CLASS_NAME,
+    EMBED_CONTENT_METHOD_NAME,
     GENERATE_CONTENT_METHOD_NAME,
     GENERATE_CONTENT_STREAM_METHOD_NAME,
     GOOGLE_GENAI_INSTRUMENTATION_NAME,
     GOOGLE_GENAI_MODELS_MODULE,
     MODELS_CLASS_NAME,
 )
+from respan_instrumentation_google_genai._embeddings import emit_embed_content_span
 from respan_instrumentation_google_genai._otel_emitter import (
     emit_generate_content_span,
 )
 from respan_instrumentation_google_genai._translator import request_kwargs_from_call
-from respan_tracing.core.tracer import RespanTracer
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +33,8 @@ _original_sync_generate_content = None
 _original_sync_generate_content_stream = None
 _original_async_generate_content = None
 _original_async_generate_content_stream = None
+_original_sync_embed_content = None
+_original_async_embed_content = None
 
 
 def _get_module_attr(module_path: str, attr_name: str) -> Any:
@@ -84,14 +91,17 @@ def _status_code_from_exception(exc: BaseException) -> int:
     return 500
 
 
-def _wrap_sync_generate_content(original: Any) -> Any:
+def _wrap_sync_generate_content(
+    original: Any, *, emitter: Any = _emit_span_safely
+) -> Any:
+    @wraps(original)
     def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
         start_ns = time.time_ns()
         request_kwargs = request_kwargs_from_call(args=args, kwargs=kwargs)
         try:
             response = original(self, *args, **kwargs)
         except Exception as exc:
-            _emit_span_safely(
+            emitter(
                 request_kwargs=request_kwargs,
                 start_ns=start_ns,
                 error_message=str(exc),
@@ -99,7 +109,7 @@ def _wrap_sync_generate_content(original: Any) -> Any:
             )
             raise
 
-        _emit_span_safely(
+        emitter(
             request_kwargs=request_kwargs,
             start_ns=start_ns,
             response_or_chunks=response,
@@ -163,14 +173,17 @@ def _wrap_sync_generate_content_stream(original: Any) -> Any:
     return wrapper
 
 
-def _wrap_async_generate_content(original: Any) -> Any:
+def _wrap_async_generate_content(
+    original: Any, *, emitter: Any = _emit_span_safely
+) -> Any:
+    @wraps(original)
     async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
         start_ns = time.time_ns()
         request_kwargs = request_kwargs_from_call(args=args, kwargs=kwargs)
         try:
             response = await original(self, *args, **kwargs)
         except Exception as exc:
-            _emit_span_safely(
+            emitter(
                 request_kwargs=request_kwargs,
                 start_ns=start_ns,
                 error_message=str(exc),
@@ -178,7 +191,7 @@ def _wrap_async_generate_content(original: Any) -> Any:
             )
             raise
 
-        _emit_span_safely(
+        emitter(
             request_kwargs=request_kwargs,
             start_ns=start_ns,
             response_or_chunks=response,
@@ -246,6 +259,8 @@ class GoogleGenAIInstrumentor:
     """Respan instrumentor for the Google Gen AI Python SDK."""
 
     name = GOOGLE_GENAI_INSTRUMENTATION_NAME
+    _activation_count = 0
+    _state_lock: ClassVar[RLock] = RLock()
 
     def __init__(self) -> None:
         self._is_instrumented = False
@@ -258,13 +273,24 @@ class GoogleGenAIInstrumentor:
         return bool(getattr(tracer, "is_enabled", True))
 
     def activate(self) -> None:
-        """Monkey-patch Google Gen AI model generation methods."""
+        """Share one set of model patches across active instrumentor instances."""
+        with self._state_lock:
+            self._activate()
+
+    def _activate(self) -> None:
         global _original_sync_generate_content
         global _original_sync_generate_content_stream
         global _original_async_generate_content
         global _original_async_generate_content_stream
+        global _original_sync_embed_content
+        global _original_async_embed_content
 
         if self._is_instrumented:
+            return
+
+        if type(self)._activation_count:
+            type(self)._activation_count += 1
+            self._is_instrumented = True
             return
 
         if not self._is_respan_tracing_enabled():
@@ -292,9 +318,15 @@ class GoogleGenAIInstrumentor:
             )
             return
         except Exception as exc:
-            logger.warning("Failed to activate Google Gen AI instrumentation: %s", exc)
+            logger.warning(
+                "Failed to activate Google Gen AI instrumentation: %s",
+                exc,
+                exc_info=True,
+            )
             return
 
+        self._is_instrumented = True
+        type(self)._activation_count = 1
         try:
             if _original_sync_generate_content is None:
                 _original_sync_generate_content = getattr(
@@ -343,8 +375,37 @@ class GoogleGenAIInstrumentor:
                     _original_async_generate_content_stream
                 ),
             )
+            if hasattr(Models, EMBED_CONTENT_METHOD_NAME):
+                if _original_sync_embed_content is None:
+                    _original_sync_embed_content = getattr(
+                        Models, EMBED_CONTENT_METHOD_NAME
+                    )
+                setattr(
+                    Models,
+                    EMBED_CONTENT_METHOD_NAME,
+                    _wrap_sync_generate_content(
+                        _original_sync_embed_content, emitter=emit_embed_content_span
+                    ),
+                )
+            if hasattr(AsyncModels, EMBED_CONTENT_METHOD_NAME):
+                if _original_async_embed_content is None:
+                    _original_async_embed_content = getattr(
+                        AsyncModels, EMBED_CONTENT_METHOD_NAME
+                    )
+                setattr(
+                    AsyncModels,
+                    EMBED_CONTENT_METHOD_NAME,
+                    _wrap_async_generate_content(
+                        _original_async_embed_content, emitter=emit_embed_content_span
+                    ),
+                )
+
         except Exception as exc:
-            logger.warning("Failed to activate Google Gen AI instrumentation: %s", exc)
+            logger.warning(
+                "Failed to activate Google Gen AI instrumentation: %s",
+                exc,
+                exc_info=True,
+            )
             self.deactivate()
             return
 
@@ -352,17 +413,37 @@ class GoogleGenAIInstrumentor:
         logger.info("Google Gen AI instrumentation activated")
 
     def deactivate(self) -> None:
-        """Restore original Google Gen AI SDK methods."""
+        """Restore SDK methods after the final owner deactivates."""
+        with self._state_lock:
+            self._deactivate()
+
+    def _deactivate(self) -> None:
         global _original_sync_generate_content
         global _original_sync_generate_content_stream
         global _original_async_generate_content
         global _original_async_generate_content_stream
+        global _original_sync_embed_content
+        global _original_async_embed_content
 
         if not self._is_instrumented:
+            return
+        self._is_instrumented = False
+        type(self)._activation_count -= 1
+        if type(self)._activation_count:
             return
 
         try:
             Models, AsyncModels = _load_models_classes()
+            if _original_sync_embed_content is not None:
+                setattr(Models, EMBED_CONTENT_METHOD_NAME, _original_sync_embed_content)
+                _original_sync_embed_content = None
+            if _original_async_embed_content is not None:
+                setattr(
+                    AsyncModels,
+                    EMBED_CONTENT_METHOD_NAME,
+                    _original_async_embed_content,
+                )
+                _original_async_embed_content = None
             if _original_sync_generate_content is not None:
                 setattr(
                     Models,

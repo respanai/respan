@@ -9,9 +9,10 @@ from typing import Any
 import pytest
 from opentelemetry import context as context_api
 from opentelemetry.semconv_ai import SpanAttributes
-
-from respan_instrumentation_google_genai import GoogleGenAIInstrumentor
-from respan_instrumentation_google_genai import _instrumentation
+from respan_instrumentation_google_genai import (
+    GoogleGenAIInstrumentor,
+    _instrumentation,
+)
 from respan_instrumentation_google_genai._constants import (
     ASYNC_MODELS_CLASS_NAME,
     CANDIDATES_TOKEN_COUNT_KEY,
@@ -133,8 +134,8 @@ def fake_google_genai(monkeypatch: pytest.MonkeyPatch) -> tuple[type[Any], type[
     models_module = ModuleType(GOOGLE_GENAI_MODELS_MODULE)
     setattr(models_module, MODELS_CLASS_NAME, Models)
     setattr(models_module, ASYNC_MODELS_CLASS_NAME, AsyncModels)
-    setattr(genai_module, "models", models_module)
-    setattr(google_module, "genai", genai_module)
+    genai_module.models = models_module
+    google_module.genai = genai_module
 
     monkeypatch.setitem(sys.modules, "google", google_module)
     monkeypatch.setitem(sys.modules, "google.genai", genai_module)
@@ -288,13 +289,14 @@ def test_active_workflow_name_is_attached_to_injected_chat_span() -> None:
     )
 
 
-def test_automatic_function_calling_history_promotes_tool_calls() -> None:
+def test_automatic_function_calling_history_stays_in_prompt_fields() -> None:
     function_call = Obj(id="call_1", name="get_weather", args={"city": "Tokyo"})
     history = [
+        Obj(role="user", parts=[Obj(text="Weather in Tokyo?")]),
         Obj(
             role="model",
             parts=[Obj(function_call=function_call)],
-        )
+        ),
     ]
     response = make_response(text="It is sunny.", history=history)
 
@@ -307,7 +309,8 @@ def test_automatic_function_calling_history_promotes_tool_calls() -> None:
         response_or_chunks=response,
     )
 
-    tool_calls = json.loads(attrs["gen_ai.completion.0.tool_calls"])
+    assert "gen_ai.completion.0.tool_calls" not in attrs
+    tool_calls = json.loads(attrs["gen_ai.prompt.1.tool_calls"])
     assert tool_calls == [
         {
             "id": "call_1",
