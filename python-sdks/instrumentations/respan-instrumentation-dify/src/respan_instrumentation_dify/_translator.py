@@ -9,8 +9,24 @@ from typing import Any
 from opentelemetry.semconv._incubating.attributes import (
     gen_ai_attributes as GenAIAttributes,
 )
-from opentelemetry.semconv_ai import LLMRequestTypeValues
-from opentelemetry.semconv_ai import SpanAttributes
+from opentelemetry.semconv_ai import LLMRequestTypeValues, SpanAttributes
+from respan_sdk.constants.llm_logging import (
+    LOG_TYPE_CHAT,
+    LOG_TYPE_TASK,
+    LOG_TYPE_TEXT,
+    LOG_TYPE_WORKFLOW,
+    LogMethodChoices,
+)
+from respan_sdk.constants.span_attributes import (
+    RESPAN_CUSTOMER_PARAMS_ID,
+    RESPAN_LOG_METHOD,
+    RESPAN_LOG_TYPE,
+    RESPAN_METADATA,
+    RESPAN_SPAN_ATTRIBUTES_MAP,
+    RESPAN_THREADS_ID,
+    RESPAN_TRACE_GROUP_ID,
+)
+from respan_sdk.utils.serialization import serialize_value
 
 from respan_instrumentation_dify._constants import (
     ANSWER_KEY,
@@ -36,7 +52,6 @@ from respan_instrumentation_dify._constants import (
     MODE_KEY,
     OFF_CONTRACT_ALIASES,
     OUTPUTS_KEY,
-    PARAMS_KEY,
     PROMPT_TOKENS_KEY,
     QUERY_KEY,
     RESPONSE_MODE_KEY,
@@ -47,33 +62,85 @@ from respan_instrumentation_dify._constants import (
     USER_KEY,
     WORKFLOW_RUN_ID_KEY,
 )
-from respan_sdk.constants.llm_logging import LOG_TYPE_CHAT
-from respan_sdk.constants.llm_logging import LOG_TYPE_TASK
-from respan_sdk.constants.llm_logging import LOG_TYPE_TEXT
-from respan_sdk.constants.llm_logging import LOG_TYPE_WORKFLOW
-from respan_sdk.constants.llm_logging import LogMethodChoices
-from respan_sdk.constants.span_attributes import (
-    RESPAN_CUSTOMER_PARAMS_ID,
-    RESPAN_LOG_METHOD,
-    RESPAN_LOG_TYPE,
-    RESPAN_METADATA,
-    RESPAN_SPAN_ATTRIBUTES_MAP,
-    RESPAN_THREADS_ID,
-    RESPAN_TRACE_GROUP_ID,
+
+_REDACTED = "[REDACTED]"
+_SENSITIVE_KEY_FRAGMENTS = (
+    "accesskey",
+    "apikey",
+    "authorization",
+    "cookie",
+    "credential",
+    "password",
+    "passwd",
+    "passphrase",
+    "privatekey",
+    "secret",
+    "token",
 )
-from respan_sdk.utils.serialization import serialize_value
+_NON_SECRET_TOKEN_KEYS = {
+    "cachedtokens",
+    "completiontokens",
+    "inputtokens",
+    "maxtokens",
+    "outputtokens",
+    "prompttokens",
+    "reasoningtokens",
+    "tokencount",
+    "totaltokens",
+}
+
+
+def _normalized_key(key: Any) -> str:
+    return "".join(
+        character for character in str(key).casefold() if character.isalnum()
+    )
+
+
+def _is_sensitive_key(key: Any) -> bool:
+    normalized = _normalized_key(key)
+    if any(normalized.endswith(key) for key in _NON_SECRET_TOKEN_KEYS):
+        return False
+    return any(fragment in normalized for fragment in _SENSITIVE_KEY_FRAGMENTS)
+
+
+def _redact_sensitive(value: Any, seen: set[int] | None = None) -> Any:
+    seen = seen or set()
+    if isinstance(value, Mapping):
+        identity = id(value)
+        if identity in seen:
+            return "[Circular]"
+        seen.add(identity)
+        return {
+            str(key): (
+                _REDACTED if _is_sensitive_key(key) else _redact_sensitive(nested, seen)
+            )
+            for key, nested in value.items()
+        }
+    if isinstance(value, (list, tuple, set)):
+        identity = id(value)
+        if identity in seen:
+            return "[Circular]"
+        seen.add(identity)
+        return [_redact_sensitive(nested, seen) for nested in value]
+    return value
 
 
 def safe_json(value: Any) -> str:
     """Serialize arbitrary Dify values into an OTEL-safe JSON string."""
     try:
+        serialized = serialize_value(value=value)
         return json.dumps(
-            serialize_value(value=value),
-            default=str,
-            separators=(",", ":"),
+            _redact_sensitive(serialized), default=str, separators=(",", ":")
         )
-    except Exception:
-        return json.dumps(str(value), separators=(",", ":"))
+    except Exception:  # noqa: BLE001 -- arbitrary vendor values may fail serialization
+        try:
+            return json.dumps(
+                _redact_sensitive(value),
+                default=lambda _: "[Unserializable]",
+                separators=(",", ":"),
+            )
+        except Exception:  # noqa: BLE001 -- never leak or break on vendor values
+            return json.dumps("[Unserializable]", separators=(",", ":"))
 
 
 def _to_mapping(value: Any) -> Mapping[str, Any] | None:
@@ -85,15 +152,15 @@ def _to_mapping(value: Any) -> Mapping[str, Any] | None:
             continue
         try:
             converted = method()
-        except Exception:
+        except Exception:  # noqa: BLE001, S112 -- best-effort vendor hook
             continue
         if isinstance(converted, Mapping):
             return converted
         if isinstance(converted, str):
             try:
                 parsed = json.loads(converted)
-            except Exception:
-                continue
+            except json.JSONDecodeError:
+                parsed = None
             if isinstance(parsed, Mapping):
                 return parsed
     value_dict = getattr(value, "__dict__", None)
@@ -123,7 +190,7 @@ def _response_json(response: Any) -> Mapping[str, Any]:
     if callable(json_method):
         try:
             value = json_method()
-        except Exception:
+        except Exception:  # noqa: BLE001 -- vendor response parsing is best effort
             return {}
         mapping = _to_mapping(value)
         return mapping or {}
@@ -136,7 +203,11 @@ def _endpoint_kind(endpoint: str) -> str:
         return "chat"
     if endpoint == COMPLETION_MESSAGES_ENDPOINT:
         return "completion"
-    if endpoint.startswith("/workflows/") or endpoint == "/workflows":
+    if (
+        endpoint.startswith("/workflows/")
+        or endpoint == "/workflows"
+        or endpoint.endswith("/pipeline/run")
+    ):
         return "workflow"
     return "api"
 
@@ -149,7 +220,9 @@ def _default_span_name(endpoint: str) -> str:
         return DIFY_COMPLETION_SPAN_NAME
     if kind == "workflow":
         return DIFY_WORKFLOW_SPAN_NAME
-    return f"{DIFY_API_SPAN_NAME}:{endpoint.strip('/') or 'root'}"
+    # Keep endpoint paths (which often contain high-cardinality IDs) in
+    # metadata, never in the span name.
+    return DIFY_API_SPAN_NAME
 
 
 def _log_type(endpoint: str) -> str:
@@ -275,6 +348,15 @@ def _stream_usage(stream_events: Sequence[Any]) -> Mapping[str, Any]:
     return {}
 
 
+def _stream_response_data(stream_events: Sequence[Any]) -> Mapping[str, Any]:
+    merged: dict[str, Any] = {}
+    for event in stream_events:
+        mapping = _to_mapping(event)
+        if mapping is not None:
+            merged.update(mapping)
+    return merged
+
+
 def _int_value(mapping: Mapping[str, Any], key: str) -> int | None:
     value = mapping.get(key)
     if isinstance(value, bool):
@@ -289,12 +371,62 @@ def _int_value(mapping: Mapping[str, Any], key: str) -> int | None:
 def _set_metadata(attributes: dict[str, Any], key: str, value: Any) -> None:
     if value is None:
         return
-    if isinstance(value, bool):
-        attributes[f"{RESPAN_METADATA}.{key}"] = str(value).lower()
-    elif isinstance(value, (str, int, float)):
-        attributes[f"{RESPAN_METADATA}.{key}"] = str(value)
-    else:
-        attributes[f"{RESPAN_METADATA}.{key}"] = safe_json(value=value)
+    canonical = _metadata_mapping(attributes.get(RESPAN_METADATA))
+
+    serialized_value = serialize_value(value=value)
+    canonical[key] = serialized_value
+    attributes[RESPAN_METADATA] = safe_json(value=canonical)
+
+
+def _metadata_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def _otel_safe_attribute(value: Any) -> Any:
+    serialized = serialize_value(value=value)
+    if serialized is None or isinstance(serialized, (str, bool, int, float)):
+        return serialized
+    if isinstance(serialized, (list, tuple)) and serialized:
+        item_types = {type(item) for item in serialized}
+        if len(item_types) == 1 and item_types.pop() in {str, bool, int, float}:
+            return list(serialized)
+    return safe_json(value=serialized)
+
+
+def _merge_propagated_attributes(
+    attributes: dict[str, Any],
+    propagated_attributes: Mapping[str, Any],
+) -> None:
+    canonical_metadata = _metadata_mapping(attributes.get(RESPAN_METADATA))
+    metadata_prefix = f"{RESPAN_METADATA}."
+    for key, value in propagated_attributes.items():
+        if key == RESPAN_METADATA:
+            for metadata_key, metadata_value in _metadata_mapping(value).items():
+                canonical_metadata.setdefault(metadata_key, metadata_value)
+            continue
+        if key.startswith(metadata_prefix):
+            metadata_key = key.removeprefix(metadata_prefix)
+            if metadata_key:
+                canonical_metadata.setdefault(
+                    metadata_key,
+                    serialize_value(value=value),
+                )
+            continue
+        attribute_value = _otel_safe_attribute(value)
+        if attribute_value is not None:
+            attributes[key] = attribute_value
+
+    if canonical_metadata:
+        attributes[RESPAN_METADATA] = safe_json(value=canonical_metadata)
 
 
 def _apply_response_metadata(
@@ -468,7 +600,9 @@ def _apply_respan_params(
                     value=metadata_value,
                 )
         else:
-            attributes[attr_key] = value
+            attribute_value = _otel_safe_attribute(value)
+            if attribute_value is not None:
+                attributes[attr_key] = attribute_value
     return span_name
 
 
@@ -487,6 +621,7 @@ def build_dify_span_data(
     respan_params: Mapping[str, Any] | None = None,
     propagated_attributes: Mapping[str, Any] | None = None,
     current_workflow_name: str | None = None,
+    parent_id: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Build canonical span name and attributes from a Dify client call."""
     endpoint = endpoint or ""
@@ -506,7 +641,7 @@ def build_dify_span_data(
         RESPAN_LOG_METHOD: LogMethodChoices.TRACING_INTEGRATION.value,
         RESPAN_LOG_TYPE: _log_type(endpoint=endpoint),
         SpanAttributes.TRACELOOP_ENTITY_NAME: default_span_name,
-        SpanAttributes.TRACELOOP_ENTITY_PATH: default_span_name,
+        SpanAttributes.TRACELOOP_ENTITY_PATH: "",
     }
 
     _set_metadata(attributes=attributes, key=f"dify.{METHOD_KEY}", value=method)
@@ -519,7 +654,13 @@ def build_dify_span_data(
         request_json=request_json_mapping,
         request_params=request_params_mapping,
     )
-    _apply_response_metadata(attributes=attributes, response_data=response_data)
+    semantic_response_data = dict(response_data)
+    if stream_events:
+        semantic_response_data.update(_stream_response_data(stream_events))
+    _apply_response_metadata(
+        attributes=attributes,
+        response_data=semantic_response_data,
+    )
 
     usage = (
         _stream_usage(stream_events=stream_events)
@@ -542,7 +683,7 @@ def build_dify_span_data(
             attributes=attributes,
             endpoint=endpoint,
             request_json=request_json_mapping,
-            response_data=response_data,
+            response_data=semantic_response_data,
             usage=usage,
             output=output,
         )
@@ -554,10 +695,16 @@ def build_dify_span_data(
         default_span_name=default_span_name,
     )
     attributes[SpanAttributes.TRACELOOP_ENTITY_NAME] = span_name
-    attributes[SpanAttributes.TRACELOOP_ENTITY_PATH] = span_name
 
-    for key, value in (propagated_attributes or {}).items():
-        attributes[key] = value
+    _merge_propagated_attributes(
+        attributes,
+        propagated_attributes or {},
+    )
+
+    workflow_name = attributes.get(SpanAttributes.TRACELOOP_WORKFLOW_NAME)
+    attributes[SpanAttributes.TRACELOOP_ENTITY_PATH] = (
+        str(workflow_name) if parent_id and workflow_name else ""
+    )
 
     for alias in OFF_CONTRACT_ALIASES:
         attributes.pop(alias, None)

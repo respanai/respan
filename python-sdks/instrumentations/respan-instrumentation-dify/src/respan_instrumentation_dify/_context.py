@@ -7,10 +7,9 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from typing import Any
 
-
-_RESPAN_PARAMS: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
+_RESPAN_PARAMS: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
     "respan_dify_params",
-    default={},
+    default=None,
 )
 
 
@@ -24,7 +23,7 @@ def _to_mapping(value: Any) -> Mapping[str, Any] | None:
         if callable(method):
             try:
                 converted = method()
-            except Exception:
+            except Exception:  # noqa: BLE001, S112 -- best-effort vendor hook
                 continue
             if isinstance(converted, Mapping):
                 return converted
@@ -38,7 +37,7 @@ def _to_mapping(value: Any) -> Mapping[str, Any] | None:
 def use_respan_params(value: Any):
     """Temporarily attach optional Respan params to the current Dify call."""
     mapping = _to_mapping(value) or {}
-    parent = _RESPAN_PARAMS.get()
+    parent = _RESPAN_PARAMS.get() or {}
     merged = {**parent, **dict(mapping)}
     token = _RESPAN_PARAMS.set(merged)
     try:
@@ -48,4 +47,4 @@ def use_respan_params(value: Any):
 
 
 def read_respan_params() -> dict[str, Any]:
-    return dict(_RESPAN_PARAMS.get())
+    return dict(_RESPAN_PARAMS.get() or {})
