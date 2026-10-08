@@ -2,12 +2,11 @@ import os
 
 import pytest
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from respan_instrumentation_llama_index import LlamaIndexInstrumentor
 from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
 from respan_tracing import RespanTelemetry
 from respan_tracing.core.tracer import RespanTracer
 from respan_tracing.testing import InMemorySpanExporter
-
-from respan_instrumentation_llama_index import LlamaIndexInstrumentor
 
 pytestmark = pytest.mark.integration
 

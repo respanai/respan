@@ -3,11 +3,11 @@ import os
 import dspy
 import pytest
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from respan_instrumentation_dspy import DSPyInstrumentor
 from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
 from respan_tracing import RespanTelemetry
 from respan_tracing.core.tracer import RespanTracer
-from respan_tracing.testing import InMemorySpanExporter
 
 
 @pytest.mark.integration
@@ -45,9 +45,9 @@ def test_real_gateway_dspy_spans():
 
         spans = span_exporter.get_finished_spans()
         assert spans, "DSPy instrumentation did not produce spans."
-        assert any(
-            span.attributes.get(RESPAN_LOG_TYPE) == "chat" for span in spans
-        ), f"No chat span found. Span names: {[span.name for span in spans]}"
+        assert any(span.attributes.get(RESPAN_LOG_TYPE) == "chat" for span in spans), (
+            f"No chat span found. Span names: {[span.name for span in spans]}"
+        )
     finally:
         instrumentor.deactivate()
         RespanTracer.reset_instance()

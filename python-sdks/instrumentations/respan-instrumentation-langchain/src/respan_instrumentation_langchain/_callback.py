@@ -1,790 +1,342 @@
-"""LangChain callback handler that emits Respan-compatible spans."""
+"""Native LangChain callbacks into the active OpenTelemetry provider."""
 
 from __future__ import annotations
 
-import hashlib
+import functools
 import json
 import logging
-import re
-import time
+import os
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
-from http import HTTPStatus
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from threading import RLock
 from typing import Any
 from uuid import UUID, uuid4
 
-from opentelemetry import trace
-from opentelemetry.semconv_ai import SpanAttributes
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.callbacks.base import BaseCallbackManager
+from langchain_core.messages import BaseMessage, ToolMessage
+from opentelemetry import context, trace
+from opentelemetry.instrumentation.utils import _SUPPRESS_INSTRUMENTATION_KEY
+from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import (
+    GEN_AI_PROVIDER_NAME,
+    GEN_AI_TOOL_CALL_ID,
+    GEN_AI_USAGE_INPUT_TOKENS,
+    GEN_AI_USAGE_OUTPUT_TOKENS,
+)
+from opentelemetry.semconv.attributes.exception_attributes import (
+    EXCEPTION_MESSAGE,
+    EXCEPTION_TYPE,
+)
+from opentelemetry.semconv_ai import (
+    SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY,
+    SpanAttributes,
+)
+from opentelemetry.trace import Status, StatusCode
 from respan_sdk.constants.llm_logging import (
     LOG_TYPE_AGENT,
     LOG_TYPE_CHAT,
-    LOG_TYPE_CUSTOM,
     LOG_TYPE_TASK,
     LOG_TYPE_TEXT,
     LOG_TYPE_TOOL,
     LOG_TYPE_WORKFLOW,
-    LogMethodChoices,
 )
-from respan_sdk.constants.otlp_constants import ERROR_MESSAGE_ATTR
 from respan_sdk.constants.span_attributes import (
-    GEN_AI_TOOL_CALL_ARGUMENTS,
-    GEN_AI_TOOL_CALL_RESULT,
-    GEN_AI_TOOL_NAME,
-    LLM_REQUEST_MODEL,
-    LLM_REQUEST_TYPE,
-    LLM_USAGE_COMPLETION_TOKENS,
-    LLM_USAGE_PROMPT_TOKENS,
-    RESPAN_LOG_METHOD,
     RESPAN_LOG_TYPE,
     RESPAN_METADATA,
     RESPAN_SPAN_ATTRIBUTES_MAP,
 )
-from respan_sdk.utils.data_processing.id_processing import (
-    format_span_id,
-    format_trace_id,
-)
-from respan_tracing.utils.span_factory import build_readable_span, inject_span
+from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+from respan_tracing.core.tracer import RespanTracer
 
-from respan_instrumentation_langchain._constants import (
-    AGENT_ACTION_FALLBACK_NAME,
-    AGENT_FINISH_EVENT_NAME,
-    CHAIN_FALLBACK_NAME,
-    CHAT_MODEL_FALLBACK_NAME,
-    FRAMEWORK_LANGCHAIN,
-    FRAMEWORK_LANGFLOW,
-    FRAMEWORK_LANGGRAPH,
-    GROUP_LANGFLOW_ROOT_RUNS_KWARG,
-    LANGCHAIN_ADDITIONAL_KWARGS_KEY,
-    LANGCHAIN_ADDITIONAL_MESSAGE_FIELDS,
-    LANGCHAIN_ARGS_KEY,
-    LANGCHAIN_ARGUMENTS_KEY,
-    LANGCHAIN_ASSISTANT_ROLE,
-    LANGCHAIN_CALLBACK_ADD_HANDLER_METHOD,
-    LANGCHAIN_CALLBACK_HANDLERS_ATTR,
-    LANGCHAIN_CALLBACK_INHERIT_KWARG,
-    LANGCHAIN_CALLBACKS_CONFIG_KEY,
-    LANGCHAIN_COMPLETION_TOKENS_KEY,
-    LANGCHAIN_CONTENT_KEY,
-    LANGCHAIN_DICT_ATTR,
-    LANGCHAIN_DICT_METHOD,
-    LANGCHAIN_ENTITY_PATH_SEPARATOR,
+from ._constants import (
     LANGCHAIN_FRAMEWORK_ATTR,
-    LANGCHAIN_FRAMEWORK_METADATA_KEY,
-    LANGCHAIN_FUNCTION_KEY,
-    LANGCHAIN_FUNCTIONS_KEY,
-    LANGCHAIN_GENERATIONS_ATTR,
-    LANGCHAIN_GRAPH_TAG_PREFIX,
-    LANGCHAIN_HASH_ENCODING,
-    LANGCHAIN_HASH_SEPARATOR,
-    LANGCHAIN_ID_KEY,
-    LANGCHAIN_INPUT_TOKENS_KEY,
-    LANGCHAIN_JSON_CODE_FENCE_BODY_GROUP,
-    LANGCHAIN_JSON_CODE_FENCE_LANGUAGE_GROUP,
-    LANGCHAIN_JSON_CODE_FENCE_PATTERN,
-    LANGCHAIN_KWARGS_KEY,
-    LANGCHAIN_LLM_OUTPUT_ATTR,
-    LANGCHAIN_LLM_OUTPUT_USAGE_FIELDS,
-    LANGCHAIN_LOG_ATTR,
-    LANGCHAIN_MESSAGE_ATTR,
-    LANGCHAIN_MESSAGE_ID_FIELDS,
-    LANGCHAIN_MESSAGE_ROLE_MAP,
     LANGCHAIN_METADATA_ATTR,
-    LANGCHAIN_METADATA_MODEL_FIELDS,
-    LANGCHAIN_METADATA_OBJECT_ATTR,
-    LANGCHAIN_MODEL_DUMP_METHOD,
-    LANGCHAIN_NAME_KEY,
-    LANGCHAIN_OTEL_SPAN_ID_ATTR,
-    LANGCHAIN_OTEL_TRACE_ID_ATTR,
-    LANGCHAIN_OUTPUT_TOKENS_KEY,
-    LANGCHAIN_PAGE_CONTENT_ATTR,
     LANGCHAIN_PARENT_RUN_ID_ATTR,
-    LANGCHAIN_PREGEL_MARKER,
-    LANGCHAIN_PRIVATE_ATTR_PREFIX,
-    LANGCHAIN_PROMPT_TOKENS_KEY,
-    LANGCHAIN_RESPONSE_METADATA_KEY,
-    LANGCHAIN_RETRY_COUNT_ATTR,
-    LANGCHAIN_RETRY_STATE_ATTR,
-    LANGCHAIN_RETURN_VALUES_ATTR,
-    LANGCHAIN_ROLE_KEY,
     LANGCHAIN_RUN_ID_ATTR,
-    LANGCHAIN_RUN_ID_KEY,
     LANGCHAIN_SERIALIZED_ATTR,
-    LANGCHAIN_SERIALIZED_MODEL_FIELDS,
-    LANGCHAIN_SERIALIZED_MODEL_KWARG_FIELDS,
-    LANGCHAIN_SERIALIZED_NAME_FIELDS,
     LANGCHAIN_TAGS_ATTR,
-    LANGCHAIN_TEXT_ATTR,
-    LANGCHAIN_TOOL_ATTR,
-    LANGCHAIN_TOOL_CALLS_KEY,
-    LANGCHAIN_TOOL_INPUT_ATTR,
-    LANGCHAIN_TOOLS_KEY,
-    LANGCHAIN_TOTAL_TOKENS_KEY,
-    LANGCHAIN_TYPE_KEY,
-    LANGCHAIN_UNKNOWN_ROLE,
-    LANGCHAIN_USAGE_METADATA_KEY,
-    LANGCHAIN_USER_ROLE,
-    LANGGRAPH_CALLBACK_HANDLER_CLASS,
-    LANGGRAPH_INTERRUPT_EVENT_NAME,
-    LANGGRAPH_RESUME_EVENT_NAME,
-    LLM_FALLBACK_NAME,
-    RETRIEVER_FALLBACK_NAME,
-    TOOL_FALLBACK_NAME,
-    ZERO_SPAN_ID_FALLBACK,
 )
+from ._serialization import MAX_CHARS, data, json_value, text
 
 logger = logging.getLogger(__name__)
+_MARKER_FIELDS = {
+    "run_id",
+    "example_run_id",
+    "framework",
+    "example",
+    "workflow_name",
+    "example_set",
+    "example_name",
+}
 
-try:
-    from langchain_core.callbacks import BaseCallbackHandler
-except Exception:  # noqa: BLE001  # pragma: no cover - optional dependency
 
-    class BaseCallbackHandler:  # type: ignore[no-redef]
-        """Fallback so importing the package does not require LangChain eagerly."""
+def _safe_callback(method):
+    @functools.wraps(method)
+    def call(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except Exception:  # noqa: BLE001 - instrumentation cannot change application behavior
+            logger.debug("Could not translate a LangChain callback")
+            return None
 
-        raise_error = False
-        run_inline = True
+    return call
 
 
-try:
-    import langgraph.callbacks
-except Exception:  # noqa: BLE001  # pragma: no cover - optional dependency
-    GraphCallbackHandler = None
-else:
-    GraphCallbackHandler = getattr(
-        langgraph.callbacks,
-        LANGGRAPH_CALLBACK_HANDLER_CLASS,
-        None,
+def _key(value: Any) -> str:
+    if isinstance(value, UUID):
+        return value.hex
+    return value if isinstance(value, str) else ""
+
+
+def _content_enabled(handler) -> bool:
+    return (
+        handler.include_content
+        and context.get_value(ENABLE_CONTENT_TRACING_KEY) is not False
+        and os.getenv("TRACELOOP_TRACE_CONTENT", "true").strip().lower()
+        not in {"0", "false", "off", "no"}
     )
 
 
-if GraphCallbackHandler is None:
-    _CallbackBase = BaseCallbackHandler
-elif issubclass(GraphCallbackHandler, BaseCallbackHandler):
-    _CallbackBase = GraphCallbackHandler
-else:
-
-    class _CallbackBase(  # type: ignore[misc, valid-type]
-        GraphCallbackHandler,
-        BaseCallbackHandler,
-    ):
-        pass
-
-
-_EMPTY_VALUES = (None, "", (), [])
-_JSON_CODE_FENCE_RE = re.compile(
-    LANGCHAIN_JSON_CODE_FENCE_PATTERN, re.IGNORECASE | re.DOTALL
-)
-
-
-class _RunRecord:
-    __slots__ = (
-        "entity_path",
-        "extra_attributes",
-        "framework",
-        "input_value",
-        "log_type",
-        "metadata",
-        "name",
-        "parent_run_id",
-        "parent_span_id",
-        "run_id",
-        "serialized",
-        "span_id",
-        "span_kind",
-        "start_ns",
-        "streamed_tokens",
-        "tags",
-        "trace_id",
+def _suppressed() -> bool:
+    tracer = getattr(RespanTracer, "_instance", None)
+    return bool(
+        context.get_value(_SUPPRESS_INSTRUMENTATION_KEY)
+        or context.get_value(SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY)
+        or (tracer is not None and not getattr(tracer, "is_enabled", True))
     )
 
-    def __init__(
-        self,
-        *,
-        run_id: str,
-        trace_id: str,
-        span_id: str,
-        parent_run_id: str | None,
-        parent_span_id: str | None,
-        name: str,
-        entity_path: str,
-        log_type: str,
-        span_kind: str,
-        start_ns: int,
-        framework: str,
-        input_value: Any = None,
-        serialized: Any = None,
-        tags: list[str] | None = None,
-        metadata: dict[str, Any] | None = None,
-        extra_attributes: dict[str, Any] | None = None,
-    ) -> None:
-        self.run_id = run_id
-        self.trace_id = trace_id
-        self.span_id = span_id
-        self.parent_run_id = parent_run_id
-        self.parent_span_id = parent_span_id
-        self.name = name
-        self.entity_path = entity_path
-        self.log_type = log_type
-        self.span_kind = span_kind
-        self.start_ns = start_ns
-        self.input_value = input_value
-        self.serialized = serialized
-        self.tags = tags
-        self.metadata = metadata
-        self.framework = framework
-        self.extra_attributes = extra_attributes or {}
-        self.streamed_tokens: list[str] = []
+
+def _payload(value: Any) -> dict:
+    return (
+        value
+        if isinstance(value, dict)
+        else vars(value)
+        if isinstance(value, BaseMessage)
+        else {}
+    )
 
 
-def _run_id_to_hex(run_id: Any) -> str:
-    if run_id is None:
-        return uuid4().hex
-    if isinstance(run_id, UUID):
-        return run_id.hex
-    value = str(run_id)
-    try:
-        return UUID(value).hex
-    except (TypeError, ValueError):
-        digest = hashlib.sha256(value.encode(LANGCHAIN_HASH_ENCODING)).hexdigest()
-        return digest[:32]
+def _arguments(value: Any) -> str:
+    return (
+        data(value, complete=True)
+        if isinstance(value, str)
+        else json_value(value, complete=True)
+    )
 
 
-def _derive_span_id(*parts: Any) -> str:
-    digest = hashlib.sha256(
-        LANGCHAIN_HASH_SEPARATOR.join(str(part) for part in parts).encode(
-            LANGCHAIN_HASH_ENCODING
-        )
-    ).hexdigest()
-    span_id = digest[:16]
-    if int(span_id, 16) == 0:
-        return ZERO_SPAN_ID_FALLBACK
-    return span_id
-
-
-def _get_active_otel_parent() -> tuple[str, str] | None:
-    try:
-        span_context = trace.get_current_span().get_span_context()
-    except Exception:  # noqa: BLE001 - OpenTelemetry context access is best-effort
-        return None
-
-    trace_id = getattr(span_context, LANGCHAIN_OTEL_TRACE_ID_ATTR, 0)
-    span_id = getattr(span_context, LANGCHAIN_OTEL_SPAN_ID_ATTR, 0)
-    if not trace_id or not span_id:
-        return None
-    return format_trace_id(trace_id), format_span_id(span_id)
-
-
-def _json_default(value: Any) -> Any:
-    if hasattr(value, LANGCHAIN_MODEL_DUMP_METHOD):
-        return getattr(value, LANGCHAIN_MODEL_DUMP_METHOD)()
-    if hasattr(value, LANGCHAIN_DICT_METHOD):
-        return getattr(value, LANGCHAIN_DICT_METHOD)()
-    if hasattr(value, LANGCHAIN_DICT_ATTR):
-        return {
-            key: item
-            for key, item in vars(value).items()
-            if not key.startswith(LANGCHAIN_PRIVATE_ATTR_PREFIX)
+def _calls(calls: Any) -> list[dict]:
+    result = []
+    for call in calls or []:
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function")
+        function = function if isinstance(function, dict) else call
+        name = function.get("name")
+        if not isinstance(name, str):
+            continue
+        item = {
+            "type": "function",
+            "function": {
+                "name": text(name, None),
+                "arguments": _arguments(
+                    function.get("arguments", function.get("args", {}))
+                ),
+            },
         }
-    return str(value)
+        if isinstance(call.get("id"), str):
+            item["id"] = text(call["id"], None)
+        result.append(item)
+    return result
 
 
-def _to_json_string(value: Any) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return value
-    try:
-        return json.dumps(value, default=_json_default)
-    except (TypeError, ValueError):
-        return json.dumps(str(value))
+def _message(message: Any) -> dict:
+    value = _payload(message)
+    role = value.get("role") or value.get("type")
+    role = {"ai": "assistant", "human": "user", "function": "tool"}.get(role, role)
+    result = {"role": role if isinstance(role, str) else "unknown"}
+    complete = role == "tool"
+    if "content" in value:
+        result["content"] = data(value["content"], complete=complete)
+    extra = value.get("additional_kwargs") or {}
+    calls = _calls(value.get("tool_calls") or extra.get("tool_calls"))
+    legacy = extra.get("function_call")
+    if not calls and isinstance(legacy, dict):
+        calls = _calls([{"function": legacy}])
+    if calls:
+        result["tool_calls"] = calls
+    call_id = value.get("tool_call_id")
+    if isinstance(call_id, str):
+        result["tool_call_id"] = text(call_id, None)
+    return result
 
 
-def _safe_dict(value: Any) -> dict[str, Any] | None:
-    if isinstance(value, Mapping):
-        return dict(value)
-    if hasattr(value, LANGCHAIN_MODEL_DUMP_METHOD):
-        dumped = getattr(value, LANGCHAIN_MODEL_DUMP_METHOD)()
-        return dict(dumped) if isinstance(dumped, Mapping) else None
-    if hasattr(value, LANGCHAIN_DICT_METHOD):
-        dumped = getattr(value, LANGCHAIN_DICT_METHOD)()
-        return dict(dumped) if isinstance(dumped, Mapping) else None
+def _message_attributes(messages: list[dict], prefix: str) -> dict:
+    attrs = {}
+    for index, message in enumerate(messages):
+        base = f"{prefix}.{index}"
+        attrs[f"{base}.role"] = message["role"]
+        complete = message.get("role") == "tool"
+        if "content" in message:
+            content = message["content"]
+            attrs[f"{base}.content"] = (
+                text(content, None if complete else MAX_CHARS)
+                if isinstance(content, str)
+                else json_value(content, complete=complete)
+            )
+        if message.get("tool_calls"):
+            attrs[f"{base}.tool_calls"] = json_value(
+                message["tool_calls"], complete=True
+            )
+        if message.get("tool_call_id"):
+            attrs[f"{base}.tool_call_id"] = message["tool_call_id"]
+    return attrs
+
+
+def _model(serialized, metadata, response=None):
+    sources = [
+        metadata or {},
+        (serialized or {}).get("kwargs", {}) if isinstance(serialized, dict) else {},
+        serialized or {},
+    ]
+    if response is not None and isinstance(getattr(response, "llm_output", None), dict):
+        sources.append(response.llm_output)
+    for source in sources:
+        if isinstance(source, dict):
+            for key in ("ls_model_name", "model_name", "model", "repo_id"):
+                if isinstance(source.get(key), str) and source[key]:
+                    return text(source[key], 512)
     return None
 
 
-def _message_to_dict(message: Any) -> dict[str, Any]:
-    message_dict = _safe_dict(message)
-    if message_dict is None:
-        message_dict = {}
-
-    role = (
-        message_dict.get(LANGCHAIN_ROLE_KEY)
-        or message_dict.get(LANGCHAIN_TYPE_KEY)
-        or getattr(message, LANGCHAIN_ROLE_KEY, None)
-        or getattr(message, LANGCHAIN_TYPE_KEY, None)
-    )
-    content = message_dict.get(
-        LANGCHAIN_CONTENT_KEY,
-        getattr(message, LANGCHAIN_CONTENT_KEY, None),
-    )
-    normalized: dict[str, Any] = {
-        LANGCHAIN_ROLE_KEY: LANGCHAIN_MESSAGE_ROLE_MAP.get(str(role), str(role))
-        if role
-        else LANGCHAIN_UNKNOWN_ROLE,
-        LANGCHAIN_CONTENT_KEY: content,
-    }
-
-    for key in LANGCHAIN_MESSAGE_ID_FIELDS:
-        value = message_dict.get(key, getattr(message, key, None))
-        if value not in _EMPTY_VALUES:
-            normalized[key] = value
-
-    tool_calls = message_dict.get(
-        LANGCHAIN_TOOL_CALLS_KEY,
-        getattr(message, LANGCHAIN_TOOL_CALLS_KEY, None),
-    )
-    if tool_calls not in _EMPTY_VALUES:
-        normalized[LANGCHAIN_TOOL_CALLS_KEY] = _serialize_value(tool_calls)
-
-    additional_kwargs = message_dict.get(
-        LANGCHAIN_ADDITIONAL_KWARGS_KEY,
-        getattr(message, LANGCHAIN_ADDITIONAL_KWARGS_KEY, None),
-    )
-    if isinstance(additional_kwargs, Mapping):
-        for key in LANGCHAIN_ADDITIONAL_MESSAGE_FIELDS:
-            if key in additional_kwargs and key not in normalized:
-                normalized[key] = _serialize_value(additional_kwargs[key])
-
-    return normalized
-
-
-def _serialize_value(value: Any) -> Any:
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, Mapping):
-        return {str(key): _serialize_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_serialize_value(item) for item in value]
-    value_dict = _safe_dict(value)
-    if value_dict is not None:
-        return _serialize_value(value_dict)
-    if hasattr(value, LANGCHAIN_PAGE_CONTENT_ATTR):
-        payload = {
-            LANGCHAIN_PAGE_CONTENT_ATTR: getattr(
-                value, LANGCHAIN_PAGE_CONTENT_ATTR, None
-            ),
-            LANGCHAIN_METADATA_OBJECT_ATTR: getattr(
-                value,
-                LANGCHAIN_METADATA_OBJECT_ATTR,
-                None,
-            ),
-        }
-        doc_id = getattr(value, LANGCHAIN_ID_KEY, None)
-        if doc_id not in _EMPTY_VALUES:
-            payload[LANGCHAIN_ID_KEY] = doc_id
-        return _serialize_value(payload)
-    return str(value)
-
-
-def _strip_json_code_fence(value: str) -> str:
-    match = _JSON_CODE_FENCE_RE.match(value)
-    if not match:
-        return value
-
-    body = match.group(LANGCHAIN_JSON_CODE_FENCE_BODY_GROUP).strip()
-    if match.group(LANGCHAIN_JSON_CODE_FENCE_LANGUAGE_GROUP):
-        return body
-
-    try:
-        json.loads(body)
-    except (TypeError, ValueError):
-        return value
-    return body
-
-
-def _normalize_output_for_logging(value: Any) -> Any:
-    if isinstance(value, str):
-        return _strip_json_code_fence(value)
-    if isinstance(value, Mapping):
-        return {
-            str(key): _normalize_output_for_logging(item) for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [_normalize_output_for_logging(item) for item in value]
-    if isinstance(value, tuple):
-        return [_normalize_output_for_logging(item) for item in value]
-    return value
-
-
-def _normalize_chat_messages(messages: Any) -> list[list[dict[str, Any]]]:
-    conversations = messages if isinstance(messages, list) else [messages]
-    normalized: list[list[dict[str, Any]]] = []
-    for conversation in conversations:
-        if not isinstance(conversation, list):
-            conversation = [conversation]
-        normalized.append([_message_to_dict(message) for message in conversation])
-    return normalized
-
-
-def _extract_name(serialized: Any, fallback: str) -> str:
-    if isinstance(serialized, Mapping):
-        for key in LANGCHAIN_SERIALIZED_NAME_FIELDS:
-            value = serialized.get(key)
-            if isinstance(value, str) and value:
-                if key == LANGCHAIN_ID_KEY and LANGCHAIN_ENTITY_PATH_SEPARATOR in value:
-                    return value.rsplit(LANGCHAIN_ENTITY_PATH_SEPARATOR, 1)[-1]
-                return value
-            if (
-                isinstance(value, Sequence)
-                and not isinstance(value, (str, bytes))
-                and value
-            ):
-                return str(value[-1])
-        kwargs = serialized.get(LANGCHAIN_KWARGS_KEY)
-        if isinstance(kwargs, Mapping):
-            for key in (LANGCHAIN_NAME_KEY, *LANGCHAIN_SERIALIZED_MODEL_KWARG_FIELDS):
-                value = kwargs.get(key)
-                if isinstance(value, str) and value:
-                    return value
+def _name(serialized, kwargs, fallback):
+    if isinstance(kwargs.get("name"), str):
+        return text(kwargs["name"], 512)
+    if isinstance(serialized, dict):
+        value = serialized.get("name") or serialized.get("id")
+        if isinstance(value, list) and value:
+            value = value[-1]
+        if isinstance(value, str):
+            return text(value, 512)
     return fallback
 
 
-def _extract_model(
-    serialized: Any,
-    response: Any = None,
-    metadata: Mapping[str, Any] | None = None,
-) -> str | None:
-    candidates: list[Any] = []
-    if isinstance(metadata, Mapping):
-        candidates.extend(metadata.get(key) for key in LANGCHAIN_METADATA_MODEL_FIELDS)
-    if isinstance(serialized, Mapping):
-        kwargs = serialized.get(LANGCHAIN_KWARGS_KEY)
-        if isinstance(kwargs, Mapping):
-            candidates.extend(
-                kwargs.get(key) for key in LANGCHAIN_SERIALIZED_MODEL_KWARG_FIELDS
-            )
-        candidates.extend(
-            serialized.get(key) for key in LANGCHAIN_SERIALIZED_MODEL_FIELDS
+def _usage(response) -> dict:
+    sources = []
+    output = getattr(response, "llm_output", None)
+    if isinstance(output, dict):
+        sources.extend(
+            output.get(key) for key in ("token_usage", "usage", "usage_metadata")
         )
-
-    llm_output = getattr(response, LANGCHAIN_LLM_OUTPUT_ATTR, None)
-    if isinstance(llm_output, Mapping):
-        candidates.extend(
-            llm_output.get(key) for key in LANGCHAIN_SERIALIZED_MODEL_FIELDS
-        )
-
-    for candidate in candidates:
-        if isinstance(candidate, str) and candidate:
-            return candidate
-    return None
-
-
-def _coerce_int(value: Any) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    return None
-
-
-def _extract_usage(response: Any) -> tuple[int | None, int | None, int | None]:
-    payloads: list[Any] = []
-    llm_output = getattr(response, LANGCHAIN_LLM_OUTPUT_ATTR, None)
-    if isinstance(llm_output, Mapping):
-        payloads.extend(
-            llm_output.get(key) for key in LANGCHAIN_LLM_OUTPUT_USAGE_FIELDS
-        )
-        payloads.append(llm_output)
-
-    generations = getattr(response, LANGCHAIN_GENERATIONS_ATTR, None)
-    if isinstance(generations, list) and generations:
-        first_generation = (
-            generations[0][0]
-            if isinstance(generations[0], list) and generations[0]
-            else generations[0]
-        )
-        message = getattr(first_generation, LANGCHAIN_MESSAGE_ATTR, None)
-        if message is not None:
-            payloads.append(getattr(message, LANGCHAIN_USAGE_METADATA_KEY, None))
-            response_metadata = getattr(message, LANGCHAIN_RESPONSE_METADATA_KEY, None)
-            if isinstance(response_metadata, Mapping):
-                payloads.extend(
+    for batch in getattr(response, "generations", []) or []:
+        for generation in batch if isinstance(batch, list) else [batch]:
+            message = getattr(generation, "message", None)
+            if isinstance(message, BaseMessage):
+                values = vars(message)
+                sources.append(values.get("usage_metadata"))
+                response_metadata = values.get("response_metadata") or {}
+                sources.extend(
                     response_metadata.get(key)
-                    for key in LANGCHAIN_LLM_OUTPUT_USAGE_FIELDS
+                    for key in ("token_usage", "usage", "usage_metadata")
                 )
-
-    for payload in payloads:
-        if not isinstance(payload, Mapping):
-            continue
-        prompt_tokens = _coerce_int(
-            payload.get(
-                LANGCHAIN_PROMPT_TOKENS_KEY,
-                payload.get(LANGCHAIN_INPUT_TOKENS_KEY),
-            )
-        )
-        completion_tokens = _coerce_int(
-            payload.get(
-                LANGCHAIN_COMPLETION_TOKENS_KEY,
-                payload.get(LANGCHAIN_OUTPUT_TOKENS_KEY),
-            )
-        )
-        total_tokens = _coerce_int(payload.get(LANGCHAIN_TOTAL_TOKENS_KEY))
-        if total_tokens is None and (
-            prompt_tokens is not None or completion_tokens is not None
-        ):
-            total_tokens = (prompt_tokens or 0) + (completion_tokens or 0)
-        if (
-            prompt_tokens is not None
-            or completion_tokens is not None
-            or total_tokens is not None
-        ):
-            return prompt_tokens, completion_tokens, total_tokens
-
-    return None, None, None
-
-
-def _generation_to_message(generation: Any) -> dict[str, Any]:
-    message = getattr(generation, LANGCHAIN_MESSAGE_ATTR, None)
-    if message is not None:
-        return _message_to_dict(message)
-    text = getattr(generation, LANGCHAIN_TEXT_ATTR, None)
-    if text is not None:
-        return {
-            LANGCHAIN_ROLE_KEY: LANGCHAIN_ASSISTANT_ROLE,
-            LANGCHAIN_CONTENT_KEY: text,
-        }
-    return {
-        LANGCHAIN_ROLE_KEY: LANGCHAIN_ASSISTANT_ROLE,
-        LANGCHAIN_CONTENT_KEY: _serialize_value(generation),
-    }
-
-
-def _extract_llm_output(response: Any) -> tuple[Any, list[dict[str, Any]]]:
-    generations = getattr(response, LANGCHAIN_GENERATIONS_ATTR, None)
-    if isinstance(generations, list):
-        normalized_batches = []
-        completion_messages = []
-        for batch in generations:
-            batch_items = batch if isinstance(batch, list) else [batch]
-            normalized_batch = [_generation_to_message(item) for item in batch_items]
-            normalized_batches.append(normalized_batch)
-            completion_messages.extend(normalized_batch)
-        return normalized_batches, completion_messages
-
-    serialized = _serialize_value(response)
-    message = (
-        serialized
-        if isinstance(serialized, Mapping) and LANGCHAIN_CONTENT_KEY in serialized
-        else {
-            LANGCHAIN_ROLE_KEY: LANGCHAIN_ASSISTANT_ROLE,
-            LANGCHAIN_CONTENT_KEY: serialized,
-        }
-    )
-    return serialized, [dict(message)]
-
-
-def _extract_tool_calls_from_messages(
-    messages: list[dict[str, Any]],
-) -> list[dict[str, Any]] | None:
-    tool_calls: list[dict[str, Any]] = []
-    for message in messages:
-        raw_tool_calls = message.get(LANGCHAIN_TOOL_CALLS_KEY)
-        if not isinstance(raw_tool_calls, list):
-            continue
-        for raw_tool_call in raw_tool_calls:
-            if not isinstance(raw_tool_call, Mapping):
-                continue
-            tool_call = dict(raw_tool_call)
-            if (
-                LANGCHAIN_FUNCTION_KEY not in tool_call
-                and LANGCHAIN_NAME_KEY in tool_call
-            ):
-                tool_call = {
-                    LANGCHAIN_ID_KEY: tool_call.get(LANGCHAIN_ID_KEY),
-                    LANGCHAIN_TYPE_KEY: LANGCHAIN_FUNCTION_KEY,
-                    LANGCHAIN_FUNCTION_KEY: {
-                        LANGCHAIN_NAME_KEY: tool_call.get(LANGCHAIN_NAME_KEY),
-                        LANGCHAIN_ARGUMENTS_KEY: _to_json_string(
-                            tool_call.get(
-                                LANGCHAIN_ARGS_KEY,
-                                tool_call.get(LANGCHAIN_ARGUMENTS_KEY),
-                            )
-                        ),
-                    },
-                }
-            tool_calls.append(_serialize_value(tool_call))
-    return tool_calls or None
-
-
-def _extract_tools(*sources: Any) -> list[dict[str, Any]] | None:
-    """Return complete tool definitions from LangChain callback payloads."""
-    candidates: list[Any] = []
+    attrs = {}
     for source in sources:
-        if not isinstance(source, Mapping):
+        if not isinstance(source, dict):
             continue
-        candidates.append(source)
-        for key in (LANGCHAIN_KWARGS_KEY, "invocation_params", "options"):
-            nested = source.get(key)
-            if isinstance(nested, Mapping):
-                candidates.append(nested)
-
-    for candidate in candidates:
-        tools = candidate.get(LANGCHAIN_TOOLS_KEY) or candidate.get(
-            LANGCHAIN_FUNCTIONS_KEY
-        )
-        if not isinstance(tools, list):
-            continue
-        normalized = []
-        for tool in tools:
-            serialized_tool = _serialize_value(tool)
-            if isinstance(serialized_tool, Mapping):
-                normalized.append(dict(serialized_tool))
-        if normalized:
-            return normalized
-    return None
-
-
-def _extract_respan_attributes(metadata: Any) -> dict[str, Any]:
-    """Bridge explicit ``metadata.respan_params`` into canonical attributes."""
-    if not isinstance(metadata, Mapping):
-        return {}
-    params = metadata.get("respan_params")
-    if not isinstance(params, Mapping):
-        return {}
-
-    attributes: dict[str, Any] = {}
-    for key, value in params.items():
-        attribute_key = RESPAN_SPAN_ATTRIBUTES_MAP.get(str(key))
-        if attribute_key is None:
-            continue
-        if attribute_key == RESPAN_METADATA and isinstance(value, Mapping):
-            for metadata_key, metadata_value in value.items():
-                attributes[f"{RESPAN_METADATA}.{metadata_key}"] = (
-                    metadata_value
-                    if isinstance(metadata_value, (str, bool, int, float))
-                    else _to_json_string(metadata_value)
+        for fields, keys in (
+            (
+                ("input_tokens", "prompt_tokens"),
+                (GEN_AI_USAGE_INPUT_TOKENS, SpanAttributes.LLM_USAGE_PROMPT_TOKENS),
+            ),
+            (
+                ("output_tokens", "completion_tokens"),
+                (
+                    GEN_AI_USAGE_OUTPUT_TOKENS,
+                    SpanAttributes.LLM_USAGE_COMPLETION_TOKENS,
+                ),
+            ),
+            (("total_tokens",), (SpanAttributes.LLM_USAGE_TOTAL_TOKENS,)),
+        ):
+            value = next((source[key] for key in fields if key in source), None)
+            if type(value) is int and value >= 0:
+                for key in keys:
+                    attrs.setdefault(key, value)
+        for details, usage_field, keys in (
+            (
+                source.get("input_token_details")
+                or source.get("input_tokens_details")
+                or source.get("prompt_tokens_details"),
+                "cache_read",
+                (
+                    SpanAttributes.GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
+                    SpanAttributes.LLM_USAGE_CACHE_READ_INPUT_TOKENS,
+                ),
+            ),
+            (
+                source.get("input_token_details")
+                or source.get("input_tokens_details")
+                or source.get("prompt_tokens_details"),
+                "cache_creation",
+                (
+                    SpanAttributes.GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
+                    SpanAttributes.LLM_USAGE_CACHE_CREATION_INPUT_TOKENS,
+                ),
+            ),
+            (
+                source.get("output_token_details")
+                or source.get("output_tokens_details")
+                or source.get("completion_tokens_details"),
+                "reasoning",
+                (
+                    SpanAttributes.GEN_AI_USAGE_REASONING_TOKENS,
+                    SpanAttributes.LLM_USAGE_REASONING_TOKENS,
+                ),
+            ),
+        ):
+            if isinstance(details, dict):
+                value = details.get(
+                    usage_field,
+                    details.get(
+                        "cached_tokens"
+                        if usage_field == "cache_read"
+                        else "reasoning_tokens"
+                        if usage_field == "reasoning"
+                        else "cache_write_tokens"
+                    ),
                 )
-            continue
-        if isinstance(value, (Mapping, list, tuple, set)):
-            attributes[attribute_key] = _to_json_string(value)
-        elif value is not None:
-            attributes[attribute_key] = value
-    return attributes
+                if type(value) is int and value >= 0:
+                    for key in keys:
+                        attrs.setdefault(key, value)
+    return attrs
 
 
-def _detect_framework(
-    *,
-    serialized: Any = None,
-    tags: list[str] | None = None,
-    metadata: Mapping[str, Any] | None = None,
-    name: str | None = None,
-) -> str:
-    haystack: list[str] = []
-    haystack.extend(str(tag).lower() for tag in tags or [])
-    if isinstance(metadata, Mapping):
-        haystack.extend(str(key).lower() for key in metadata)
-        haystack.extend(
-            str(value).lower() for value in metadata.values() if isinstance(value, str)
-        )
-    if isinstance(serialized, Mapping):
-        haystack.append(json.dumps(_serialize_value(serialized), default=str).lower())
-    if name:
-        haystack.append(name.lower())
-    text = " ".join(haystack)
-    if FRAMEWORK_LANGFLOW in text:
-        return FRAMEWORK_LANGFLOW
-    if (
-        FRAMEWORK_LANGGRAPH in text
-        or LANGCHAIN_GRAPH_TAG_PREFIX in text
-        or LANGCHAIN_PREGEL_MARKER in text
-    ):
-        return FRAMEWORK_LANGGRAPH
-    return FRAMEWORK_LANGCHAIN
+def _completions(response) -> list[dict]:
+    result = []
+    for batch in getattr(response, "generations", []) or []:
+        for generation in batch if isinstance(batch, list) else [batch]:
+            message = getattr(generation, "message", None)
+            if isinstance(message, BaseMessage):
+                result.append(_message(message))
+            elif isinstance(getattr(generation, "text", None), str):
+                result.append({"role": "assistant", "content": text(generation.text)})
+    return result
 
 
-def _set_if_present(attrs: dict[str, Any], key: str, value: Any) -> None:
-    if value not in _EMPTY_VALUES:
-        attrs[key] = value
+@dataclass
+class _Run:
+    span: Any
+    name: str
+    log_type: str
+    capture: bool
+    parent_key: str = ""
+    metadata: dict = field(default_factory=dict)
+    input: str | None = None
+    extra: dict = field(default_factory=dict)
+    tokens: list[str] = field(default_factory=list)
 
 
-def _set_error_attributes(
-    attrs: dict[str, Any],
-    error: BaseException | None,
-) -> str | None:
-    if error is None:
-        return None
-
-    error_message = str(error)
-    attrs.setdefault(ERROR_MESSAGE_ATTR, error_message)
-    return error_message
-
-
-def _callback_list_contains(callbacks: list[Any], handler: Any) -> bool:
-    return any(
-        callback is handler or isinstance(callback, RespanCallbackHandler)
-        for callback in callbacks
-    )
-
-
-def add_respan_callback(
-    config: Mapping[str, Any] | None = None,
-    handler: RespanCallbackHandler | None = None,
-) -> dict[str, Any]:
-    """Return a RunnableConfig copy with a Respan callback handler attached."""
-    callback_handler = handler or get_callback_handler()
-    new_config = dict(config or {})
-    callbacks = new_config.get(LANGCHAIN_CALLBACKS_CONFIG_KEY)
-    new_config[LANGCHAIN_CALLBACKS_CONFIG_KEY] = _with_respan_callback(
-        callbacks,
-        callback_handler,
-    )
-    return new_config
-
-
-def _with_respan_callback(callbacks: Any, handler: RespanCallbackHandler) -> Any:
-    if callbacks is None:
-        return [handler]
-
-    if isinstance(callbacks, tuple):
-        callback_list = list(callbacks)
-        if _callback_list_contains(callback_list, handler):
-            return callbacks
-        return [*callback_list, handler]
-
-    if isinstance(callbacks, list):
-        if _callback_list_contains(callbacks, handler):
-            return callbacks
-        return [*callbacks, handler]
-
-    existing_handlers = getattr(callbacks, LANGCHAIN_CALLBACK_HANDLERS_ATTR, None)
-    if isinstance(existing_handlers, list):
-        if not _callback_list_contains(existing_handlers, handler):
-            if hasattr(callbacks, LANGCHAIN_CALLBACK_ADD_HANDLER_METHOD):
-                getattr(callbacks, LANGCHAIN_CALLBACK_ADD_HANDLER_METHOD)(
-                    handler,
-                    **{LANGCHAIN_CALLBACK_INHERIT_KWARG: True},
-                )
-            else:
-                existing_handlers.append(handler)
-        return callbacks
-
-    if isinstance(callbacks, BaseCallbackHandler):
-        if isinstance(callbacks, RespanCallbackHandler):
-            return [callbacks]
-        return [callbacks, handler]
-
-    return [callbacks, handler]
-
-
-def get_callback_handler(**kwargs: Any) -> RespanCallbackHandler:
-    """Create a Respan callback handler for explicit LangChain/LangGraph config."""
-    kwargs.setdefault(GROUP_LANGFLOW_ROOT_RUNS_KWARG, True)
-    return RespanCallbackHandler(**kwargs)
-
-
-class RespanCallbackHandler(_CallbackBase):  # type: ignore[misc, valid-type]
-    """LangChain callback handler that emits spans into the Respan OTEL pipeline."""
+class RespanCallbackHandler(BaseCallbackHandler):
+    """Real OTel spans driven by LangChain's public run callbacks."""
 
     raise_error = False
     run_inline = True
@@ -792,618 +344,587 @@ class RespanCallbackHandler(_CallbackBase):  # type: ignore[misc, valid-type]
     def __init__(
         self,
         *,
-        include_content: bool = True,
-        include_metadata: bool = True,
-        group_langflow_root_runs: bool = False,
-        max_cached_runs: int = 4096,
-    ) -> None:
+        include_content=True,
+        include_metadata=True,
+        group_langflow_root_runs=False,
+        max_cached_runs=4096,
+    ):
         super().__init__()
         self.include_content = include_content
         self.include_metadata = include_metadata
         self.group_langflow_root_runs = group_langflow_root_runs
         self.max_cached_runs = max_cached_runs
-        self._runs: dict[str, _RunRecord] = {}
-        self._run_trace_ids: OrderedDict[str, str] = OrderedDict()
-        self._run_paths: OrderedDict[str, str] = OrderedDict()
-        self._langflow_trace_id = uuid4().hex
+        self._runs: dict[str, _Run | None] = {}
+        self._parents: OrderedDict[str, Any] = OrderedDict()
+        self._lock = RLock()
+        self._enabled = True
+        self._langflow_group = uuid4().hex
 
-    def _remember_run(self, record: _RunRecord) -> None:
-        self._run_trace_ids[record.run_id] = record.trace_id
-        self._run_paths[record.run_id] = record.entity_path
-        self._run_trace_ids.move_to_end(record.run_id)
-        self._run_paths.move_to_end(record.run_id)
-        while len(self._run_trace_ids) > self.max_cached_runs:
-            self._run_trace_ids.popitem(last=False)
-        while len(self._run_paths) > self.max_cached_runs:
-            self._run_paths.popitem(last=False)
-
-    def _start_run(
+    def _start(
         self,
         *,
-        run_id: Any,
-        parent_run_id: Any,
-        name: str,
-        log_type: str,
-        span_kind: str,
-        input_value: Any = None,
-        serialized: Any = None,
-        tags: list[str] | None = None,
-        metadata: dict[str, Any] | None = None,
-        extra_attributes: dict[str, Any] | None = None,
-    ) -> None:
-        run_hex = _run_id_to_hex(run_id)
-        parent_hex = (
-            _run_id_to_hex(parent_run_id) if parent_run_id is not None else None
-        )
-        framework = _detect_framework(
-            serialized=serialized,
-            tags=tags,
-            metadata=metadata,
-            name=name,
-        )
-        active_parent = _get_active_otel_parent() if parent_hex is None else None
-        fallback_trace_id = (
-            self._langflow_trace_id
+        run_id,
+        parent_run_id,
+        name,
+        log_type,
+        input_value=None,
+        serialized=None,
+        tags=None,
+        metadata=None,
+        extra=None,
+    ):
+        key = _key(run_id)
+        parent_key = _key(parent_run_id)
+        with self._lock:
+            if not self._enabled or not key or key in self._runs:
+                return None
+            if _suppressed() or (
+                parent_key in self._runs and self._runs[parent_key] is None
+            ):
+                self._runs[key] = None
+                return None
+            parent = self._record(parent_run_id) if parent_key else None
+            cached = self._parents.get(parent_key)
+            parent_span = (
+                parent.span
+                if parent
+                else trace.NonRecordingSpan(cached[0])
+                if cached
+                else None
+            )
+            parent_context = (
+                trace.set_span_in_context(parent_span)
+                if parent_span
+                else context.get_current()
+            )
+            attrs = {
+                RESPAN_LOG_TYPE: log_type,
+                SpanAttributes.TRACELOOP_ENTITY_NAME: name,
+                SpanAttributes.TRACELOOP_ENTITY_PATH: "" if not parent_span else name,
+                LANGCHAIN_RUN_ID_ATTR: key,
+            }
+            if parent_key:
+                attrs[LANGCHAIN_PARENT_RUN_ID_ATTR] = parent_key
+            framework = (
+                "langgraph"
+                if any(
+                    isinstance(k, str) and k.startswith("langgraph_")
+                    for k in (metadata or {})
+                )
+                else "langflow"
+                if (metadata or {}).get("framework") == "langflow"
+                else "langchain"
+            )
+            attrs[LANGCHAIN_FRAMEWORK_ATTR] = framework
+            span = trace.get_tracer(__name__).start_span(
+                name, context=parent_context, attributes=attrs
+            )
+            run = _Run(
+                span,
+                name,
+                log_type,
+                span.is_recording()
+                and _content_enabled(self)
+                and (parent.capture if parent else cached[1] if cached else True),
+            )
+            run.parent_key = parent_key
+            self._runs[key] = run
+            if not span.is_recording():
+                return run
+            params = (metadata or {}).get("respan_params") or {}
+            if isinstance(params, dict):
+                for field_name, value in params.items():
+                    attr = RESPAN_SPAN_ATTRIBUTES_MAP.get(field_name)
+                    if attr == RESPAN_METADATA and isinstance(value, dict):
+                        run.metadata = {
+                            k: data(v)
+                            for k, v in value.items()
+                            if run.capture or k in _MARKER_FIELDS
+                        }
+                    elif (
+                        isinstance(attr, str)
+                        and attr.startswith("respan.")
+                        and attr != RESPAN_LOG_TYPE
+                        and isinstance(value, (str, int, float, bool))
+                    ):
+                        span.set_attribute(
+                            attr, text(value, None) if isinstance(value, str) else value
+                        )
             if (
-                framework == FRAMEWORK_LANGFLOW
+                framework == "langflow"
                 and self.group_langflow_root_runs
-                and active_parent is None
-                and parent_hex is None
+                and not parent_key
+            ):
+                span.set_attribute(
+                    RESPAN_SPAN_ATTRIBUTES_MAP["trace_group_identifier"],
+                    self._langflow_group,
+                )
+            if framework == "langgraph" and isinstance(
+                (metadata or {}).get("thread_id"), str
+            ):
+                span.set_attribute(
+                    RESPAN_SPAN_ATTRIBUTES_MAP["thread_identifier"],
+                    text(metadata["thread_id"], None),
+                )
+            if run.capture:
+                run.input = json_value(input_value, complete=log_type == LOG_TYPE_TOOL)
+                if self.include_metadata:
+                    run.extra.update(
+                        {
+                            LANGCHAIN_METADATA_ATTR: json_value(metadata),
+                            LANGCHAIN_SERIALIZED_ATTR: json_value(serialized),
+                            LANGCHAIN_TAGS_ATTR: json_value(tags),
+                        }
+                    )
+                if extra:
+                    run.extra.update(extra)
+            return run
+
+    def _record(self, run_id):
+        run = self._runs.get(_key(run_id))
+        if not _content_enabled(self):
+            key = _key(run_id)
+            visited = set()
+            while key and key not in visited:
+                visited.add(key)
+                active = self._runs.get(key)
+                cached = self._parents.get(key)
+                if cached:
+                    self._parents[key] = (cached[0], False, cached[2])
+                if active is None:
+                    key = cached[2] if cached else ""
+                    continue
+                active.capture = False
+                active.input = None
+                active.extra.clear()
+                active.tokens.clear()
+                active.metadata = {
+                    k: v for k, v in active.metadata.items() if k in _MARKER_FIELDS
+                }
+                key = active.parent_key
+        return run
+
+    def _end(self, run_id, *, output=None, error=None, extra=None):
+        key = _key(run_id)
+        with self._lock:
+            run = self._record(run_id)
+            if key not in self._runs:
+                return
+            self._runs.pop(key, None)
+            if run is None:
+                return
+            self._parents[key] = (
+                run.span.get_span_context(),
+                run.capture,
+                run.parent_key,
             )
-            else parent_hex or run_hex
-        )
-        trace_id = (
-            self._runs[parent_hex].trace_id
-            if parent_hex in self._runs
-            else self._run_trace_ids.get(
-                parent_hex or "",
-                active_parent[0] if active_parent else fallback_trace_id,
-            )
-        )
-        parent_span_id = (
-            _derive_span_id(parent_hex)
-            if parent_hex
-            else active_parent[1]
-            if active_parent
-            else None
-        )
-        span_id = _derive_span_id(run_hex)
-        parent_path = (
-            self._runs[parent_hex].entity_path
-            if parent_hex in self._runs
-            else self._run_paths.get(parent_hex or "")
-        )
-        entity_path = (
-            f"{parent_path}{LANGCHAIN_ENTITY_PATH_SEPARATOR}{name}"
-            if parent_path
-            else name
-        )
-        self._runs[run_hex] = _RunRecord(
-            run_id=run_hex,
-            trace_id=trace_id,
-            span_id=span_id,
-            parent_run_id=parent_hex,
-            parent_span_id=parent_span_id,
-            name=name,
-            entity_path=entity_path,
-            log_type=log_type,
-            span_kind=span_kind,
-            start_ns=time.time_ns(),
-            input_value=input_value,
-            serialized=_serialize_value(serialized),
-            tags=tags,
-            metadata=metadata,
-            framework=framework,
-            extra_attributes=extra_attributes or {},
-        )
+            self._parents.move_to_end(key)
+            while len(self._parents) > self.max_cached_runs:
+                self._parents.popitem(last=False)
+        try:
+            if not run.span.is_recording():
+                return
+            if extra:
+                for name, value in extra.items():
+                    run.span.set_attribute(name, value)
+            if error is not None:
+                run.span.set_status(Status(StatusCode.ERROR))
+                event = {EXCEPTION_TYPE: type(error).__name__}
+                if run.capture:
+                    args = BaseException.args.__get__(error)
+                    message = "; ".join(
+                        text(value) for value in args if isinstance(value, str)
+                    )
+                    if message:
+                        event[EXCEPTION_MESSAGE] = message
+                        run.span.set_status(Status(StatusCode.ERROR, message))
+                run.span.add_event("exception", event)
+            if run.capture:
+                if run.input is not None:
+                    run.span.set_attribute(
+                        SpanAttributes.TRACELOOP_ENTITY_INPUT, run.input
+                    )
+                for name, value in run.extra.items():
+                    run.span.set_attribute(name, value)
+                if error is None and output is not None:
+                    run.span.set_attribute(
+                        SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+                        json_value(output, complete=run.log_type == LOG_TYPE_TOOL),
+                    )
+            if run.metadata:
+                run.span.set_attribute(RESPAN_METADATA, json_value(run.metadata))
+                for name, value in run.metadata.items():
+                    run.span.set_attribute(
+                        f"{RESPAN_METADATA}.{name}",
+                        value
+                        if isinstance(value, (str, int, float, bool))
+                        else json_value(value),
+                    )
+        finally:
+            run.span.end()
 
-    def _build_attributes(
-        self,
-        record: _RunRecord,
-        *,
-        output_value: Any = None,
-    ) -> dict[str, Any]:
-        attrs: dict[str, Any] = {
-            RESPAN_LOG_METHOD: LogMethodChoices.TRACING_INTEGRATION.value,
-            RESPAN_LOG_TYPE: record.log_type,
-            SpanAttributes.TRACELOOP_ENTITY_NAME: record.name,
-            SpanAttributes.TRACELOOP_ENTITY_PATH: record.entity_path,
-            LANGCHAIN_RUN_ID_ATTR: record.run_id,
-            LANGCHAIN_FRAMEWORK_ATTR: record.framework,
-        }
-        _set_if_present(attrs, LANGCHAIN_PARENT_RUN_ID_ATTR, record.parent_run_id)
+    def _event(self, name, payload, run_id, metadata=None):
+        parent = self._record(run_id)
+        if not self._enabled or _suppressed() or parent is None:
+            return
+        with trace.get_tracer(__name__).start_as_current_span(
+            name,
+            context=trace.set_span_in_context(parent.span),
+            attributes={
+                RESPAN_LOG_TYPE: LOG_TYPE_TASK,
+                SpanAttributes.TRACELOOP_ENTITY_NAME: name,
+                SpanAttributes.TRACELOOP_ENTITY_PATH: name,
+            },
+        ) as span:
+            if parent.capture and span.is_recording() and _content_enabled(self):
+                span.set_attribute(
+                    SpanAttributes.TRACELOOP_ENTITY_INPUT, json_value(payload)
+                )
 
-        if self.include_metadata:
-            _set_if_present(attrs, LANGCHAIN_TAGS_ATTR, _to_json_string(record.tags))
-            _set_if_present(
-                attrs, LANGCHAIN_METADATA_ATTR, _to_json_string(record.metadata)
-            )
-            _set_if_present(
-                attrs, LANGCHAIN_SERIALIZED_ATTR, _to_json_string(record.serialized)
-            )
-
-        attrs.update(_extract_respan_attributes(record.metadata))
-
-        if self.include_content:
-            input_string = _to_json_string(record.input_value)
-            output_string = _to_json_string(_normalize_output_for_logging(output_value))
-            _set_if_present(attrs, SpanAttributes.TRACELOOP_ENTITY_INPUT, input_string)
-            _set_if_present(
-                attrs, SpanAttributes.TRACELOOP_ENTITY_OUTPUT, output_string
-            )
-
-        attrs.update(record.extra_attributes)
-        return attrs
-
-    def _end_run(
-        self,
-        *,
-        run_id: Any,
-        output_value: Any = None,
-        error: BaseException | None = None,
-        extra_attributes: dict[str, Any] | None = None,
-    ) -> bool:
-        run_hex = _run_id_to_hex(run_id)
-        record = self._runs.pop(run_hex, None)
-        if record is None:
-            return False
-
-        if record.streamed_tokens and output_value in _EMPTY_VALUES:
-            output_value = "".join(record.streamed_tokens)
-
-        if extra_attributes:
-            record.extra_attributes.update(extra_attributes)
-
-        attrs = self._build_attributes(record, output_value=output_value)
-        error_message = _set_error_attributes(attrs, error)
-        span = build_readable_span(
-            name=record.name,
-            trace_id=record.trace_id,
-            span_id=record.span_id,
-            parent_id=record.parent_span_id,
-            start_time_ns=record.start_ns,
-            end_time_ns=time.time_ns(),
-            attributes=attrs,
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR if error else HTTPStatus.OK,
-            error_message=error_message,
-        )
-        self._remember_run(record)
-        return inject_span(span)
-
-    def _emit_event_span(
-        self,
-        *,
-        parent_run_id: Any = None,
-        name: str,
-        log_type: str = LOG_TYPE_TASK,
-        span_kind: str = LOG_TYPE_TASK,
-        input_value: Any = None,
-        output_value: Any = None,
-        tags: list[str] | None = None,
-        metadata: dict[str, Any] | None = None,
-        error: BaseException | None = None,
-        extra_attributes: dict[str, Any] | None = None,
-    ) -> bool:
-        parent_hex = (
-            _run_id_to_hex(parent_run_id) if parent_run_id is not None else None
-        )
-        active_parent = _get_active_otel_parent() if parent_hex is None else None
-        trace_id = (
-            self._runs[parent_hex].trace_id
-            if parent_hex in self._runs
-            else self._run_trace_ids.get(
-                parent_hex or "",
-                active_parent[0] if active_parent else parent_hex or uuid4().hex,
-            )
-        )
-        parent_span_id = (
-            _derive_span_id(parent_hex)
-            if parent_hex
-            else active_parent[1]
-            if active_parent
-            else None
-        )
-        parent_path = (
-            self._runs[parent_hex].entity_path
-            if parent_hex in self._runs
-            else self._run_paths.get(parent_hex or "")
-        )
-        entity_path = (
-            f"{parent_path}{LANGCHAIN_ENTITY_PATH_SEPARATOR}{name}"
-            if parent_path
-            else name
-        )
-        span_key = LANGCHAIN_HASH_SEPARATOR.join(
-            (trace_id, str(parent_hex), name, str(time.time_ns()))
-        )
-        record = _RunRecord(
-            run_id=_run_id_to_hex(span_key),
-            trace_id=trace_id,
-            span_id=_derive_span_id(span_key),
-            parent_run_id=parent_hex,
-            parent_span_id=parent_span_id,
-            name=name,
-            entity_path=entity_path,
-            log_type=log_type,
-            span_kind=span_kind,
-            start_ns=time.time_ns(),
-            input_value=input_value,
-            tags=tags,
-            metadata=metadata,
-            framework=_detect_framework(tags=tags, metadata=metadata, name=name),
-            extra_attributes=extra_attributes or {},
-        )
-        attrs = self._build_attributes(record, output_value=output_value)
-        error_message = _set_error_attributes(attrs, error)
-        span = build_readable_span(
-            name=name,
-            trace_id=trace_id,
-            span_id=record.span_id,
-            parent_id=parent_span_id,
-            start_time_ns=record.start_ns,
-            end_time_ns=time.time_ns(),
-            attributes=attrs,
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR if error else HTTPStatus.OK,
-            error_message=error_message,
-        )
-        return inject_span(span)
-
+    @_safe_callback
     def on_chain_start(
         self,
-        serialized: dict[str, Any],
-        inputs: dict[str, Any],
+        serialized,
+        inputs,
         *,
-        run_id: UUID,
-        parent_run_id: UUID | None = None,
-        tags: list[str] | None = None,
-        metadata: dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> None:
-        name = kwargs.get(LANGCHAIN_NAME_KEY) or _extract_name(
-            serialized,
-            CHAIN_FALLBACK_NAME,
+        run_id,
+        parent_run_id=None,
+        tags=None,
+        metadata=None,
+        **kwargs,
+    ):
+        name = _name(serialized, kwargs, "chain")
+        agent = (
+            isinstance(serialized, dict)
+            and (serialized.get("id") or [None])[-1] == "AgentExecutor"
         )
-        is_root = parent_run_id is None
-        self._start_run(
+        self._start(
             run_id=run_id,
             parent_run_id=parent_run_id,
             name=name,
-            log_type=LOG_TYPE_WORKFLOW if is_root else LOG_TYPE_TASK,
-            span_kind=LOG_TYPE_WORKFLOW if is_root else LOG_TYPE_TASK,
-            input_value=_serialize_value(inputs),
+            log_type=LOG_TYPE_AGENT
+            if agent
+            else LOG_TYPE_WORKFLOW
+            if parent_run_id is None
+            else LOG_TYPE_TASK,
+            input_value=inputs,
             serialized=serialized,
             tags=tags,
             metadata=metadata,
         )
 
-    def on_chain_end(
-        self, outputs: dict[str, Any], *, run_id: UUID, **kwargs: Any
-    ) -> None:
-        self._end_run(run_id=run_id, output_value=_serialize_value(outputs))
+    @_safe_callback
+    def on_chain_end(self, outputs, *, run_id, **kwargs):
+        self._end(run_id, output=outputs)
 
-    def on_chain_error(
-        self, error: BaseException, *, run_id: UUID, **kwargs: Any
-    ) -> None:
-        self._end_run(run_id=run_id, error=error)
+    @_safe_callback
+    def on_chain_error(self, error, *, run_id, **kwargs):
+        try:
+            from langgraph.errors import GraphInterrupt
+        except ImportError:
+            GraphInterrupt = None
+        if GraphInterrupt is not None and isinstance(error, GraphInterrupt):
+            self._event(
+                "langgraph.interrupt", BaseException.args.__get__(error), run_id
+            )
+            self._end(run_id)
+        else:
+            self._end(run_id, error=error)
 
+    @_safe_callback
     def on_chat_model_start(
         self,
-        serialized: dict[str, Any],
-        messages: list[list[Any]],
+        serialized,
+        messages,
         *,
-        run_id: UUID,
-        parent_run_id: UUID | None = None,
-        tags: list[str] | None = None,
-        metadata: dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> None:
-        normalized_messages = _normalize_chat_messages(messages)
-        first_conversation = normalized_messages[0] if normalized_messages else []
-        extra_attrs: dict[str, Any] = {
-            LLM_REQUEST_TYPE: LOG_TYPE_CHAT,
-        }
-        model = _extract_model(serialized, metadata=metadata)
-        _set_if_present(extra_attrs, LLM_REQUEST_MODEL, model)
-        for index, message in enumerate(first_conversation):
-            for key, value in message.items():
-                _set_if_present(
-                    extra_attrs,
-                    f"{SpanAttributes.LLM_PROMPTS}.{index}.{key}",
-                    _to_json_string(value)
-                    if isinstance(value, (dict, list))
-                    else value,
-                )
-        tools = _extract_tools(serialized, kwargs)
-        _set_if_present(
-            extra_attrs,
-            SpanAttributes.LLM_REQUEST_FUNCTIONS,
-            _to_json_string(tools),
-        )
-
-        self._start_run(
+        run_id,
+        parent_run_id=None,
+        tags=None,
+        metadata=None,
+        **kwargs,
+    ):
+        model = _model(serialized, metadata)
+        run = self._start(
             run_id=run_id,
             parent_run_id=parent_run_id,
-            name=_extract_name(serialized, CHAT_MODEL_FALLBACK_NAME),
+            name=_name(serialized, kwargs, "chat_model"),
             log_type=LOG_TYPE_CHAT,
-            span_kind=LOG_TYPE_CHAT,
-            input_value=normalized_messages,
             serialized=serialized,
             tags=tags,
             metadata=metadata,
-            extra_attributes=extra_attrs,
         )
+        if run is None or not run.span.is_recording():
+            return
+        run.span.set_attribute(SpanAttributes.LLM_REQUEST_TYPE, "chat")
+        if model:
+            run.span.set_attribute(SpanAttributes.LLM_REQUEST_MODEL, model)
+        provider = (metadata or {}).get("ls_provider")
+        if isinstance(provider, str):
+            run.span.set_attribute(
+                SpanAttributes.LLM_SYSTEM, text(provider, 64).lower()
+            )
+            run.span.set_attribute(GEN_AI_PROVIDER_NAME, text(provider, 64).lower())
+        invocation = kwargs.get("invocation_params") or {}
+        for field_name, key in (
+            ("temperature", SpanAttributes.LLM_REQUEST_TEMPERATURE),
+            ("max_tokens", SpanAttributes.LLM_REQUEST_MAX_TOKENS),
+            ("stream", SpanAttributes.LLM_IS_STREAMING),
+        ):
+            value = invocation.get(field_name)
+            if isinstance(value, (bool, int, float)):
+                run.span.set_attribute(key, value)
+        if run.capture:
+            normalized = [
+                [_message(m) for m in conversation] for conversation in messages
+            ]
+            run.input = json_value(normalized)
+            run.extra.update(
+                _message_attributes(
+                    normalized[0] if normalized else [], SpanAttributes.LLM_PROMPTS
+                )
+            )
+            tools = invocation.get("tools") or invocation.get("functions")
+            if isinstance(tools, list):
+                run.extra[SpanAttributes.LLM_REQUEST_FUNCTIONS] = json_value(
+                    tools, complete=True
+                )
 
+    @_safe_callback
     def on_llm_start(
         self,
-        serialized: dict[str, Any],
-        prompts: list[str],
+        serialized,
+        prompts,
         *,
-        run_id: UUID,
-        parent_run_id: UUID | None = None,
-        tags: list[str] | None = None,
-        metadata: dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> None:
-        extra_attrs: dict[str, Any] = {LLM_REQUEST_TYPE: LOG_TYPE_CHAT}
-        model = _extract_model(serialized, metadata=metadata)
-        _set_if_present(extra_attrs, LLM_REQUEST_MODEL, model)
-        for index, prompt in enumerate(prompts or []):
-            extra_attrs[
-                f"{SpanAttributes.LLM_PROMPTS}.{index}.{LANGCHAIN_ROLE_KEY}"
-            ] = LANGCHAIN_USER_ROLE
-            extra_attrs[
-                f"{SpanAttributes.LLM_PROMPTS}.{index}.{LANGCHAIN_CONTENT_KEY}"
-            ] = prompt
-
-        self._start_run(
+        run_id,
+        parent_run_id=None,
+        tags=None,
+        metadata=None,
+        **kwargs,
+    ):
+        run = self._start(
             run_id=run_id,
             parent_run_id=parent_run_id,
-            name=_extract_name(serialized, LLM_FALLBACK_NAME),
+            name=_name(serialized, kwargs, "llm"),
             log_type=LOG_TYPE_TEXT,
-            span_kind=LOG_TYPE_TEXT,
             input_value=prompts,
             serialized=serialized,
             tags=tags,
             metadata=metadata,
-            extra_attributes=extra_attrs,
         )
-
-    def on_llm_new_token(self, token: str, *, run_id: UUID, **kwargs: Any) -> None:
-        record = self._runs.get(_run_id_to_hex(run_id))
-        if record is not None and token:
-            record.streamed_tokens.append(token)
-            record.extra_attributes[SpanAttributes.LLM_IS_STREAMING] = True
-
-    def on_llm_end(self, response: Any, *, run_id: UUID, **kwargs: Any) -> None:
-        run_hex = _run_id_to_hex(run_id)
-        record = self._runs.get(run_hex)
-        output_payload, completion_messages = _extract_llm_output(response)
-        completion_messages = _normalize_output_for_logging(completion_messages)
-        extra_attrs: dict[str, Any] = {}
-        if record is not None:
-            model = _extract_model(
-                record.serialized, response=response, metadata=record.metadata
-            )
-            _set_if_present(extra_attrs, LLM_REQUEST_MODEL, model)
-
-        for index, message in enumerate(completion_messages):
-            for key, value in message.items():
-                if key == LANGCHAIN_TOOL_CALLS_KEY:
-                    value = _extract_tool_calls_from_messages([message])
-                _set_if_present(
-                    extra_attrs,
-                    f"{SpanAttributes.LLM_COMPLETIONS}.{index}.{key}",
-                    _to_json_string(value)
-                    if isinstance(value, (dict, list))
-                    else value,
+        if run is None or not run.span.is_recording():
+            return
+        run.span.set_attribute(SpanAttributes.LLM_REQUEST_TYPE, "chat")
+        model = _model(serialized, metadata)
+        if model:
+            run.span.set_attribute(SpanAttributes.LLM_REQUEST_MODEL, model)
+        if run.capture:
+            run.extra.update(
+                _message_attributes(
+                    [{"role": "user", "content": data(p)} for p in prompts],
+                    SpanAttributes.LLM_PROMPTS,
                 )
+            )
 
-        prompt_tokens, completion_tokens, total_tokens = _extract_usage(response)
-        for key, value in (
-            (LLM_USAGE_PROMPT_TOKENS, prompt_tokens),
-            (LLM_USAGE_COMPLETION_TOKENS, completion_tokens),
-            (SpanAttributes.LLM_USAGE_TOTAL_TOKENS, total_tokens),
-        ):
-            _set_if_present(extra_attrs, key, value)
+    @_safe_callback
+    def on_llm_new_token(self, token, *, run_id, **kwargs):
+        run = self._record(run_id)
+        if run is not None and run.span.is_recording():
+            run.span.set_attribute(SpanAttributes.LLM_IS_STREAMING, True)
 
-        self._end_run(
-            run_id=run_id,
-            output_value=output_payload,
-            extra_attributes=extra_attrs,
-        )
+    @_safe_callback
+    def on_llm_end(self, response, *, run_id, **kwargs):
+        run = self._record(run_id)
+        if run is None:
+            self._end(run_id)
+            return
+        extra = _usage(response) if run.span.is_recording() else {}
+        if run.capture:
+            messages = _completions(response)
+            run.extra.update(
+                _message_attributes(messages, SpanAttributes.LLM_COMPLETIONS)
+            )
+            output = {"messages": messages}
+        else:
+            output = None
+        self._end(run_id, output=output, extra=extra)
 
-    def on_llm_error(
-        self, error: BaseException, *, run_id: UUID, **kwargs: Any
-    ) -> None:
-        self._end_run(run_id=run_id, error=error)
+    @_safe_callback
+    def on_llm_error(self, error, *, run_id, **kwargs):
+        self._end(run_id, error=error)
 
+    @_safe_callback
     def on_tool_start(
         self,
-        serialized: dict[str, Any],
-        input_str: str,
+        serialized,
+        input_str,
         *,
-        run_id: UUID,
-        parent_run_id: UUID | None = None,
-        tags: list[str] | None = None,
-        metadata: dict[str, Any] | None = None,
-        inputs: dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> None:
-        name = kwargs.get(LANGCHAIN_NAME_KEY) or _extract_name(
-            serialized,
-            TOOL_FALLBACK_NAME,
-        )
-        input_value = _serialize_value(inputs) if inputs is not None else input_str
-        self._start_run(
+        run_id,
+        parent_run_id=None,
+        tags=None,
+        metadata=None,
+        inputs=None,
+        **kwargs,
+    ):
+        name = _name(serialized, {}, "tool")
+        value = inputs if inputs is not None else input_str
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (ValueError, TypeError):
+                pass
+        run = self._start(
             run_id=run_id,
             parent_run_id=parent_run_id,
             name=name,
             log_type=LOG_TYPE_TOOL,
-            span_kind=LOG_TYPE_TOOL,
-            input_value=input_value,
+            input_value={"name": name, "arguments": value},
             serialized=serialized,
             tags=tags,
             metadata=metadata,
-            extra_attributes={
-                GEN_AI_TOOL_NAME: name,
-                GEN_AI_TOOL_CALL_ARGUMENTS: _to_json_string(input_value),
-            },
         )
+        if run is not None and isinstance(kwargs.get("tool_call_id"), str):
+            run.span.set_attribute(
+                GEN_AI_TOOL_CALL_ID, text(kwargs["tool_call_id"], None)
+            )
 
-    def on_tool_end(self, output: Any, *, run_id: UUID, **kwargs: Any) -> None:
-        self._end_run(
-            run_id=run_id,
-            output_value=_serialize_value(output),
-            extra_attributes={
-                GEN_AI_TOOL_CALL_RESULT: _to_json_string(_serialize_value(output))
-            },
-        )
+    @_safe_callback
+    def on_tool_end(self, output, *, run_id, **kwargs):
+        run = self._record(run_id)
+        if run is not None and isinstance(output, ToolMessage):
+            values = vars(output)
+            call_id = values.get("tool_call_id")
+            if isinstance(call_id, str):
+                run.span.set_attribute(GEN_AI_TOOL_CALL_ID, text(call_id, None))
+            output = (
+                {"content": values.get("content"), "artifact": values.get("artifact")}
+                if values.get("artifact") is not None
+                else values.get("content")
+            )
+        self._end(run_id, output=output)
 
-    def on_tool_error(
-        self, error: BaseException, *, run_id: UUID, **kwargs: Any
-    ) -> None:
-        self._end_run(run_id=run_id, error=error)
+    @_safe_callback
+    def on_tool_error(self, error, *, run_id, **kwargs):
+        self._end(run_id, error=error)
 
+    @_safe_callback
     def on_retriever_start(
         self,
-        serialized: dict[str, Any],
-        query: str,
+        serialized,
+        query,
         *,
-        run_id: UUID,
-        parent_run_id: UUID | None = None,
-        tags: list[str] | None = None,
-        metadata: dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> None:
-        self._start_run(
+        run_id,
+        parent_run_id=None,
+        tags=None,
+        metadata=None,
+        **kwargs,
+    ):
+        self._start(
             run_id=run_id,
             parent_run_id=parent_run_id,
-            name=kwargs.get(LANGCHAIN_NAME_KEY)
-            or _extract_name(serialized, RETRIEVER_FALLBACK_NAME),
+            name=_name(serialized, kwargs, "retriever"),
             log_type=LOG_TYPE_TASK,
-            span_kind=LOG_TYPE_TASK,
             input_value=query,
             serialized=serialized,
             tags=tags,
             metadata=metadata,
         )
 
-    def on_retriever_end(
-        self, documents: Sequence[Any], *, run_id: UUID, **kwargs: Any
-    ) -> None:
-        self._end_run(run_id=run_id, output_value=_serialize_value(list(documents)))
+    @_safe_callback
+    def on_retriever_end(self, documents, *, run_id, **kwargs):
+        self._end(run_id, output=list(documents))
 
-    def on_retriever_error(
-        self, error: BaseException, *, run_id: UUID, **kwargs: Any
-    ) -> None:
-        self._end_run(run_id=run_id, error=error)
+    @_safe_callback
+    def on_retriever_error(self, error, *, run_id, **kwargs):
+        self._end(run_id, error=error)
 
-    def on_agent_action(
-        self,
-        action: Any,
-        *,
-        run_id: UUID,
-        parent_run_id: UUID | None = None,
-        tags: list[str] | None = None,
-        metadata: dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> None:
-        tool_name = (
-            getattr(action, LANGCHAIN_TOOL_ATTR, None) or AGENT_ACTION_FALLBACK_NAME
-        )
-        tool_input = getattr(action, LANGCHAIN_TOOL_INPUT_ATTR, None)
-        log = getattr(action, LANGCHAIN_LOG_ATTR, None)
-        self._emit_event_span(
-            parent_run_id=run_id or parent_run_id,
-            name=str(tool_name),
-            log_type=LOG_TYPE_TOOL,
-            span_kind=LOG_TYPE_TOOL,
-            input_value=_serialize_value(tool_input),
-            output_value=log,
-            tags=tags,
-            metadata=metadata,
-            extra_attributes={
-                GEN_AI_TOOL_NAME: str(tool_name),
-                GEN_AI_TOOL_CALL_ARGUMENTS: _to_json_string(
-                    _serialize_value(tool_input)
-                ),
-            },
-        )
+    @_safe_callback
+    def on_agent_action(self, action, *, run_id, **kwargs):
+        self._event("agent_action", action, run_id)
 
-    def on_agent_finish(
-        self,
-        finish: Any,
-        *,
-        run_id: UUID,
-        parent_run_id: UUID | None = None,
-        tags: list[str] | None = None,
-        metadata: dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> None:
-        output = getattr(finish, LANGCHAIN_RETURN_VALUES_ATTR, finish)
-        self._emit_event_span(
-            parent_run_id=run_id or parent_run_id,
-            name=AGENT_FINISH_EVENT_NAME,
-            log_type=LOG_TYPE_AGENT,
-            span_kind=LOG_TYPE_AGENT,
-            output_value=_serialize_value(output),
-            tags=tags,
-            metadata=metadata,
-        )
+    @_safe_callback
+    def on_agent_finish(self, finish, *, run_id, **kwargs):
+        self._event("agent_finish", finish, run_id)
 
-    def on_text(self, text: str, *, run_id: UUID, **kwargs: Any) -> None:
-        record = self._runs.get(_run_id_to_hex(run_id))
-        if record is not None and text:
-            record.streamed_tokens.append(text)
+    @_safe_callback
+    def on_text(self, value, *, run_id, **kwargs):
+        # on_text is diagnostic output, not a synthetic assistant completion.
+        run = self._record(run_id)
+        if run is not None and run.capture:
+            self._event("text", value, run_id)
 
-    def on_retry(self, retry_state: Any, *, run_id: UUID, **kwargs: Any) -> None:
-        record = self._runs.get(_run_id_to_hex(run_id))
-        if record is None:
-            return
-        retries = record.extra_attributes.setdefault(LANGCHAIN_RETRY_COUNT_ATTR, 0)
-        record.extra_attributes[LANGCHAIN_RETRY_COUNT_ATTR] = retries + 1
-        record.extra_attributes[LANGCHAIN_RETRY_STATE_ATTR] = _to_json_string(
-            _serialize_value(retry_state)
-        )
+    @_safe_callback
+    def on_retry(self, retry_state, *, run_id, **kwargs):
+        run = self._record(run_id)
+        if run is not None and run.span.is_recording():
+            key = "langchain.retry_count"
+            run.span.set_attribute(
+                key, getattr(run.span, "attributes", {}).get(key, 0) + 1
+            )
 
-    def on_custom_event(
-        self,
-        name: str,
-        data: Any,
-        *,
-        run_id: UUID,
-        tags: list[str] | None = None,
-        metadata: dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> None:
-        self._emit_event_span(
-            parent_run_id=run_id,
-            name=name,
-            log_type=LOG_TYPE_CUSTOM,
-            span_kind=LOG_TYPE_TASK,
-            input_value=_serialize_value(data),
-            tags=tags,
-            metadata=metadata,
-        )
+    @_safe_callback
+    def on_custom_event(self, name, data, *, run_id, **kwargs):
+        self._event(text(name, 512), data, run_id)
 
-    def on_interrupt(self, event: Any) -> None:
-        self._emit_graph_lifecycle_event(LANGGRAPH_INTERRUPT_EVENT_NAME, event)
+    @_safe_callback
+    def on_interrupt(self, event):
+        self._event("langgraph.interrupt", event, getattr(event, "run_id", None))
 
-    def on_resume(self, event: Any) -> None:
-        self._emit_graph_lifecycle_event(LANGGRAPH_RESUME_EVENT_NAME, event)
+    @_safe_callback
+    def on_resume(self, event):
+        self._event("langgraph.resume", event, getattr(event, "run_id", None))
 
-    def _emit_graph_lifecycle_event(self, name: str, event: Any) -> None:
-        event_payload = _serialize_value(event)
-        run_id = (
-            event_payload.get(LANGCHAIN_RUN_ID_KEY)
-            if isinstance(event_payload, Mapping)
-            else None
-        )
-        self._emit_event_span(
-            parent_run_id=run_id,
-            name=name,
-            log_type=LOG_TYPE_TASK,
-            span_kind=LOG_TYPE_TASK,
-            input_value=event_payload,
-            metadata={LANGCHAIN_FRAMEWORK_METADATA_KEY: FRAMEWORK_LANGGRAPH},
-        )
+    def shutdown(self):
+        with self._lock:
+            self._enabled = False
+            runs, self._runs = self._runs, {}
+            self._parents.clear()
+        for run in runs.values():
+            if run is not None:
+                run.span.end()
+
+
+def _with_respan_callback(callbacks, handler, *, replace=False):
+    if isinstance(callbacks, BaseCallbackManager):
+        manager = callbacks.copy()
+        existing = [x for x in manager.handlers if isinstance(x, RespanCallbackHandler)]
+        if existing:
+            if replace and handler not in existing:
+                for previous in existing:
+                    manager.remove_handler(previous)
+                manager.add_handler(handler, inherit=True)
+        else:
+            manager.add_handler(handler, inherit=True)
+        return manager
+    values = (
+        list(callbacks)
+        if isinstance(callbacks, (list, tuple))
+        else [callbacks]
+        if callbacks is not None
+        else []
+    )
+    existing = [x for x in values if isinstance(x, RespanCallbackHandler)]
+    if existing:
+        if replace and handler not in existing:
+            return [x for x in values if not isinstance(x, RespanCallbackHandler)] + [
+                handler
+            ]
+        return values
+    return values + [handler]
+
+
+def get_callback_handler(**kwargs):
+    kwargs.setdefault("group_langflow_root_runs", True)
+    return RespanCallbackHandler(**kwargs)
+
+
+def add_respan_callback(
+    config: Mapping[str, Any] | None = None,
+    handler: RespanCallbackHandler | None = None,
+) -> dict[str, Any]:
+    result = dict(config or {})
+    result["callbacks"] = _with_respan_callback(
+        result.get("callbacks"),
+        handler or get_callback_handler(),
+        replace=handler is not None,
+    )
+    return result

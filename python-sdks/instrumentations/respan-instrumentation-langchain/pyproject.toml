@@ -12,11 +12,12 @@ packages = [
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
 respan-tracing = "^2.16.6"
-respan-sdk = ">=2.6.1"
-opentelemetry-semantic-conventions-ai = ">=0.4.1"
-langchain-core = ">=0.3.0"
-langgraph = { version = ">=0.2.0", optional = true }
-langflow = { version = ">=1.0.0", optional = true }
+respan-sdk = ">=2.7.6"
+opentelemetry-semantic-conventions-ai = ">=0.5.1,<0.6.0"
+opentelemetry-semantic-conventions = ">=0.59b0"
+langchain-core = ">=0.3.0,<2.0.0"
+langgraph = { version = ">=0.2.20,<2.0.0", optional = true }
+langflow = { version = ">=1.1.0", optional = true }
 
 [tool.poetry.extras]
 langgraph = ["langgraph"]

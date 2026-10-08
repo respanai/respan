@@ -1,65 +1,33 @@
 # respan-instrumentation-dspy
 
-Respan instrumentation plugin for [DSPy](https://dspy.ai/).
-
-This package registers a native DSPy callback and emits module, language model,
-tool, adapter, and evaluation spans into the Respan tracing pipeline.
-
-## Configuration
-
-### 1. Install
+Respan tracing for DSPy 3.x using native callbacks and actual sampled OpenTelemetry spans. Tested with released DSPy 3.0.0 and 3.4.0.
 
 ```bash
-pip install respan-instrumentation-dspy
+pip install respan-instrumentation-dspy respan-ai
 ```
-
-### 2. Set Environment Variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `RESPAN_API_KEY` | Yes | Your Respan API key. Authenticates both proxy and tracing. |
-| `RESPAN_BASE_URL` | No | Defaults to `https://api.respan.ai/api`. |
-
-## Quickstart
-
-### 3. Run Script
 
 ```python
 import os
-
 import dspy
 from respan import Respan
 from respan_instrumentation_dspy import DSPyInstrumentor
 
-respan_api_key = os.environ["RESPAN_API_KEY"]
-respan_base_url = os.getenv("RESPAN_BASE_URL", "https://api.respan.ai/api")
-
-os.environ["OPENAI_API_KEY"] = respan_api_key
-os.environ["OPENAI_BASE_URL"] = respan_base_url
-os.environ["OPENAI_API_BASE"] = respan_base_url
-
 respan = Respan(
-    api_key=respan_api_key,
-    base_url=respan_base_url,
-    app_name="dspy-quickstart",
-    instrumentations=[DSPyInstrumentor()],
+    api_key=os.environ["RESPAN_API_KEY"], instrumentations=[DSPyInstrumentor()]
 )
-
-dspy.configure(lm=dspy.LM("openai/gpt-4o-mini", cache=False))
-question_answerer = dspy.Predict("question -> answer")
-prediction = question_answerer(question="What is DSPy in one sentence?")
-
-print(prediction.answer)
-respan.flush()
+dspy.configure(
+    lm=dspy.LM("openai/gpt-4o-mini", api_key=os.environ["OPENAI_API_KEY"], cache=False)
+)
+try:
+    print(dspy.Predict("question -> answer")(question="What is DSPy?").answer)
+finally:
+    respan.shutdown()
 ```
 
-### 4. View Dashboard
+The callback observes modules, models, tools, adapters and evaluation. On SDKs that expose them, native compile and interpreter callbacks are also recognized. Small owned hooks capture actual model responses independently of DSPy history, observe sync/async Embedder results, and correlate ReActV2 tool executions with unambiguous native call IDs. Original responses, exceptions, NumPy arrays and DSPy streaming iterators retain their native behavior.
 
-Open the Respan dashboard and inspect the `dspy-quickstart` trace.
+DSPy 3.4 native `lm15.Request`/`Response`, custom engines, `streamify`, and async ReActV2 are covered by controlled released-SDK examples. Usage comes from observed response fields; cache hits omit historical token usage. Callable Embedder returns complete vectors but exposes no provider usage, so the adapter does not manufacture token counts. Failed calls have error spans and no invented output or HTTP status. Remote interpreters, external tools and live provider streaming have not been validated by these fixtures.
 
-## Further Reading
+`DSPyInstrumentor(target=None, include_content=True, tracer_provider=None)` supports global or target registration. Shared compatible registrations emit one subtree and remain active until their final owner deactivates. Foreign callbacks and wrappers are retained. Set `include_content=False`, `TRACELOOP_TRACE_CONTENT=false`, or the Respan content context to disable payload capture. The initial policy bounds the call; a later opt-out removes captured payload before export. OTel suppression and sampling are respected. Credential values are redacted, unknown application objects are described without calling their string or dump hooks, and complete tool arguments/results and vectors are preserved.
 
-- [DSPy examples](https://github.com/Keywords-AI/respan-example-projects/tree/main/python/tracing/dspy)
-- [respan-ai](https://pypi.org/project/respan-ai/)
-- [respan-tracing](https://pypi.org/project/respan-tracing/)
-- [DSPy](https://dspy.ai/)
+See the [paired fixture examples](https://github.com/Keywords-AI/respan-example-projects/tree/main/python/tracing/dspy). They default to deterministic local model fixtures and can export traces without making provider requests. Live Gateway mode is an explicit option.

@@ -1,594 +1,356 @@
-"""DSPy callback that emits native Respan spans."""
+"""DSPy native callbacks routed through actual sampled OpenTelemetry spans."""
 
 from __future__ import annotations
 
-import importlib
 import logging
+import os
 import threading
-import time
-from collections.abc import Mapping
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Any
 
-from opentelemetry import trace
-from opentelemetry.semconv_ai import SpanAttributes
-
-from respan_instrumentation_dspy._constants import (
-    ASSISTANT_ROLE,
-    DSPY_ADAPTER_SPAN_NAME,
-    DSPY_CALL_KIND_ADAPTER_FORMAT,
-    DSPY_CALL_KIND_ADAPTER_PARSE,
-    DSPY_CALL_KIND_EVALUATE,
-    DSPY_CALL_KIND_LANGUAGE_MODEL,
-    DSPY_CALL_KIND_MODULE,
-    DSPY_CALL_KIND_TOOL,
-    DSPY_EVALUATE_SPAN_NAME,
-    DSPY_LANGUAGE_MODEL_SPAN_NAME,
-    DSPY_MODULE_SPAN_NAME,
-    DSPY_TOOL_SPAN_NAME,
+from dspy.clients.base_lm import BaseLM
+from dspy.utils.callback import ACTIVE_CALL_ID, BaseCallback
+from opentelemetry import context, trace
+from opentelemetry.semconv._incubating.attributes import gen_ai_attributes
+from opentelemetry.semconv.attributes.exception_attributes import (
+    EXCEPTION_MESSAGE,
+    EXCEPTION_TYPE,
 )
+from opentelemetry.semconv_ai import (
+    SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY,
+    SpanAttributes,
+)
+from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
+from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+
+from respan_instrumentation_dspy._serialization import redact_text
 from respan_instrumentation_dspy._utils import (
     add_lm_request_attributes,
     add_lm_usage_attributes,
-    content_to_string,
-    extract_first_completion,
+    get,
+    message,
     normalize_messages,
-    output_to_json,
-    output_to_plain_value,
+    plain,
     safe_json,
+    set_messages,
+    tool_definitions,
 )
-from respan_sdk.constants.llm_logging import (
-    LOG_TYPE_AGENT,
-    LOG_TYPE_CHAT,
-    LOG_TYPE_TASK,
-    LOG_TYPE_TOOL,
-    LogMethodChoices,
-)
-from respan_sdk.constants.span_attributes import (
-    RESPAN_LOG_METHOD,
-    RESPAN_LOG_TYPE,
-)
-from respan_sdk.utils.data_processing.id_processing import (
-    format_span_id,
-    format_trace_id,
-    generate_unique_id,
-)
-from respan_tracing.utils.span_factory import build_readable_span, inject_span
 
 logger = logging.getLogger(__name__)
-
-_MODULE_TASK_CLASS_NAMES = frozenset(
-    {
-        "ChainOfThought",
-        "Predict",
-        "ProgramOfThought",
-        "Retry",
-        "TypedPredictor",
-    }
-)
-_MODULE_AGENT_CLASS_NAMES = frozenset({"ReAct"})
+_CONTENT_BOUND = "dspy.capture_content_bound"
+_TOOL_CALLS = ContextVar("respan_dspy_tool_calls", default=())
 
 
+def allowed() -> bool:
+    return (
+        context.get_value(ENABLE_CONTENT_TRACING_KEY) is not False
+        and context.get_value(_CONTENT_BOUND) is not False
+        and os.getenv("TRACELOOP_TRACE_CONTENT", "true").strip().lower()
+        not in {"false", "0", "no", "off"}
+    )
+
+
+@dataclass
 class _CallState:
-    """Internal call state used to stitch DSPy nested callbacks into one trace."""
-
-    def __init__(
-        self,
-        *,
-        call_id: str,
-        call_kind: str,
-        instance: Any,
-        inputs: Mapping[str, Any],
-        started_at_ns: int,
-        trace_id: str | None,
-        span_id: str,
-        parent_id: str | None,
-        history_index: int | None = None,
-    ) -> None:
-        self.call_id = call_id
-        self.call_kind = call_kind
-        self.instance = instance
-        self.inputs = inputs
-        self.started_at_ns = started_at_ns
-        self.trace_id = trace_id
-        self.span_id = span_id
-        self.parent_id = parent_id
-        self.history_index = history_index
+    span: Any
+    kind: str
+    instance: Any
+    capture: bool
+    token: Any
+    content: dict = field(default_factory=dict)
+    result: Any = None
+    ended: bool = False
 
 
-def _get_active_dspy_call_id() -> str | None:
-    try:
-        callback_module = importlib.import_module("dspy.utils.callback")
-        active_call_id = getattr(callback_module, "ACTIVE_CALL_ID", None)
-        if active_call_id is None:
-            return None
-        value = active_call_id.get()
-    except Exception:
-        return None
-    return value if isinstance(value, str) and value else None
-
-
-def _get_current_otel_parent() -> tuple[str | None, str | None]:
-    current_span = trace.get_current_span()
-    try:
-        span_context = current_span.get_span_context()
-    except Exception:
-        return None, None
-
-    trace_id = getattr(span_context, "trace_id", 0)
-    span_id = getattr(span_context, "span_id", 0)
-    if not isinstance(trace_id, int) or not isinstance(span_id, int):
-        return None, None
-    if trace_id == 0 or span_id == 0:
-        return None, None
-    return format_trace_id(trace_id=trace_id), format_span_id(span_id=span_id)
-
-
-def _module_display_name(instance: Any) -> str:
-    class_name = type(instance).__name__
-    stage = getattr(instance, "stage", None)
-    if isinstance(stage, str) and stage:
-        return f"{class_name}:{stage}"
-    return class_name
-
-
-def _tool_display_name(instance: Any) -> str:
-    name = getattr(instance, "name", None)
-    if isinstance(name, str) and name:
-        return name
-    function = getattr(instance, "func", None)
-    function_name = getattr(function, "__name__", None)
-    if isinstance(function_name, str) and function_name:
-        return function_name
-    return type(instance).__name__
-
-
-def _adapter_display_name(instance: Any, call_kind: str) -> str:
-    method_name = "format" if call_kind == DSPY_CALL_KIND_ADAPTER_FORMAT else "parse"
-    return f"{type(instance).__name__}.{method_name}"
-
-
-def _module_log_type(instance: Any) -> str:
-    class_name = type(instance).__name__
-    module_name = type(instance).__module__
-    if class_name in _MODULE_AGENT_CLASS_NAMES:
-        return LOG_TYPE_AGENT
-    if class_name in _MODULE_TASK_CLASS_NAMES or module_name.startswith("dspy."):
-        return LOG_TYPE_TASK
-    return LOG_TYPE_AGENT
-
-
-def _get_history_index(instance: Any) -> int | None:
-    history = getattr(instance, "history", None)
-    if isinstance(history, list):
-        return len(history)
-    return None
-
-
-def _get_lm_history_entry(state: _CallState) -> Mapping[str, Any] | None:
-    history = getattr(state.instance, "history", None)
-    if not isinstance(history, list) or state.history_index is None:
-        return None
-    if len(history) <= state.history_index:
-        return None
-    history_entry = history[state.history_index]
-    return history_entry if isinstance(history_entry, Mapping) else None
-
-
-def _tool_input_value(*, name: str, inputs: Mapping[str, Any]) -> dict[str, Any]:
-    return {
-        "name": name,
-        "arguments": _tool_arguments(inputs=inputs),
-    }
-
-
-def _tool_arguments(*, inputs: Mapping[str, Any]) -> Any:
-    kwargs = inputs.get("kwargs")
-    args = inputs.get("args")
-    if isinstance(kwargs, Mapping):
-        if args:
-            return {
-                "args": output_to_plain_value(value=args),
-                "kwargs": output_to_plain_value(value=kwargs),
-            }
-        return output_to_plain_value(value=kwargs)
-    return output_to_plain_value(value=inputs)
-
-
-class DSPyInstrumentationCallback:
-    """DSPy callback handler that emits Respan-compatible OTEL spans."""
-
-    def __init__(self, *, include_content: bool = True) -> None:
+class DSPyInstrumentationCallback(BaseCallback):
+    def __init__(self, *, include_content=True, tracer_provider=None, policy=None):
         self._include_content = include_content
-        self._active_calls: dict[str, _CallState] = {}
+        self._policy = policy
+        self._tracer = (tracer_provider or trace.get_tracer_provider()).get_tracer(
+            "respan.instrumentation.dspy"
+        )
+        self._active_calls: dict[str, _CallState | None] = {}
         self._lock = threading.RLock()
+        self._closed = False
 
-    def _start_call(
-        self,
-        *,
-        call_id: str,
-        call_kind: str,
-        instance: Any,
-        inputs: Mapping[str, Any],
-    ) -> None:
-        parent_call_id = _get_active_dspy_call_id()
-        with self._lock:
-            parent_state = (
-                self._active_calls.get(parent_call_id)
-                if parent_call_id is not None
-                else None
-            )
-            if parent_state is not None:
-                trace_id = parent_state.trace_id
-                parent_id = parent_state.span_id
-            else:
-                trace_id, parent_id = _get_current_otel_parent()
-                if trace_id is None:
-                    trace_id = generate_unique_id()
+    def _start_call(self, call_id, call_kind, instance, inputs):
+        try:
+            with self._lock:
+                if self._closed or call_id in self._active_calls:
+                    return
+                parent = self._active_calls.get(ACTIVE_CALL_ID.get())
+                if (
+                    context.get_value(context._SUPPRESS_INSTRUMENTATION_KEY)
+                    or context.get_value(SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY)
+                    or (ACTIVE_CALL_ID.get() in self._active_calls and parent is None)
+                ):
+                    self._active_calls[call_id] = None
+                    return
+                if call_kind == "module" and isinstance(instance, BaseLM):
+                    # DSPy 3.0 sends custom BaseLM subclasses to module callbacks.
+                    call_kind = "chat"
+                if call_kind == "module":
+                    call_kind = (
+                        "agent"
+                        if type(instance).__name__ in {"ReAct", "ReActV2", "RLM"}
+                        or not type(instance).__module__.startswith("dspy.")
+                        else "task"
+                    )
+                name = (
+                    get(instance, "name", type(instance).__name__)
+                    if call_kind == "tool"
+                    else type(instance).__name__
+                )
+                span_name = (
+                    f"{call_kind}.{name}"
+                    if call_kind in {"agent", "tool"}
+                    else "llm"
+                    if call_kind == "chat"
+                    else call_kind
+                )
+                parent_context = (
+                    trace.set_span_in_context(parent.span)
+                    if parent
+                    else context.get_current()
+                )
+                span = self._tracer.start_span(
+                    span_name,
+                    context=parent_context,
+                    attributes={
+                        RESPAN_LOG_TYPE: call_kind,
+                        SpanAttributes.TRACELOOP_ENTITY_NAME: name,
+                        SpanAttributes.TRACELOOP_ENTITY_PATH: "",
+                    },
+                )
+                capture = (
+                    span.is_recording()
+                    and self._include_content
+                    and allowed()
+                    and (self._policy(instance) if self._policy else True)
+                )
+                token = context.attach(
+                    context.set_value(
+                        _CONTENT_BOUND, capture, trace.set_span_in_context(span)
+                    )
+                )
+                state = _CallState(span, call_kind, instance, capture, token)
+                self._active_calls[call_id] = state
+            if call_kind == "chat":
+                attrs = {}
+                add_lm_request_attributes(attrs, instance, inputs)
+                from dspy import settings
 
-            state = _CallState(
-                call_id=call_id,
-                call_kind=call_kind,
-                instance=instance,
-                inputs=dict(inputs),
-                started_at_ns=time.time_ns(),
-                trace_id=trace_id,
-                span_id=generate_unique_id()[:16],
-                parent_id=parent_id,
-                history_index=(
-                    _get_history_index(instance=instance)
-                    if call_kind == DSPY_CALL_KIND_LANGUAGE_MODEL
-                    else None
-                ),
-            )
-            self._active_calls[call_id] = state
+                if settings.send_stream is not None:
+                    attrs[SpanAttributes.GEN_AI_IS_STREAMING] = True
+                span.set_attributes(attrs)
+            elif call_kind == "embedding":
+                span.set_attribute(SpanAttributes.LLM_REQUEST_TYPE, "embedding")
+                if isinstance(get(instance, "model"), str):
+                    span.set_attribute(SpanAttributes.LLM_REQUEST_MODEL, instance.model)
+            if capture:
+                if call_kind == "chat":
+                    messages = normalize_messages(
+                        inputs.get("prompt"), inputs.get("messages")
+                    )
+                    set_messages(state.content, SpanAttributes.LLM_PROMPTS, messages)
+                    tools = get(
+                        inputs.get("prompt"),
+                        "tools",
+                        inputs.get("kwargs", {}).get("tools"),
+                    )
+                    if tools:
+                        state.content[SpanAttributes.LLM_REQUEST_FUNCTIONS] = safe_json(
+                            tool_definitions(tools)
+                        )
+                elif call_kind == "tool":
+                    arguments = dict(inputs.get("kwargs", {}))
+                    arguments.update(
+                        {k: v for k, v in inputs.items() if k not in {"args", "kwargs"}}
+                    )
+                    if inputs.get("args"):
+                        arguments["args"] = inputs["args"]
+                    candidates = [
+                        call
+                        for call in _TOOL_CALLS.get()
+                        if get(call, "name") == name
+                        and plain(get(call, "args") or {}) == plain(arguments)
+                    ]
+                    if len(candidates) == 1 and isinstance(
+                        get(candidates[0], "id"), str
+                    ):
+                        state.content[gen_ai_attributes.GEN_AI_TOOL_CALL_ID] = get(
+                            candidates[0], "id"
+                        )
+                    state.content[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safe_json(
+                        {"name": name, "arguments": arguments}
+                    )
+                elif call_kind == "embedding":
+                    state.content[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safe_json(
+                        inputs.get("inputs")
+                    )
+                else:
+                    state.content[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safe_json(
+                        inputs
+                    )
+        except Exception:  # noqa: BLE001 - tracing cannot alter SDK calls
+            logger.debug("DSPy callback start failed open")
 
-    def _end_call(
-        self,
-        *,
-        call_id: str,
-        outputs: Any,
-        exception: Exception | None,
-    ) -> None:
+    def capture_result(self, instance, result):
+        state = self._active_calls.get(ACTIVE_CALL_ID.get())
+        if (
+            state
+            and state.instance is instance
+            and state.kind == "chat"
+            and state.span.is_recording()
+        ):
+            state.result = result
+
+    def _end_call(self, call_id, outputs, exception=None):
         with self._lock:
             state = self._active_calls.pop(call_id, None)
-
         if state is None:
-            logger.debug("DSPy callback ended without start state for %s", call_id)
             return
-
-        attributes = self._build_attributes(
-            state=state,
-            outputs=outputs,
-            exception=exception,
-        )
-        span = build_readable_span(
-            name=self._span_name(state=state),
-            trace_id=state.trace_id,
-            span_id=state.span_id,
-            parent_id=state.parent_id,
-            start_time_ns=state.started_at_ns,
-            end_time_ns=time.time_ns(),
-            attributes=attributes,
-            status_code=500 if exception is not None else 200,
-            error_message=str(exception) if exception is not None else None,
-        )
-        inject_span(span=span)
-
-    def _base_attributes(
-        self,
-        *,
-        log_type: str,
-        entity_name: str,
-        input_value: Any,
-        output_value: Any,
-    ) -> dict[str, Any]:
-        attributes: dict[str, Any] = {
-            RESPAN_LOG_METHOD: LogMethodChoices.TRACING_INTEGRATION.value,
-            RESPAN_LOG_TYPE: log_type,
-            SpanAttributes.TRACELOOP_ENTITY_NAME: entity_name,
-            SpanAttributes.TRACELOOP_ENTITY_PATH: entity_name,
-        }
-        if self._include_content:
-            attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safe_json(
-                value=input_value
-            )
-            attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = output_to_json(
-                value=output_value
-            )
-        return attributes
-
-    def _build_attributes(
-        self,
-        *,
-        state: _CallState,
-        outputs: Any,
-        exception: Exception | None,
-    ) -> dict[str, Any]:
-        if state.call_kind == DSPY_CALL_KIND_LANGUAGE_MODEL:
-            return self._build_lm_attributes(
-                state=state,
-                outputs=outputs,
-                exception=exception,
-            )
-        if state.call_kind == DSPY_CALL_KIND_TOOL:
-            return self._build_tool_attributes(
-                state=state,
-                outputs=outputs,
-                exception=exception,
-            )
-        if state.call_kind in {
-            DSPY_CALL_KIND_ADAPTER_FORMAT,
-            DSPY_CALL_KIND_ADAPTER_PARSE,
-        }:
-            return self._build_adapter_attributes(
-                state=state,
-                outputs=outputs,
-                exception=exception,
-            )
-        if state.call_kind == DSPY_CALL_KIND_EVALUATE:
-            return self._build_evaluate_attributes(
-                state=state,
-                outputs=outputs,
-                exception=exception,
-            )
-        return self._build_module_attributes(
-            state=state,
-            outputs=outputs,
-            exception=exception,
-        )
-
-    def _build_lm_attributes(
-        self,
-        *,
-        state: _CallState,
-        outputs: Any,
-        exception: Exception | None,
-    ) -> dict[str, Any]:
-        prompt = state.inputs.get("prompt")
-        messages = normalize_messages(
-            prompt=prompt,
-            messages=state.inputs.get("messages"),
-        )
-        output_value = str(exception) if exception is not None else outputs
-        attributes = self._base_attributes(
-            log_type=LOG_TYPE_CHAT,
-            entity_name=DSPY_LANGUAGE_MODEL_SPAN_NAME,
-            input_value=messages or prompt,
-            output_value=output_value,
-        )
-        add_lm_request_attributes(
-            attributes=attributes,
-            instance=state.instance,
-            inputs=state.inputs,
-        )
-
-        if self._include_content:
-            for message_index, message in enumerate(messages):
-                prompt_prefix = f"{SpanAttributes.LLM_PROMPTS}.{message_index}"
-                attributes[f"{prompt_prefix}.role"] = str(message.get("role") or "user")
-                attributes[f"{prompt_prefix}.content"] = content_to_string(
-                    value=message.get("content")
+        try:
+            if state.ended:
+                return
+            if not allowed():
+                state.capture = False
+            if exception is not None:
+                state.span.set_status(trace.StatusCode.ERROR)
+                attrs = {EXCEPTION_TYPE: type(exception).__name__}
+                if state.capture:
+                    args = BaseException.args.__get__(exception)
+                    attrs[EXCEPTION_MESSAGE] = (
+                        redact_text(args[0])
+                        if len(args) == 1 and isinstance(args[0], str)
+                        else safe_json(args)
+                    )
+                state.span.add_event("exception", attrs)
+            if state.kind == "chat":
+                self._finish_lm(state, outputs, exception)
+            elif state.capture and exception is None and outputs is not None:
+                state.content[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safe_json(
+                    outputs
                 )
+            if state.capture:
+                state.span.set_attributes(state.content)
+        except Exception:  # noqa: BLE001 - tracing cannot alter SDK calls
+            logger.debug("DSPy callback completion failed open")
+        finally:
+            state.content.clear()
+            state.result = None
+            try:
+                if not state.ended:
+                    state.span.end()
+                    state.ended = True
+            finally:
+                context.detach(state.token)
 
-            completion_content = (
-                str(exception)
-                if exception is not None
-                else extract_first_completion(outputs=outputs)
+    def _finish_lm(self, state, outputs, exception):
+        result = state.result
+        cached = get(result, "cache_hit", False)
+        if cached:
+            state.span.set_attribute("dspy.cache_hit", True)
+        responses = get(result, "responses")
+        raw = get(result, "raw", result)
+        if not cached:
+            usage = (
+                get(responses[0], "usage")
+                if responses and len(responses) == 1
+                else get(raw, "usage", get(result, "usage", get(outputs, "usage")))
             )
-            attributes[f"{SpanAttributes.LLM_COMPLETIONS}.0.role"] = ASSISTANT_ROLE
-            attributes[f"{SpanAttributes.LLM_COMPLETIONS}.0.content"] = completion_content
+            attrs = {}
+            add_lm_usage_attributes(attrs, usage)
+            state.span.set_attributes(attrs)
+        response = responses[0] if responses and len(responses) == 1 else raw
+        response_model = get(response, "model", get(result, "response_model"))
+        response_id = get(response, "id")
+        if isinstance(response_model, str) and response_model:
+            state.span.set_attribute(SpanAttributes.LLM_RESPONSE_MODEL, response_model)
+        if isinstance(response_id, str) and response_id:
+            state.span.set_attribute(gen_ai_attributes.GEN_AI_RESPONSE_ID, response_id)
+        reasons = [
+            get(item, "finish_reason")
+            for item in (responses or get(raw, "choices", ()))
+        ]
+        reasons = [reason for reason in reasons if isinstance(reason, str) and reason]
+        if reasons:
+            state.span.set_attribute(
+                SpanAttributes.LLM_RESPONSE_FINISH_REASON, tuple(reasons)
+            )
+        if not state.capture or exception is not None or outputs is None:
+            return
+        if responses:
+            messages = [message(get(response, "message")) for response in responses]
+        elif get(outputs, "message") is not None:
+            messages = [message(outputs.message)]
+        elif get(raw, "choices") is not None:
+            messages = [
+                message(
+                    get(
+                        choice,
+                        "message",
+                        {"role": "assistant", "content": get(choice, "text")},
+                    )
+                )
+                for choice in get(raw, "choices")
+            ]
+        else:
+            messages = (
+                [
+                    message(value)
+                    if isinstance(value, dict)
+                    else {"role": "assistant", "content": value}
+                    for value in outputs
+                ]
+                if isinstance(outputs, list)
+                else [{"role": "assistant", "content": outputs}]
+            )
+        set_messages(state.content, SpanAttributes.LLM_COMPLETIONS, messages)
+        if responses and len(responses) == 1 and get(responses[0], "finish_reason"):
+            state.span.set_attribute(
+                SpanAttributes.LLM_RESPONSE_FINISH_REASON,
+                (get(responses[0], "finish_reason"),),
+            )
 
-        history_entry = _get_lm_history_entry(state=state)
-        if history_entry is not None:
-            usage = history_entry.get("usage")
-            if isinstance(usage, Mapping):
-                add_lm_usage_attributes(attributes=attributes, usage=usage)
-        return attributes
+    def close(self):
+        self._closed = True
+        with self._lock:
+            for state in self._active_calls.values():
+                if state:
+                    state.capture = False
+                    state.content.clear()
+                    state.result = None
+                    state.instance = None
+                    state.ended = True
+                    state.span.end()
 
-    def _build_module_attributes(
-        self,
-        *,
-        state: _CallState,
-        outputs: Any,
-        exception: Exception | None,
-    ) -> dict[str, Any]:
-        entity_name = _module_display_name(instance=state.instance)
-        output_value = str(exception) if exception is not None else outputs
-        return self._base_attributes(
-            log_type=_module_log_type(instance=state.instance),
-            entity_name=entity_name,
-            input_value=state.inputs,
-            output_value=output_value,
-        )
 
-    def _build_tool_attributes(
-        self,
-        *,
-        state: _CallState,
-        outputs: Any,
-        exception: Exception | None,
-    ) -> dict[str, Any]:
-        entity_name = _tool_display_name(instance=state.instance)
-        output_value = str(exception) if exception is not None else outputs
-        return self._base_attributes(
-            log_type=LOG_TYPE_TOOL,
-            entity_name=entity_name,
-            input_value=_tool_input_value(name=entity_name, inputs=state.inputs),
-            output_value=output_value,
-        )
+def _start(kind):
+    def callback(self, call_id, instance, inputs):
+        self._start_call(call_id, kind, instance, inputs)
 
-    def _build_adapter_attributes(
-        self,
-        *,
-        state: _CallState,
-        outputs: Any,
-        exception: Exception | None,
-    ) -> dict[str, Any]:
-        entity_name = _adapter_display_name(
-            instance=state.instance,
-            call_kind=state.call_kind,
-        )
-        output_value = str(exception) if exception is not None else outputs
-        return self._base_attributes(
-            log_type=LOG_TYPE_TASK,
-            entity_name=entity_name,
-            input_value=state.inputs,
-            output_value=output_value,
-        )
+    return callback
 
-    def _build_evaluate_attributes(
-        self,
-        *,
-        state: _CallState,
-        outputs: Any,
-        exception: Exception | None,
-    ) -> dict[str, Any]:
-        entity_name = type(state.instance).__name__
-        output_value = str(exception) if exception is not None else outputs
-        return self._base_attributes(
-            log_type=LOG_TYPE_TASK,
-            entity_name=entity_name,
-            input_value=state.inputs,
-            output_value=output_to_plain_value(value=output_value),
-        )
 
-    @staticmethod
-    def _span_name(*, state: _CallState) -> str:
-        if state.call_kind == DSPY_CALL_KIND_LANGUAGE_MODEL:
-            return DSPY_LANGUAGE_MODEL_SPAN_NAME
-        if state.call_kind == DSPY_CALL_KIND_TOOL:
-            return DSPY_TOOL_SPAN_NAME
-        if state.call_kind in {
-            DSPY_CALL_KIND_ADAPTER_FORMAT,
-            DSPY_CALL_KIND_ADAPTER_PARSE,
-        }:
-            return DSPY_ADAPTER_SPAN_NAME
-        if state.call_kind == DSPY_CALL_KIND_EVALUATE:
-            return DSPY_EVALUATE_SPAN_NAME
-        return DSPY_MODULE_SPAN_NAME
+def _end(self, call_id, outputs=None, exception=None):
+    self._end_call(call_id, outputs, exception)
 
-    def on_module_start(
-        self,
-        call_id: str,
-        instance: Any,
-        inputs: dict[str, Any],
-    ) -> None:
-        self._start_call(
-            call_id=call_id,
-            call_kind=DSPY_CALL_KIND_MODULE,
-            instance=instance,
-            inputs=inputs,
-        )
 
-    def on_module_end(
-        self,
-        call_id: str,
-        outputs: Any | None,
-        exception: Exception | None = None,
-    ) -> None:
-        self._end_call(call_id=call_id, outputs=outputs, exception=exception)
-
-    def on_lm_start(
-        self,
-        call_id: str,
-        instance: Any,
-        inputs: dict[str, Any],
-    ) -> None:
-        self._start_call(
-            call_id=call_id,
-            call_kind=DSPY_CALL_KIND_LANGUAGE_MODEL,
-            instance=instance,
-            inputs=inputs,
-        )
-
-    def on_lm_end(
-        self,
-        call_id: str,
-        outputs: Any | None,
-        exception: Exception | None = None,
-    ) -> None:
-        self._end_call(call_id=call_id, outputs=outputs, exception=exception)
-
-    def on_tool_start(
-        self,
-        call_id: str,
-        instance: Any,
-        inputs: dict[str, Any],
-    ) -> None:
-        self._start_call(
-            call_id=call_id,
-            call_kind=DSPY_CALL_KIND_TOOL,
-            instance=instance,
-            inputs=inputs,
-        )
-
-    def on_tool_end(
-        self,
-        call_id: str,
-        outputs: Any | None,
-        exception: Exception | None = None,
-    ) -> None:
-        self._end_call(call_id=call_id, outputs=outputs, exception=exception)
-
-    def on_adapter_format_start(
-        self,
-        call_id: str,
-        instance: Any,
-        inputs: dict[str, Any],
-    ) -> None:
-        self._start_call(
-            call_id=call_id,
-            call_kind=DSPY_CALL_KIND_ADAPTER_FORMAT,
-            instance=instance,
-            inputs=inputs,
-        )
-
-    def on_adapter_format_end(
-        self,
-        call_id: str,
-        outputs: Any | None,
-        exception: Exception | None = None,
-    ) -> None:
-        self._end_call(call_id=call_id, outputs=outputs, exception=exception)
-
-    def on_adapter_parse_start(
-        self,
-        call_id: str,
-        instance: Any,
-        inputs: dict[str, Any],
-    ) -> None:
-        self._start_call(
-            call_id=call_id,
-            call_kind=DSPY_CALL_KIND_ADAPTER_PARSE,
-            instance=instance,
-            inputs=inputs,
-        )
-
-    def on_adapter_parse_end(
-        self,
-        call_id: str,
-        outputs: Any | None,
-        exception: Exception | None = None,
-    ) -> None:
-        self._end_call(call_id=call_id, outputs=outputs, exception=exception)
-
-    def on_evaluate_start(
-        self,
-        call_id: str,
-        instance: Any,
-        inputs: dict[str, Any],
-    ) -> None:
-        self._start_call(
-            call_id=call_id,
-            call_kind=DSPY_CALL_KIND_EVALUATE,
-            instance=instance,
-            inputs=inputs,
-        )
-
-    def on_evaluate_end(
-        self,
-        call_id: str,
-        outputs: Any | None,
-        exception: Exception | None = None,
-    ) -> None:
-        self._end_call(call_id=call_id, outputs=outputs, exception=exception)
+for _name, _kind in (
+    ("module", "module"),
+    ("lm", "chat"),
+    ("tool", "tool"),
+    ("adapter_format", "task"),
+    ("adapter_parse", "task"),
+    ("evaluate", "task"),
+    ("compile", "task"),
+    ("interpreter_execute", "task"),
+    ("interpreter_startup", "task"),
+    ("interpreter_tool_call", "tool"),
+    ("interpreter_shutdown", "task"),
+    ("embedding", "embedding"),
+):
+    setattr(DSPyInstrumentationCallback, f"on_{_name}_start", _start(_kind))
+    setattr(DSPyInstrumentationCallback, f"on_{_name}_end", _end)

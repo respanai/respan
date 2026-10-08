@@ -74,4 +74,33 @@ After running the script, traces appear on your [Respan dashboard](https://platf
 ## Further Reading
 
 See the [python/tracing/llama-index](https://github.com/respanai/respan-example-projects/tree/main/python/tracing/llama-index)
-examples for runnable scripts covering Core LLM, embedding, retrieval, and agent APIs, plus standalone Workflows success and failure paths.
+examples for runnable scripts covering Core LLM, embedding, retrieval, and agent APIs, plus standalone workflow execution and provider failure paths.
+
+## Compatibility and capture
+
+Validated against released core `0.14.23` and `0.14.25`, Workflows `2.14.0`
+and `2.25.0`, and native instrumentation `0.4.3` and `0.6.0`. The adapter uses
+native dispatcher events for LLMs, dense and sparse embeddings, tools, agents,
+query engines, structured predictions, and standalone workflows. Application
+return values, exceptions, workflow handles, and streaming iterators remain
+unchanged.
+
+Content capture respects `capture_content=False`, `TRACELOOP_TRACE_CONTENT=false`,
+and the Respan context content policy. The initial opt-out remains a bound for
+that call; a later veto removes already captured content. OpenTelemetry
+suppression and sampling apply to native spans. Compatible instrumentor instances
+share their registration, and deactivation removes only the adapter's own hooks.
+
+Ordinary payloads are bounded and secrets redacted. Known tool schemas, tool
+calls, dense vectors, and sparse vectors remain complete while content capture is
+allowed. Provider usage comes from actual response counters, including cache and
+reasoning details. OpenAI embedding usage is observed at the provider response
+boundary because native embedding events omit that information. A cached or
+custom embedding without provider usage gets no invented token count.
+
+Native error status is preserved without synthetic HTTP status codes or error
+outputs. Older workflows provide less detailed start tags; the adapter captures
+the available native arguments instead. Remote stores, hosted workflows, and
+billed live model calls require separate validation. The paired
+`python/tracing/llama-index` examples run controlled fixtures by default and
+include explicit export and live options.

@@ -11,12 +11,13 @@ packages = [
 
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
-respan-tracing = "^2.17.0"
-respan-sdk = ">=2.6.1"
+respan-tracing = ">=2.20.0"
+respan-sdk = ">=2.7.6"
 llama-index-core = ">=0.14.23,<1.0"
 llama-index-workflows = ">=2.14.0,<3"
 llama-index-instrumentation = ">=0.4.3"
-opentelemetry-semantic-conventions-ai = ">=0.4.1"
+opentelemetry-semantic-conventions-ai = ">=0.5.1,<0.6.0"
+opentelemetry-semantic-conventions = ">=0.60b0,<1"
 
 [tool.poetry.plugins."respan.instrumentations"]
 llama-index = "respan_instrumentation_llama_index:LlamaIndexInstrumentor"

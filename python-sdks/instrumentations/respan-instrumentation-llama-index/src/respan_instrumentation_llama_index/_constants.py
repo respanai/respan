@@ -22,8 +22,3 @@ LLAMA_INDEX_STEP_INPUT_SUMMARY_TAG = "llamaindex.step.input_summary"
 MESSAGE_ROLE_ASSISTANT = "assistant"
 MESSAGE_ROLE_SYSTEM = "system"
 MESSAGE_ROLE_USER = "user"
-
-# Not available in the supported Traceloop GenAI semantic-convention package.
-LLAMA_INDEX_USAGE_INPUT_TOKENS = "gen_ai.usage.input_tokens"
-LLAMA_INDEX_USAGE_OUTPUT_TOKENS = "gen_ai.usage.output_tokens"
-STATUS_CODE_ATTR = "status_code"

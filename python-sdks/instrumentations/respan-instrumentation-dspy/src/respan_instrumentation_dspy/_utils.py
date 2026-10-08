@@ -1,351 +1,293 @@
-"""Serialization and attribute helpers for DSPy instrumentation."""
+"""Translate actual DSPy/lm15 response data into canonical attributes."""
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
+from dataclasses import fields, is_dataclass
 from typing import Any
 
-from opentelemetry.semconv_ai import LLMRequestTypeValues, SpanAttributes
-from respan_sdk.utils.serialization import serialize_value
+from opentelemetry.semconv._incubating.attributes import gen_ai_attributes
+from opentelemetry.semconv_ai import SpanAttributes
 
-from respan_instrumentation_dspy._constants import (
-    ANTHROPIC_PROVIDER_PREFIX,
-    AZURE_PROVIDER_PREFIX,
-    BEDROCK_PROVIDER_PREFIX,
-    COMPLETION_TOKENS_KEY,
-    DSPY_PROVIDER_NAME,
-    DSPY_USAGE_INPUT_TOKENS_ATTR,
-    DSPY_USAGE_OUTPUT_TOKENS_ATTR,
-    GEMINI_PROVIDER_PREFIX,
-    GOOGLE_PROVIDER_PREFIX,
-    INPUT_TOKENS_KEY,
-    OLLAMA_PROVIDER_PREFIX,
-    OPENAI_PROVIDER_PREFIX,
-    OUTPUT_TOKENS_KEY,
-    PROMPT_TOKENS_KEY,
-    TOTAL_TOKENS_KEY,
-    USER_ROLE,
-)
+from respan_instrumentation_dspy._serialization import json_string, redact_text
+
+
+def get(value: Any, key: str, default: Any = None) -> Any:
+    try:
+        return (
+            value.get(key, default)
+            if isinstance(value, Mapping)
+            else getattr(value, key, default)
+        )
+    except Exception:  # noqa: BLE001 - telemetry access cannot alter SDK behavior
+        return default
+
+
+def plain(value: Any, depth: int = 0) -> Any:
+    if depth > 64:
+        return {"type": type(value).__name__, "recursive": True}
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    if isinstance(value, Mapping):
+        return {
+            key: plain(item, depth + 1)
+            for key, item in value.items()
+            if isinstance(key, str)
+        }
+    if isinstance(value, list | tuple):
+        return [plain(item, depth + 1) for item in value]
+    if type(value).__module__ == "numpy" and type(value).__name__ == "ndarray":
+        return value.tolist()
+    module = type(value).__module__
+    if module.startswith("dspy."):
+        if is_dataclass(value):
+            return {
+                field.name: plain(get(value, field.name), depth + 1)
+                for field in fields(value)
+                if field.name not in {"provider_data", "raw", "adaptations"}
+            }
+        store = get(value, "_store")
+        if isinstance(store, dict):
+            return plain(store, depth + 1)
+        # SDK ToolCalls / typed decisions are Pydantic objects. Read validated
+        # fields without invoking model_dump, repr, or arbitrary application hooks.
+        namespace = get(value, "__dict__", {})
+        if isinstance(namespace, dict) and namespace:
+            return {
+                key: plain(item, depth + 1)
+                for key, item in namespace.items()
+                if not key.startswith("_")
+                and key not in {"kwargs", "history", "callbacks", "lm", "func"}
+            }
+    if isinstance(value, type) and getattr(value, "__module__", "").startswith("dspy."):
+        return {"type": value.__name__}
+    return {"type": type(value).__name__}
 
 
 def safe_json(value: Any) -> str:
-    """Serialize arbitrary DSPy payloads into OTEL-safe JSON strings."""
-    try:
-        return json.dumps(_dspy_safe_value(value=value), default=str)
-    except Exception:
-        return str(value)
+    return json_string(plain(value)) or "null"
 
 
 def content_to_string(value: Any) -> str:
-    """Convert a prompt/completion content value into a readable string."""
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    return safe_json(value=value)
+    return redact_text(value) if isinstance(value, str) else safe_json(value)
 
 
-def output_to_plain_value(value: Any) -> Any:
-    """Normalize DSPy outputs before serializing them on entity spans."""
-    if value is None:
-        return None
-
-    signature_value = _dspy_signature_value(value=value)
-    if signature_value is not None:
-        return signature_value
-
-    for method_name in ("toDict", "to_dict", "model_dump", "dict"):
-        method = getattr(value, method_name, None)
-        if callable(method):
-            try:
-                return _dspy_safe_value(value=method())
-            except Exception:
-                continue
-
-    return _dspy_safe_value(value=value)
-
-
-def output_to_json(value: Any) -> str:
-    """Serialize DSPy outputs into the canonical entity output attribute."""
-    return safe_json(value=output_to_plain_value(value=value))
-
-
-def normalize_messages(prompt: Any, messages: Any) -> list[dict[str, Any]]:
-    """Normalize DSPy LM prompt inputs into chat-style message dictionaries."""
-    if isinstance(messages, list):
-        normalized_messages: list[dict[str, Any]] = []
-        for message in messages:
-            if isinstance(message, Mapping):
-                role = message.get("role") or USER_ROLE
-                content = message.get("content")
-                normalized_messages.append(
-                    {
-                        "role": str(role),
-                        "content": output_to_plain_value(value=content),
-                    }
-                )
-            else:
-                normalized_messages.append(
-                    {
-                        "role": USER_ROLE,
-                        "content": output_to_plain_value(value=message),
-                    }
-                )
-        return normalized_messages
-
-    if prompt is not None:
-        return [{"role": USER_ROLE, "content": output_to_plain_value(value=prompt)}]
-
-    return []
-
-
-def extract_first_completion(outputs: Any) -> str:
-    """Extract the first assistant completion text from DSPy LM outputs."""
-    if isinstance(outputs, list) and outputs:
-        first_output = outputs[0]
-    else:
-        first_output = outputs
-
-    if isinstance(first_output, Mapping):
-        for key in ("content", "text", "answer", "output"):
-            value = first_output.get(key)
-            if value is not None:
-                return content_to_string(value=value)
-        return safe_json(value=first_output)
-
-    return content_to_string(value=first_output)
-
-
-def extract_provider_name(model_name: Any) -> str:
-    """Infer the GenAI provider name from a DSPy/LiteLLM model string."""
-    if not isinstance(model_name, str) or not model_name:
-        return DSPY_PROVIDER_NAME
-
-    provider_prefix = model_name.split("/", maxsplit=1)[0].lower()
-    if provider_prefix in {
-        OPENAI_PROVIDER_PREFIX,
-        ANTHROPIC_PROVIDER_PREFIX,
-        GOOGLE_PROVIDER_PREFIX,
-        GEMINI_PROVIDER_PREFIX,
-        BEDROCK_PROVIDER_PREFIX,
-        AZURE_PROVIDER_PREFIX,
-        OLLAMA_PROVIDER_PREFIX,
-    }:
-        if provider_prefix == GEMINI_PROVIDER_PREFIX:
-            return GOOGLE_PROVIDER_PREFIX
-        return provider_prefix
-
-    return DSPY_PROVIDER_NAME
-
-
-def request_type_from_model_type(model_type: Any) -> str:
-    """Return the canonical request type for every DSPy LLM surface."""
-    del model_type
-    return LLMRequestTypeValues.CHAT.value
-
-
-def extract_int(mapping: Mapping[str, Any], keys: tuple[str, ...]) -> int | None:
-    """Return the first integer-like usage value for the provided keys."""
-    for key in keys:
-        value = mapping.get(key)
-        if isinstance(value, bool):
-            continue
-        if isinstance(value, int):
-            return value
-        if isinstance(value, float) and value.is_integer():
-            return int(value)
-    return None
-
-
-def add_lm_usage_attributes(
-    attributes: dict[str, Any],
-    usage: Mapping[str, Any],
-) -> None:
-    """Populate canonical and legacy token usage attributes from LiteLLM usage."""
-    prompt_tokens = extract_int(
-        mapping=usage,
-        keys=(INPUT_TOKENS_KEY, PROMPT_TOKENS_KEY),
-    )
-    completion_tokens = extract_int(
-        mapping=usage,
-        keys=(OUTPUT_TOKENS_KEY, COMPLETION_TOKENS_KEY),
-    )
-    total_tokens = extract_int(mapping=usage, keys=(TOTAL_TOKENS_KEY,))
-
-    if total_tokens is None and (
-        prompt_tokens is not None or completion_tokens is not None
-    ):
-        total_tokens = (prompt_tokens or 0) + (completion_tokens or 0)
-
-    if prompt_tokens is not None:
-        attributes[DSPY_USAGE_INPUT_TOKENS_ATTR] = prompt_tokens
-        attributes[SpanAttributes.LLM_USAGE_PROMPT_TOKENS] = prompt_tokens
-    if completion_tokens is not None:
-        attributes[DSPY_USAGE_OUTPUT_TOKENS_ATTR] = completion_tokens
-        attributes[SpanAttributes.LLM_USAGE_COMPLETION_TOKENS] = completion_tokens
-    if total_tokens is not None:
-        attributes[SpanAttributes.LLM_USAGE_TOTAL_TOKENS] = total_tokens
-
-
-def add_lm_request_attributes(
-    attributes: dict[str, Any],
-    *,
-    instance: Any,
-    inputs: Mapping[str, Any],
-) -> None:
-    """Populate canonical LLM request attributes for a DSPy LM call."""
-    model_name = getattr(instance, "model", None)
-    model_type = getattr(instance, "model_type", None)
-    instance_kwargs = getattr(instance, "kwargs", None)
-    request_kwargs = inputs.get("kwargs")
-
-    attributes[SpanAttributes.LLM_SYSTEM] = extract_provider_name(model_name=model_name)
-    if isinstance(model_name, str) and model_name:
-        attributes[SpanAttributes.LLM_REQUEST_MODEL] = model_name
-    attributes[SpanAttributes.LLM_REQUEST_TYPE] = request_type_from_model_type(
-        model_type=model_type
-    )
-
-    merged_kwargs: dict[str, Any] = {}
-    if isinstance(instance_kwargs, Mapping):
-        merged_kwargs.update(instance_kwargs)
-    if isinstance(request_kwargs, Mapping):
-        merged_kwargs.update(request_kwargs)
-
-    temperature = merged_kwargs.get("temperature")
-    if isinstance(temperature, (int, float)) and not isinstance(temperature, bool):
-        attributes[SpanAttributes.LLM_REQUEST_TEMPERATURE] = temperature
-
-    max_tokens = merged_kwargs.get("max_tokens") or merged_kwargs.get(
-        "max_completion_tokens"
-    )
-    if isinstance(max_tokens, int) and not isinstance(max_tokens, bool):
-        attributes[SpanAttributes.LLM_REQUEST_MAX_TOKENS] = max_tokens
-
-
-def _dspy_safe_value(value: Any) -> Any:
-    module_value = _dspy_module_value(value=value)
-    if module_value is not None:
-        return module_value
-
-    signature_value = _dspy_signature_value(value=value)
-    if signature_value is not None:
-        return signature_value
-
-    field_value = _dspy_field_value(value=value)
-    if field_value is not None:
-        return field_value
-
-    example_value = _dspy_example_value(value=value)
-    if example_value is not None:
-        return example_value
-
-    method_value = _dspy_method_value(value=value)
-    if method_value is not None:
-        return method_value
-
-    if isinstance(value, Mapping):
-        return {
-            str(key): _dspy_safe_value(value=nested_value)
-            for key, nested_value in value.items()
+def calls(values: Any) -> list[dict]:
+    result = []
+    for call in values or ():
+        function = get(call, "function")
+        name = get(function, "name") if function is not None else get(call, "name")
+        arguments = (
+            get(function, "arguments")
+            if function is not None
+            else get(call, "input", get(call, "args"))
+        )
+        item = {
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": redact_text(arguments)
+                if isinstance(arguments, str)
+                else safe_json(arguments),
+            },
         }
-
-    if isinstance(value, (list, tuple, set)):
-        return [_dspy_safe_value(value=nested_value) for nested_value in value]
-
-    return serialize_value(value=value)
-
-
-def _dspy_module_value(value: Any) -> dict[str, Any] | None:
-    named_predictors = getattr(value, "named_predictors", None)
-    if not callable(named_predictors):
-        return None
-
-    result: dict[str, Any] = {
-        "name": type(value).__name__,
-    }
-    stage = getattr(value, "stage", None)
-    if isinstance(stage, str) and stage:
-        result["stage"] = stage
-
-    signature_value = _dspy_signature_value(value=getattr(value, "signature", None))
-    if signature_value is not None:
-        result["signature"] = signature_value
-
-    try:
-        predictors = [str(name) for name, _ in named_predictors()]
-    except Exception:
-        predictors = []
-    if predictors:
-        result["predictors"] = predictors
-
+        if identifier := get(call, "id"):
+            item["id"] = identifier
+        result.append(item)
     return result
 
 
-def _dspy_signature_value(value: Any) -> dict[str, Any] | None:
-    input_fields = getattr(value, "input_fields", None)
-    output_fields = getattr(value, "output_fields", None)
-    instructions = getattr(value, "instructions", None)
-    if not isinstance(input_fields, Mapping) or not isinstance(output_fields, Mapping):
+def message(value: Any) -> dict:
+    role = get(value, "role", "assistant")
+    item = {"role": role}
+    parts = get(value, "parts")
+    if parts is not None:
+        contents = []
+        tool_calls = []
+        for part in parts:
+            kind = get(part, "type")
+            if kind == "tool_call":
+                tool_calls.extend(calls([part]))
+            elif kind == "tool_result":
+                item["tool_call_id"] = get(part, "id")
+                contents.extend(plain(get(part, "content", ())))
+            elif kind == "text":
+                contents.append(get(part, "text"))
+            else:
+                contents.append(plain(part))
+        if contents:
+            item["content"] = (
+                "".join(contents)
+                if all(isinstance(x, str) for x in contents)
+                else contents
+            )
+        if tool_calls:
+            item["tool_calls"] = tool_calls
+    else:
+        content = get(value, "content", get(value, "text"))
+        if content is not None:
+            item["content"] = plain(content)
+        tool_calls = calls(get(value, "tool_calls"))
+        if tool_calls:
+            item["tool_calls"] = tool_calls
+        if identifier := get(value, "tool_call_id"):
+            item["tool_call_id"] = identifier
+    return item
+
+
+def normalize_messages(prompt: Any, messages: Any) -> list[dict]:
+    if get(prompt, "messages") is not None:
+        messages = get(prompt, "messages")
+        result = []
+        if (system := get(prompt, "system")) is not None:
+            result.append({"role": "system", "content": plain(system)})
+        return result + [message(item) for item in messages]
+    if messages is not None:
+        return [message(item) for item in messages]
+    if prompt is not None:
+        return [{"role": "user", "content": plain(prompt)}]
+    return []
+
+
+def set_messages(attrs: dict, prefix: str, messages: list[dict]) -> None:
+    for index, item in enumerate(messages):
+        root = f"{prefix}.{index}"
+        attrs[f"{root}.role"] = item["role"]
+        if "content" in item:
+            attrs[f"{root}.content"] = content_to_string(item["content"])
+        if item.get("tool_calls"):
+            attrs[f"{root}.tool_calls"] = safe_json(item["tool_calls"])
+        if item.get("tool_call_id"):
+            attrs[f"{root}.tool_call_id"] = item["tool_call_id"]
+
+
+def add_lm_usage_attributes(attributes: dict, usage: Any) -> None:
+    def counter(*keys):
+        for key in keys:
+            value = get(usage, key)
+            if type(value) is int and value >= 0:
+                return value
         return None
 
-    name = getattr(value, "__name__", None) or type(value).__name__
-    return {
-        "name": str(name),
-        "instructions": instructions,
-        "input_fields": _field_names(fields=input_fields),
-        "output_fields": _field_names(fields=output_fields),
-    }
+    for value, keys in (
+        (
+            counter("input_tokens", "prompt_tokens"),
+            (
+                gen_ai_attributes.GEN_AI_USAGE_INPUT_TOKENS,
+                SpanAttributes.LLM_USAGE_PROMPT_TOKENS,
+            ),
+        ),
+        (
+            counter("output_tokens", "completion_tokens"),
+            (
+                gen_ai_attributes.GEN_AI_USAGE_OUTPUT_TOKENS,
+                SpanAttributes.LLM_USAGE_COMPLETION_TOKENS,
+            ),
+        ),
+        (counter("total_tokens"), (SpanAttributes.LLM_USAGE_TOTAL_TOKENS,)),
+        (
+            counter("cache_read_tokens"),
+            (
+                SpanAttributes.GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
+                SpanAttributes.LLM_USAGE_CACHE_READ_INPUT_TOKENS,
+            ),
+        ),
+        (
+            counter("cache_write_tokens"),
+            (
+                SpanAttributes.GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
+                SpanAttributes.LLM_USAGE_CACHE_CREATION_INPUT_TOKENS,
+            ),
+        ),
+        (
+            counter("reasoning_tokens"),
+            (
+                SpanAttributes.GEN_AI_USAGE_REASONING_TOKENS,
+                SpanAttributes.LLM_USAGE_REASONING_TOKENS,
+            ),
+        ),
+    ):
+        if value is not None:
+            for key in keys:
+                attributes[key] = value
+    for details, field, keys in (
+        (
+            ("prompt_tokens_details", "input_tokens_details"),
+            ("cached_tokens",),
+            (
+                SpanAttributes.GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
+                SpanAttributes.LLM_USAGE_CACHE_READ_INPUT_TOKENS,
+            ),
+        ),
+        (
+            ("prompt_tokens_details", "input_tokens_details"),
+            ("cache_write_tokens", "cache_creation_tokens"),
+            (
+                SpanAttributes.GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
+                SpanAttributes.LLM_USAGE_CACHE_CREATION_INPUT_TOKENS,
+            ),
+        ),
+        (
+            ("completion_tokens_details", "output_tokens_details"),
+            ("reasoning_tokens",),
+            (
+                SpanAttributes.GEN_AI_USAGE_REASONING_TOKENS,
+                SpanAttributes.LLM_USAGE_REASONING_TOKENS,
+            ),
+        ),
+    ):
+        for detail in details:
+            for name in field:
+                value = get(get(usage, detail), name)
+                if type(value) is int and value >= 0:
+                    for key in keys:
+                        attributes[key] = value
+                    break
 
 
-def _dspy_field_value(value: Any) -> dict[str, Any] | None:
-    json_schema_extra = getattr(value, "json_schema_extra", None)
-    annotation = getattr(value, "annotation", None)
-    if not isinstance(json_schema_extra, Mapping) or annotation is None:
-        return None
-
-    field_type = json_schema_extra.get("__dspy_field_type")
-    description = json_schema_extra.get("desc")
-    annotation_name = getattr(annotation, "__name__", None) or str(annotation)
-    return {
-        "field_type": field_type,
-        "annotation": annotation_name,
-        "description": description,
-    }
-
-
-def _dspy_example_value(value: Any) -> dict[str, Any] | None:
-    to_dict = getattr(value, "toDict", None)
-    inputs = getattr(value, "inputs", None)
-    labels = getattr(value, "labels", None)
-    if not callable(to_dict) or not callable(inputs) or not callable(labels):
-        return None
-
-    try:
-        return {
-            "values": _dspy_safe_value(value=to_dict()),
-            "inputs": _dspy_safe_value(value=inputs().toDict()),
-            "labels": _dspy_safe_value(value=labels().toDict()),
-        }
-    except Exception:
-        return None
+def add_lm_request_attributes(attributes: dict, instance: Any, inputs: Mapping) -> None:
+    prompt = inputs.get("prompt")
+    model = get(prompt, "model", get(instance, "model"))
+    if isinstance(model, str) and model:
+        attributes[SpanAttributes.LLM_REQUEST_MODEL] = model
+        if "/" in model:
+            attributes[SpanAttributes.LLM_SYSTEM] = {
+                "gemini": "google",
+                "azure": "openai",
+            }.get(model.split("/")[0], model.split("/")[0])
+    attributes[SpanAttributes.LLM_REQUEST_TYPE] = "chat"
+    kwargs = dict(get(instance, "kwargs", {}) or {})
+    kwargs.update(inputs.get("kwargs", {}))
+    config = get(prompt, "config")
+    for name, key in (
+        ("temperature", SpanAttributes.LLM_REQUEST_TEMPERATURE),
+        ("max_tokens", SpanAttributes.LLM_REQUEST_MAX_TOKENS),
+        ("top_p", SpanAttributes.LLM_REQUEST_TOP_P),
+        ("reasoning_effort", SpanAttributes.GEN_AI_REQUEST_REASONING_EFFORT),
+    ):
+        value = get(
+            config,
+            "max_output_tokens" if name == "max_tokens" else name,
+            kwargs.get(name),
+        )
+        if value is None and name == "max_tokens":
+            value = kwargs.get("max_completion_tokens")
+        if isinstance(value, str | int | float) and not isinstance(value, bool):
+            attributes[key] = redact_text(value) if isinstance(value, str) else value
 
 
-def _dspy_method_value(value: Any) -> Any | None:
-    module_name = type(value).__module__
-    if not module_name.startswith("dspy."):
-        return None
-
-    for method_name in ("toDict", "to_dict", "model_dump", "dict"):
-        method = getattr(value, method_name, None)
-        if callable(method):
-            try:
-                return _dspy_safe_value(value=method())
-            except Exception:
-                continue
-    return None
-
-
-def _field_names(*, fields: Mapping[str, Any]) -> list[str]:
-    return [str(field_name) for field_name in fields]
+def tool_definitions(tools: Any) -> list[dict]:
+    """Keep validated definitions complete in the canonical function shape."""
+    result = []
+    for tool in tools:
+        if get(tool, "type") == "function" and get(tool, "function") is None:
+            definition = {
+                "name": get(tool, "name"),
+                "parameters": plain(get(tool, "parameters")),
+            }
+            if get(tool, "description") is not None:
+                definition["description"] = get(tool, "description")
+            result.append({"type": "function", "function": definition})
+        else:
+            result.append(plain(tool))
+    return result

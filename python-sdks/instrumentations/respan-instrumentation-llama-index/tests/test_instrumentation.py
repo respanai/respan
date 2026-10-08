@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 from llama_index.core import instrumentation
 from llama_index.core.agent.workflow import ReActAgent
-from llama_index.core.llms import CompletionResponse, LLMMetadata, MockLLM
+from llama_index.core.llms import ChatMessage, CompletionResponse, LLMMetadata, MockLLM
 from llama_index.core.tools import FunctionTool
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.semconv_ai import SpanAttributes
@@ -20,7 +20,6 @@ from respan_instrumentation_llama_index._handlers import (
 )
 from respan_instrumentation_llama_index._serialization import extract_usage
 from respan_sdk.constants.llm_logging import (
-    LOG_TYPE_AGENT,
     LOG_TYPE_CHAT,
     LOG_TYPE_EMBEDDING,
     LOG_TYPE_TASK,
@@ -47,13 +46,18 @@ def reset_tracer():
 
 
 @pytest.fixture
-def span_exporter():
+def span_exporter(monkeypatch):
     exporter = InMemorySpanExporter()
     telemetry = RespanTelemetry(
         app_name="llama-index-test",
         api_key=None,
         is_auto_instrument=False,
         is_batching_enabled=False,
+    )
+    from opentelemetry import trace
+
+    monkeypatch.setattr(
+        trace, "get_tracer_provider", lambda: telemetry.tracer.tracer_provider
     )
     telemetry.tracer.tracer_provider.add_span_processor(
         SimpleSpanProcessor(span_exporter=exporter)
@@ -193,15 +197,11 @@ def test_span_handler_error_respects_content_capture_setting(span_exporter):
 
     span = span_exporter.get_finished_spans()[0]
     assert span.status.status_code == StatusCode.ERROR
-    assert span.attributes["status_code"] == 500
-    assert span.attributes["error.message"] == "RuntimeError"
+    assert "status_code" not in span.attributes
+    assert "error.message" not in span.attributes
     assert SpanAttributes.TRACELOOP_ENTITY_INPUT not in span.attributes
-    assert json.loads(span.attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]) == {
-        "error": "RuntimeError",
-        "status": "error",
-    }
-    assert "top-secret" not in json.dumps(dict(span.attributes))
-    assert not span.events
+    assert SpanAttributes.TRACELOOP_ENTITY_OUTPUT not in span.attributes
+    assert "top-secret" not in str([event.attributes for event in span.events])
 
 
 def test_span_handler_uses_cached_parent_context_after_parent_exits(span_exporter):
@@ -240,7 +240,7 @@ def test_span_handler_uses_cached_parent_context_after_parent_exits(span_exporte
     assert child_span.parent.span_id == root_span.context.span_id
 
 
-def test_span_handler_groups_missing_parent_siblings_under_synthetic_parent(
+def test_span_handler_does_not_invent_missing_parent(
     span_exporter,
 ):
     handler = RespanLlamaIndexSpanHandler()
@@ -269,18 +269,11 @@ def test_span_handler_groups_missing_parent_siblings_under_synthetic_parent(
     )
 
     spans_by_name = {span.name: span for span in span_exporter.get_finished_spans()}
-    synthetic_parent = spans_by_name["ReActAgent.run"]
-    setup_span = spans_by_name["BaseWorkflowAgent.setup_agent"]
-    step_span = spans_by_name["BaseWorkflowAgent.run_agent_step"]
-
-    assert synthetic_parent.attributes[RESPAN_LOG_TYPE] == LOG_TYPE_AGENT
-    assert not any(
-        key.startswith("llama_index.") for key in synthetic_parent.attributes
-    )
-    assert setup_span.context.trace_id == synthetic_parent.context.trace_id
-    assert step_span.context.trace_id == synthetic_parent.context.trace_id
-    assert setup_span.parent.span_id == synthetic_parent.context.span_id
-    assert step_span.parent.span_id == synthetic_parent.context.span_id
+    assert set(spans_by_name) == {
+        "BaseWorkflowAgent.setup_agent",
+        "BaseWorkflowAgent.run_agent_step",
+    }
+    assert all(span.parent is None for span in spans_by_name.values())
 
 
 def test_standalone_workflows_emit_real_root_and_step_spans(span_exporter):
@@ -313,12 +306,10 @@ def test_standalone_workflows_emit_real_root_and_step_spans(span_exporter):
     finish_span = spans_by_name["DemoWorkflow.finish"]
 
     assert root_span.attributes[RESPAN_LOG_TYPE] == LOG_TYPE_WORKFLOW
-    assert (
-        "StartEvent"
-        in json.loads(root_span.attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT])[
-            "event"
-        ]
-    )
+    root_input = json.loads(root_span.attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT])
+    assert "StartEvent" in str(root_input.get("event", "")) or root_input.get(
+        "kwargs"
+    ) == {"topic": "respan"}
     assert json.loads(root_span.attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]) == {
         "result": "DRAFT:RESPAN"
     }
@@ -480,12 +471,12 @@ def test_generic_span_payload_marks_react_observations_as_system(span_exporter):
     bound_args = SimpleNamespace(
         args=(
             [
-                SimpleNamespace(role="user", content="Question"),
-                SimpleNamespace(
+                ChatMessage(role="user", content="Question"),
+                ChatMessage(
                     role="assistant",
                     content='Action: multiply_numbers\nAction Input: {"a": 7, "b": 6}',
                 ),
-                SimpleNamespace(role="user", content="Observation: 42"),
+                ChatMessage(role="user", content="Observation: 42"),
             ],
         ),
         kwargs={},
@@ -724,9 +715,10 @@ def test_embedding_events_capture_full_vectors(span_exporter):
 
     assert attributes[RESPAN_LOG_TYPE] == LOG_TYPE_EMBEDDING
     assert attributes[SpanAttributes.LLM_REQUEST_TYPE] == "embedding"
-    assert attributes[f"{SpanAttributes.LLM_PROMPTS}.0.content"] == (
-        '["alpha", "beta"]'
-    )
+    assert json.loads(attributes[f"{SpanAttributes.LLM_PROMPTS}.0.content"]) == [
+        "alpha",
+        "beta",
+    ]
     assert json.loads(attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]) == [
         [0.1, 0.2],
         [0.3, 0.4],
@@ -803,13 +795,9 @@ def test_registered_react_runtime_emits_one_logical_tool_execution(span_exporter
     assert len(tool_spans) == 1
 
     root_span = next(span for span in spans if span.name == "ReActAgent.run")
-    call_span = next(
-        span for span in spans if span.name == "BaseWorkflowAgent.call_tool"
-    )
+    call_span = next(span for span in spans if span.name.endswith(".call_tool"))
     aggregate_span = next(
-        span
-        for span in spans
-        if span.name == "BaseWorkflowAgent.aggregate_tool_results"
+        span for span in spans if span.name.endswith(".aggregate_tool_results")
     )
     tool_span = tool_spans[0]
 
@@ -910,15 +898,9 @@ def test_exception_event_marks_open_event_span_error(span_exporter):
     )
 
     assert completion_span.status.status_code == StatusCode.ERROR
-    assert completion_span.attributes["error.message"] == "llama failure"
-    assert completion_span.attributes["status_code"] == 500
-    assert json.loads(
-        completion_span.attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]
-    ) == {
-        "error": "RuntimeError",
-        "message": "llama failure",
-        "status": "error",
-    }
+    assert "status_code" not in completion_span.attributes
+    assert SpanAttributes.TRACELOOP_ENTITY_OUTPUT not in completion_span.attributes
+    assert completion_span.status.description == "llama failure"
 
 
 def test_exception_event_respects_content_capture_setting(span_exporter):
@@ -945,13 +927,13 @@ def test_exception_event_respects_content_capture_setting(span_exporter):
         if span.name == "llama_index.completion"
     )
     assert completion_span.status.status_code == StatusCode.ERROR
-    assert completion_span.attributes["error.message"] == "RuntimeError"
-    assert json.loads(
-        completion_span.attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]
-    ) == {"error": "RuntimeError", "status": "error"}
+    assert "error.message" not in completion_span.attributes
+    assert SpanAttributes.TRACELOOP_ENTITY_OUTPUT not in completion_span.attributes
     serialized = json.dumps(dict(completion_span.attributes))
     assert "top-secret" not in serialized
-    assert not completion_span.events
+    assert all(
+        "exception.message" not in event.attributes for event in completion_span.events
+    )
 
 
 def test_extract_usage_ignores_fractional_token_counts():
@@ -967,4 +949,4 @@ def test_extract_usage_ignores_fractional_token_counts():
 
     assert prompt_tokens is None
     assert completion_tokens == 2
-    assert total_tokens == 2
+    assert total_tokens is None

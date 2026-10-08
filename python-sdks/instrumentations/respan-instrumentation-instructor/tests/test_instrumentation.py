@@ -35,7 +35,7 @@ class UserResult:
     def __init__(self, name: str = "Ada") -> None:
         self.name = name
 
-    def model_dump(self):
+    def model_dump(self, **kwargs):
         return {"name": self.name}
 
 
@@ -62,6 +62,15 @@ class FakeSpan:
     def record_exception(self, exception):
         self.exceptions.append(exception)
 
+    def is_recording(self):
+        return True
+
+    def end(self):
+        self.ended = True
+
+    def add_event(self, name, attributes):
+        self.exceptions.append(attributes)
+
 
 class FakeSpanContext:
     def __init__(self, span):
@@ -77,6 +86,11 @@ class FakeSpanContext:
 class FakeTracer:
     def __init__(self):
         self.spans = []
+
+    def start_span(self, name, **kwargs):
+        span = FakeSpan(name=name, attributes={})
+        self.spans.append(span)
+        return span
 
     def start_as_current_span(self, name, attributes, **kwargs):
         span = FakeSpan(name=name, attributes=attributes)
@@ -135,7 +149,7 @@ def _install_fake_tracer(monkeypatch):
 
 
 def _install_fake_instructor_modules(monkeypatch):
-    def patch(client=None, create=None, mode=FakeMode()):
+    def patch(client=None, create=None, mode=None):
         create_callable = create
         if create_callable is None:
             create_callable = client.chat.completions.create
@@ -231,10 +245,12 @@ def _install_fake_instructor_modules(monkeypatch):
 
     instructor_module = ModuleType("instructor")
     core_module = ModuleType("instructor.core")
-    patch_module = ModuleType(_instrumentation.INSTRUCTOR_CORE_PATCH_MODULE)
-    client_module = ModuleType(_instrumentation.INSTRUCTOR_CORE_CLIENT_MODULE)
+    patch_module = ModuleType("instructor.core.patch")
+    client_module = ModuleType("instructor.core.client")
 
     instructor_module.patch = patch
+    instructor_module.Instructor = FakeInstructor
+    instructor_module.AsyncInstructor = FakeAsyncInstructor
     patch_module.patch = patch
     client_module.Instructor = FakeInstructor
     client_module.AsyncInstructor = FakeAsyncInstructor
@@ -254,12 +270,12 @@ def _install_fake_instructor_modules(monkeypatch):
     )
     monkeypatch.setitem(
         dic=sys.modules,
-        name=_instrumentation.INSTRUCTOR_CORE_PATCH_MODULE,
+        name="instructor.core.patch",
         value=patch_module,
     )
     monkeypatch.setitem(
         dic=sys.modules,
-        name=_instrumentation.INSTRUCTOR_CORE_CLIENT_MODULE,
+        name="instructor.core.client",
         value=client_module,
     )
 
@@ -274,6 +290,9 @@ def _install_fake_instructor_modules(monkeypatch):
 def reset_tracer():
     RespanTracer.reset_instance()
     yield
+    if _instrumentation._RUNTIME is not None:
+        _instrumentation._RUNTIME.restore()
+        _instrumentation._RUNTIME = None
     RespanTracer.reset_instance()
 
 

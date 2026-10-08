@@ -1,75 +1,81 @@
 # respan-instrumentation-instructor
 
-Respan instrumentation plugin for Instructor. This package instruments Instructor's native `patch()` and `Instructor.create()` paths directly and emits Respan-compatible chat spans without using `openinference-instrumentation-instructor`.
-
-## Configuration
-
-### 1. Install
+Native Respan tracing for Instructor's public clients and `patch(create=...)`
+callables. Tested with Instructor **1.17.0** and the declared minimum **1.3.7**.
+The adapter supports the older flat modules and the current v2 module layout.
 
 ```bash
-pip install respan-instrumentation-instructor
+pip install respan-tracing respan-instrumentation-instructor
 ```
-
-### 2. Set Environment Variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `RESPAN_API_KEY` | Yes | Your Respan API key. Authenticates both proxy and tracing. |
-| `RESPAN_BASE_URL` | No | Defaults to `https://api.respan.ai/api`. |
-
-## Quickstart
-
-### 3. Run Script
 
 ```python
 import os
 
 import instructor
-from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import BaseModel
-from respan import Respan
 from respan_instrumentation_instructor import InstructorInstrumentor
-
-load_dotenv()
-
-respan_api_key = os.environ["RESPAN_API_KEY"]
-respan_base_url = os.getenv("RESPAN_BASE_URL", "https://api.respan.ai/api")
-
-# Route OpenAI traffic through the Respan gateway.
-os.environ["OPENAI_API_KEY"] = respan_api_key
-os.environ["OPENAI_BASE_URL"] = respan_base_url
+from respan_tracing import RespanTelemetry
 
 
-class UserInfo(BaseModel):
+class User(BaseModel):
     name: str
     age: int
 
 
-respan = Respan(
-    api_key=respan_api_key,
-    base_url=respan_base_url,
-    app_name="instructor-quickstart",
-    instrumentations=[InstructorInstrumentor()],
+telemetry = RespanTelemetry(
+    api_key=os.environ["RESPAN_API_KEY"],
+    is_auto_instrument=False,
 )
-
-client = instructor.from_openai(OpenAI())
-user_info = client.create(
-    response_model=UserInfo,
-    messages=[{"role": "user", "content": "Ada Lovelace is 36 years old."}],
-    model="gpt-4o-mini",
-)
-
-print(user_info.model_dump())
-respan.flush()
+instrumentor = InstructorInstrumentor()
+instrumentor.activate()
+try:
+    # OpenAI uses its own OPENAI_API_KEY; tracing configuration is separate.
+    with OpenAI() as provider:
+        client = instructor.from_openai(provider)
+        result = client.create(
+            response_model=User,
+            messages=[{"role": "user", "content": "Ada is 36 years old."}],
+            model="gpt-4o-mini",
+        )
+        print(result.model_dump())
+finally:
+    instrumentor.deactivate()
+    telemetry.flush()
+    telemetry.tracer.tracer_provider.shutdown()
 ```
 
-### 4. View Dashboard
+`RESPAN_BASE_URL` selects the tracing API base. Configure provider endpoints and
+credentials on the native provider client. Installing the `respan-ai` facade is
+optional; its current aggregate dependencies may require newer provider SDKs
+than an old Instructor environment allows.
 
-After running the script, traces appear on your [Respan dashboard](https://platform.respan.ai).
+The integration covers sync/async `create`, `create_with_completion`,
+`create_partial`, `create_iterable`, and low-level `patch`. Current Responses
+clients, `from_provider`, TypedDict schemas, completion hooks, and retry token
+budgets use the native SDK behavior. Instructor 1.3.7 predates those newer APIs.
+Native return types, exceptions, cancellation, retry counts, and iterator
+advance/send/throw/close remain unchanged. Some current stream paths return a
+native list response; the adapter retains that return type.
 
-## Further Reading
+Chat spans contain canonical messages, schemas, current response tool calls,
+source call IDs, response IDs, and actual reported usage. Completed and failed
+retry totals use the native observed aggregate. Missing, invalid, or SDK-only
+default counts are omitted. Known schema/tool payloads remain complete; normal
+payloads use explicit 16 KiB/50-item bounds and credential redaction. Private data
+is not copied into schema/output attributes when content capture is disabled.
 
-Runnable examples with full setup instructions:
+Content opt-out: `InstructorInstrumentor(trace_content=False)`,
+`TRACELOOP_TRACE_CONTENT=false`, or Respan's content context flag. The initial
+policy bounds the whole call; a later veto removes earlier captured content.
+Sampling and OTel/Traceloop suppression are honored. Compatible owners share
+hooks; conflicting provider/privacy settings are rejected. Final release
+finishes pending telemetry without advancing or closing native streams, and
+preserves foreign wrappers.
 
-- **Python:** [python/tracing/instructor](https://github.com/respanai/respan-example-projects/tree/main/python/tracing/instructor)
+[Eleven runnable examples](https://github.com/respanai/respan-example-projects/tree/main/python/tracing/instructor)
+exercise released SDKs with controlled HTTP responses by default. Fixtures cover
+current and minimum APIs, streams, schemas, retry/error usage, user hooks,
+privacy, and cancellation; live providers are optional and separately configured.
+The controlled suite does not establish live provider availability, billing,
+cache services, or every optional provider transport.

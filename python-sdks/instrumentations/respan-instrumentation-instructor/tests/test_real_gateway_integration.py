@@ -5,7 +5,9 @@ import pytest
 pytestmark = pytest.mark.integration
 
 if os.getenv("IS_REAL_GATEWAY_TESTING_ENABLED") != "1":
-    pytest.skip("Set IS_REAL_GATEWAY_TESTING_ENABLED=1 to run.", allow_module_level=True)
+    pytest.skip(
+        "Set IS_REAL_GATEWAY_TESTING_ENABLED=1 to run.", allow_module_level=True
+    )
 
 respan_api_key = os.getenv("RESPAN_API_KEY")
 if not respan_api_key:
@@ -19,12 +21,11 @@ import instructor
 from openai import OpenAI
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from pydantic import BaseModel
+from respan_instrumentation_instructor import InstructorInstrumentor
 from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
 from respan_tracing import RespanTelemetry
 from respan_tracing.core.tracer import RespanTracer
 from respan_tracing.testing import InMemorySpanExporter
-
-from respan_instrumentation_instructor import InstructorInstrumentor
 
 
 class UserInfo(BaseModel):

@@ -1,0 +1,9 @@
+{
+  "summary": "Support current LangChain, LlamaIndex, DSPy and Instructor Python SDKs",
+  "packages": {
+    "respan-instrumentation-langchain": "minor",
+    "respan-instrumentation-llama-index": "minor",
+    "respan-instrumentation-dspy": "minor",
+    "respan-instrumentation-instructor": "minor"
+  }
+}

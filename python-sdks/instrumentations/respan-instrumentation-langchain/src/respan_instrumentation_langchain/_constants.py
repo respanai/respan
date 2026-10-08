@@ -2,7 +2,6 @@
 
 from respan_sdk.constants.span_attributes import RESPAN_METADATA
 
-
 LANGCHAIN_RUN_ID_ATTR = "langchain.run_id"
 LANGCHAIN_PARENT_RUN_ID_ATTR = "langchain.parent_run_id"
 LANGCHAIN_TAGS_ATTR = "langchain.tags"
