@@ -1,57 +1,32 @@
-# Respan Braintrust Instrumentation
+# respan-instrumentation-braintrust
 
-Send Braintrust spans to Respan through the current Respan OTLP tracing pipeline.
-
-## Installation
-
-```bash
-pip install respan-ai respan-instrumentation-braintrust braintrust
-```
-
-## Quick Start
+Observe released Braintrust native spans through Respan. Tested with Braintrust 0.44.0 and the declared minimum 0.5.0.
 
 ```python
+import os
 import braintrust
 from respan import Respan
 from respan_instrumentation_braintrust import BraintrustInstrumentor
 
-respan = Respan(instrumentations=[BraintrustInstrumentor()])
-
-logger = braintrust.init_logger(
-    project="braintrust-demo",
-    async_flush=False,
+respan = Respan(
+    api_key=os.environ["RESPAN_API_KEY"], instrumentations=[BraintrustInstrumentor()]
 )
-
-with respan.propagate_attributes(group_identifier="Braintrust Demo"):
-    with logger.start_span(name="Braintrust Demo", type="task") as root:
-        with root.start_span(name="answer_question", type="llm") as span:
-            span.log(
-                input=[{"role": "user", "content": "What is Respan?"}],
-                output="Respan captures production LLM traces.",
-                metadata={"model": "gpt-4o-mini"},
-                metrics={"prompt_tokens": 8, "completion_tokens": 9},
-            )
-
+logger = braintrust.init_logger(project="My project")
+try:
+    with logger.start_span(name="lookup", type="tool") as span:
+        result = {"answer": "controlled result"}
+        span.log(input={"question": "example"}, output=result)
+finally:
     logger.flush()
-
-respan.flush()
-respan.shutdown()
+    respan.shutdown()
 ```
 
-## How It Works
+The adapter creates sampled OpenTelemetry spans at native span construction and observes incremental records when Braintrust resolves its lazy exports. Braintrust's sink receives the same native records and return values. Its native customizers remain in order and run once. Compatible owners share hooks; final teardown restores owned methods while preserving foreign wrappers and outstanding context cleanup. The legacy class alias and context-manager API remain available.
 
-`BraintrustInstrumentor` installs itself as Braintrust's background logger.
-When Braintrust flushes, the instrumentor translates Braintrust records into
-canonical Respan/OpenTelemetry spans and injects them into the same pipeline used
-by `respan-tracing`.
+`BraintrustInstrumentor(tracer_provider=None, include_content=True)` honors OTel suppression/sampling, `TRACELOOP_TRACE_CONTENT=false`, and Respan's content context. Initial privacy bounds descendants; an observed later opt-out cannot be undone before deferred export. Unknown application objects are described without calling string/dump hooks. Credentials are redacted. Usage is mapped only from native provider fields, including explicit zero; absent/invalid counters remain absent.
 
-The instrumentation maps Braintrust span types as follows:
+Manual spans, scores/tags, sync/async traced functions, native generators, current/history tool calls and complete tool results are covered. Scoped released OpenAI wrapper observations preserve actual response objects, provider usage and complete embedding vectors; Braintrust's own embedding record currently retains only vector length. Streaming remains a native iterator. Generator functions decorated before activation retain native caller context; functions decorated during activation also retain generator/async-generator introspection and detached OTel advances.
 
-- `llm` and `chat` -> `chat`
-- `tool` and `function` -> `tool`
-- `eval` and `automation` -> `workflow`
-- `task`, `score`, `facet`, and `preprocessor` -> `task`
+A sink-local Braintrust masking function runs after lazy record resolution. The adapter conservatively disables Respan content capture when that native mask is active, avoiding observation of pre-mask payload and duplicate mask invocation. Adapter `set_masking_function` masks Respan payload; changing its policy while multiple owners are active requires matching settings. Its initial mask remains a bound if removed during a span. Queue limits forward to the native sink.
 
-Braintrust-specific record fields are stored as metadata, while shared Respan
-and GenAI span fields use constants from `respan-sdk` and upstream semantic
-convention packages.
+Native Braintrust logging remains enabled unless the application configures a local sink. The [paired examples](https://github.com/Keywords-AI/respan-example-projects/tree/main/python/tracing/braintrust) use a controlled local sink and HTTP fixtures by default, so they export only to Respan and require no Braintrust/model-provider account. They validate SDK compatibility, not live provider, remote evaluation/function, attachment-upload, dataset or platform eligibility. OTel compatibility mode keeps Braintrust's native context/traceparent APIs intact; cross-framework parenting in that optional mode has not been independently validated.

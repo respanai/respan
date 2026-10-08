@@ -1,0 +1,9 @@
+{
+  "summary": "Support current Python AgentOps, Arize, Braintrust and OpenInference SDK features with native lifecycle and canonical privacy-safe traces",
+  "packages": {
+    "respan-instrumentation-agentops": "minor",
+    "respan-instrumentation-arize": "minor",
+    "respan-instrumentation-braintrust": "minor",
+    "respan-instrumentation-openinference": "minor"
+  }
+}

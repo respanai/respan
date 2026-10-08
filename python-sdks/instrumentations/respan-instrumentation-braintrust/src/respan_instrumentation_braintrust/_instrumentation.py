@@ -1,696 +1,889 @@
-"""Braintrust instrumentation plugin for Respan."""
+"""Observe native Braintrust lifecycle and export records without replacing its sink."""
 
 from __future__ import annotations
 
-import datetime
-import json
+import inspect
 import logging
-import math
+import os
 import threading
-import uuid
-from collections.abc import Mapping
-from dataclasses import dataclass
-from typing import Any, Callable
+from collections import OrderedDict
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from functools import wraps
+from typing import Any
 
-from opentelemetry.sdk.trace import ReadableSpan
-from opentelemetry.semconv_ai import LLMRequestTypeValues
-from opentelemetry.semconv_ai import SpanAttributes as TLSpanAttributes
+from opentelemetry import context, trace
+from opentelemetry.semconv._incubating.attributes.error_attributes import ERROR_MESSAGE
+from opentelemetry.semconv.attributes.error_attributes import ERROR_TYPE
+from opentelemetry.semconv.attributes.exception_attributes import (
+    EXCEPTION_MESSAGE,
+    EXCEPTION_TYPE,
+)
+from opentelemetry.semconv_ai import (
+    SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY,
+    SpanAttributes,
+)
+from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
+from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+from respan_tracing.core.tracer import RespanTracer
 
-from respan_sdk.constants.llm_logging import (
-    LOG_TYPE_CHAT,
-    LOG_TYPE_TASK,
-    LogMethodChoices,
-)
-from respan_sdk.constants.span_attributes import (
-    GEN_AI_SYSTEM,
-    LLM_REQUEST_MODEL,
-    LLM_REQUEST_TYPE,
-    LLM_USAGE_COMPLETION_TOKENS,
-    LLM_USAGE_PROMPT_TOKENS,
-    RESPAN_LOG_METHOD,
-    RESPAN_LOG_TYPE,
-    RESPAN_METADATA,
-    RESPAN_TRACE_GROUP_ID,
-)
-from respan_sdk.utils.serialization import serialize_value
-from respan_tracing.utils.span_factory import (
-    build_readable_span,
-    inject_span,
-    read_propagated_attributes,
-)
-
-from respan_instrumentation_braintrust._constants import (
-    BRAINTRUST_DEFAULT_SPAN_NAME,
-    BRAINTRUST_ENTITY_PATH,
-    BRAINTRUST_METADATA_PREFIX,
-    BRAINTRUST_SPAN_TYPE_TO_LOG_TYPE,
-)
+from ._constants import BRAINTRUST_SPAN_TYPE_TO_LOG_TYPE
+from ._mapping import attributes, get, plain, private_usage
+from ._serialization import json_string, redact_text
 
 logger = logging.getLogger(__name__)
-
-_GEN_AI_PROMPT_PREFIX = f"{TLSpanAttributes.LLM_PROMPTS}."
-_GEN_AI_COMPLETION_PREFIX = f"{TLSpanAttributes.LLM_COMPLETIONS}."
-_GEN_AI_USAGE_INPUT_TOKENS = getattr(
-    TLSpanAttributes,
-    "LLM_USAGE_INPUT_TOKENS",
-    "gen_ai.usage.input_tokens",
-)
-_GEN_AI_USAGE_OUTPUT_TOKENS = getattr(
-    TLSpanAttributes,
-    "LLM_USAGE_OUTPUT_TOKENS",
-    "gen_ai.usage.output_tokens",
-)
-_LLM_USAGE_TOTAL_TOKENS = TLSpanAttributes.LLM_USAGE_TOTAL_TOKENS
+_LOCK = threading.RLock()
+_RUNTIME = None
+_WRITE = ContextVar("respan_braintrust_write", default=None)
+_REQUEST = ContextVar("respan_braintrust_request", default=None)
+_ADVANCE = ContextVar("respan_braintrust_advance", default=False)
+_CONTENT_BOUND = "respan_braintrust_content_bound"
+_MISSING = object()
 
 
-@dataclass(frozen=True)
-class _BufferedBraintrustItem:
-    item: Any
-    propagated_attributes: dict[str, Any]
+def _allowed():
+    return (
+        context.get_value(ENABLE_CONTENT_TRACING_KEY) is not False
+        and context.get_value(_CONTENT_BOUND) is not False
+        and os.getenv("TRACELOOP_TRACE_CONTENT", "true").strip().lower()
+        not in {"0", "false", "off", "no"}
+    )
 
 
-def _coerce_int(value: Any) -> int | None:
-    if value is None or isinstance(value, bool):
+def _safe(fn, *args):
+    try:
+        return fn(*args)
+    except Exception:  # noqa: BLE001 - telemetry must preserve native behavior
+        logger.debug("Braintrust telemetry observation failed open")
         return None
-    if isinstance(value, int):
+
+
+@dataclass
+class _State:
+    span: Any
+    capture: bool
+    rows: list = field(default_factory=list)
+    pending: int = 0
+    next_sequence: int = 0
+    sdk_ended: bool = False
+    finished: bool = False
+    source_id: str | None = None
+    token: Any = None
+    error: BaseException | None = None
+    parent: Any = None
+    embedding: dict | None = None
+    native_sink: Any = None
+    masking: Any = None
+
+
+class _ObservedLazy:
+    def __init__(self, native, runtime, state, sequence):
+        self.native, self.runtime, self.state = native, runtime, state
+        self.sequence = sequence
+        self.resolved = False
+
+    def __getattr__(self, name):
+        return getattr(self.native, name)
+
+    def get(self, *args, **kwargs):
+        value = self.native.get(*args, **kwargs)
+        with self.runtime.lock:
+            if not self.resolved:
+                self.resolved = True
+                _safe(self.runtime.record, self.state, value, self.sequence)
+                self.state.pending -= 1
+                _safe(self.runtime.maybe_finish, self.state)
         return value
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            return None
-        return int(value)
-    if isinstance(value, str):
+
+
+class _ObservedLogger:
+    def __init__(self, native, runtime):
+        self.native, self.runtime = native, runtime
+
+    def __getattr__(self, name):
+        return getattr(self.native, name)
+
+    def log(self, *items):
+        state = _WRITE.get()
+        if state is not None:
+            state.native_sink = self.native
+            _safe(self.runtime.veto, state)
+        if not self.runtime.active or state is None or state.finished:
+            return self.native.log(*items)
+        wrappers = []
+        with self.runtime.lock:
+            for item in items:
+                state.pending += 1
+                wrappers.append(
+                    _ObservedLazy(item, self.runtime, state, state.next_sequence)
+                )
+                state.next_sequence += 1
+        return self.native.log(*wrappers)
+
+
+class _Iterator:
+    """Detach only the OTel context between native generator advances."""
+
+    def __init__(self, native):
+        self.native, self.saved = native, None
+
+    def __iter__(self):
+        return self
+
+    def __getattr__(self, name):
+        return getattr(self.native, name)
+
+    def advance(self, method, *args):
+        advancing = _ADVANCE.set(True)
+        token = context.attach(self.saved or context.get_current())
         try:
-            return int(value)
-        except ValueError:
-            return None
-    return None
-
-
-def _coerce_str(value: Any) -> str | None:
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, str):
-        return value
-    if isinstance(value, int | float):
-        return str(value)
-    return None
-
-
-def _format_id(value: Any) -> str | None:
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, uuid.UUID):
-        return value.hex
-    if isinstance(value, str):
-        try:
-            return uuid.UUID(value).hex
-        except ValueError:
+            value = method(*args)
+            self.saved = context.get_current()
             return value
-    return str(value)
+        except BaseException:
+            self.saved = None
+            raise
+        finally:
+            context.detach(token)
+            _ADVANCE.reset(advancing)
 
+    def __next__(self):
+        return self.advance(self.native.__next__)
 
-def _timestamp_to_ns(value: Any) -> int | None:
-    if isinstance(value, bool) or value is None:
-        return None
-    if isinstance(value, int | float):
-        if not math.isfinite(value):
-            return None
-        return int(value * 1_000_000_000)
-    if isinstance(value, datetime.datetime):
-        return int(value.astimezone(datetime.timezone.utc).timestamp() * 1_000_000_000)
-    return None
+    def send(self, value):
+        return self.advance(self.native.send, value)
 
+    def throw(self, *args):
+        return self.advance(self.native.throw, *args)
 
-def _sanitize_json(value: Any, seen: set[int] | None = None) -> Any:
-    if seen is None:
-        seen = set()
-
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    if isinstance(value, str | int | bool) or value is None:
-        return value
-    if isinstance(value, datetime.datetime):
-        return value.astimezone(datetime.timezone.utc).isoformat()
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    if isinstance(value, Mapping):
-        object_id = id(value)
-        if object_id in seen:
-            return "[CYCLE]"
-        seen.add(object_id)
-        return {str(key): _sanitize_json(val, seen=seen) for key, val in value.items()}
-    if isinstance(value, list | tuple | set):
-        object_id = id(value)
-        if object_id in seen:
-            return ["[CYCLE]"]
-        seen.add(object_id)
-        return [_sanitize_json(item, seen=seen) for item in value]
-    return str(value)
-
-
-def _json_string(value: Any) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return value
-    return json.dumps(_sanitize_json(serialize_value(value)), default=str)
-
-
-def _extract_nested_mapping(value: Any, key: str) -> Any:
-    if isinstance(value, Mapping):
-        return value.get(key)
-    return None
-
-
-def _extract_model(record: Mapping[str, Any], span_attributes: Mapping[str, Any]) -> str | None:
-    model = _coerce_str(record.get("model"))
-    if model:
-        return model
-
-    for source in (record.get("metadata"), span_attributes, record.get("metrics")):
-        if not isinstance(source, Mapping):
-            continue
-        for key in ("model", "model_name", "llm_model", "model_id"):
-            model = _coerce_str(source.get(key))
-            if model:
-                return model
-
-        invocation_params = source.get("invocation_params") or source.get(
-            "invocation_parameters"
-        )
-        model = _coerce_str(_extract_nested_mapping(invocation_params, "model"))
-        if model:
-            return model
-
-    return None
-
-
-def _extract_workflow_name(
-    record: Mapping[str, Any],
-    span_attributes: Mapping[str, Any],
-    extra_attributes: Mapping[str, Any] | None,
-) -> str | None:
-    for source in (record.get("metadata"), span_attributes):
-        if not isinstance(source, Mapping):
-            continue
-        workflow_name = _coerce_str(source.get("workflow_name"))
-        if workflow_name:
-            return workflow_name
-
-    if extra_attributes is not None:
-        workflow_name = _coerce_str(extra_attributes.get(RESPAN_TRACE_GROUP_ID))
-        if workflow_name:
-            return workflow_name
-
-    return None
-
-
-def _read_tokens(source: Any) -> tuple[int | None, int | None]:
-    if not isinstance(source, Mapping):
-        return None, None
-
-    prompt = _coerce_int(source.get("prompt_tokens"))
-    completion = _coerce_int(source.get("completion_tokens"))
-    if prompt is None and completion is None:
-        prompt = _coerce_int(source.get("input_tokens"))
-        completion = _coerce_int(source.get("output_tokens"))
-    return prompt, completion
-
-
-def _extract_token_usage(record: Mapping[str, Any]) -> tuple[int | None, int | None]:
-    for source in (record.get("metrics"), record.get("metadata")):
-        prompt_tokens, completion_tokens = _read_tokens(source)
-        if prompt_tokens is not None or completion_tokens is not None:
-            return prompt_tokens, completion_tokens
-        if isinstance(source, Mapping):
-            for nested_key in ("usage", "tokens", "token_usage"):
-                prompt_tokens, completion_tokens = _read_tokens(source.get(nested_key))
-                if prompt_tokens is not None or completion_tokens is not None:
-                    return prompt_tokens, completion_tokens
-    return None, None
-
-
-def _normalize_messages(value: Any) -> list[dict[str, Any]] | None:
-    if isinstance(value, str):
+    def close(self):
         try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError:
-            return [{"role": "user", "content": value}]
-        return _normalize_messages(parsed)
-
-    if isinstance(value, Mapping):
-        messages = value.get("messages")
-        if messages is not None:
-            return _normalize_messages(messages)
-        if "role" in value or "content" in value:
-            return [dict(value)]
-        if "input" in value:
-            return _normalize_messages(value["input"])
-
-    if isinstance(value, list):
-        messages = [dict(item) for item in value if isinstance(item, Mapping)]
-        if messages:
-            return messages
-
-    return None
+            return self.advance(self.native.close)
+        finally:
+            self.saved = None
 
 
-def _message_content(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    return json.dumps(_sanitize_json(serialize_value(value)), default=str)
+class _AsyncIterator:
+    def __init__(self, native):
+        self.native, self.saved = native, None
 
+    def __aiter__(self):
+        return self
 
-def _set_prompt_attributes(attrs: dict[str, Any], input_value: Any) -> None:
-    messages = _normalize_messages(input_value)
-    if not messages:
-        if input_value is not None:
-            attrs[f"{_GEN_AI_PROMPT_PREFIX}0.role"] = "user"
-            attrs[f"{_GEN_AI_PROMPT_PREFIX}0.content"] = _message_content(input_value)
-        return
+    def __getattr__(self, name):
+        return getattr(self.native, name)
 
-    for index, message in enumerate(messages):
-        prefix = f"{_GEN_AI_PROMPT_PREFIX}{index}."
-        role = _coerce_str(message.get("role")) or "user"
-        attrs[f"{prefix}role"] = role
-        if message.get("content") is not None:
-            attrs[f"{prefix}content"] = _message_content(message.get("content"))
-        if message.get("tool_calls") is not None:
-            attrs[f"{prefix}tool_calls"] = json.dumps(
-                _sanitize_json(serialize_value(message.get("tool_calls"))),
-                default=str,
-            )
-
-
-def _extract_completion_message(output_value: Any) -> dict[str, Any] | None:
-    if output_value is None:
-        return None
-    if isinstance(output_value, str):
+    async def advance(self, method, *args):
+        advancing = _ADVANCE.set(True)
+        token = context.attach(self.saved or context.get_current())
         try:
-            parsed = json.loads(output_value)
-        except json.JSONDecodeError:
-            return {"role": "assistant", "content": output_value}
-        return _extract_completion_message(parsed)
-    if isinstance(output_value, Mapping):
-        if "role" in output_value or "content" in output_value or "tool_calls" in output_value:
-            return dict(output_value)
-        choices = output_value.get("choices")
-        if isinstance(choices, list) and choices:
-            first_choice = choices[0]
-            if isinstance(first_choice, Mapping):
-                message = first_choice.get("message") or first_choice.get("delta")
-                if isinstance(message, Mapping):
-                    return dict(message)
-                if first_choice.get("text") is not None:
-                    return {"role": "assistant", "content": first_choice.get("text")}
-        if output_value.get("output") is not None:
-            return _extract_completion_message(output_value.get("output"))
-    return {"role": "assistant", "content": _message_content(output_value)}
+            value = await method(*args)
+            self.saved = context.get_current()
+            return value
+        except BaseException:
+            self.saved = None
+            raise
+        finally:
+            context.detach(token)
+            _ADVANCE.reset(advancing)
+
+    async def __anext__(self):
+        return await self.advance(self.native.__anext__)
+
+    async def asend(self, value):
+        return await self.advance(self.native.asend, value)
+
+    async def athrow(self, *args):
+        return await self.advance(self.native.athrow, *args)
+
+    async def aclose(self):
+        try:
+            return await self.advance(self.native.aclose)
+        finally:
+            self.saved = None
 
 
-def _set_completion_attributes(attrs: dict[str, Any], output_value: Any) -> None:
-    message = _extract_completion_message(output_value)
-    if message is None:
-        return
-
-    attrs[f"{_GEN_AI_COMPLETION_PREFIX}0.role"] = (
-        _coerce_str(message.get("role")) or "assistant"
-    )
-    if message.get("content") is not None:
-        attrs[f"{_GEN_AI_COMPLETION_PREFIX}0.content"] = _message_content(
-            message.get("content")
+class _Runtime:
+    def __init__(self, braintrust, provider, content, masking):
+        self.braintrust, self.provider, self.content, self.masking = (
+            braintrust,
+            provider,
+            content,
+            masking,
         )
-    if message.get("tool_calls") is not None:
-        attrs[f"{_GEN_AI_COMPLETION_PREFIX}0.tool_calls"] = json.dumps(
-            _sanitize_json(serialize_value(message.get("tool_calls"))),
-            default=str,
+        self.active = True
+        self.count = 1
+        self.patches = []
+        self.states = {}
+        self.source = {}
+        self.parents = OrderedDict()
+        self.lock = threading.RLock()
+        self.tracer = provider.get_tracer("respan.instrumentation.braintrust")
+
+    def patch(self, owner, name, factory):
+        original = getattr(owner, name, None)
+        if original is None:
+            return
+        replacement = factory(original)
+        previous = vars(owner).get(name, _MISSING)
+        self.patches.append((owner, name, previous, replacement))
+        setattr(owner, name, replacement)
+
+    def begin(self, instance, arguments):
+        parent_ids = arguments.get("parent_span_ids")
+        parent_id = get(parent_ids, "span_id")
+        ids = get(parent_ids, "span_parents")
+        if not parent_id and ids:
+            parent_id = ids[0]
+        parent = self.source.get(parent_id)
+        cached = self.parents.get(parent_id)
+        if (
+            context.get_value(context._SUPPRESS_INSTRUMENTATION_KEY)
+            or context.get_value(SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY)
+            or (parent_id in self.source and parent is None)
+        ):
+            self.states[id(instance)] = None
+            return
+        native = arguments.get("span_attributes") or {}
+        kind = (
+            get(native, "type")
+            or arguments.get("type")
+            or arguments.get("default_root_type")
+        )
+        kind = BRAINTRUST_SPAN_TYPE_TO_LOG_TYPE.get(kind, "task")
+        name = arguments.get("name") or get(native, "name") or kind
+        name = redact_text(name) if isinstance(name, str) else kind
+        parent_span = (
+            parent.span
+            if parent
+            else trace.NonRecordingSpan(cached[0])
+            if cached
+            else None
+        )
+        parent_context = (
+            trace.set_span_in_context(parent_span)
+            if parent_span
+            else context.get_current()
+        )
+        span = self.tracer.start_span(
+            f"{kind}.{name}"
+            if kind in {"tool", "agent"}
+            else "llm"
+            if kind == "chat"
+            else kind,
+            context=parent_context,
+            attributes={
+                RESPAN_LOG_TYPE: kind,
+                SpanAttributes.TRACELOOP_ENTITY_NAME: name,
+                SpanAttributes.TRACELOOP_ENTITY_PATH: "",
+            },
+        )
+        state = _State(span, False, parent=parent, masking=self.masking)
+        self.states[id(instance)] = state
+        request = _REQUEST.get()
+        if request is not None:
+            span.set_attribute(SpanAttributes.GEN_AI_IS_STREAMING, request)
+        state.capture = (
+            span.is_recording()
+            and self.content
+            and _allowed()
+            and (parent.capture if parent else cached[1] if cached else True)
         )
 
+    def bind(self, instance):
+        state = self.states.get(id(instance))
+        identifier = get(instance, "span_id")
+        if isinstance(identifier, str):
+            self.source[identifier] = state
+            if state:
+                state.source_id = identifier
+                state.span.set_attribute("braintrust.span_id", identifier)
 
-def _build_metadata(record: Mapping[str, Any]) -> dict[str, Any] | None:
-    metadata: dict[str, Any] = {}
-    base_metadata = record.get("metadata")
-    if isinstance(base_metadata, Mapping):
-        metadata.update(base_metadata)
-    elif base_metadata is not None:
-        metadata[f"{BRAINTRUST_METADATA_PREFIX}metadata"] = base_metadata
+    def veto(self, state):
+        if state is None or state.finished:
+            return
+        ancestor = state.parent
+        denied = False
+        while ancestor is not None:
+            if not ancestor.capture:
+                denied = True
+                break
+            ancestor = ancestor.parent
+        sink = state.native_sink
+        masked = sink is not None and bool(
+            get(sink, "_export_customizers") or get(sink, "_masking_function")
+        )
+        if state.capture and (denied or masked or not _allowed()):
+            state.capture = False
+            state.rows.clear()
+            state.embedding = None
 
-    for source_key, metadata_key in (
-        ("tags", "tags"),
-        ("scores", "scores"),
-        ("metrics", "metrics"),
-        ("span_attributes", "span_attributes"),
-        ("context", "context"),
-    ):
-        if record.get(source_key) is not None:
-            metadata[f"{BRAINTRUST_METADATA_PREFIX}{metadata_key}"] = record.get(
-                source_key
+    def enter(self, instance):
+        state = self.states.get(id(instance))
+        self.veto(state)
+        if not state or state.finished or not get(instance, "can_set_current"):
+            return
+        if not _ADVANCE.get():
+            frame = inspect.currentframe()
+            try:
+                while frame is not None:
+                    if frame.f_globals.get(
+                        "__name__"
+                    ) == "braintrust.logger" and frame.f_code.co_flags & (
+                        inspect.CO_GENERATOR | inspect.CO_ASYNC_GENERATOR
+                    ):
+                        # Generators decorated before activation cannot be wrapped
+                        # retroactively. Leave their native caller context intact.
+                        return
+                    frame = frame.f_back
+            finally:
+                del frame
+        current = context.get_current()
+        # Braintrust's compatibility context must retain its native NonRecordingSpan
+        # so current_span/traceparent APIs continue returning the native SDK span.
+        if type(instance.state.context_manager).__module__.startswith(
+            "braintrust.otel"
+        ):
+            state.token = context.attach(
+                context.set_value(_CONTENT_BOUND, state.capture, current)
             )
-
-    if record.get("id") is not None:
-        metadata[f"{BRAINTRUST_METADATA_PREFIX}log_id"] = _format_id(record.get("id"))
-
-    for field in ("project_id", "experiment_id", "dataset_id", "org_id"):
-        if record.get(field) is not None:
-            metadata[f"{BRAINTRUST_METADATA_PREFIX}{field}"] = _format_id(
-                record.get(field)
-            )
-
-    if not metadata:
-        return None
-    return _sanitize_json(metadata)
-
-
-def _metadata_mapping(value: Any) -> dict[str, Any]:
-    if isinstance(value, Mapping):
-        return dict(value)
-    if not isinstance(value, str):
-        return {}
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError:
-        return {}
-    return dict(parsed) if isinstance(parsed, Mapping) else {}
-
-
-def _merge_metadata(
-    braintrust_metadata: Mapping[str, Any] | None,
-    propagated_metadata: Any,
-) -> dict[str, Any] | None:
-    """Merge propagated metadata without replacing Braintrust evaluation data.
-
-    Propagated fields win generic-key collisions because they describe the
-    active Respan run. Braintrust-owned scores, metrics, tags, and identifiers
-    are namespaced under ``braintrust_*`` and therefore remain intact.
-    """
-
-    merged = dict(braintrust_metadata or {})
-    merged.update(_metadata_mapping(propagated_metadata))
-    return _sanitize_json(merged) if merged else None
-
-
-def _flatten_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
-    """Expose metadata through canonical per-key attributes used by OTLP."""
-
-    flattened: dict[str, Any] = {}
-    for key, value in metadata.items():
-        attribute = f"{RESPAN_METADATA}.{key}"
-        if value is None or isinstance(value, str | int | float | bool):
-            flattened[attribute] = value
         else:
-            flattened[attribute] = json.dumps(_sanitize_json(value), default=str)
-    return flattened
+            state.token = context.attach(
+                context.set_value(
+                    _CONTENT_BOUND,
+                    state.capture,
+                    trace.set_span_in_context(state.span, current),
+                )
+            )
 
+    def leave(self, instance):
+        state = self.states.get(id(instance))
+        self.veto(state)
+        if state and state.token is not None:
+            token, state.token = state.token, None
+            context.detach(token)
+        if state and state.finished:
+            self.states.pop(id(instance), None)
+        if not self.active and not any(
+            value and value.token is not None for value in self.states.values()
+        ):
+            self.restore_deferred()
 
-def _propagated_metadata(extra_attributes: Mapping[str, Any] | None) -> dict[str, Any]:
-    if not extra_attributes:
-        return {}
-    metadata = _metadata_mapping(extra_attributes.get(RESPAN_METADATA))
-    prefix = f"{RESPAN_METADATA}."
-    metadata.update(
-        {
-            key[len(prefix) :]: value
-            for key, value in extra_attributes.items()
-            if key.startswith(prefix)
+    def record(self, state, record, sequence):
+        if (
+            not self.active
+            or state.finished
+            or not state.span.is_recording()
+            or not isinstance(record, dict)
+        ):
+            return
+        self.veto(state)
+        # Source records are already copied/customized by Braintrust. Never resolve
+        # extra lazy values or upload attachments to construct Respan payloads.
+        keys = {
+            "id",
+            "span_id",
+            "root_span_id",
+            "span_parents",
+            "span_attributes",
+            "metrics",
+            "error",
+            "_is_merge",
+            "_merge_paths",
         }
-    )
-    return metadata
+        if state.capture:
+            keys |= {"input", "output", "metadata", "scores", "tags", "expected"}
+        snapshot = {
+            k: plain(v)
+            for k, v in record.items()
+            if k in keys and (state.capture or k not in {"span_attributes", "metrics"})
+        }
+        if not state.capture:
+            snapshot.pop("error", None)
+            snapshot["metrics"] = private_usage(record.get("metrics"))
+            native = record.get("span_attributes")
+            if isinstance(native, dict):
+                snapshot["span_attributes"] = {
+                    k: get(native, k)
+                    for k in ("type", "name", "model", "provider")
+                    if isinstance(get(native, k), str)
+                }
+            metadata = record.get("metadata")
+            if isinstance(metadata, dict):
+                safe = {
+                    k: get(metadata, k)
+                    for k in ("model", "model_name", "provider", "system")
+                    if isinstance(get(metadata, k), str)
+                }
+                for key in ("usage", "token_usage"):
+                    counters = private_usage(get(metadata, key))
+                    if counters:
+                        safe[key] = counters
+                snapshot["metadata"] = safe
+        state.rows.append((sequence, snapshot))
 
+    def maybe_finish(self, state):
+        if state.sdk_ended and state.pending == 0:
+            self.finish(state)
 
-def _record_mapping(item: Any) -> Mapping[str, Any] | None:
-    if isinstance(item, Mapping):
-        return item
-    get_method = getattr(item, "get", None)
-    if callable(get_method):
-        record = get_method()
-        if isinstance(record, Mapping):
-            return record
-    return None
+    def finish(self, state, error=None):
+        if state.finished:
+            return
+        state.finished = True
+        try:
+            if state.rows:
+                from braintrust.merge_row_batch import merge_row_batch
 
+                merged = merge_row_batch(
+                    [row for _, row in sorted(state.rows, key=lambda value: value[0])]
+                )
+                record = (
+                    merged[0][0]
+                    if merged and isinstance(merged[0], list) and merged[0]
+                    else merged[0]
+                    if merged
+                    else {}
+                )
+            else:
+                record = {}
+            if state.embedding is not None:
+                record.setdefault("span_attributes", {})["type"] = "embedding"
+                record.setdefault("metadata", {})["model"] = state.embedding.get(
+                    "model"
+                )
+                record["metrics"] = state.embedding.get("usage") or record.get(
+                    "metrics", {}
+                )
+                if (
+                    state.capture
+                    and isinstance(record.get("output"), dict)
+                    and "embedding_length" in record["output"]
+                ):
+                    record["output"] = state.embedding.get("vectors")
+            masker = state.masking or self.masking
+            if (
+                state.masking is not None
+                and self.masking is not None
+                and state.masking is not self.masking
+            ):
 
-def _build_span_from_record(
-    record: Mapping[str, Any],
-    *,
-    extra_attributes: Mapping[str, Any] | None = None,
-    masking_function: Callable[[Any], Any] | None = None,
-) -> ReadableSpan:
-    span_attributes = record.get("span_attributes")
-    if not isinstance(span_attributes, Mapping):
-        span_attributes = {}
+                def masker(value):
+                    return self.masking(state.masking(value))
 
-    span_type = _coerce_str(span_attributes.get("type"))
-    normalized_span_type = span_type.lower() if span_type else ""
-    log_type = BRAINTRUST_SPAN_TYPE_TO_LOG_TYPE.get(
-        normalized_span_type,
-        LOG_TYPE_TASK,
-    )
+            attrs = (
+                attributes(record, capture=state.capture, masking=masker)
+                if record
+                else {}
+            )
+            state.span.set_attributes(attrs)
+            actual = error or state.error
+            if actual is not None or record.get("error"):
+                state.span.set_status(trace.StatusCode.ERROR)
+                event = {}
+                if actual is not None:
+                    event[EXCEPTION_TYPE] = type(actual).__name__
+                    state.span.set_attribute(ERROR_TYPE, type(actual).__name__)
+                    args = BaseException.args.__get__(actual) if state.capture else ()
+                    message = (
+                        redact_text(args[0])
+                        if len(args) == 1 and isinstance(args[0], str)
+                        else json_string(args)
+                    )
+                else:
+                    message = record.get("error")
+                if state.capture and isinstance(message, str):
+                    event[EXCEPTION_MESSAGE] = redact_text(message)
+                    state.span.set_attribute(ERROR_MESSAGE, event[EXCEPTION_MESSAGE])
+                state.span.add_event("exception", event)
+            if state.source_id:
+                self.parents[state.source_id] = (
+                    state.span.get_span_context(),
+                    state.capture,
+                )
+                self.parents.move_to_end(state.source_id)
+                while len(self.parents) > 4096:
+                    self.parents.popitem(last=False)
+        finally:
+            state.rows.clear()
+            state.embedding = None
+            state.masking = None
+            state.error = None
+            state.span.end()
+            if state.source_id:
+                self.source.pop(state.source_id, None)
+            for key, value in tuple(self.states.items()):
+                if value is state and state.token is None:
+                    self.states.pop(key, None)
 
-    span_parents = record.get("span_parents")
-    parent_id = None
-    if isinstance(span_parents, list | tuple) and span_parents:
-        parent_id = _format_id(span_parents[0])
+    def install(self):
+        runtime = self
 
-    metrics = record.get("metrics") if isinstance(record.get("metrics"), Mapping) else {}
-    start_time_ns = _timestamp_to_ns(metrics.get("start"))
-    end_time_ns = _timestamp_to_ns(metrics.get("end"))
+        def constructor(original):
+            signature = inspect.signature(original)
 
-    span_name = (
-        _coerce_str(span_attributes.get("name"))
-        or _coerce_str(record.get("name"))
-        or BRAINTRUST_DEFAULT_SPAN_NAME
-    )
-    input_value = record.get("input")
-    output_value = record.get("output")
-    metadata = _build_metadata(record)
-    model = _extract_model(record, span_attributes)
-    workflow_name = _extract_workflow_name(record, span_attributes, extra_attributes)
-    prompt_tokens, completion_tokens = _extract_token_usage(record)
-    total_tokens = (
-        None
-        if prompt_tokens is None and completion_tokens is None
-        else (prompt_tokens or 0) + (completion_tokens or 0)
-    )
+            @wraps(original)
+            def wrapped(instance, *args, **kwargs):
+                if not runtime.active:
+                    return original(instance, *args, **kwargs)
+                bound = signature.bind(instance, *args, **kwargs)
+                _safe(runtime.begin, instance, bound.arguments)
+                try:
+                    result = original(instance, *args, **kwargs)
+                except BaseException as error:
+                    state = runtime.states.get(id(instance))
+                    if state:
+                        _safe(runtime.finish, state, error)
+                    raise
+                _safe(runtime.bind, instance)
+                return result
 
-    if masking_function is not None:
-        input_value = _apply_masking(masking_function, input_value, "input")
-        output_value = _apply_masking(masking_function, output_value, "output")
-        metadata = _apply_masking(masking_function, metadata, "metadata")
+            return wrapped
 
-    attrs: dict[str, Any] = {
-        RESPAN_LOG_METHOD: LogMethodChoices.TRACING_INTEGRATION.value,
-        RESPAN_LOG_TYPE: log_type,
-        TLSpanAttributes.TRACELOOP_ENTITY_NAME: span_name,
-        TLSpanAttributes.TRACELOOP_ENTITY_PATH: (
-            BRAINTRUST_ENTITY_PATH if parent_id else ""
-        ),
-    }
+        self.patch(self.braintrust.logger.SpanImpl, "__init__", constructor)
 
-    input_string = _json_string(input_value)
-    output_string = _json_string(output_value)
-    if input_string is not None:
-        attrs[TLSpanAttributes.TRACELOOP_ENTITY_INPUT] = input_string
-    if output_string is not None:
-        attrs[TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT] = output_string
-    metadata = _merge_metadata(metadata, _propagated_metadata(extra_attributes))
-    if metadata is not None:
-        attrs[RESPAN_METADATA] = json.dumps(metadata, default=str)
-        attrs.update(_flatten_metadata(metadata))
+        def sink(original):
+            @wraps(original)
+            def wrapped(instance, *args, **kwargs):
+                native = original(instance, *args, **kwargs)
+                return _ObservedLogger(native, runtime) if runtime.active else native
 
-    if log_type == LOG_TYPE_CHAT:
-        attrs[LLM_REQUEST_TYPE] = LLMRequestTypeValues.CHAT.value
-        attrs[GEN_AI_SYSTEM] = "braintrust"
-        _set_prompt_attributes(attrs, input_value)
-        _set_completion_attributes(attrs, output_value)
-        if model is not None:
-            attrs[LLM_REQUEST_MODEL] = model
-        if prompt_tokens is not None:
-            attrs[LLM_USAGE_PROMPT_TOKENS] = prompt_tokens
-            attrs[_GEN_AI_USAGE_INPUT_TOKENS] = prompt_tokens
-        if completion_tokens is not None:
-            attrs[LLM_USAGE_COMPLETION_TOKENS] = completion_tokens
-            attrs[_GEN_AI_USAGE_OUTPUT_TOKENS] = completion_tokens
-        if total_tokens is not None:
-            attrs[_LLM_USAGE_TOTAL_TOKENS] = total_tokens
+            return wrapped
 
-    if extra_attributes:
-        attrs.update(
-            {
-                key: value
-                for key, value in extra_attributes.items()
-                if key != RESPAN_METADATA and not key.startswith(f"{RESPAN_METADATA}.")
-            }
-        )
-    if workflow_name is not None:
-        attrs[TLSpanAttributes.TRACELOOP_WORKFLOW_NAME] = workflow_name
+        self.patch(self.braintrust.logger.BraintrustState, "global_bg_logger", sink)
 
-    status_code = 500 if record.get("error") else 200
-    error_message = _coerce_str(record.get("error"))
+        def writer(original):
+            @wraps(original)
+            def wrapped(instance, *args, **kwargs):
+                if not runtime.active:
+                    return original(instance, *args, **kwargs)
+                state = runtime.states.get(id(instance))
+                _safe(runtime.veto, state)
+                token = _WRITE.set(state)
+                try:
+                    return original(instance, *args, **kwargs)
+                finally:
+                    _WRITE.reset(token)
 
-    return build_readable_span(
-        name=span_name,
-        trace_id=_format_id(record.get("root_span_id")),
-        span_id=_format_id(record.get("span_id")),
-        parent_id=parent_id,
-        start_time_ns=start_time_ns,
-        end_time_ns=end_time_ns,
-        attributes=attrs,
-        status_code=status_code,
-        error_message=error_message,
-    )
+            return wrapped
 
+        self.patch(self.braintrust.logger.SpanImpl, "log_internal", writer)
 
-def _apply_masking(
-    masking_function: Callable[[Any], Any],
-    value: Any,
-    field_name: str,
-) -> Any:
-    try:
-        return masking_function(value)
-    except Exception as exc:  # pragma: no cover - defensive
-        return f"ERROR: Failed to mask field '{field_name}' - {type(exc).__name__}"
+        def current(original):
+            @wraps(original)
+            def wrapped(instance, *args, **kwargs):
+                result = original(instance, *args, **kwargs)
+                if runtime.active:
+                    _safe(runtime.enter, instance)
+                return result
+
+            return wrapped
+
+        self.patch(self.braintrust.logger.SpanImpl, "set_current", current)
+
+        def uncurrent(original):
+            @wraps(original)
+            def wrapped(instance, *args, **kwargs):
+                _safe(runtime.leave, instance)
+                return original(instance, *args, **kwargs)
+
+            return wrapped
+
+        self.patch(self.braintrust.logger.SpanImpl, "unset_current", uncurrent)
+
+        def ending(original):
+            @wraps(original)
+            def wrapped(instance, *args, **kwargs):
+                state = runtime.states.get(id(instance))
+                _safe(runtime.veto, state)
+                try:
+                    return original(instance, *args, **kwargs)
+                finally:
+                    if state:
+                        state.sdk_ended = True
+                        _safe(runtime.maybe_finish, state)
+                    else:
+                        runtime.states.pop(id(instance), None)
+
+            return wrapped
+
+        self.patch(self.braintrust.logger.SpanImpl, "end", ending)
+
+        def exit_factory(original):
+            @wraps(original)
+            def wrapped(instance, exc_type, exc_value, tb):
+                state = runtime.states.get(id(instance))
+                if state:
+                    state.error = exc_value
+                    _safe(runtime.veto, state)
+                return original(instance, exc_type, exc_value, tb)
+
+            return wrapped
+
+        self.patch(self.braintrust.logger.SpanImpl, "__exit__", exit_factory)
+
+        def traced_factory(original):
+            @wraps(original)
+            def wrapped(*args, **kwargs):
+                result = original(*args, **kwargs)
+
+                def decorate(function):
+                    if inspect.isgeneratorfunction(function):
+
+                        @wraps(function)
+                        def wrapper(*a, **kw):
+                            return (
+                                yield from (
+                                    _Iterator(function(*a, **kw))
+                                    if runtime.active
+                                    else function(*a, **kw)
+                                )
+                            )
+
+                        return wrapper
+                    if inspect.isasyncgenfunction(function):
+
+                        @wraps(function)
+                        async def wrapper(*a, **kw):
+                            iterator = (
+                                _AsyncIterator(function(*a, **kw))
+                                if runtime.active
+                                else function(*a, **kw)
+                            )
+                            method, args = iterator.__anext__, ()
+                            while True:
+                                try:
+                                    value = await method(*args)
+                                except StopAsyncIteration:
+                                    return
+                                try:
+                                    sent = yield value
+                                except GeneratorExit:
+                                    await iterator.aclose()
+                                    raise
+                                except BaseException as error:  # noqa: BLE001 - forward native async generator throw
+                                    method, args = (
+                                        iterator.athrow,
+                                        (type(error), error, error.__traceback__),
+                                    )
+                                else:
+                                    method, args = iterator.asend, (sent,)
+
+                        return wrapper
+                    return function
+
+                if args and callable(args[0]) and len(args) == 1 and not kwargs:
+                    return decorate(result)
+
+                @wraps(result)
+                def decorator(function):
+                    return decorate(result(function))
+
+                return decorator
+
+            return wrapped
+
+        # The released native OpenAI embedding wrapper logs only vector length.
+        # Observe its real response while preserving its own record and return.
+        def embedding_factory(original):
+            @wraps(original)
+            def wrapped(instance, response, span, *args, **kwargs):
+                result = original(instance, response, span, *args, **kwargs)
+                if runtime.active:
+                    state = runtime.states.get(id(span))
+                    if state and state.span.is_recording():
+
+                        def capture():
+                            runtime.veto(state)
+                            state.embedding = {
+                                "model": get(response, "model"),
+                                "usage": private_usage(get(response, "usage")),
+                            }
+                            if state.capture:
+                                state.embedding["vectors"] = [
+                                    plain(get(item, "embedding"))
+                                    for item in get(response, "data", ())
+                                ]
+
+                        _safe(capture)
+                return result
+
+            return wrapped
+
+        import importlib
+
+        for module_name in ("braintrust.integrations.openai.tracing", "braintrust.oai"):
+            try:
+                module = importlib.import_module(module_name)
+            except ImportError:
+                continue
+
+            def request_factory(original):
+                if inspect.iscoroutinefunction(original):
+
+                    @wraps(original)
+                    async def wrapped(instance, *args, **kwargs):
+                        token = _REQUEST.set(
+                            kwargs.get("stream")
+                            if type(kwargs.get("stream")) is bool
+                            else None
+                        )
+                        try:
+                            return await original(instance, *args, **kwargs)
+                        finally:
+                            _REQUEST.reset(token)
+
+                    return wrapped
+
+                @wraps(original)
+                def wrapped(instance, *args, **kwargs):
+                    token = _REQUEST.set(
+                        kwargs.get("stream")
+                        if type(kwargs.get("stream")) is bool
+                        else None
+                    )
+                    try:
+                        return original(instance, *args, **kwargs)
+                    finally:
+                        _REQUEST.reset(token)
+
+                return wrapped
+
+            self.patch(module.ChatCompletionWrapper, "create", request_factory)
+            self.patch(module.ChatCompletionWrapper, "acreate", request_factory)
+            self.patch(module.EmbeddingWrapper, "process_output", embedding_factory)
+            break
+        self.patch(self.braintrust.logger, "traced", traced_factory)
+        self.patch(self.braintrust, "traced", traced_factory)
+
+    def close(self):
+        self.active = False
+        for state in tuple(self.states.values()):
+            if state:
+                state.capture = False
+                state.rows.clear()
+                _safe(self.finish, state)
+        self.states = {
+            key: state
+            for key, state in self.states.items()
+            if state and state.token is not None
+        }
+        self.source.clear()
+        self.parents.clear()
+        retained = []
+        for owner, name, previous, replacement in reversed(self.patches):
+            if name == "unset_current" and self.states:
+                retained.append((owner, name, previous, replacement))
+                continue
+            if getattr(owner, name, None) is replacement:
+                if previous is _MISSING:
+                    delattr(owner, name)
+                else:
+                    setattr(owner, name, previous)
+        self.patches = retained
+
+    def restore_deferred(self):
+        for owner, name, previous, replacement in self.patches:
+            if getattr(owner, name, None) is replacement:
+                if previous is _MISSING:
+                    delattr(owner, name)
+                else:
+                    setattr(owner, name, previous)
+        self.patches.clear()
 
 
 class BraintrustInstrumentor:
-    """Respan instrumentor for Braintrust."""
-
     name = "braintrust"
 
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._buffer: list[_BufferedBraintrustItem] = []
-        self._previous_logger: Any | None = None
-        self._masking_function: Callable[[Any], Any] | None = None
-        self._is_instrumented = False
-        self._braintrust: Any | None = None
-        self._merge_row_batch: Callable[[Any], Any] | None = None
-        self._extract_attachments: Callable[[Any, list[Any]], Any] | None = None
+    def __init__(self, *, tracer_provider=None, include_content=True):
+        self._provider, self._content = tracer_provider, bool(include_content)
+        self._runtime = None
+        self._masking = None
 
-    def __enter__(self) -> "BraintrustInstrumentor":
+    @property
+    def is_instrumented(self):
+        return self._runtime is not None
+
+    def __enter__(self):
         self.activate()
         return self
 
-    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        del exc_type, exc_value, traceback
+    def __exit__(self, *args):
         self.deactivate()
 
-    @property
-    def is_instrumented(self) -> bool:
-        return self._is_instrumented
-
-    def activate(self) -> None:
-        if self._is_instrumented:
-            return
-
-        try:
-            import braintrust
-        except ImportError:
-            logger.warning("Failed to activate Braintrust instrumentation: braintrust is not installed")
-            return
-
-        self._braintrust = braintrust
-        self._load_optional_braintrust_helpers()
-
-        state = braintrust._internal_get_global_state()
-        override_bg_logger = getattr(state, "_override_bg_logger", None)
-        if override_bg_logger is None:
-            logger.warning(
-                "Failed to activate Braintrust instrumentation: unsupported Braintrust logger state"
-            )
-            return
-
-        self._previous_logger = getattr(override_bg_logger, "logger", None)
-        override_bg_logger.logger = self
-        self._is_instrumented = True
-        logger.info("Braintrust instrumentation activated")
-
-    def deactivate(self) -> None:
-        if not self._is_instrumented or self._braintrust is None:
-            self._is_instrumented = False
-            return
-
-        try:
-            state = self._braintrust._internal_get_global_state()
-            override_bg_logger = getattr(state, "_override_bg_logger", None)
-            if getattr(override_bg_logger, "logger", None) is self:
-                override_bg_logger.logger = self._previous_logger
-        except Exception:
-            logger.exception("Failed to restore Braintrust logger")
-        finally:
-            self._previous_logger = None
-            self._is_instrumented = False
-            logger.info("Braintrust instrumentation deactivated")
-
-    def enforce_queue_size_limit(self, enforce: bool) -> None:
-        del enforce
-
-    def set_masking_function(self, masking_function: Callable[[Any], Any] | None) -> None:
-        self._masking_function = masking_function
-
-    def log(self, *args: Any) -> None:
-        propagated_attributes = read_propagated_attributes()
-        with self._lock:
-            self._buffer.extend(
-                _BufferedBraintrustItem(
-                    item=arg,
-                    propagated_attributes=dict(propagated_attributes),
-                )
-                for arg in args
-            )
-
-    def flush(self, batch_size: int | None = None) -> None:
-        del batch_size
-        with self._lock:
-            if not self._buffer:
+    def activate(self):
+        global _RUNTIME
+        with _LOCK:
+            if self._runtime:
                 return
-            items = self._buffer
-            self._buffer = []
+            tracer = getattr(RespanTracer, "_instance", None)
+            if tracer is not None and not getattr(tracer, "is_enabled", True):
+                return
+            import braintrust
 
-        records_with_attributes = [
-            (record, buffered_item.propagated_attributes)
-            for buffered_item in items
-            if (record := _record_mapping(buffered_item.item)) is not None
-        ]
+            provider = self._provider or trace.get_tracer_provider()
+            if _RUNTIME:
+                if (
+                    _RUNTIME.provider is not provider
+                    or _RUNTIME.content != self._content
+                    or _RUNTIME.masking is not self._masking
+                ):
+                    raise ValueError(
+                        "Braintrust instrumentation already has different provider/privacy settings"
+                    )
+                _RUNTIME.count += 1
+            else:
+                runtime = _Runtime(braintrust, provider, self._content, self._masking)
+                try:
+                    runtime.install()
+                except BaseException:
+                    runtime.close()
+                    raise
+                _RUNTIME = runtime
+            self._runtime = _RUNTIME
 
-        if self._merge_row_batch is not None:
-            merged_records = self._merge_row_batch(
-                [record for record, _attributes in records_with_attributes]
+    def deactivate(self):
+        global _RUNTIME
+        with _LOCK:
+            if not self._runtime:
+                return
+            runtime, self._runtime = self._runtime, None
+            runtime.count -= 1
+            if not runtime.count:
+                runtime.close()
+                _RUNTIME = None
+
+    def set_masking_function(self, masking_function):
+        if (
+            self._runtime
+            and self._runtime.count > 1
+            and self._runtime.masking is not masking_function
+        ):
+            raise ValueError(
+                "Shared Braintrust owners must use the same masking function"
             )
-            records_with_attributes = [
-                (
-                    record,
-                    records_with_attributes[index][1]
-                    if index < len(records_with_attributes)
-                    else {},
-                )
-                for index, record in enumerate(merged_records)
-            ]
+        self._masking = masking_function
+        if self._runtime:
+            self._runtime.masking = masking_function
 
-        attachments: list[Any] = []
-        for record, propagated_attributes in records_with_attributes:
-            if self._extract_attachments is not None:
-                self._extract_attachments(record, attachments)
-            span = _build_span_from_record(
-                record,
-                extra_attributes=propagated_attributes,
-                masking_function=self._masking_function,
+    def enforce_queue_size_limit(self, enforce):
+        if self._runtime:
+            self._runtime.braintrust._internal_get_global_state().global_bg_logger().enforce_queue_size_limit(
+                enforce
             )
-            if not inject_span(span):
-                logger.warning("Failed to export Braintrust span %r", span.name)
 
-    def _load_optional_braintrust_helpers(self) -> None:
-        try:
-            from braintrust.logger import _extract_attachments
-        except (ImportError, AttributeError):
-            self._extract_attachments = None
-        else:
-            self._extract_attachments = _extract_attachments
+    def log(self, *items):
+        # Retain the old logger-facing interface without replacing Braintrust's sink.
+        if not self._runtime:
+            return
+        self._runtime.braintrust._internal_get_global_state().global_bg_logger().log(
+            *items
+        )
 
-        try:
-            from braintrust.merge_row_batch import merge_row_batch
-        except (ImportError, AttributeError):
-            self._merge_row_batch = None
-        else:
-            self._merge_row_batch = merge_row_batch
+    def flush(self, batch_size=None):
+        if self._runtime:
+            self._runtime.braintrust._internal_get_global_state().global_bg_logger().flush(
+                batch_size
+            )
 
 
 RespanBraintrustInstrumentor = BraintrustInstrumentor

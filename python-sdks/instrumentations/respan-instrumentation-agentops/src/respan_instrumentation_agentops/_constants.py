@@ -1,42 +1,34 @@
-"""AgentOps-owned attribute keys and translation tables."""
+"""AgentOps translator classification, with canonical Respan log values."""
 
-from __future__ import annotations
+from respan_sdk.constants.llm_logging import (
+    LOG_TYPE_AGENT,
+    LOG_TYPE_CHAT,
+    LOG_TYPE_EMBEDDING,
+    LOG_TYPE_GUARDRAIL,
+    LOG_TYPE_TASK,
+    LOG_TYPE_TEXT,
+    LOG_TYPE_TOOL,
+    LOG_TYPE_WORKFLOW,
+)
 
 AGENTOPS_INSTRUMENTATION_NAME = "agentops"
-AGENTOPS_SCOPE_PREFIX = "agentops"
-
-AGENTOPS_ENTITY_INPUT = "agentops.entity.input"
-AGENTOPS_ENTITY_OUTPUT = "agentops.entity.output"
-AGENTOPS_SPAN_KIND = "agentops.span.kind"
-AGENTOPS_ENTITY_NAME = "agentops.entity.name"
-AGENTOPS_SESSION_END_STATE = "agentops.session.end_state"
-AGENTOPS_TAGS = "agentops.tags"
-AGENTOPS_DECORATOR_INPUT_TEMPLATE = "agentops.{kind}.input"
-AGENTOPS_DECORATOR_OUTPUT_TEMPLATE = "agentops.{kind}.output"
-
-AGENT_NAME = "agent.name"
-TOOL_NAME = "tool.name"
-OPERATION_NAME = "operation.name"
-OPERATION_VERSION = "operation.version"
-
-AGENTOPS_REQUEST_TYPE = "gen_ai.request.type"
-AGENTOPS_REQUEST_FUNCTIONS = "gen_ai.request.functions"
-AGENTOPS_USAGE_TOTAL_TOKENS = "gen_ai.usage.total_tokens"
-
+# Default prefix used by AgentOps' public update_trace_metadata API.
+AGENTOPS_METADATA_PREFIX = "trace.metadata."
 AGENTOPS_KIND_LOG_TYPES = {
-    "session": "workflow",
-    "workflow": "workflow",
-    "agent": "agent",
-    "task": "task",
-    "operation": "task",
-    "chain": "task",
-    "tool": "tool",
-    "guardrail": "guardrail",
-    "http": "task",
-    "llm": "chat",
-    "text": "text",
+    "session": LOG_TYPE_WORKFLOW,
+    "workflow": LOG_TYPE_WORKFLOW,
+    "agent": LOG_TYPE_AGENT,
+    "task": LOG_TYPE_TASK,
+    "operation": LOG_TYPE_TASK,
+    "chain": LOG_TYPE_TASK,
+    "tool": LOG_TYPE_TOOL,
+    "guardrail": LOG_TYPE_GUARDRAIL,
+    "http": LOG_TYPE_TASK,
+    "llm": LOG_TYPE_CHAT,
+    "text": LOG_TYPE_TEXT,
+    "embedding": LOG_TYPE_EMBEDDING,
 }
-
+# Removal list only: these source aliases are explicitly prohibited by span-contract.
 OFF_CONTRACT_ALIASES = {
     "tools",
     "tool_calls",
@@ -50,4 +42,6 @@ OFF_CONTRACT_ALIASES = {
     "respan.span.tools",
     "respan.span.tool_calls",
     "respan.span.handoffs",
+    "status_code",
+    "error.message",
 }

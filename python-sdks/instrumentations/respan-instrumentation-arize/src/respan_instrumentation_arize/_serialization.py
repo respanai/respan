@@ -1,140 +1,242 @@
-"""Serialization helpers for Arize SDK operation spans."""
+"""Serialize known SDK data without consuming opaque iterators or user hooks."""
 
 from __future__ import annotations
 
-import concurrent.futures
 import dataclasses
 import datetime as dt
 import json
 import math
-from collections.abc import Mapping, Sequence
-from typing import Any
+import re
+from enum import Enum
+from itertools import islice
 
-MAX_ITEMS = 6
-MAX_STRING_LENGTH = 2000
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+from pydantic import BaseModel
+from requests import Response
 
-
-def _truncate(value: str) -> str:
-    if len(value) <= MAX_STRING_LENGTH:
-        return value
-    return f"{value[:MAX_STRING_LENGTH]}...<truncated>"
-
-
-def _summarize_dataframe(value: Any) -> dict[str, Any] | None:
-    module_name = type(value).__module__
-    class_name = type(value).__name__
-    if module_name.startswith("pandas.") and class_name == "DataFrame":
-        columns = [str(column) for column in getattr(value, "columns", [])]
-        return {
-            "type": "pandas.DataFrame",
-            "rows": len(value),
-            "columns": columns[:MAX_ITEMS],
-            "truncated_columns": max(0, len(columns) - MAX_ITEMS),
-        }
-    return None
+MAX_ITEMS = 50
+MAX_JSON_BYTES = 16000
+MAX_DEPTH = 8
+_SENSITIVE = re.compile(
+    r"(^|[._-])(api[_-]?key|authorization|cookie|password|secret|token|credential|access[_-]?key)([._-]|$)|^key$",
+    re.IGNORECASE,
+)
 
 
+def redact_text(value):
+    value = re.sub(r"(?i)(https?://)[^\s/@]+@", r"\1[REDACTED]@", value)
+    value = re.sub(r"(?i)\b(bearer)\s+[^\s,;]+", r"\1 [REDACTED]", value)
+    value = re.sub(
+        r"(?i)\b(basic)\s+(?:[A-Za-z0-9+/]{4})+(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?(?=$|[\s,;])",
+        r"\1 [REDACTED]",
+        value,
+    )
+    value = re.sub(
+        r"""(?i)(["'](?:[^"']*[._-])?(?:api[_-]?key|authorization|cookie|password|secret|token|credential|access[_-]?key|key)["']\s*:\s*)(["'])(.*?)\2""",
+        lambda m: m[1] + m[2] + "[REDACTED]" + m[2],
+        value,
+    )
+    return re.sub(
+        r"(?i)(api[_-]?key|authorization|cookie|password|secret|token|credential)\s*[:=]\s*([^\s,;]+)",
+        lambda m: m[1] + "=[REDACTED]",
+        value,
+    )
 
-def _summarize_future(value: Any, *, depth: int, seen: set[int]) -> dict[str, Any] | None:
-    if not isinstance(value, concurrent.futures.Future):
+
+def safe_text(value, max_bytes=MAX_JSON_BYTES):
+    text = redact_text(value) if isinstance(value, str) else ""
+    if len(text.encode("utf-8")) <= max_bytes:
+        return text
+    return (
+        text.encode("utf-8")[: max_bytes - 16].decode("utf-8", errors="ignore")
+        + "...[truncated]"
+    )
+
+
+def _type_name(value):
+    return type(value).__name__[:120]
+
+
+def _raw_fields(value):
+    if type(value).__module__.startswith("arize.") and isinstance(value, tuple):
+        fields = getattr(type(value), "_fields", None)
+        if type(fields) is tuple:
+            return dict(zip(fields, tuple.__iter__(value), strict=True))
+    if BaseModel in type(value).__mro__:
+        fields = type(value).model_fields
+    elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+        fields = {field.name: None for field in dataclasses.fields(type(value))}
+    else:
         return None
-
-    result: dict[str, Any] = {
-        "type": type(value).__name__,
-        "done": value.done(),
-        "cancelled": value.cancelled(),
-    }
-    if value.done() and not value.cancelled():
-        exception = value.exception()
-        if exception is not None:
-            result["exception"] = str(exception)
-            result["exception_type"] = type(exception).__name__
-        else:
-            result["result"] = _summarize_value(value.result(), depth=depth + 1, seen=seen)
-    return result
-
-
-def _summarize_response(value: Any) -> dict[str, Any] | None:
-    status_code = getattr(value, "status_code", None)
-    if status_code is None:
+    try:
+        data = object.__getattribute__(value, "__dict__")
+    except (AttributeError, TypeError):
         return None
-    result: dict[str, Any] = {
-        "type": type(value).__name__,
-        "status_code": status_code,
-    }
-    url = getattr(value, "url", None)
-    if url:
-        result["url"] = str(url)
-    text = getattr(value, "text", None)
-    if isinstance(text, str) and text:
-        result["text"] = _truncate(text)
-    return result
+    return {key: data[key] for key in fields if key in data}
 
 
-def _summarize_mapping(value: Mapping[Any, Any], *, depth: int, seen: set[int]) -> dict[str, Any]:
-    return {
-        str(key): _summarize_value(child, depth=depth + 1, seen=seen)
-        for key, child in list(value.items())[:MAX_ITEMS]
-    }
-
-
-def _summarize_sequence(value: Sequence[Any], *, depth: int, seen: set[int]) -> list[Any]:
-    return [_summarize_value(child, depth=depth + 1, seen=seen) for child in value[:MAX_ITEMS]]
-
-
-def _summarize_value(value: Any, *, depth: int = 0, seen: set[int] | None = None) -> Any:
-    if seen is None:
-        seen = set()
-
-    if value is None or isinstance(value, bool | int | str):
-        return _truncate(value) if isinstance(value, str) else value
-    if isinstance(value, float):
-        return value if math.isfinite(value) else str(value)
-    if isinstance(value, dt.datetime | dt.date | dt.time):
-        return value.isoformat()
-    if isinstance(value, bytes):
-        return _truncate(value.decode("utf-8", errors="replace"))
-
-    dataframe_summary = _summarize_dataframe(value)
-    if dataframe_summary is not None:
-        return dataframe_summary
-
-    response_summary = _summarize_response(value)
-    if response_summary is not None:
-        return response_summary
-
-    future_summary = _summarize_future(value, depth=depth, seen=seen)
-    if future_summary is not None:
-        return future_summary
-
-    object_id = id(value)
-    if object_id in seen:
-        return "[CYCLE]"
-    seen.add(object_id)
-
-    if depth >= 4:
-        return str(value)
-    if isinstance(value, Mapping):
-        return _summarize_mapping(value, depth=depth, seen=seen)
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return _summarize_mapping(dataclasses.asdict(value), depth=depth, seen=seen)
-    if isinstance(value, tuple):
-        return _summarize_sequence(value, depth=depth, seen=seen)
-    if isinstance(value, list):
-        return _summarize_sequence(value, depth=depth, seen=seen)
-    if isinstance(value, set | frozenset):
-        return _summarize_sequence(list(value), depth=depth, seen=seen)
-
-    to_dict = getattr(value, "to_dict", None)
-    if callable(to_dict):
+def requires_complete_payload(value, depth=0):
+    if depth >= MAX_DEPTH:
+        return False
+    if type(value) is str and value.lstrip().startswith(("{", "[")):
         try:
-            return _summarize_value(to_dict(), depth=depth + 1, seen=seen)
-        except Exception:
-            pass
+            return requires_complete_payload(json.loads(value), depth + 1)
+        except (ValueError, TypeError):
+            return False
+    if type(value) is np.ndarray:
+        return np.issubdtype(value.dtype, np.number)
+    if type(value) is pd.DataFrame:
+        return requires_complete_payload(
+            pd.DataFrame.to_dict(value, orient="records"), depth + 1
+        )
+    fields = _raw_fields(value)
+    if fields is not None:
+        return requires_complete_payload(fields, depth + 1)
+    if type(value) in (tuple, list):
+        return (
+            bool(value)
+            and all(type(v) in (int, float) for v in value)
+            or any(requires_complete_payload(v, depth + 1) for v in value)
+        )
+    if type(value) is dict:
+        if value and all(
+            (type(k) is int and k >= 0 or type(k) is str and k.isdecimal())
+            and type(v) in (int, float)
+            for k, v in value.items()
+        ):
+            return True
+        if any(
+            k in value
+            for k in (
+                "tool_calls",
+                "function",
+                "inputSchema",
+                "toolUse",
+                "toolResult",
+                "embedding",
+                "embeddings",
+                "vector",
+                "vectors",
+                "vector_values",
+            )
+        ):
+            return True
+        return any(requires_complete_payload(v, depth + 1) for v in value.values())
+    return False
 
-    return str(value)
+
+def _safe_key(value):
+    if type(value) is str:
+        return redact_text(value)[:256]
+    if type(value) in (int, bool) or value is None:
+        return json.dumps(value)
+    return "<" + _type_name(value) + ">"
 
 
-def safe_json_dumps(value: Any) -> str:
-    """JSON serialize *value* into an OTel-safe string attribute."""
-    return json.dumps(_summarize_value(value), default=str, sort_keys=True)
+def to_jsonable(value, depth=0, complete=False, seen=frozenset()):
+    complete = complete or requires_complete_payload(value)
+    if id(value) in seen:
+        return {"type": _type_name(value), "circular": True}
+    if value is None or type(value) in (bool, int):
+        return value
+    if type(value) is float:
+        return value if math.isfinite(value) else str(value)
+    if type(value) is str:
+        return redact_text(value)
+    if isinstance(value, Enum):
+        return to_jsonable(
+            object.__getattribute__(value, "__dict__").get("_value_"),
+            depth,
+            complete,
+            seen,
+        )
+    if type(value) in (dt.datetime, dt.date, dt.time):
+        return value.isoformat()
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return {"type": "bytes", "length": len(value)}
+    if depth >= MAX_DEPTH and not complete:
+        return {"type": _type_name(value), "truncated": True}
+    seen = seen | {id(value)}
+    if type(value) is np.ndarray:
+        return to_jsonable(np.ndarray.tolist(value), depth, complete, seen)
+    if isinstance(value, np.generic):
+        return to_jsonable(value.item(), depth, complete, seen)
+    if type(value) is pd.DataFrame:
+        return to_jsonable(
+            {
+                "type": "DataFrame",
+                "columns": list(value.columns),
+                "rows": len(value),
+                "records": pd.DataFrame.to_dict(value, orient="records"),
+            },
+            depth,
+            complete,
+            seen,
+        )
+    if type(value) in (pa.Table, pa.RecordBatch):
+        return to_jsonable(
+            {
+                "type": _type_name(value),
+                "rows": value.num_rows,
+                "records": value.to_pylist(),
+            },
+            depth,
+            complete,
+            seen,
+        )
+    if isinstance(value, Response):
+        content = value.__dict__.get("_content")
+        payload = {"type": "Response"}
+        if isinstance(content, bytes):
+            try:
+                payload["body"] = json.loads(content)
+            except (ValueError, UnicodeDecodeError):
+                payload["body"] = safe_text(content.decode("utf-8", errors="replace"))
+        return to_jsonable(payload, depth, complete, seen)
+    fields = _raw_fields(value)
+    if fields is not None:
+        return to_jsonable(fields, depth, complete, seen)
+    if type(value) is dict:
+        output = {}
+        for key, item in (
+            value.items() if complete else islice(value.items(), MAX_ITEMS + 1)
+        ):
+            if not complete and len(output) >= MAX_ITEMS:
+                output["_respan_truncated_items"] = True
+                break
+            key = _safe_key(key)
+            output[key] = (
+                "[REDACTED]"
+                if _SENSITIVE.search(key)
+                else to_jsonable(item, depth + 1, complete, seen)
+            )
+        return output
+    if type(value) in (list, tuple):
+        output = [
+            to_jsonable(item, depth + 1, complete, seen)
+            for item in (value if complete else value[:MAX_ITEMS])
+        ]
+        if not complete and len(value) > MAX_ITEMS:
+            output.append({"_respan_truncated_items": True})
+        return output
+    return {"type": _type_name(value)}
+
+
+def safe_json_dumps(value):
+    normalized = to_jsonable(value)
+    serialized = json.dumps(
+        normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    if (
+        requires_complete_payload(normalized)
+        or len(serialized.encode("utf-8")) <= MAX_JSON_BYTES
+    ):
+        return serialized
+    preview = safe_text(serialized, max_bytes=MAX_JSON_BYTES // 3)
+    return json.dumps(
+        {"_respan_truncated_bytes": True, "preview": preview},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )

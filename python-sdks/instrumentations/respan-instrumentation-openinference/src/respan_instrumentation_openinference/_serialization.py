@@ -59,6 +59,7 @@ def _is_sensitive_key(key: str) -> bool:
 
 def sanitize_text(value: str) -> str:
     """Redact common credential shapes without stringifying arbitrary objects."""
+    value = re.sub(r"(https?://)[^/@\s]+@", r"\1[REDACTED]@", value)
     value = _BEARER_RE.sub("Bearer [REDACTED]", value)
     value = _BASIC_AUTH_RE.sub("Basic [REDACTED]", value)
     value = _API_KEY_RE.sub(_REDACTED, value)
@@ -79,9 +80,9 @@ def bounded_text(value: Any, *, max_chars: int = MAX_LABEL_CHARS) -> str:
     return f"{sanitized[: max(0, max_chars - len(suffix))]}{suffix}"
 
 
-def to_jsonable(value: Any, *, depth: int = 0) -> Any:
+def to_jsonable(value: Any, *, depth: int = 0, complete: bool = False) -> Any:
     """Convert supported values to JSON data without calling user ``repr``/``str``."""
-    if depth > _MAX_DEPTH:
+    if depth > _MAX_DEPTH and not complete:
         return "[MAX_DEPTH]"
     if value is None or isinstance(value, (bool, int)):
         return value
@@ -94,19 +95,24 @@ def to_jsonable(value: Any, *, depth: int = 0) -> Any:
     if isinstance(value, dict):
         result: dict[str, Any] = {}
         for index, (raw_key, item) in enumerate(value.items()):
-            if index >= _MAX_ITEMS:
+            if index >= _MAX_ITEMS and not complete:
                 result["__truncated_items__"] = True
                 break
-            key = raw_key if isinstance(raw_key, str) else type(raw_key).__name__
+            key = (
+                str(raw_key) if type(raw_key) in (str, int) else type(raw_key).__name__
+            )
             result[key] = (
                 _REDACTED
                 if _is_sensitive_key(key)
-                else to_jsonable(item, depth=depth + 1)
+                else to_jsonable(item, depth=depth + 1, complete=complete)
             )
         return result
     if isinstance(value, (list, tuple)):
-        result = [to_jsonable(item, depth=depth + 1) for item in value[:_MAX_ITEMS]]
-        if len(value) > _MAX_ITEMS:
+        result = [
+            to_jsonable(item, depth=depth + 1, complete=complete)
+            for item in (value if complete else value[:_MAX_ITEMS])
+        ]
+        if len(value) > _MAX_ITEMS and not complete:
             result.append("[TRUNCATED_ITEMS]")
         return result
     return f"[UNSUPPORTED:{type(value).__name__}]"
@@ -124,7 +130,10 @@ def parse_json(value: Any) -> Any:
 
 def bounded_json(value: Any, *, max_chars: int = MAX_ATTRIBUTE_CHARS) -> str:
     """Return redacted valid JSON no longer than ``max_chars``."""
-    normalized = to_jsonable(parse_json(value))
+    parsed = parse_json(value)
+    if _contains_vector(parsed):
+        return complete_json(parsed)
+    normalized = to_jsonable(parsed)
     serialized = json.dumps(
         normalized,
         ensure_ascii=False,
@@ -165,3 +174,39 @@ def content_value(value: Any) -> str:
         if len(text) <= MAX_ATTRIBUTE_CHARS:
             return text
     return bounded_json(parsed)
+
+
+def complete_json(value: Any) -> str:
+    """Serialize full tool/vector payloads; storage limits belong to ingestion."""
+    return json.dumps(
+        to_jsonable(parse_json(value), complete=True),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def complete_value(value: str) -> str:
+    """Redact an actual invocation ID/signature without changing its length."""
+    return sanitize_text(value)
+
+
+def _contains_vector(value: Any, seen: set[int] | None = None) -> bool:
+    """Do not preview dense/sparse vectors nested in message/document payloads."""
+    seen = set() if seen is None else seen
+    if isinstance(value, (dict, list, tuple)):
+        if id(value) in seen:
+            return False
+        seen.add(id(value))
+        if isinstance(value, (list, tuple)):
+            if value and all(type(item) in (int, float) for item in value):
+                return True
+            return any(_contains_vector(item, seen) for item in value)
+        if value and all(
+            (type(key) is int or (isinstance(key, str) and key.isdigit()))
+            and type(item) in (int, float)
+            for key, item in value.items()
+        ):
+            return True
+        return any(_contains_vector(item, seen) for item in value.values())
+    return False

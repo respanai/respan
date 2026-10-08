@@ -12,8 +12,9 @@ packages = [
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
 braintrust = ">=0.5.0"
-opentelemetry-semantic-conventions-ai = ">=0.4.1"
-respan-sdk = ">=2.5.0"
+opentelemetry-semantic-conventions-ai = ">=0.5.1"
+opentelemetry-semantic-conventions = ">=0.59b0"
+respan-sdk = ">=2.7.6"
 respan-tracing = "^2.16.1"
 
 [tool.poetry.plugins."respan.instrumentations"]

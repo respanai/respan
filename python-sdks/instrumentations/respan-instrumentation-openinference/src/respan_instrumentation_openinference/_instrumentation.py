@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import wraps
 from typing import Any, ClassVar
 
 from opentelemetry import trace
@@ -38,6 +40,36 @@ class OpenInferenceInstrumentor:
     _active_span_processors: ClassVar[list[Any]] = []
     _registrations: ClassVar[dict[type, _SharedRegistration]] = {}
     _provider: ClassVar[Any] = None
+    _original_order: ClassVar[tuple[Any, ...]] = ()
+    _scope_patch: ClassVar[tuple[Any, Any, Any] | None] = None
+
+    @classmethod
+    def _observe_native_scope(cls) -> None:
+        if cls._scope_patch is not None:
+            return
+        try:
+            from openinference.instrumentation import OITracer
+        except ImportError:
+            return
+        original = OITracer.start_as_current_span
+
+        @wraps(original)
+        @contextmanager
+        def scope(instance, *args, **kwargs):
+            with original(instance, *args, **kwargs) as span:
+                try:
+                    yield span
+                finally:
+                    if cls._scope_patch is not None and cls._scope_patch[2] is scope:
+                        try:
+                            cls._translator._policy.observe_veto(span)
+                        except Exception:
+                            logger.debug(
+                                "Native OI scope observation failed", exc_info=True
+                            )
+
+        OITracer.start_as_current_span = scope
+        cls._scope_patch = (OITracer, original, scope)
 
     def __init__(self, instrumentor_class: type, **kwargs: Any) -> None:
         self._instrumentor_class = instrumentor_class
@@ -117,7 +149,17 @@ class OpenInferenceInstrumentor:
             )
             cls._translator_registered = True
         else:
-            active._span_processors = other_processors
+            # Restore adopted processors' original relative positions. Preserve
+            # processors added by other owners while this wrapper was active.
+            active._span_processors = tuple(
+                processor
+                for processor in cls._original_order
+                if any(processor is item for item in other_processors)
+            ) + tuple(
+                processor
+                for processor in other_processors
+                if not any(processor is item for item in cls._original_order)
+            )
             cls._translator_registered = False
         cls._active_span_processors = list(processor_delegates)
 
@@ -156,6 +198,13 @@ class OpenInferenceInstrumentor:
         cls._translator_registered = False
         cls._active_span_processors = []
         cls._provider = None
+        cls._original_order = ()
+        cls._translator.shutdown()
+        if cls._scope_patch is not None:
+            owner, original, replacement = cls._scope_patch
+            cls._scope_patch = None
+            if owner.start_as_current_span is replacement:
+                owner.start_as_current_span = original
 
     def activate(self) -> None:
         """Activate or reference-count one shared OpenInference delegate."""
@@ -185,8 +234,22 @@ class OpenInferenceInstrumentor:
                 self._is_instrumented = True
                 return
 
-            delegate = self._instrumentor_class()
-            is_standard = callable(getattr(delegate, "instrument", None))
+            is_standard = callable(
+                getattr(self._instrumentor_class, "instrument", None)
+            )
+            # Processor-style delegates receive their actual constructor
+            # options; standard OTel instrumentors receive instrument kwargs.
+            external = (
+                None
+                if is_standard
+                else cls._existing_processor(provider, self._instrumentor_class)
+            )
+            if is_standard:
+                delegate = self._instrumentor_class()
+            elif external is not None:
+                delegate = external
+            else:
+                delegate = self._instrumentor_class(**self._instrumentor_kwargs)
             is_processor = not is_standard and callable(
                 getattr(provider, "add_span_processor", None)
             )
@@ -197,6 +260,11 @@ class OpenInferenceInstrumentor:
                 )
 
             owned_activation = False
+            _, processor_order = cls._active_processor_state(provider)
+            if processor_order is None:
+                raise TypeError("OpenInference requires an OTel SDK processor chain")
+            if not cls._registrations:
+                cls._original_order = tuple(processor_order)
             try:
                 if is_standard:
                     already_active = cls._delegate_is_active(delegate)
@@ -224,6 +292,7 @@ class OpenInferenceInstrumentor:
                     owned_activation=owned_activation,
                 )
                 cls._registrations[self._instrumentor_class] = registration
+                cls._observe_native_scope()
                 if is_processor:
                     cls._active_span_processors.append(delegate)
                     cls._rebuild_processor_chain(provider)

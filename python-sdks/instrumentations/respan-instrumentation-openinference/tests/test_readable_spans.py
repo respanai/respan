@@ -12,7 +12,6 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
 )
 from opentelemetry.semconv_ai import SpanAttributes as TLSpanAttributes
 from opentelemetry.trace import Status, StatusCode
-
 from respan_instrumentation_openinference._serialization import MAX_ATTRIBUTE_CHARS
 from respan_instrumentation_openinference._translator import OpenInferenceTranslator
 
