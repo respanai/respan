@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import re
@@ -19,7 +20,7 @@ _SENSITIVE_KEY = re.compile(
     re.IGNORECASE,
 )
 _TEXT_SECRET = re.compile(
-    r"(?i)(api[_-]?key|authorization|cookie|password|secret|token)\s*[:=]\s*([^\s,;]+)"
+    r"(?i)(api[_-]?key|authorization|cookie|password|secret|token)\s*[:=]\s*((?:(?:bearer|basic)\s+)?[^\s,;]+)"
 )
 _QUOTED_SECRET = re.compile(
     r"""(?i)(["'](?:api[_-]?key|authorization|cookie|password|secret|token)["']\s*:\s*)(["'])(.*?)\2"""
@@ -27,6 +28,17 @@ _QUOTED_SECRET = re.compile(
 
 
 def _redact_text(value: str) -> str:
+    value = re.sub(r"(?i)([a-z][a-z0-9+.-]*://)[^/\s@]+@", r"\1[REDACTED]@", value)
+    value = re.sub(r"(?i)\b(bearer)\s+[^\s,;]+", r"\1 [REDACTED]", value)
+
+    def basic(match):
+        try:
+            decoded = base64.b64decode(match.group(2), validate=True)
+        except ValueError:
+            return match.group(0)
+        return match.group(1) + "[REDACTED]" if b":" in decoded else match.group(0)
+
+    value = re.sub(r"(?i)\b(Basic\s+)([A-Za-z0-9+/]+={0,2})", basic, value)
     value = _QUOTED_SECRET.sub(
         lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]{match.group(2)}",
         value,
@@ -87,7 +99,11 @@ def _jsonable(value: Any, *, depth: int = 0) -> Any:
     if depth >= MAX_DEPTH:
         return {"type": _type_name(value), "truncated": True}
     if isinstance(value, (bytes, bytearray, memoryview)):
-        return {"type": "bytes", "length": len(value)}
+        return {
+            "type": "bytes",
+            "length": len(value),
+            "base64": base64.b64encode(value).decode("ascii"),
+        }
     if isinstance(value, Mapping):
         result: dict[str, Any] = {}
         try:
@@ -169,7 +185,22 @@ def normalize_call_input(
         payload[INPUT_KEY if method_name != "scan" else REPO_KEY] = primary
     if model:
         payload[MODEL_KEY] = model
-    for key in ("entities", "chunk_size"):
+    for key in (
+        "entities",
+        "chunk_size",
+        "system_prompt",
+        "fallback_model",
+        "rewrite",
+        "branch",
+    ):
+        option = args[0] if args else kwargs.get(INPUT_KEY, kwargs.get(REPO_KEY))
+        if option is not None and key not in kwargs:
+            try:
+                value = getattr(option, key, None)
+            except BaseException:  # noqa: BLE001 - option serialization is best effort
+                value = None
+            if value is not None:
+                payload[key] = value
         if key in kwargs:
             payload[key] = kwargs[key]
     return payload
@@ -179,10 +210,9 @@ def extract_model(*, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str | Non
     model = kwargs.get(MODEL_KEY)
     if isinstance(model, str) and model:
         return safe_text(model)
-    if not args:
-        return None
+    option = args[0] if args else kwargs.get(INPUT_KEY, kwargs.get(REPO_KEY))
     try:
-        option_model = getattr(args[0], MODEL_KEY, None)
+        option_model = getattr(option, MODEL_KEY, None)
     except BaseException:  # noqa: BLE001 - hostile option objects must fail closed
         return None
     return (
@@ -197,7 +227,12 @@ def extract_primary_input(
 ) -> Any:
     for field_name in (INPUT_KEY, REPO_KEY):
         if field_name in kwargs:
-            return kwargs[field_name]
+            candidate = kwargs[field_name]
+            try:
+                value = getattr(candidate, field_name, None)
+            except BaseException:  # noqa: BLE001 - hostile options must not alter the SDK
+                value = None
+            return value if value is not None else candidate
     if not args:
         return None
     first_arg = args[0]

@@ -12,11 +12,10 @@ packages = [
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
 respan-tracing = "^2.16.1"
-respan-sdk = ">=2.5.0"
-respan-instrumentation-openinference = ">=1.2.2"
-opentelemetry-semantic-conventions-ai = ">=0.4.1"
+respan-sdk = ">=2.7.6"
+opentelemetry-semantic-conventions-ai = ">=0.5.1,<0.6.0"
+opentelemetry-semantic-conventions = ">=0.59b0"
 beeai-framework = ">=0.1.51"
-openinference-instrumentation-beeai = ">=0.1.16"
 
 [tool.poetry.plugins."respan.instrumentations"]
 beeai = "respan_instrumentation_beeai:BeeAIInstrumentor"

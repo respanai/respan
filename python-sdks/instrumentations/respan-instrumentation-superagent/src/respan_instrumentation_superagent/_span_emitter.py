@@ -1,11 +1,16 @@
-"""Emit Superagent safety-agent calls as Respan OTEL spans."""
+"""Live Superagent spans in the active OpenTelemetry provider."""
 
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any
 
-from opentelemetry import trace
+from opentelemetry import context, trace
+from opentelemetry.semconv._incubating.attributes.error_attributes import ERROR_MESSAGE
+from opentelemetry.semconv.attributes.error_attributes import ERROR_TYPE
+from opentelemetry.semconv.attributes.http_attributes import HTTP_RESPONSE_STATUS_CODE
 from opentelemetry.semconv_ai import SpanAttributes
 from respan_sdk.constants.llm_logging import LOG_TYPE_GUARDRAIL, LOG_TYPE_TOOL
 from respan_sdk.constants.span_attributes import (
@@ -13,13 +18,11 @@ from respan_sdk.constants.span_attributes import (
     RESPAN_METADATA_GUARDRAIL_NAME,
     RESPAN_METADATA_TRIGGERED,
 )
-from respan_sdk.utils.data_processing.id_processing import (
-    format_span_id,
-    format_trace_id,
-)
-from respan_tracing.utils.span_factory import build_readable_span, inject_span
+from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+from respan_tracing.decorators.base import _should_send_prompts
+from respan_tracing.utils.span_factory import read_propagated_attributes
 
-from respan_instrumentation_superagent._constants import (
+from ._constants import (
     GUARD_METHOD,
     SUPERAGENT_INSTRUMENTATION_NAME,
     SUPERAGENT_METADATA_CLASSIFICATION,
@@ -29,30 +32,14 @@ from respan_instrumentation_superagent._constants import (
     SUPERAGENT_METADATA_REDACT_FINDINGS,
     SUPERAGENT_METADATA_USAGE,
 )
-from respan_instrumentation_superagent._serialization import (
+from ._serialization import (
     extract_model,
     normalize_call_input,
     safe_error_message,
     safe_json_dumps,
-    safe_text,
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _current_trace_context() -> tuple[str | None, str | None]:
-    current_span = trace.get_current_span()
-    if current_span is None:
-        return None, None
-
-    span_context = current_span.get_span_context()
-    if not span_context or not span_context.is_valid:
-        return None, None
-
-    return (
-        format_trace_id(span_context.trace_id),
-        format_span_id(span_context.span_id),
-    )
 
 
 def _get_attr(value: Any, name: str) -> Any:
@@ -60,46 +47,54 @@ def _get_attr(value: Any, name: str) -> Any:
         return value.get(name)
     try:
         return getattr(value, name, None)
-    except BaseException:  # noqa: BLE001 - hostile SDK result objects must fail closed
+    except BaseException:  # noqa: BLE001 - telemetry cannot change the SDK result
         return None
 
 
-def _operation_log_type(method_name: str) -> str:
-    if method_name == GUARD_METHOD:
-        return LOG_TYPE_GUARDRAIL
-    return LOG_TYPE_TOOL
+def _error_status_code(error: BaseException) -> int | None:
+    status = _get_attr(error, "status_code")
+    if not isinstance(status, int) or isinstance(status, bool):
+        status = _get_attr(_get_attr(error, "response"), "status_code")
+    return (
+        status
+        if isinstance(status, int)
+        and not isinstance(status, bool)
+        and 400 <= status <= 599
+        else None
+    )
 
 
-def _error_status_code(error: BaseException) -> int:
-    try:
-        direct = getattr(error, "status_code", None)
-    except BaseException:  # noqa: BLE001 - hostile provider errors must fail closed
-        direct = None
-    if isinstance(direct, int) and 400 <= direct <= 599:
-        return direct
-    try:
-        response = getattr(error, "response", None)
-        nested = (
-            getattr(response, "status_code", None) if response is not None else None
-        )
-    except BaseException:  # noqa: BLE001 - hostile provider errors must fail closed
-        nested = None
-    return nested if isinstance(nested, int) and 400 <= nested <= 599 else 500
-
-
-def _add_result_metadata(attrs: dict[str, Any], method_name: str, result: Any) -> None:
+def _add_result_metadata(
+    attrs: dict[str, Any], method_name: str, result: Any, *, capture: bool
+) -> None:
     usage = _get_attr(result, "usage")
     if usage is not None:
-        attrs[SUPERAGENT_METADATA_USAGE] = safe_json_dumps(usage)
+        counts = {
+            key: _get_attr(usage, key)
+            for key in [
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
+                "input_tokens",
+                "output_tokens",
+                "reasoning_tokens",
+                "cost",
+            ]
+        }
+        counts = {
+            key: value
+            for key, value in counts.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+        if counts:
+            attrs[SUPERAGENT_METADATA_USAGE] = safe_json_dumps(counts)
     if method_name == GUARD_METHOD:
         classification = _get_attr(result, "classification")
-        if isinstance(classification, str) and classification:
-            attrs[SUPERAGENT_METADATA_CLASSIFICATION] = safe_text(classification)
+        if classification in {"pass", "block"}:
+            attrs[SUPERAGENT_METADATA_CLASSIFICATION] = classification
             attrs[RESPAN_METADATA_TRIGGERED] = classification == "block"
         attrs[RESPAN_METADATA_GUARDRAIL_NAME] = "superagent.guard"
-        return
-
-    if method_name == "redact":
+    if method_name == "redact" and capture:
         findings = _get_attr(result, "findings")
         if findings is not None:
             attrs[SUPERAGENT_METADATA_REDACT_FINDINGS] = safe_json_dumps(findings)
@@ -111,31 +106,124 @@ def build_superagent_span_attributes(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     result: Any,
+    capture: bool = True,
 ) -> dict[str, Any]:
-    """Build canonical Respan attributes for a Superagent operation."""
-    operation_name = f"superagent.{method_name}"
-    model = extract_model(args=args, kwargs=kwargs)
-    attrs: dict[str, Any] = {
-        RESPAN_LOG_TYPE: _operation_log_type(method_name),
-        SpanAttributes.TRACELOOP_ENTITY_NAME: operation_name,
-        SpanAttributes.TRACELOOP_ENTITY_PATH: operation_name,
-        SpanAttributes.TRACELOOP_ENTITY_INPUT: safe_json_dumps(
-            normalize_call_input(
-                method_name=method_name,
-                args=args,
-                kwargs=kwargs,
-            )
-        ),
-        SpanAttributes.TRACELOOP_ENTITY_OUTPUT: safe_json_dumps(result),
+    operation = method_name
+    attrs = {
+        RESPAN_LOG_TYPE: LOG_TYPE_GUARDRAIL
+        if method_name == GUARD_METHOD
+        else LOG_TYPE_TOOL,
+        SpanAttributes.TRACELOOP_ENTITY_NAME: operation,
+        SpanAttributes.TRACELOOP_ENTITY_PATH: operation,
         SUPERAGENT_METADATA_INTEGRATION: SUPERAGENT_INSTRUMENTATION_NAME,
         SUPERAGENT_METADATA_METHOD: method_name,
     }
-
+    model = extract_model(args=args, kwargs=kwargs)
     if model:
         attrs[SUPERAGENT_METADATA_MODEL] = model
-
-    _add_result_metadata(attrs, method_name, result)
+    if capture:
+        attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safe_json_dumps(
+            normalize_call_input(method_name=method_name, args=args, kwargs=kwargs)
+        )
+        attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safe_json_dumps(result)
+    _add_result_metadata(attrs, method_name, result, capture=capture)
     return attrs
+
+
+@dataclass
+class CallSpan:
+    span: Any
+    method_name: str
+    capture: bool
+
+
+@contextmanager
+def call_scope(call):
+    if call is None:
+        yield
+        return
+    ctx = trace.set_span_in_context(call.span)
+    if not call.capture:
+        ctx = context.set_value(ENABLE_CONTENT_TRACING_KEY, False, ctx)
+    token = context.attach(ctx)
+    try:
+        yield
+    finally:
+        context.detach(token)
+
+
+def start_superagent_span(
+    *,
+    method_name: str,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    provider=None,
+    start_time_ns: int | None = None,
+) -> CallSpan | None:
+    if context.get_value(context._SUPPRESS_INSTRUMENTATION_KEY):
+        return None
+    try:
+        capture = _should_send_prompts()
+        attrs = build_superagent_span_attributes(
+            method_name=method_name,
+            args=args,
+            kwargs=kwargs,
+            result=None,
+            capture=capture,
+        )
+        attrs.pop(SpanAttributes.TRACELOOP_ENTITY_OUTPUT, None)
+        attrs.update(read_propagated_attributes())
+        span = (
+            (provider or trace.get_tracer_provider())
+            .get_tracer(__name__)
+            .start_span(
+                f"superagent.{method_name}", attributes=attrs, start_time=start_time_ns
+            )
+        )
+        return CallSpan(span, method_name, capture)
+    except Exception:
+        logger.debug("Could not start Superagent span", exc_info=True)
+        return None
+
+
+def finish_superagent_span(
+    call: CallSpan | None,
+    *,
+    result: Any = None,
+    error: BaseException | None = None,
+    end_time_ns: int | None = None,
+) -> None:
+    if call is None:
+        return
+    span = call.span
+    try:
+        capture = call.capture and _should_send_prompts()
+        if not capture:
+            # A later content veto removes the already captured request too.
+            attributes = getattr(span, "_attributes", None)
+            if attributes is not None:
+                attributes.pop(SpanAttributes.TRACELOOP_ENTITY_INPUT, None)
+        attrs = {}
+        if error is None:
+            if capture:
+                attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safe_json_dumps(result)
+            _add_result_metadata(attrs, call.method_name, result, capture=capture)
+        else:
+            message = safe_error_message(error) if capture else type(error).__name__
+            attrs[ERROR_TYPE] = type(error).__name__
+            attrs[ERROR_MESSAGE] = message
+            status = _error_status_code(error)
+            if status is not None:
+                attrs[HTTP_RESPONSE_STATUS_CODE] = status
+            span.set_status(trace.Status(trace.StatusCode.ERROR, message))
+        span.set_attributes(attrs)
+    except Exception:
+        logger.debug("Could not finish Superagent attributes", exc_info=True)
+    finally:
+        try:
+            span.end(end_time=end_time_ns)
+        except Exception:
+            logger.debug("Could not end Superagent span", exc_info=True)
 
 
 def emit_superagent_span(
@@ -146,35 +234,11 @@ def emit_superagent_span(
     result: Any,
     start_time_ns: int,
     end_time_ns: int,
-    error: Exception | None = None,
+    error: BaseException | None = None,
 ) -> bool:
-    """Emit one completed Superagent operation into the active OTEL pipeline."""
-    try:
-        trace_id, parent_id = _current_trace_context()
-        attrs = build_superagent_span_attributes(
-            method_name=method_name,
-            args=args,
-            kwargs=kwargs,
-            result=result,
-        )
-
-        if error is not None:
-            message = safe_error_message(error)
-            attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safe_json_dumps(
-                {"error": type(error).__name__, "message": message}
-            )
-
-        span = build_readable_span(
-            name=f"superagent.{method_name}",
-            trace_id=trace_id,
-            parent_id=parent_id,
-            start_time_ns=start_time_ns,
-            end_time_ns=end_time_ns,
-            attributes=attrs,
-            status_code=_error_status_code(error) if error else 200,
-            error_message=safe_error_message(error) if error else None,
-        )
-        return inject_span(span)
-    except Exception:
-        logger.debug("Failed to emit Superagent span", exc_info=True)
-        return False
+    """Compatibility helper; normal instrumentation starts its span at call time."""
+    call = start_superagent_span(
+        method_name=method_name, args=args, kwargs=kwargs, start_time_ns=start_time_ns
+    )
+    finish_superagent_span(call, result=result, error=error, end_time_ns=end_time_ns)
+    return call is not None

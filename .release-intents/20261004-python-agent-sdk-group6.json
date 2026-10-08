@@ -1,0 +1,9 @@
+{
+  "summary": "Support current BeeAI, smolagents, Strands Agents and Superagent Python SDKs",
+  "packages": {
+    "respan-instrumentation-beeai": "minor",
+    "respan-instrumentation-smolagents": "minor",
+    "respan-instrumentation-strands-agents": "minor",
+    "respan-instrumentation-superagent": "minor"
+  }
+}

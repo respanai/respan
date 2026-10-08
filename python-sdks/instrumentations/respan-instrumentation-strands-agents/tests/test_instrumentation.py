@@ -11,6 +11,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
+from opentelemetry.semconv._incubating.attributes import gen_ai_attributes as gen_ai
 from opentelemetry.semconv_ai import LLMRequestTypeValues, SpanAttributes
 from opentelemetry.trace import Status, StatusCode
 from respan_instrumentation_strands_agents import (
@@ -26,13 +27,8 @@ from respan_instrumentation_strands_agents._constants import (
     STRANDS_OPERATION_INVOKE_AGENT,
     STRANDS_SEMCONV_TOOL_DEFINITIONS_OPT_IN,
     STRANDS_SYSTEM_NAME,
-    STRANDS_TOOL_CALL_ID_ATTR,
-    STRANDS_TOOL_DEFINITIONS_ATTR,
-    STRANDS_TOOL_DESCRIPTION_ATTR,
     STRANDS_TOOL_JSON_SCHEMA_ATTR,
     STRANDS_TOP_LEVEL_ALIAS_ATTRS_TO_STRIP,
-    STRANDS_USAGE_INPUT_TOKENS_ATTR,
-    STRANDS_USAGE_OUTPUT_TOKENS_ATTR,
 )
 from respan_instrumentation_strands_agents._processor import (
     StrandsAgentsSpanProcessor,
@@ -46,10 +42,6 @@ from respan_sdk.constants.llm_logging import (
     LogMethodChoices,
 )
 from respan_sdk.constants.span_attributes import (
-    GEN_AI_AGENT_NAME,
-    GEN_AI_OPERATION_NAME,
-    GEN_AI_SYSTEM,
-    GEN_AI_TOOL_NAME,
     RESPAN_LOG_METHOD,
     RESPAN_LOG_TYPE,
     RESPAN_SPAN_HANDOFFS,
@@ -248,13 +240,16 @@ def test_real_export_drops_raw_events_and_preserves_private_bounded_error():
     provider = TracerProvider()
     provider.add_span_processor(StrandsAgentsSpanProcessor())
     provider.add_span_processor(SimpleSpanProcessor(exporter))
-    span = provider.get_tracer("strands-error-test").start_span(
+    span = provider.get_tracer("strands.telemetry.tracer").start_span(
         STRANDS_OPERATION_CHAT,
         attributes={
-            GEN_AI_SYSTEM: STRANDS_SYSTEM_NAME,
-            GEN_AI_OPERATION_NAME: STRANDS_OPERATION_CHAT,
+            SpanAttributes.LLM_SYSTEM: STRANDS_SYSTEM_NAME,
+            gen_ai.GEN_AI_OPERATION_NAME: STRANDS_OPERATION_CHAT,
             "http.response.status_code": 429,
         },
+    )
+    provider._active_span_processor._span_processors[0].register_native(
+        span, True, span.attributes
     )
     span.record_exception(RuntimeError('{"api_key":"plain-secret"}'))
     span.set_status(
@@ -266,13 +261,14 @@ def test_real_export_drops_raw_events_and_preserves_private_bounded_error():
     assert len(exported) == 1
     result = exported[0]
     attrs = dict(result.attributes)
-    assert result.events == ()
+    assert len(result.events) == 1
+    assert result.events[0].name == "exception"
     assert result.status.status_code is StatusCode.ERROR
     assert len((result.status.description or "").encode("utf-8")) <= 4_000
     assert "plain-secret" not in (result.status.description or "")
-    assert attrs["status_code"] == 429
-    assert "plain-secret" not in attrs["error.message"]
-    assert "plain-secret" not in attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]
+    assert "status_code" not in attrs
+    assert "error.message" not in attrs
+    assert SpanAttributes.TRACELOOP_ENTITY_OUTPUT not in attrs
 
 
 def test_activate_logs_warning_when_dependency_missing(monkeypatch, caplog):
@@ -298,11 +294,11 @@ def test_enrich_agent_span_maps_common_fields_and_tool_definitions():
     span = _make_span(
         name=f"{STRANDS_OPERATION_INVOKE_AGENT} WeatherAgent",
         attributes={
-            GEN_AI_SYSTEM: STRANDS_SYSTEM_NAME,
-            GEN_AI_OPERATION_NAME: STRANDS_OPERATION_INVOKE_AGENT,
-            GEN_AI_AGENT_NAME: "WeatherAgent",
+            SpanAttributes.LLM_SYSTEM: STRANDS_SYSTEM_NAME,
+            gen_ai.GEN_AI_OPERATION_NAME: STRANDS_OPERATION_INVOKE_AGENT,
+            gen_ai.GEN_AI_AGENT_NAME: "WeatherAgent",
             SpanAttributes.LLM_REQUEST_MODEL: "gpt-4o-mini",
-            STRANDS_TOOL_DEFINITIONS_ATTR: json.dumps(
+            gen_ai.GEN_AI_TOOL_DEFINITIONS: json.dumps(
                 [
                     {
                         "name": "get_weather",
@@ -311,8 +307,8 @@ def test_enrich_agent_span_maps_common_fields_and_tool_definitions():
                     }
                 ]
             ),
-            STRANDS_USAGE_INPUT_TOKENS_ATTR: 30,
-            STRANDS_USAGE_OUTPUT_TOKENS_ATTR: 6,
+            gen_ai.GEN_AI_USAGE_INPUT_TOKENS: 30,
+            gen_ai.GEN_AI_USAGE_OUTPUT_TOKENS: 6,
         },
         events=[
             _event(
@@ -339,11 +335,11 @@ def test_enrich_agent_span_maps_common_fields_and_tool_definitions():
     ]
     assert SpanAttributes.LLM_REQUEST_FUNCTIONS not in attrs
     assert SpanAttributes.LLM_REQUEST_MODEL not in attrs
-    assert GEN_AI_SYSTEM not in attrs
+    assert SpanAttributes.LLM_SYSTEM not in attrs
     assert SpanAttributes.LLM_REQUEST_TYPE not in attrs
-    assert STRANDS_USAGE_INPUT_TOKENS_ATTR not in attrs
+    assert gen_ai.GEN_AI_USAGE_INPUT_TOKENS not in attrs
     assert SpanAttributes.TRACELOOP_SPAN_KIND not in attrs
-    assert GEN_AI_AGENT_NAME not in attrs
+    assert gen_ai.GEN_AI_AGENT_NAME not in attrs
     _assert_no_off_contract_aliases(attrs)
 
 
@@ -351,11 +347,11 @@ def test_enrich_chat_span_maps_messages_usage_and_tool_calls():
     span = _make_span(
         name=STRANDS_OPERATION_CHAT,
         attributes={
-            GEN_AI_SYSTEM: STRANDS_SYSTEM_NAME,
-            GEN_AI_OPERATION_NAME: STRANDS_OPERATION_CHAT,
+            SpanAttributes.LLM_SYSTEM: STRANDS_SYSTEM_NAME,
+            gen_ai.GEN_AI_OPERATION_NAME: STRANDS_OPERATION_CHAT,
             SpanAttributes.LLM_REQUEST_MODEL: "gpt-4o-mini",
-            STRANDS_USAGE_INPUT_TOKENS_ATTR: 12,
-            STRANDS_USAGE_OUTPUT_TOKENS_ATTR: 4,
+            gen_ai.GEN_AI_USAGE_INPUT_TOKENS: 12,
+            gen_ai.GEN_AI_USAGE_OUTPUT_TOKENS: 4,
             SpanAttributes.GEN_AI_USAGE_TOTAL_TOKENS: 16,
         },
         events=[
@@ -406,7 +402,7 @@ def test_enrich_chat_span_maps_messages_usage_and_tool_calls():
         }
     ]
     assert SpanAttributes.TRACELOOP_SPAN_KIND not in attrs
-    assert GEN_AI_OPERATION_NAME not in attrs
+    assert gen_ai.GEN_AI_OPERATION_NAME not in attrs
     _assert_no_off_contract_aliases(attrs)
 
 
@@ -414,11 +410,11 @@ def test_enrich_tool_span_maps_input_and_output():
     span = _make_span(
         name=f"{STRANDS_OPERATION_EXECUTE_TOOL} get_weather",
         attributes={
-            GEN_AI_SYSTEM: STRANDS_SYSTEM_NAME,
-            GEN_AI_OPERATION_NAME: STRANDS_OPERATION_EXECUTE_TOOL,
-            GEN_AI_TOOL_NAME: "get_weather",
-            STRANDS_TOOL_CALL_ID_ATTR: "tool_1",
-            STRANDS_TOOL_DESCRIPTION_ATTR: "Get weather.",
+            SpanAttributes.LLM_SYSTEM: STRANDS_SYSTEM_NAME,
+            gen_ai.GEN_AI_OPERATION_NAME: STRANDS_OPERATION_EXECUTE_TOOL,
+            gen_ai.GEN_AI_TOOL_NAME: "get_weather",
+            gen_ai.GEN_AI_TOOL_CALL_ID: "tool_1",
+            gen_ai.GEN_AI_TOOL_DESCRIPTION: "Get weather.",
             STRANDS_TOOL_JSON_SCHEMA_ATTR: json.dumps({"type": "object"}),
         },
         events=[
@@ -438,15 +434,14 @@ def test_enrich_tool_span_maps_input_and_output():
     assert attrs[SpanAttributes.TRACELOOP_ENTITY_PATH] == "get_weather"
     assert json.loads(attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT]) == {
         "name": "get_weather",
-        "id": "tool_1",
         "arguments": {"city": "Seattle"},
     }
     assert json.loads(attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]) == "Sunny and 72F."
-    assert GEN_AI_TOOL_NAME not in attrs
-    assert GEN_AI_SYSTEM not in attrs
+    assert gen_ai.GEN_AI_TOOL_NAME not in attrs
+    assert SpanAttributes.LLM_SYSTEM not in attrs
     assert SpanAttributes.LLM_REQUEST_TYPE not in attrs
-    assert STRANDS_TOOL_CALL_ID_ATTR not in attrs
-    assert STRANDS_TOOL_DESCRIPTION_ATTR not in attrs
+    assert attrs[gen_ai.GEN_AI_TOOL_CALL_ID] == "tool_1"
+    assert gen_ai.GEN_AI_TOOL_DESCRIPTION not in attrs
     assert STRANDS_TOOL_JSON_SCHEMA_ATTR not in attrs
     assert SpanAttributes.TRACELOOP_SPAN_KIND not in attrs
     _assert_no_off_contract_aliases(attrs)
@@ -456,8 +451,8 @@ def test_chat_inherits_normalized_agent_tool_definitions():
     span = _make_span(
         name=STRANDS_OPERATION_CHAT,
         attributes={
-            GEN_AI_SYSTEM: STRANDS_SYSTEM_NAME,
-            GEN_AI_OPERATION_NAME: STRANDS_OPERATION_CHAT,
+            SpanAttributes.LLM_SYSTEM: STRANDS_SYSTEM_NAME,
+            gen_ai.GEN_AI_OPERATION_NAME: STRANDS_OPERATION_CHAT,
         },
     )
     inherited = [
@@ -482,9 +477,9 @@ def test_tool_schema_json_envelope_is_unwrapped():
     span = _make_span(
         name=STRANDS_OPERATION_CHAT,
         attributes={
-            GEN_AI_SYSTEM: STRANDS_SYSTEM_NAME,
-            GEN_AI_OPERATION_NAME: STRANDS_OPERATION_CHAT,
-            STRANDS_TOOL_DEFINITIONS_ATTR: json.dumps(
+            SpanAttributes.LLM_SYSTEM: STRANDS_SYSTEM_NAME,
+            gen_ai.GEN_AI_OPERATION_NAME: STRANDS_OPERATION_CHAT,
+            gen_ai.GEN_AI_TOOL_DEFINITIONS: json.dumps(
                 [{"name": "lookup", "inputSchema": {"json": {"type": "object"}}}]
             ),
         },
@@ -520,8 +515,8 @@ def test_scalar_and_json_serialization_are_bounded_private_and_hostile_safe():
     span = _make_span(
         name=STRANDS_OPERATION_CHAT,
         attributes={
-            GEN_AI_SYSTEM: STRANDS_SYSTEM_NAME,
-            GEN_AI_OPERATION_NAME: STRANDS_OPERATION_CHAT,
+            SpanAttributes.LLM_SYSTEM: STRANDS_SYSTEM_NAME,
+            gen_ai.GEN_AI_OPERATION_NAME: STRANDS_OPERATION_CHAT,
             SpanAttributes.LLM_REQUEST_MODEL: "api_key=plain-secret",
         },
     )
@@ -533,7 +528,7 @@ def test_non_strands_span_is_unchanged():
     span = _make_span(
         name="other",
         attributes={
-            GEN_AI_SYSTEM: "openai",
+            SpanAttributes.LLM_SYSTEM: "openai",
             SpanAttributes.LLM_REQUEST_MODEL: "gpt-4o-mini",
         },
     )
@@ -541,6 +536,14 @@ def test_non_strands_span_is_unchanged():
     enrich_strands_agents_span(span)
 
     assert span._attributes == {
-        GEN_AI_SYSTEM: "openai",
+        SpanAttributes.LLM_SYSTEM: "openai",
         SpanAttributes.LLM_REQUEST_MODEL: "gpt-4o-mini",
     }
+
+
+def test_basic_auth_redaction_preserves_ordinary_agent_names():
+    assert safe_text("Strands Basic Example") == "Strands Basic Example"
+    assert "dXNlcjpwYXNz" not in safe_text("Basic dXNlcjpwYXNz")
+    assert "password-value" not in safe_text(
+        "https://user:password-value@example.invalid/path"
+    )

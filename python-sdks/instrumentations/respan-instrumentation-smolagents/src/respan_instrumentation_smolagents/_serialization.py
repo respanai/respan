@@ -1,4 +1,4 @@
-"""Bounded JSON helpers for smolagents telemetry."""
+"""Safe JSON capture without truncating tool identifiers or known payloads."""
 
 from __future__ import annotations
 
@@ -8,28 +8,37 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-_MAX_BYTES = 16_000
-_MAX_ITEMS = 50
-_MAX_DEPTH = 8
+_MAX_DEPTH = 64
 _SENSITIVE_KEY = re.compile(
-    r"(?:^|[._-])(api[_-]?key|authorization|password|secret|token)(?:$|[._-])"
-    r"|(?:api[_-]?key|authorization|password|secret|token)$",
+    r"(?:^|[._-])(api[_-]?key|authorization|cookie|password|secret|token)(?:$|[._-])"
+    r"|(?:api[_-]?key|authorization|cookie|password|secret|token)$",
     re.IGNORECASE,
 )
 _ASSIGNMENT_SECRET = re.compile(
     r"(?i)((?:['\"]?)(?:[a-z0-9_-]*[_-])?"
-    r"(?:api[_-]?key|authorization|password|secret|token)"
+    r"(?:api[_-]?key|authorization|cookie|password|secret|token)"
     r"(?:['\"]?)\s*[:=]\s*)(?:['\"]?)[^,;)\s}]+(?:['\"]?)"
 )
 
 
-def redact_text(value: str, *, limit: int = 4_000) -> str:
+_QUOTED_SECRET = re.compile(
+    r"(?i)([\"'](?:[a-z0-9_-]*[_-])?(?:api[_-]?key|authorization|cookie|password|secret|token)[\"']\s*[:=]\s*)([\"'])(.*?)\2",
+    re.DOTALL,
+)
+
+
+def redact_text(value: str) -> str:
     normalized = "".join(ch if ch >= " " or ch in "\n\t" else " " for ch in value)
+    normalized = _QUOTED_SECRET.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]{match.group(2)}",
+        normalized,
+    )
+    normalized = re.sub(r"(?i)(https?://)[^\s/@]+@", r"\1[REDACTED]@", normalized)
+    normalized = re.sub(
+        r"(?i)\b(bearer|basic)\s+[^\s,;\"']+", r"\1 [REDACTED]", normalized
+    )
     normalized = _ASSIGNMENT_SECRET.sub(r"\1[REDACTED]", normalized)
-    encoded = normalized.encode("utf-8")
-    if len(encoded) <= limit:
-        return normalized
-    return encoded[: limit - 16].decode("utf-8", errors="ignore") + "...[truncated]"
+    return normalized
 
 
 def jsonable(value: Any, *, depth: int = 0) -> Any:
@@ -47,14 +56,7 @@ def jsonable(value: Any, *, depth: int = 0) -> Any:
         result: dict[str, Any] = {}
         try:
             iterator = iter(value.items())
-            for index in range(_MAX_ITEMS + 1):
-                try:
-                    key, item = next(iterator)
-                except StopIteration:
-                    break
-                if index >= _MAX_ITEMS:
-                    result["__truncated__"] = True
-                    break
+            for key, item in iterator:
                 key_text = key if isinstance(key, str) else f"<{type(key).__name__}>"
                 result[key_text[:128]] = (
                     "[REDACTED]"
@@ -68,14 +70,7 @@ def jsonable(value: Any, *, depth: int = 0) -> Any:
         result = []
         try:
             iterator = iter(value)
-            for index in range(_MAX_ITEMS + 1):
-                try:
-                    item = next(iterator)
-                except StopIteration:
-                    break
-                if index >= _MAX_ITEMS:
-                    result.append({"truncated": True})
-                    break
+            for item in iterator:
                 result.append(jsonable(item, depth=depth + 1))
         except Exception:  # noqa: BLE001 - telemetry must fail open
             return {"type": type(value).__name__, "serialization_error": True}
@@ -93,17 +88,4 @@ def json_string(value: Any) -> str | None:
             {"type": type(value).__name__, "serialization_error": True},
             sort_keys=True,
         )
-    if len(encoded.encode("utf-8")) <= _MAX_BYTES:
-        return encoded
-    preview = encoded.encode("utf-8")[: _MAX_BYTES - 80].decode(
-        "utf-8", errors="ignore"
-    )
-    while True:
-        bounded = json.dumps(
-            {"preview": preview, "truncated": True},
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        if len(bounded.encode("utf-8")) <= _MAX_BYTES:
-            return bounded
-        preview = preview[:-64]
+    return encoded

@@ -1,403 +1,532 @@
-"""BeeAI Framework instrumentation plugin for Respan."""
+"""Translate BeeAI's public lifecycle events without patching SDK methods."""
 
-import importlib
-import json
+from __future__ import annotations
+
 import logging
-from threading import Lock
-from typing import Any
+import os
+from dataclasses import dataclass
+from threading import RLock
+from typing import Any, ClassVar
 
-from openinference.semconv.trace import OpenInferenceSpanKindValues
-from openinference.semconv.trace import SpanAttributes as OISpanAttributes
-from opentelemetry import trace
-from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor
-from opentelemetry.semconv_ai import SpanAttributes as TLSpanAttributes
-from opentelemetry.trace import Status, StatusCode
-from respan_instrumentation_openinference import OpenInferenceInstrumentor
-from respan_sdk.constants.span_attributes import (
-    RESPAN_SPAN_TOOL_CALLS,
-    RESPAN_SPAN_TOOLS,
+from opentelemetry import context, trace
+from opentelemetry.instrumentation.utils import _SUPPRESS_INSTRUMENTATION_KEY
+from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import (
+    GEN_AI_TOOL_CALL_ID,
+    GEN_AI_USAGE_INPUT_TOKENS,
+    GEN_AI_USAGE_OUTPUT_TOKENS,
 )
+from opentelemetry.semconv.attributes.exception_attributes import (
+    EXCEPTION_MESSAGE,
+    EXCEPTION_TYPE,
+)
+from opentelemetry.semconv_ai import (
+    SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY,
+    SpanAttributes,
+)
+from opentelemetry.trace import Status, StatusCode
+from respan_sdk.constants.llm_logging import (
+    LOG_TYPE_AGENT,
+    LOG_TYPE_CHAT,
+    LOG_TYPE_EMBEDDING,
+    LOG_TYPE_TASK,
+    LOG_TYPE_TOOL,
+    LOG_TYPE_WORKFLOW,
+)
+from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
+from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
 from respan_tracing.core.tracer import RespanTracer
+
+from respan_instrumentation_beeai._serialization import (
+    MAX_CHARS,
+    data,
+    json_value,
+    text,
+)
 
 logger = logging.getLogger(__name__)
 
-BEEAI_INSTRUMENTATION_NAME = "beeai"
-OPENINFERENCE_BEEAI_MODULE = "openinference.instrumentation.beeai"
-OPENINFERENCE_BEEAI_PROCESSOR_MODULE = (
-    "openinference.instrumentation.beeai.processors.base"
-)
-OPENINFERENCE_BEEAI_SPAN_MODULE = "openinference.instrumentation.beeai._span"
-_OFF_CONTRACT_ALIAS_KEYS = (
-    RESPAN_SPAN_TOOLS,
-    RESPAN_SPAN_TOOL_CALLS,
-    "tools",
-    "tool_calls",
-    "model",
-    "prompt_tokens",
-    "completion_tokens",
-    "total_request_tokens",
-)
-_GEN_AI_MESSAGE_PREFIXES = (
-    f"{TLSpanAttributes.LLM_PROMPTS}.",
-    f"{TLSpanAttributes.LLM_COMPLETIONS}.",
-)
-_TOOL_CALLS_SUFFIX = ".tool_calls"
 
-_BEEAI_PATCH_LOCK = Lock()
-_BEEAI_PATCH_REFCOUNT = 0
-_BEEAI_PATCHES: list[tuple[type, str, Any, Any]] = []
+@dataclass
+class _Run:
+    span: Any
+    log_type: str
+    capture: bool
+    name: str
+    input: str | None = None
+    output: str | None = None
+    messages: list[dict[str, Any]] | None = None
+    completions: list[dict[str, Any]] | None = None
+    tools: str | None = None
+    streamed: bool = False
 
 
-def _exception_chain(error: BaseException) -> list[BaseException]:
-    chain: list[BaseException] = []
-    seen: set[int] = set()
-    current: BaseException | None = error
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        chain.append(current)
-        next_error = getattr(current, "__cause__", None)
-        if not isinstance(next_error, BaseException):
-            next_error = getattr(current, "__context__", None)
-        if not isinstance(next_error, BaseException):
-            next_error = getattr(current, "_predecessor", None)
-        current = next_error if isinstance(next_error, BaseException) else None
-    return chain
-
-
-def _exception_status_code(error: BaseException) -> int:
-    for item in _exception_chain(error):
-        for value in (
-            getattr(item, "status_code", None),
-            getattr(getattr(item, "response", None), "status_code", None),
-            getattr(getattr(item, "response", None), "status", None),
-        ):
-            if isinstance(value, int) and value >= 400:
-                return value
-    return 500
-
-
-def _exception_message(error: BaseException) -> str:
-    explain = getattr(error, "explain", None)
-    if callable(explain):
-        try:
-            message = explain()
-        except Exception:
-            message = None
-        if isinstance(message, str) and message:
-            return message
-    return str(error) or type(error).__name__
-
-
-def _event_error(value: Any) -> BaseException | None:
-    if isinstance(value, BaseException):
-        return value
-    error = getattr(value, "error", None)
-    return error if isinstance(error, BaseException) else None
-
-
-def _record_active_parent_exception(error: BaseException) -> None:
-    active_span = trace.get_current_span()
-    is_recording = getattr(active_span, "is_recording", None)
-    if not callable(is_recording) or not is_recording():
-        return
-
-    message = _exception_message(error)
-    current_status = getattr(getattr(active_span, "status", None), "status_code", None)
-    if current_status != StatusCode.ERROR:
-        active_span.record_exception(error)
-    active_span.set_status(Status(StatusCode.ERROR, message))
-    active_span.set_attribute("status_code", _exception_status_code(error))
-    active_span.set_attribute("error.message", message)
-
-
-def _record_exception_wrapper(original: Any) -> Any:
-    def record_exception(span: Any, error: BaseException) -> None:
-        original(span, error)
-        _record_active_parent_exception(error)
-        attrs = getattr(span, "attributes", None)
-        if not isinstance(attrs, dict):
-            return
-        # Error text is diagnostic data, not an assistant completion. Keeping
-        # it in output causes platform token/cost estimation for failed calls.
-        attrs.pop(OISpanAttributes.OUTPUT_VALUE, None)
-        attrs.pop(OISpanAttributes.OUTPUT_MIME_TYPE, None)
-        attrs["status_code"] = _exception_status_code(error)
-        attrs["error.message"] = _exception_message(error)
-
-    return record_exception
-
-
-def _child_wrapper(original: Any) -> Any:
-    def child(
-        span: Any,
-        name: str | None = None,
-        event: tuple[Any, Any] | None = None,
-    ) -> Any:
-        error = _event_error(event[0]) if event is not None else None
-        if error is None:
-            return original(span, name=name, event=event)
-
-        meta = event[1]
-        span.add_event(
-            name or getattr(meta, "name", None) or "error",
-            {"error.message": _exception_message(error)},
-            getattr(meta, "created_at", None),
+def _content_enabled(options: dict[str, Any]) -> bool:
+    if context.get_value(ENABLE_CONTENT_TRACING_KEY) is False:
+        return False
+    if options.get("trace_content") is False:
+        return False
+    if os.getenv("TRACELOOP_TRACE_CONTENT", "true").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return False
+    config = options.get("config")
+    return not any(
+        getattr(config, key, False)
+        for key in (
+            "hide_inputs",
+            "hide_outputs",
+            "hide_input_messages",
+            "hide_output_messages",
+            "hide_input_text",
+            "hide_output_text",
+            "hide_input_images",
+            "hide_output_images",
+            "hide_embedding_vectors",
+            "hide_llm_tools",
+            "hide_llm_invocation_parameters",
         )
-        span.record_exception(error)
-        # Error events describe the owning operation; they are not another
-        # model invocation. Returning the owner also supports upstream callers
-        # that immediately call record_exception() on the child result.
-        return span
-
-    return child
-
-
-def _end_wrapper(original: Any) -> Any:
-    async def end(processor: Any, event: Any, meta: Any) -> None:
-        await original(processor, event, meta)
-        output = getattr(event, "output", None)
-        get_text_content = getattr(output, "get_text_content", None)
-        if (
-            getattr(processor.span, "kind", None) == OpenInferenceSpanKindValues.LLM
-            and callable(get_text_content)
-        ):
-            content = get_text_content()
-            if content:
-                processor.span.set_attribute(
-                    f"{OISpanAttributes.LLM_OUTPUT_MESSAGES}.0.message.content",
-                    content,
-                )
-        error = _event_error(event)
-        if error is not None:
-            # Upstream currently resets ERROR to OK when output is also set.
-            processor.span.record_exception(error)
-
-    return end
-
-
-def _patch_beeai_processors() -> None:
-    global _BEEAI_PATCH_REFCOUNT
-
-    with _BEEAI_PATCH_LOCK:
-        if _BEEAI_PATCH_REFCOUNT == 0:
-            processor_module = importlib.import_module(
-                OPENINFERENCE_BEEAI_PROCESSOR_MODULE
-            )
-            span_module = importlib.import_module(OPENINFERENCE_BEEAI_SPAN_MODULE)
-            patch_specs = (
-                (
-                    span_module.SpanWrapper,
-                    "record_exception",
-                    _record_exception_wrapper,
-                ),
-                (span_module.SpanWrapper, "child", _child_wrapper),
-                (processor_module.Processor, "end", _end_wrapper),
-            )
-            for owner, attribute, wrapper_factory in patch_specs:
-                original = getattr(owner, attribute)
-                patched = wrapper_factory(original)
-                setattr(owner, attribute, patched)
-                _BEEAI_PATCHES.append((owner, attribute, original, patched))
-        _BEEAI_PATCH_REFCOUNT += 1
-
-
-def _unpatch_beeai_processors() -> None:
-    global _BEEAI_PATCH_REFCOUNT
-
-    with _BEEAI_PATCH_LOCK:
-        if _BEEAI_PATCH_REFCOUNT == 0:
-            return
-        _BEEAI_PATCH_REFCOUNT -= 1
-        if _BEEAI_PATCH_REFCOUNT != 0:
-            return
-        for owner, attribute, original, patched in reversed(_BEEAI_PATCHES):
-            if getattr(owner, attribute) is patched:
-                setattr(owner, attribute, original)
-        _BEEAI_PATCHES.clear()
-
-
-def _load_openinference_beeai_class() -> type:
-    beeai_module = importlib.import_module(OPENINFERENCE_BEEAI_MODULE)
-    return beeai_module.BeeAIInstrumentor
-
-
-def _is_beeai_span(span: ReadableSpan) -> bool:
-    scope = getattr(span, "instrumentation_scope", None)
-    scope_name = getattr(scope, "name", None)
-    return scope_name == OPENINFERENCE_BEEAI_MODULE
-
-
-def _is_gen_ai_tool_calls_attr(key: str) -> bool:
-    return key.endswith(_TOOL_CALLS_SUFFIX) and key.startswith(_GEN_AI_MESSAGE_PREFIXES)
-
-
-def _safe_json_str(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    return json.dumps(value, default=str)
-
-
-class _BeeAIOffContractAliasProcessor(SpanProcessor):
-    """Remove shared OpenInference aliases from BeeAI spans only."""
-
-    def on_start(self, span: Any, parent_context: Any = None) -> None:
-        pass
-
-    def on_end(self, span: ReadableSpan) -> None:
-        if not _is_beeai_span(span):
-            return
-
-        original_attrs = getattr(span, "_attributes", None)
-        if original_attrs is None:
-            return
-
-        attrs = dict(original_attrs)
-        for key in _OFF_CONTRACT_ALIAS_KEYS:
-            attrs.pop(key, None)
-
-        for key, value in list(attrs.items()):
-            if _is_gen_ai_tool_calls_attr(key):
-                attrs[key] = _safe_json_str(value)
-
-        span._attributes = attrs
-
-    def shutdown(self) -> None:
-        pass
-
-    def force_flush(self, timeout_millis: int = 30000) -> bool:
-        return True
-
-
-def _active_span_processors() -> tuple[Any, Any]:
-    tracer_provider = trace.get_tracer_provider()
-    active_span_processor = getattr(tracer_provider, "_active_span_processor", None)
-    processors = (
-        getattr(active_span_processor, "_span_processors", None)
-        if active_span_processor is not None
-        else None
     )
-    return active_span_processor, processors
+
+
+def _messages(messages: Any) -> list[dict[str, Any]]:
+    from beeai_framework.backend import (
+        MessageTextContent,
+        MessageToolCallContent,
+        MessageToolResultContent,
+    )
+
+    result = []
+    for message in messages:
+        item: dict[str, Any] = {"role": text(message.role, 64)}
+        chunks = []
+        calls = []
+        for chunk in message.content:
+            if isinstance(chunk, MessageTextContent):
+                chunks.append(text(chunk.text))
+            elif isinstance(chunk, MessageToolCallContent):
+                call = {
+                    "type": "function",
+                    "function": {
+                        "name": text(chunk.tool_name, None),
+                        "arguments": (
+                            data(chunk.args, complete=True)
+                            if isinstance(chunk.args, str)
+                            else json_value(chunk.args, complete=True)
+                        ),
+                    },
+                }
+                if chunk.id:
+                    call["id"] = text(chunk.id, None)
+                calls.append(call)
+            elif isinstance(chunk, MessageToolResultContent):
+                chunks.append(data(chunk.result, complete=True))
+                item["tool_call_id"] = text(chunk.tool_call_id, None)
+            else:
+                chunks.append(data(chunk))
+        if chunks:
+            item["content"] = (
+                text("".join(chunks), None if "tool_call_id" in item else MAX_CHARS)
+                if all(isinstance(x, str) for x in chunks)
+                else chunks
+            )
+        if calls:
+            item["tool_calls"] = calls
+        result.append(item)
+    return result
+
+
+def _usage(span: Any, usage: Any, *, embedding: bool = False) -> None:
+    # BeeAI's usage models default to zero. An untouched default is not provider usage.
+    fields = getattr(usage, "model_fields_set", set())
+    mappings = (
+        (
+            "prompt_tokens",
+            SpanAttributes.LLM_USAGE_PROMPT_TOKENS,
+            GEN_AI_USAGE_INPUT_TOKENS,
+        ),
+        (
+            "completion_tokens",
+            SpanAttributes.LLM_USAGE_COMPLETION_TOKENS,
+            GEN_AI_USAGE_OUTPUT_TOKENS,
+        ),
+        ("total_tokens", SpanAttributes.LLM_USAGE_TOTAL_TOKENS, None),
+        (
+            "cached_prompt_tokens",
+            SpanAttributes.LLM_USAGE_CACHE_READ_INPUT_TOKENS,
+            None,
+        ),
+        (
+            "cached_creation_tokens",
+            SpanAttributes.LLM_USAGE_CACHE_CREATION_INPUT_TOKENS,
+            None,
+        ),
+    )
+    for field, key, modern in mappings:
+        if embedding and field != "prompt_tokens":
+            continue
+        value = getattr(usage, field, None)
+        if (
+            field in fields
+            and isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= 0
+        ):
+            span.set_attribute(key, value)
+            if modern:
+                span.set_attribute(modern, value)
+
+
+def _kind(instance: Any) -> tuple[str, str]:
+    from beeai_framework.agents import BaseAgent
+    from beeai_framework.backend import ChatModel, EmbeddingModel
+    from beeai_framework.tools.tool import Tool
+    from beeai_framework.workflows import Workflow
+
+    if isinstance(instance, ChatModel):
+        return LOG_TYPE_CHAT, type(instance).__name__
+    if isinstance(instance, EmbeddingModel):
+        return LOG_TYPE_EMBEDDING, "CreateEmbeddings"
+    if isinstance(instance, Tool):
+        return LOG_TYPE_TOOL, instance.name
+    if isinstance(instance, BaseAgent):
+        return LOG_TYPE_AGENT, instance.meta.name or type(instance).__name__
+    if isinstance(instance, Workflow):
+        return LOG_TYPE_WORKFLOW, instance.name
+    return LOG_TYPE_TASK, type(instance).__name__
+
+
+class _Listener:
+    def __init__(self, options: dict[str, Any]) -> None:
+        self.options = options
+        self.tracer = trace.get_tracer(__name__)
+        self.runs: dict[str, _Run | None] = {}
+        self.cleanup: Any = None
+        self.root: Any = None
+        self.callback = self.handler
+
+    async def handler(self, event: Any, meta: Any) -> None:
+        try:
+            self._handle(event, meta)
+        except Exception:  # noqa: BLE001 - telemetry must not affect application results
+            # Observers must never change SDK results or exceptions; do not log payloads.
+            logger.debug("Could not translate a BeeAI event")
+
+    def _handle(self, event: Any, meta: Any) -> None:
+        from beeai_framework.context import RunContextFinishEvent, RunContextStartEvent
+
+        if meta.trace is None:
+            return
+        run_id = meta.trace.run_id
+        if isinstance(event, RunContextStartEvent):
+            if run_id in self.runs:
+                return
+            parent_id = meta.trace.parent_run_id
+            if (
+                context.get_value(_SUPPRESS_INSTRUMENTATION_KEY)
+                or context.get_value(SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY)
+                or (parent_id in self.runs and self.runs[parent_id] is None)
+            ):
+                self.runs[run_id] = None
+                return
+            instance = meta.creator.instance
+            log_type, name = _kind(instance)
+            source_name = text(name, None)
+            name = text(name, 512)
+            parent = self.runs.get(parent_id)
+            parent_context = (
+                trace.set_span_in_context(parent.span)
+                if parent
+                else context.get_current()
+            )
+            span = self.tracer.start_span(
+                name,
+                context=parent_context,
+                attributes={
+                    RESPAN_LOG_TYPE: log_type,
+                    SpanAttributes.TRACELOOP_ENTITY_NAME: name,
+                    SpanAttributes.TRACELOOP_ENTITY_PATH: name if parent else "",
+                },
+            )
+            run = _Run(
+                span,
+                log_type,
+                span.is_recording() and _content_enabled(self.options),
+                source_name,
+            )
+            self.runs[run_id] = run
+            if not span.is_recording():
+                return
+            if log_type in {LOG_TYPE_CHAT, LOG_TYPE_EMBEDDING}:
+                span.set_attribute(
+                    SpanAttributes.LLM_REQUEST_MODEL, text(instance.model_id, 512)
+                )
+                span.set_attribute(
+                    SpanAttributes.LLM_SYSTEM, text(instance.provider_id, 64).lower()
+                )
+                span.set_attribute(
+                    SpanAttributes.LLM_REQUEST_TYPE,
+                    "chat" if log_type == LOG_TYPE_CHAT else "embedding",
+                )
+            if log_type == LOG_TYPE_TOOL:
+                call = meta.context.get("tool_call_msg")
+                call_id = getattr(call, "id", None)
+                if isinstance(call_id, str) and call_id:
+                    span.set_attribute(GEN_AI_TOOL_CALL_ID, text(call_id, None))
+            if run.capture:
+                run.input = json_value(event.input, complete=log_type == LOG_TYPE_TOOL)
+            return
+        if run_id not in self.runs:
+            return
+        run = self.runs[run_id]
+        if run is not None and not _content_enabled(self.options):
+            # Lowering privacy at an observed event permanently vetoes content.
+            run.capture = False
+            run.input = run.output = run.tools = None
+            run.messages = run.completions = None
+        if isinstance(event, RunContextFinishEvent):
+            try:
+                if run is not None and run.span.is_recording():
+                    if event.error is not None:
+                        self._error(run, event.error)
+                    elif run.capture and _content_enabled(self.options):
+                        self._finish_output(run, event.output)
+                    self._publish_content(run)
+            finally:
+                self.runs.pop(run_id, None)
+                if run is not None:
+                    run.span.end()
+            return
+        if run is None or not run.span.is_recording():
+            return
+        from beeai_framework.backend.events import (
+            ChatModelNewTokenEvent,
+            ChatModelStartEvent,
+            ChatModelSuccessEvent,
+            EmbeddingModelStartEvent,
+            EmbeddingModelSuccessEvent,
+        )
+
+        if isinstance(event, ChatModelStartEvent):
+            parameters = event.input
+            for field, key in (
+                ("temperature", SpanAttributes.LLM_REQUEST_TEMPERATURE),
+                ("top_p", SpanAttributes.LLM_REQUEST_TOP_P),
+                ("max_tokens", SpanAttributes.LLM_REQUEST_MAX_TOKENS),
+                ("stream", SpanAttributes.LLM_IS_STREAMING),
+                ("reasoning_effort", SpanAttributes.LLM_REQUEST_REASONING_EFFORT),
+            ):
+                value = getattr(parameters, field, None)
+                if getattr(
+                    self.options.get("config"), "hide_llm_invocation_parameters", False
+                ):
+                    continue
+                if value is not None and isinstance(value, (str, bool, int, float)):
+                    run.span.set_attribute(
+                        key, text(value, 512) if isinstance(value, str) else value
+                    )
+            if run.capture and _content_enabled(self.options):
+                run.messages = _messages(event.input.messages)
+                definitions = []
+                for tool in event.input.tools or []:
+                    definitions.append(
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": text(tool.name, None),
+                                "description": text(tool.description, None),
+                                "parameters": data(
+                                    tool.input_schema.model_json_schema(), complete=True
+                                ),
+                            },
+                        }
+                    )
+                if definitions:
+                    run.tools = json_value(definitions, complete=True)
+        elif isinstance(event, ChatModelSuccessEvent):
+            if not run.streamed:
+                _usage(run.span, event.value.usage)
+            if event.value.finish_reason:
+                run.span.set_attribute(
+                    SpanAttributes.LLM_RESPONSE_FINISH_REASON,
+                    (text(event.value.finish_reason, 64),),
+                )
+            if run.capture and _content_enabled(self.options):
+                run.completions = _messages(event.value.output)
+                run.output = json_value({"messages": run.completions})
+        elif isinstance(event, ChatModelNewTokenEvent):
+            # Read source chunks before BeeAI synthesizes defaults during merge.
+            run.streamed = True
+            _usage(run.span, event.value.usage)
+            # Consume neither the SDK stream nor its mutable message objects.
+            run.span.set_attribute(SpanAttributes.LLM_IS_STREAMING, True)
+        elif isinstance(event, EmbeddingModelStartEvent):
+            if run.capture and _content_enabled(self.options):
+                run.input = json_value(event.input.values)
+        elif isinstance(event, EmbeddingModelSuccessEvent):
+            _usage(run.span, event.value.usage, embedding=True)
+            if run.capture and _content_enabled(self.options):
+                run.output = json_value(event.value.embeddings, complete=True)
+
+    def _finish_output(self, run: _Run, output: Any) -> None:
+        if run.output is not None or output is None:
+            return
+        from beeai_framework.tools.types import JSONToolOutput, StringToolOutput
+
+        if isinstance(output, (StringToolOutput, JSONToolOutput)):
+            run.output = json_value(output.result, complete=True)
+        elif run.log_type == LOG_TYPE_AGENT:
+            run.output = json_value({"messages": _messages(output.output)})
+        elif run.log_type == LOG_TYPE_CHAT:
+            run.completions = _messages(output.output)
+            run.output = json_value({"messages": run.completions})
+            if not run.streamed:
+                _usage(run.span, output.usage)
+        elif run.log_type == LOG_TYPE_WORKFLOW:
+            run.output = json_value(
+                output.result if output.result is not None else output.state
+            )
+        else:
+            run.output = json_value(output)
+
+    def _error(self, run: _Run, error: BaseException) -> None:
+        run.span.set_status(Status(StatusCode.ERROR))
+        capture = run.capture and _content_enabled(self.options)
+        attrs = {EXCEPTION_TYPE: type(error).__name__}
+        if capture:
+            args = BaseException.args.__get__(error)
+            message = "; ".join(text(value) for value in args if isinstance(value, str))
+            attrs[EXCEPTION_MESSAGE] = message or type(error).__name__
+        run.span.add_event("exception", attrs)
+        run.span.set_status(Status(StatusCode.ERROR, attrs.get(EXCEPTION_MESSAGE)))
+        run.output = None
+        run.completions = None
+
+    def _publish_content(self, run: _Run) -> None:
+        if not run.capture or not _content_enabled(self.options):
+            return
+        if run.input is not None:
+            value = run.input
+            if run.log_type == LOG_TYPE_TOOL:
+                import json
+
+                raw = json.loads(value)
+                arguments = raw.get("input", raw) if isinstance(raw, dict) else raw
+                value = json_value(
+                    {"name": run.name, "arguments": arguments}, complete=True
+                )
+            run.span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_INPUT, value)
+        if run.output is not None:
+            run.span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_OUTPUT, run.output)
+        if run.tools:
+            run.span.set_attribute(SpanAttributes.LLM_REQUEST_FUNCTIONS, run.tools)
+        for messages, prefix in (
+            (run.messages, SpanAttributes.LLM_PROMPTS),
+            (run.completions, SpanAttributes.LLM_COMPLETIONS),
+        ):
+            for index, message in enumerate(messages or []):
+                base = f"{prefix}.{index}"
+                run.span.set_attribute(f"{base}.role", message["role"])
+                if "content" in message:
+                    content = message["content"]
+                    run.span.set_attribute(
+                        f"{base}.content",
+                        text(
+                            content, None if message.get("tool_call_id") else MAX_CHARS
+                        )
+                        if isinstance(content, str)
+                        else json_value(
+                            content, complete=bool(message.get("tool_call_id"))
+                        ),
+                    )
+                if message.get("tool_calls"):
+                    run.span.set_attribute(
+                        f"{base}.tool_calls",
+                        json_value(message["tool_calls"], complete=True),
+                    )
+                if message.get("tool_call_id"):
+                    run.span.set_attribute(
+                        f"{base}.tool_call_id", message["tool_call_id"]
+                    )
+
+    def close(self) -> None:
+        try:
+            if self.cleanup is not None:
+                self.cleanup()
+        finally:
+            self.cleanup = None
+            if self.root is not None:
+                self.root.off(callback=self.callback)
+            runs, self.runs = self.runs, {}
+            for run in runs.values():
+                if run is not None:
+                    run.span.end()
 
 
 class BeeAIInstrumentor:
-    """Respan instrumentor for BeeAI Framework.
+    """Observe BeeAI runs with one shared, removable root Emitter listener."""
 
-    Activates the OpenInference BeeAI instrumentor and registers Respan's
-    OpenInference translator so BeeAI spans reach the Respan OTLP pipeline
-    with the expected ``traceloop.*``, ``gen_ai.*``, and ``respan.*`` fields.
-    """
-
-    name = BEEAI_INSTRUMENTATION_NAME
+    name = "beeai"
+    _lock: ClassVar[RLock] = RLock()
+    _listener: ClassVar[_Listener | None] = None
+    _owners: ClassVar[int] = 0
+    _provider: ClassVar[Any] = None
 
     def __init__(self, **instrumentor_kwargs: Any) -> None:
-        self._instrumentor_kwargs = instrumentor_kwargs
-        self._delegate = None
-        self._cleanup_processor = None
-        self._processors_patched = False
+        self._options = instrumentor_kwargs
         self._is_instrumented = False
-
-    @staticmethod
-    def _is_respan_tracing_enabled() -> bool:
-        tracer = getattr(RespanTracer, "_instance", None)
-        if tracer is None:
-            return True
-        return bool(getattr(tracer, "is_enabled", True))
 
     def activate(self) -> None:
-        """Instrument BeeAI via OpenInference and Respan's translator."""
-        if self._is_instrumented:
-            return
+        cls = BeeAIInstrumentor
+        with cls._lock:
+            if self._is_instrumented:
+                return
+            tracer = getattr(RespanTracer, "_instance", None)
+            if tracer is not None and not getattr(tracer, "is_enabled", True):
+                return
+            provider = trace.get_tracer_provider()
+            if cls._listener is not None:
+                if cls._provider is not provider:
+                    raise RuntimeError(
+                        "BeeAI instrumentation is active on another tracer provider"
+                    )
+                if cls._listener.options != self._options:
+                    raise ValueError(
+                        "BeeAI instrumentation is active with different settings"
+                    )
+                cls._owners += 1
+                self._is_instrumented = True
+                return
+            from beeai_framework.emitter import Emitter, EmitterOptions
 
-        if not self._is_respan_tracing_enabled():
-            logger.info(
-                "BeeAI instrumentation skipped because Respan tracing is disabled"
-            )
-            return
-
-        try:
-            beeai_instrumentor_class = _load_openinference_beeai_class()
-        except ImportError as exc:
-            logger.warning(
-                "Failed to activate BeeAI instrumentation - missing dependency: %s",
-                exc,
-            )
-            return
-
-        try:
-            _patch_beeai_processors()
-            self._processors_patched = True
-            self._delegate = OpenInferenceInstrumentor(
-                beeai_instrumentor_class,
-                **self._instrumentor_kwargs,
-            )
-            self._delegate.activate()
-            self._register_cleanup_processor()
+            listener = _Listener(dict(self._options))
+            try:
+                listener.root = Emitter.root()
+                listener.cleanup = listener.root.on(
+                    "*.*",
+                    listener.callback,
+                    EmitterOptions(match_nested=True, is_blocking=True),
+                )
+            except BaseException:
+                listener.close()
+                raise
+            cls._listener = listener
+            cls._provider = provider
+            cls._owners = 1
             self._is_instrumented = True
-            logger.info("BeeAI instrumentation activated")
-        except Exception:
-            if self._delegate is not None:
-                try:
-                    self._delegate.deactivate()
-                except Exception:
-                    logger.exception("Failed to clean up BeeAI instrumentation")
-            self._delegate = None
-            self._cleanup_processor = None
-            if self._processors_patched:
-                _unpatch_beeai_processors()
-                self._processors_patched = False
-            self._is_instrumented = False
-            logger.exception("Failed to activate BeeAI instrumentation")
-
-    def _register_cleanup_processor(self) -> None:
-        translator_getter = getattr(OpenInferenceInstrumentor, "_get_translator", None)
-        if translator_getter is None:
-            return
-
-        translator = translator_getter()
-        active_span_processor, processors = _active_span_processors()
-        if active_span_processor is None or processors is None:
-            return
-
-        cleanup_processor = _BeeAIOffContractAliasProcessor()
-        rebuilt_processors = []
-        inserted = False
-
-        for processor in processors:
-            if isinstance(processor, _BeeAIOffContractAliasProcessor):
-                continue
-            rebuilt_processors.append(processor)
-            if processor is translator:
-                rebuilt_processors.append(cleanup_processor)
-                inserted = True
-
-        if inserted:
-            active_span_processor._span_processors = tuple(rebuilt_processors)
-            self._cleanup_processor = cleanup_processor
-
-    def _unregister_cleanup_processor(self) -> None:
-        if self._cleanup_processor is None:
-            return
-
-        active_span_processor, processors = _active_span_processors()
-        if active_span_processor is not None and processors is not None:
-            active_span_processor._span_processors = tuple(
-                processor
-                for processor in processors
-                if processor is not self._cleanup_processor
-            )
-        self._cleanup_processor = None
 
     def deactivate(self) -> None:
-        """Deactivate the instrumentation."""
-        self._unregister_cleanup_processor()
-        if self._is_instrumented and self._delegate is not None:
-            try:
-                self._delegate.deactivate()
-            except Exception:
-                logger.exception("Failed to deactivate BeeAI instrumentation")
-        if self._processors_patched:
-            _unpatch_beeai_processors()
-            self._processors_patched = False
-        self._delegate = None
-        self._is_instrumented = False
-        logger.info("BeeAI instrumentation deactivated")
+        cls = BeeAIInstrumentor
+        with cls._lock:
+            if not self._is_instrumented:
+                return
+            self._is_instrumented = False
+            cls._owners -= 1
+            if cls._owners:
+                return
+            listener, cls._listener = cls._listener, None
+            cls._provider = None
+            if listener is not None:
+                listener.close()

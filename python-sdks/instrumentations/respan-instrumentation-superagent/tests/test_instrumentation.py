@@ -49,8 +49,14 @@ def test_activate_patches_and_deactivate_restores_methods(monkeypatch):
 
     monkeypatch.setattr(
         _instrumentation,
-        "emit_superagent_span",
-        lambda **kwargs: emitted.append(kwargs) or True,
+        "start_superagent_span",
+        lambda **kwargs: emitted.append(kwargs),
+    )
+
+    monkeypatch.setattr(
+        _instrumentation,
+        "finish_superagent_span",
+        lambda call, **kwargs: emitted[-1].update(kwargs),
     )
 
     instrumentor = SuperagentInstrumentor()
@@ -110,10 +116,15 @@ def test_foreign_wrapper_survives_and_stale_wrapper_stays_inactive(monkeypatch):
     emitted = []
     monkeypatch.setattr(
         _instrumentation,
-        "emit_superagent_span",
-        lambda **kwargs: emitted.append(kwargs) or True,
+        "start_superagent_span",
+        lambda **kwargs: emitted.append(kwargs),
     )
 
+    monkeypatch.setattr(
+        _instrumentation,
+        "finish_superagent_span",
+        lambda call, **kwargs: emitted[-1].update(kwargs),
+    )
     first = SuperagentInstrumentor(methods=("guard",))
     first.activate()
     owned_wrapper = FakeSafetyClient.guard
@@ -151,10 +162,15 @@ def test_wrapped_method_emits_error_span(monkeypatch):
     emitted = []
     monkeypatch.setattr(
         _instrumentation,
-        "emit_superagent_span",
-        lambda **kwargs: emitted.append(kwargs) or True,
+        "start_superagent_span",
+        lambda **kwargs: emitted.append(kwargs),
     )
 
+    monkeypatch.setattr(
+        _instrumentation,
+        "finish_superagent_span",
+        lambda call, **kwargs: emitted[-1].update(kwargs),
+    )
     instrumentor = SuperagentInstrumentor(methods=("guard",))
     instrumentor.activate()
 

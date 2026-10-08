@@ -9,7 +9,7 @@ require OpenInference at runtime.
 ## Install
 
 ```bash
-pip install respan-instrumentation-strands-agents
+pip install respan-ai respan-instrumentation-strands-agents
 ```
 
 Strands Agents `1.20.0` or newer is required because that release includes the
@@ -72,3 +72,32 @@ finally:
   canonical `llm.request.functions` on each model/chat span.
 - Agent spans remain common-only by contract; model, provider, and usage fields
   belong to the child chat spans.
+
+
+## Supported surfaces and privacy
+
+Validated with released Strands Agents 1.20.0 and 1.57.2. The adapter translates
+native agent, model, tool, event-loop, structured-output, and multiagent spans.
+Current Strands memory telemetry is translated to task spans; older SDKs have no
+memory telemetry API. The current OpenAI Responses provider is covered by an
+actual controlled SSE fixture. Provider credentials, remote memory services,
+experimental bidirectional audio, and live model routing are separate checks.
+
+`TRACELOOP_TRACE_CONTENT=false` or the Respan context content opt-out disables
+payload capture. A span keeps its initial opt-out even when content is enabled
+later; a later opt-out also removes previously captured payloads. Normal payloads
+are bounded and secrets are redacted. Known tool schemas, tool calls, and numeric
+vectors remain complete when capture is enabled; use content opt-out or sampling
+to control their volume.
+
+OpenAI chat/Responses usage is read from the actual provider usage object,
+including cache and reasoning details. Missing counts remain absent. Native
+exceptions and statuses are preserved without inventing HTTP status codes or
+error outputs. Streaming and cancellation keep the SDK's native async-generator
+protocol because this adapter does not replace its iterators.
+
+Activation is shared across compatible instrumentor instances and restores only
+hooks, environment values, and native tracer state it still owns. Configure one
+active OpenTelemetry provider before activation. See the paired
+`python/tracing/strands-agents` example set for fixture-default runs and explicit
+trace-export/live options.

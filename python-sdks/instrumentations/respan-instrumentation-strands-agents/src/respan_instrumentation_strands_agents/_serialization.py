@@ -29,6 +29,13 @@ def _safe_type(value: Any) -> str:
 
 
 def redact_text(value: str) -> str:
+    value = re.sub(r"(?i)(https?://)[^\s/@]+@", r"\1[REDACTED]@", value)
+    value = re.sub(r"(?i)\b(bearer)\s+[^\s,;]+", r"\1 [REDACTED]", value)
+    value = re.sub(
+        r"(?i)\b(basic)\s+(?:[A-Za-z0-9+/]{4})+(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?(?=$|[\s,;])",
+        r"\1 [REDACTED]",
+        value,
+    )
     value = _QUOTED_SECRET.sub(
         lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]{match.group(2)}",
         value,
@@ -70,14 +77,70 @@ def _safe_key(value: Any) -> str:
     return f"<{_safe_type(value)}>"
 
 
-def to_jsonable(value: Any, *, depth: int = 0) -> Any:
+def requires_complete_payload(value: Any, *, depth: int = 0) -> bool:
+    if depth >= MAX_DEPTH:
+        return False
+    if isinstance(value, str) and value.lstrip().startswith(("{", "[")):
+        try:
+            return requires_complete_payload(json.loads(value), depth=depth + 1)
+        except (ValueError, TypeError):
+            return False
+    if type(value) in (list, tuple):
+        if value and all(type(item) in (int, float) for item in value):
+            return True
+        return any(requires_complete_payload(item, depth=depth + 1) for item in value)
+    if type(value) is dict:
+        if any(
+            key in value
+            for key in (
+                "toolUse",
+                "toolResult",
+                "tool_calls",
+                "function",
+                "inputSchema",
+                "embedding",
+                "embeddings",
+                "vector",
+                "vectors",
+            )
+        ):
+            return True
+        return any(
+            requires_complete_payload(item, depth=depth + 1) for item in value.values()
+        )
+    return False
+
+
+def payload_text(value: Any, *, complete: bool = False) -> str:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (ValueError, TypeError):
+            return safe_text(value, max_bytes=MAX_JSON_BYTES)
+    return json_dumps(value, complete=complete)
+
+
+def to_jsonable(
+    value: Any,
+    *,
+    depth: int = 0,
+    complete: bool = False,
+    _seen: frozenset[int] = frozenset(),
+) -> Any:
+    complete = complete or requires_complete_payload(value)
+    if id(value) in _seen:
+        return {"type": _safe_type(value), "circular": True}
+    if isinstance(value, (Mapping, Sequence)) and not isinstance(
+        value, (str, bytes, bytearray)
+    ):
+        _seen = _seen | {id(value)}
     if value is None or isinstance(value, (bool, int)):
         return value
     if isinstance(value, float):
         return value if math.isfinite(value) else str(value)
     if isinstance(value, str):
         return redact_text(value)
-    if depth >= MAX_DEPTH:
+    if depth >= MAX_DEPTH and not complete:
         return {"type": _safe_type(value), "truncated": True}
     if isinstance(value, (bytes, bytearray, memoryview)):
         return {"type": "bytes", "length": len(value)}
@@ -86,15 +149,17 @@ def to_jsonable(value: Any, *, depth: int = 0) -> Any:
         truncated = False
         try:
             iterator = iter(value.items())
-            for key, item in islice(iterator, MAX_ITEMS + 1):
-                if len(result) >= MAX_ITEMS:
+            for key, item in iterator if complete else islice(iterator, MAX_ITEMS + 1):
+                if not complete and len(result) >= MAX_ITEMS:
                     truncated = True
                     break
                 safe_key = _safe_key(key)
                 result[safe_key] = (
                     "[REDACTED]"
                     if _SENSITIVE_KEY.search(safe_key)
-                    else to_jsonable(item, depth=depth + 1)
+                    else to_jsonable(
+                        item, depth=depth + 1, complete=complete, _seen=_seen
+                    )
                 )
         except BaseException:  # noqa: BLE001 - hostile containers must fail closed
             return {"type": _safe_type(value), "unavailable": True}
@@ -105,11 +170,13 @@ def to_jsonable(value: Any, *, depth: int = 0) -> Any:
         result: list[Any] = []
         truncated = False
         try:
-            for item in islice(iter(value), MAX_ITEMS + 1):
-                if len(result) >= MAX_ITEMS:
+            for item in iter(value) if complete else islice(iter(value), MAX_ITEMS + 1):
+                if not complete and len(result) >= MAX_ITEMS:
                     truncated = True
                     break
-                result.append(to_jsonable(item, depth=depth + 1))
+                result.append(
+                    to_jsonable(item, depth=depth + 1, complete=complete, _seen=_seen)
+                )
         except BaseException:  # noqa: BLE001 - hostile containers must fail closed
             return {"type": _safe_type(value), "unavailable": True}
         if truncated:
@@ -121,19 +188,24 @@ def to_jsonable(value: Any, *, depth: int = 0) -> Any:
         return {"type": _safe_type(value), "unavailable": True}
     if callable(model_dump):
         try:
-            return to_jsonable(model_dump(mode="json"), depth=depth + 1)
+            return to_jsonable(
+                model_dump(mode="json"), depth=depth + 1, complete=complete, _seen=_seen
+            )
         except BaseException:  # noqa: BLE001 - vendor hooks must not break tracing
             return {"type": _safe_type(value), "unavailable": True}
     return {"type": _safe_type(value)}
 
 
-def json_dumps(value: Any, *, max_bytes: int = MAX_JSON_BYTES) -> str:
-    safe = to_jsonable(value)
+def json_dumps(
+    value: Any, *, max_bytes: int = MAX_JSON_BYTES, complete: bool = False
+) -> str:
+    complete = complete or requires_complete_payload(value)
+    safe = to_jsonable(value, complete=complete)
     serialized = json.dumps(
         safe, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     )
     encoded = serialized.encode("utf-8")
-    if len(encoded) <= max_bytes:
+    if complete or len(encoded) <= max_bytes:
         return serialized
 
     low, high = 0, min(len(serialized), max_bytes)

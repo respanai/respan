@@ -50,19 +50,6 @@ OFF_CONTRACT_ALIASES = {
 }
 
 
-def _capture_build(monkeypatch):
-    captured = []
-
-    def _fake_build_readable_span(name, **kwargs):
-        span = {"name": name, **kwargs}
-        captured.append(span)
-        return span
-
-    monkeypatch.setattr(_span_emitter, "build_readable_span", _fake_build_readable_span)
-    monkeypatch.setattr(_span_emitter, "inject_span", lambda span: True)
-    return captured
-
-
 def test_build_guard_attrs_uses_canonical_guardrail_contract():
     result = SimpleNamespace(
         classification="block",
@@ -81,8 +68,8 @@ def test_build_guard_attrs_uses_canonical_guardrail_contract():
     )
 
     assert attrs[RESPAN_LOG_TYPE] == LOG_TYPE_GUARDRAIL
-    assert attrs[SpanAttributes.TRACELOOP_ENTITY_NAME] == "superagent.guard"
-    assert attrs[SpanAttributes.TRACELOOP_ENTITY_PATH] == "superagent.guard"
+    assert attrs[SpanAttributes.TRACELOOP_ENTITY_NAME] == "guard"
+    assert attrs[SpanAttributes.TRACELOOP_ENTITY_PATH] == "guard"
     assert attrs[SUPERAGENT_METADATA_INTEGRATION] == "superagent"
     assert attrs[SUPERAGENT_METADATA_METHOD] == "guard"
     assert attrs[SUPERAGENT_METADATA_MODEL] == "superagent/guard-1.7b"
@@ -110,40 +97,11 @@ def test_build_redact_attrs_uses_tool_contract_without_aliases():
     )
 
     assert attrs[RESPAN_LOG_TYPE] == LOG_TYPE_TOOL
-    assert attrs[SpanAttributes.TRACELOOP_ENTITY_NAME] == "superagent.redact"
-    assert attrs[SpanAttributes.TRACELOOP_ENTITY_PATH] == "superagent.redact"
+    assert attrs[SpanAttributes.TRACELOOP_ENTITY_NAME] == "redact"
+    assert attrs[SpanAttributes.TRACELOOP_ENTITY_PATH] == "redact"
     assert attrs[SUPERAGENT_METADATA_REDACT_FINDINGS] == '["email"]'
     assert SpanAttributes.TRACELOOP_SPAN_KIND not in attrs
     assert OFF_CONTRACT_ALIASES.isdisjoint(attrs)
-
-
-def test_emit_span_uses_active_otel_parent(monkeypatch):
-    captured = _capture_build(monkeypatch)
-
-    class _FakeSpan:
-        def get_span_context(self):
-            return SimpleNamespace(
-                trace_id=int(TRACE_ID, 16),
-                span_id=int(SPAN_ID, 16),
-                is_valid=True,
-            )
-
-    monkeypatch.setattr(_span_emitter.trace, "get_current_span", lambda: _FakeSpan())
-
-    emitted = _span_emitter.emit_superagent_span(
-        method_name="guard",
-        args=(),
-        kwargs={"input": "hello"},
-        result={"classification": "pass"},
-        start_time_ns=100,
-        end_time_ns=200,
-    )
-
-    assert emitted is True
-    assert captured[0]["trace_id"] == TRACE_ID
-    assert captured[0]["parent_id"] == SPAN_ID
-    assert captured[0]["start_time_ns"] == 100
-    assert captured[0]["end_time_ns"] == 200
 
 
 def test_emit_span_reaches_real_otel_provider_with_parent(monkeypatch):
@@ -178,50 +136,33 @@ def test_emit_span_reaches_real_otel_provider_with_parent(monkeypatch):
     }
 
 
-def test_emit_error_span_sets_error_status(monkeypatch):
-    captured = _capture_build(monkeypatch)
-    monkeypatch.setattr(_span_emitter.trace, "get_current_span", lambda: None)
-
-    _span_emitter.emit_superagent_span(
-        method_name="scan",
-        args=(),
-        kwargs={"repo": "https://github.com/example/repo"},
-        result=None,
-        start_time_ns=100,
-        end_time_ns=200,
-        error=RuntimeError("scan failed"),
-    )
-
-    assert captured[0]["status_code"] == 500
-    assert captured[0]["error_message"] == "scan failed"
-    assert captured[0]["attributes"][RESPAN_LOG_TYPE] == LOG_TYPE_TOOL
-    assert (
-        "scan failed"
-        in captured[0]["attributes"][SpanAttributes.TRACELOOP_ENTITY_OUTPUT]
-    )
-
-
-def test_emit_error_preserves_explicit_provider_status_without_text_inference(
-    monkeypatch,
-):
-    captured = _capture_build(monkeypatch)
-    monkeypatch.setattr(_span_emitter.trace, "get_current_span", lambda: None)
+def test_errors_use_otel_status_without_fabricated_output_or_http(monkeypatch):
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(trace, "get_tracer_provider", lambda: provider)
 
     class ProviderError(RuntimeError):
         status_code = 429
 
-    _span_emitter.emit_superagent_span(
-        method_name="guard",
-        args=(),
-        kwargs={"input": "hello"},
-        result=None,
-        start_time_ns=100,
-        end_time_ns=200,
-        error=ProviderError("provider limit"),
+    for error in [RuntimeError("scan failed"), ProviderError("provider limit")]:
+        _span_emitter.emit_superagent_span(
+            method_name="scan",
+            args=(),
+            kwargs={"repo": "https://example.com/repo"},
+            result=None,
+            start_time_ns=100,
+            end_time_ns=200,
+            error=error,
+        )
+    first, second = exporter.get_finished_spans()
+    assert first.status.status_code.name == "ERROR"
+    assert "http.response.status_code" not in first.attributes
+    assert second.attributes["http.response.status_code"] == 429
+    assert all(
+        SpanAttributes.TRACELOOP_ENTITY_OUTPUT not in s.attributes
+        for s in [first, second]
     )
-
-    assert captured[0]["status_code"] == 429
-    assert captured[0]["error_message"] == "provider limit"
 
 
 def test_serialization_helpers_handle_option_objects():
@@ -293,3 +234,19 @@ def test_quoted_and_suffix_secrets_are_redacted_from_results_and_errors():
         result={"classification": "pass"},
     )
     assert "plain-secret" not in attrs[SUPERAGENT_METADATA_MODEL]
+
+
+def test_url_credentials_are_hidden_in_payload_and_error():
+    value = "https://fixture-user:fixture-password@example.invalid/repository"
+    assert "fixture-password" not in safe_json_dumps({"repo": value})
+    assert "fixture-user" not in safe_error_message(RuntimeError(value))
+
+
+def test_basic_text_is_preserved_but_real_credentials_hidden():
+    assert json.loads(safe_json_dumps("Basic Example")) == "Basic Example"
+    assert "dXNlcjpwYXNzd29yZA==" not in safe_error_message(
+        RuntimeError("Basic dXNlcjpwYXNzd29yZA==")
+    )
+    assert "fixture-password" not in safe_error_message(
+        RuntimeError("Authorization: Basic fixture-password")
+    )

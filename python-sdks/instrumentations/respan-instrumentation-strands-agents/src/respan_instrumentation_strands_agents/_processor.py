@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Iterable, Mapping
+from threading import RLock
 from typing import Any
 
-from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor
+from opentelemetry.sdk.trace import Event, ReadableSpan, SpanProcessor
+from opentelemetry.semconv._incubating.attributes import gen_ai_attributes as gen_ai
 from opentelemetry.semconv_ai import LLMRequestTypeValues, SpanAttributes
 from opentelemetry.trace import Status, StatusCode
 from respan_sdk.constants.llm_logging import (
@@ -18,10 +20,6 @@ from respan_sdk.constants.llm_logging import (
     LogMethodChoices,
 )
 from respan_sdk.constants.span_attributes import (
-    GEN_AI_AGENT_NAME,
-    GEN_AI_OPERATION_NAME,
-    GEN_AI_SYSTEM,
-    GEN_AI_TOOL_NAME,
     RESPAN_LOG_METHOD,
     RESPAN_LOG_TYPE,
     RESPAN_SPAN_HANDOFFS,
@@ -36,7 +34,6 @@ from respan_instrumentation_strands_agents._constants import (
     STRANDS_EVENT_OPERATION_DETAILS,
     STRANDS_EVENT_SYSTEM_MESSAGE,
     STRANDS_EVENT_TOOL_MESSAGE,
-    STRANDS_INPUT_MESSAGES_ATTR,
     STRANDS_NON_LLM_ATTRS_TO_STRIP,
     STRANDS_OPERATION_CHAT,
     STRANDS_OPERATION_EXECUTE_EVENT_LOOP_CYCLE,
@@ -44,17 +41,14 @@ from respan_instrumentation_strands_agents._constants import (
     STRANDS_OPERATION_EXECUTE_TOOL,
     STRANDS_OPERATION_INVOKE_AGENT,
     STRANDS_OPERATION_INVOKE_PREFIX,
-    STRANDS_OUTPUT_MESSAGES_ATTR,
-    STRANDS_PROVIDER_NAME_ATTR,
     STRANDS_RAW_ATTR_PREFIXES_TO_STRIP,
     STRANDS_RAW_ATTRS_TO_STRIP,
-    STRANDS_SYSTEM_INSTRUCTIONS_ATTR,
     STRANDS_SYSTEM_NAME,
-    STRANDS_TOOL_CALL_ID_ATTR,
-    STRANDS_TOOL_DEFINITIONS_ATTR,
     STRANDS_TOP_LEVEL_ALIAS_ATTRS_TO_STRIP,
-    STRANDS_USAGE_INPUT_TOKENS_ATTR,
-    STRANDS_USAGE_OUTPUT_TOKENS_ATTR,
+)
+from respan_instrumentation_strands_agents._policy import (
+    content_enabled,
+    filter_attributes,
 )
 from respan_instrumentation_strands_agents._serialization import (
     json_dumps,
@@ -116,35 +110,23 @@ def _get_events(span: ReadableSpan) -> Iterable[tuple[str, Mapping[str, Any]]]:
 
 def _is_strands_system(attrs: Mapping[str, Any]) -> bool:
     return (
-        attrs.get(GEN_AI_SYSTEM) == STRANDS_SYSTEM_NAME
-        or attrs.get(STRANDS_PROVIDER_NAME_ATTR) == STRANDS_SYSTEM_NAME
+        attrs.get(SpanAttributes.LLM_SYSTEM) == STRANDS_SYSTEM_NAME
+        or attrs.get(gen_ai.GEN_AI_PROVIDER_NAME) == STRANDS_SYSTEM_NAME
     )
 
 
 def is_strands_agents_span(span: ReadableSpan, attrs: Mapping[str, Any]) -> bool:
-    operation_name = attrs.get(GEN_AI_OPERATION_NAME)
-    return (
-        _is_strands_system(attrs)
-        or operation_name
-        in {
-            STRANDS_OPERATION_INVOKE_AGENT,
-            STRANDS_OPERATION_CHAT,
-            STRANDS_OPERATION_EXECUTE_TOOL,
-            STRANDS_OPERATION_EXECUTE_EVENT_LOOP_CYCLE,
-            STRANDS_OPERATION_EXECUTE_STRUCTURED_OUTPUT,
-        }
-        or isinstance(attrs.get(GEN_AI_AGENT_NAME), str)
-        or isinstance(attrs.get(GEN_AI_TOOL_NAME), str)
-        or span.name.startswith(f"{STRANDS_OPERATION_INVOKE_AGENT} ")
-        or span.name.startswith(f"{STRANDS_OPERATION_EXECUTE_TOOL} ")
-    )
+    scope = getattr(span, "instrumentation_scope", None)
+    if scope is not None:
+        return scope.name == "strands.telemetry.tracer"
+    return _is_strands_system(attrs)
 
 
 def _extract_log_type(span: ReadableSpan, attrs: Mapping[str, Any]) -> str | None:
-    if isinstance(attrs.get(GEN_AI_TOOL_NAME), str):
+    if isinstance(attrs.get(gen_ai.GEN_AI_TOOL_NAME), str):
         return LOG_TYPE_TOOL
 
-    operation_name = attrs.get(GEN_AI_OPERATION_NAME)
+    operation_name = attrs.get(gen_ai.GEN_AI_OPERATION_NAME)
     if operation_name == STRANDS_OPERATION_CHAT:
         return LOG_TYPE_CHAT
     if operation_name == STRANDS_OPERATION_EXECUTE_TOOL:
@@ -153,6 +135,8 @@ def _extract_log_type(span: ReadableSpan, attrs: Mapping[str, Any]) -> str | Non
         STRANDS_OPERATION_EXECUTE_EVENT_LOOP_CYCLE,
         STRANDS_OPERATION_EXECUTE_STRUCTURED_OUTPUT,
     }:
+        return LOG_TYPE_TASK
+    if isinstance(operation_name, str) and operation_name.startswith("memory."):
         return LOG_TYPE_TASK
     if operation_name == STRANDS_OPERATION_INVOKE_AGENT:
         return LOG_TYPE_AGENT
@@ -177,20 +161,23 @@ def _span_suffix_name(span_name: str, prefix: str, fallback: str) -> str:
 
 
 def _extract_agent_name(span: ReadableSpan, attrs: Mapping[str, Any]) -> str:
-    agent_name = attrs.get(GEN_AI_AGENT_NAME)
+    agent_name = attrs.get(gen_ai.GEN_AI_AGENT_NAME)
     if isinstance(agent_name, str) and agent_name:
         return safe_text(agent_name)
     return safe_text(
         _span_suffix_name(
             span_name=span.name,
             prefix=STRANDS_OPERATION_INVOKE_AGENT,
-            fallback=STRANDS_SYSTEM_NAME,
+            fallback=safe_text(
+                attrs.get(gen_ai.GEN_AI_OPERATION_NAME)
+                or STRANDS_OPERATION_INVOKE_AGENT
+            ).removeprefix(STRANDS_OPERATION_INVOKE_PREFIX),
         )
     )
 
 
 def _extract_tool_name(span: ReadableSpan, attrs: Mapping[str, Any]) -> str:
-    tool_name = attrs.get(GEN_AI_TOOL_NAME)
+    tool_name = attrs.get(gen_ai.GEN_AI_TOOL_NAME)
     if isinstance(tool_name, str) and tool_name:
         return safe_text(tool_name)
     return safe_text(
@@ -386,34 +373,27 @@ def _legacy_output_messages(
 
 
 def _extract_input_messages(
-    span: ReadableSpan,
-    attrs: Mapping[str, Any],
+    span: ReadableSpan, attrs: Mapping[str, Any]
 ) -> list[dict[str, Any]] | None:
-    messages = _normalize_messages(
-        value=attrs.get(STRANDS_INPUT_MESSAGES_ATTR),
-        default_role="user",
+    messages = (
+        _normalize_messages(attrs.get(gen_ai.GEN_AI_INPUT_MESSAGES), "user")
+        or _operation_detail_messages(span, gen_ai.GEN_AI_INPUT_MESSAGES, "user")
+        or _legacy_input_messages(span)
+        or []
     )
-    if messages:
-        return messages
-
-    messages = _operation_detail_messages(
-        span=span,
-        attr_name=STRANDS_INPUT_MESSAGES_ATTR,
-        default_role="user",
-    )
-    if messages:
-        return messages
-
-    system_instructions = attrs.get(STRANDS_SYSTEM_INSTRUCTIONS_ATTR)
-    legacy_messages = _legacy_input_messages(span) or []
-    if system_instructions:
-        normalized_system = _normalize_message(
-            raw_message={"role": "system", "content": system_instructions},
-            default_role="system",
+    system_instructions = attrs.get(gen_ai.GEN_AI_SYSTEM_INSTRUCTIONS)
+    if not system_instructions:
+        for _, event_attrs in _get_events(span):
+            if event_attrs.get(gen_ai.GEN_AI_SYSTEM_INSTRUCTIONS):
+                system_instructions = event_attrs[gen_ai.GEN_AI_SYSTEM_INSTRUCTIONS]
+                break
+    if system_instructions and not any(
+        message["role"] == "system" for message in messages
+    ):
+        messages.insert(
+            0, {"role": "system", "content": _content_for_message(system_instructions)}
         )
-        if normalized_system is not None:
-            legacy_messages.insert(0, normalized_system)
-    return legacy_messages or None
+    return messages or None
 
 
 def _extract_output_messages(
@@ -422,7 +402,7 @@ def _extract_output_messages(
     default_role: str = "assistant",
 ) -> list[dict[str, Any]] | None:
     messages = _normalize_messages(
-        value=attrs.get(STRANDS_OUTPUT_MESSAGES_ATTR),
+        value=attrs.get(gen_ai.GEN_AI_OUTPUT_MESSAGES),
         default_role=default_role,
     )
     if messages:
@@ -430,7 +410,7 @@ def _extract_output_messages(
 
     messages = _operation_detail_messages(
         span=span,
-        attr_name=STRANDS_OUTPUT_MESSAGES_ATTR,
+        attr_name=gen_ai.GEN_AI_OUTPUT_MESSAGES,
         default_role=default_role,
     )
     if messages:
@@ -508,7 +488,9 @@ def _set_indexed_messages(
         attrs[f"{indexed_prefix}.content"] = _message_content_attr_value(content)
         tool_calls = _tool_calls_from_content(content)
         if tool_calls:
-            attrs[f"{indexed_prefix}.tool_calls"] = json_dumps(tool_calls)
+            attrs[f"{indexed_prefix}.tool_calls"] = json_dumps(
+                tool_calls, complete=True
+            )
 
 
 def _normalize_tool_definition(
@@ -536,7 +518,7 @@ def _normalize_tool_definition(
 
 
 def _extract_tool_definitions(attrs: Mapping[str, Any]) -> list[dict[str, Any]] | None:
-    raw_tool_definitions = _safe_json_loads(attrs.get(STRANDS_TOOL_DEFINITIONS_ATTR))
+    raw_tool_definitions = _safe_json_loads(attrs.get(gen_ai.GEN_AI_TOOL_DEFINITIONS))
     if not isinstance(raw_tool_definitions, list):
         return None
 
@@ -559,11 +541,11 @@ def _extract_tool_definitions(attrs: Mapping[str, Any]) -> list[dict[str, Any]] 
 def _extract_usage(
     attrs: Mapping[str, Any],
 ) -> tuple[int | None, int | None, int | None, int | None]:
-    prompt_tokens = attrs.get(STRANDS_USAGE_INPUT_TOKENS_ATTR)
+    prompt_tokens = attrs.get(gen_ai.GEN_AI_USAGE_INPUT_TOKENS)
     if not isinstance(prompt_tokens, int):
         prompt_tokens = attrs.get(SpanAttributes.LLM_USAGE_PROMPT_TOKENS)
 
-    completion_tokens = attrs.get(STRANDS_USAGE_OUTPUT_TOKENS_ATTR)
+    completion_tokens = attrs.get(gen_ai.GEN_AI_USAGE_OUTPUT_TOKENS)
     if not isinstance(completion_tokens, int):
         completion_tokens = attrs.get(SpanAttributes.LLM_USAGE_COMPLETION_TOKENS)
 
@@ -571,19 +553,29 @@ def _extract_usage(
     if not isinstance(total_tokens, int):
         total_tokens = attrs.get(SpanAttributes.LLM_USAGE_TOTAL_TOKENS)
     if not isinstance(total_tokens, int) and (
-        isinstance(prompt_tokens, int) or isinstance(completion_tokens, int)
+        type(prompt_tokens) is int
+        and prompt_tokens >= 0
+        and type(completion_tokens) is int
+        and completion_tokens >= 0
     ):
         total_tokens = (prompt_tokens if isinstance(prompt_tokens, int) else 0) + (
             completion_tokens if isinstance(completion_tokens, int) else 0
         )
 
-    cache_read_tokens = attrs.get(SpanAttributes.LLM_USAGE_CACHE_READ_INPUT_TOKENS)
+    cache_read_tokens = attrs.get(
+        SpanAttributes.GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
+        attrs.get(SpanAttributes.LLM_USAGE_CACHE_READ_INPUT_TOKENS),
+    )
 
     return (
-        prompt_tokens if isinstance(prompt_tokens, int) else None,
-        completion_tokens if isinstance(completion_tokens, int) else None,
-        total_tokens if isinstance(total_tokens, int) else None,
-        cache_read_tokens if isinstance(cache_read_tokens, int) else None,
+        prompt_tokens if type(prompt_tokens) is int and prompt_tokens >= 0 else None,
+        completion_tokens
+        if type(completion_tokens) is int and completion_tokens >= 0
+        else None,
+        total_tokens if type(total_tokens) is int and total_tokens >= 0 else None,
+        cache_read_tokens
+        if type(cache_read_tokens) is int and cache_read_tokens >= 0
+        else None,
     )
 
 
@@ -591,17 +583,41 @@ def _set_usage_attrs(attrs: dict[str, Any]) -> None:
     prompt_tokens, completion_tokens, total_tokens, cache_read_tokens = _extract_usage(
         attrs=attrs
     )
+    for key in (
+        gen_ai.GEN_AI_USAGE_INPUT_TOKENS,
+        gen_ai.GEN_AI_USAGE_OUTPUT_TOKENS,
+        SpanAttributes.LLM_USAGE_PROMPT_TOKENS,
+        SpanAttributes.LLM_USAGE_COMPLETION_TOKENS,
+        SpanAttributes.GEN_AI_USAGE_TOTAL_TOKENS,
+        SpanAttributes.LLM_USAGE_TOTAL_TOKENS,
+        SpanAttributes.GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
+        SpanAttributes.LLM_USAGE_CACHE_READ_INPUT_TOKENS,
+        SpanAttributes.GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
+        SpanAttributes.LLM_USAGE_CACHE_CREATION_INPUT_TOKENS,
+        SpanAttributes.GEN_AI_USAGE_REASONING_TOKENS,
+    ):
+        value = attrs.get(key)
+        if value is not None and (type(value) is not int or value < 0):
+            attrs.pop(key, None)
     if prompt_tokens is not None:
-        attrs[STRANDS_USAGE_INPUT_TOKENS_ATTR] = prompt_tokens
+        attrs[gen_ai.GEN_AI_USAGE_INPUT_TOKENS] = prompt_tokens
         attrs[SpanAttributes.LLM_USAGE_PROMPT_TOKENS] = prompt_tokens
     if completion_tokens is not None:
-        attrs[STRANDS_USAGE_OUTPUT_TOKENS_ATTR] = completion_tokens
+        attrs[gen_ai.GEN_AI_USAGE_OUTPUT_TOKENS] = completion_tokens
         attrs[SpanAttributes.LLM_USAGE_COMPLETION_TOKENS] = completion_tokens
     if total_tokens is not None:
         attrs[SpanAttributes.GEN_AI_USAGE_TOTAL_TOKENS] = total_tokens
         attrs[SpanAttributes.LLM_USAGE_TOTAL_TOKENS] = total_tokens
     if cache_read_tokens is not None:
         attrs[SpanAttributes.LLM_USAGE_CACHE_READ_INPUT_TOKENS] = cache_read_tokens
+        attrs[SpanAttributes.GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS] = cache_read_tokens
+    cache_write = attrs.get(
+        SpanAttributes.GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
+        attrs.get("gen_ai.usage.cache_write_input_tokens"),
+    )
+    if type(cache_write) is int and cache_write >= 0:
+        attrs[SpanAttributes.GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS] = cache_write
+        attrs[SpanAttributes.LLM_USAGE_CACHE_CREATION_INPUT_TOKENS] = cache_write
 
 
 def _set_common_attrs(
@@ -613,7 +629,6 @@ def _set_common_attrs(
 ) -> None:
     attrs[RESPAN_LOG_METHOD] = LogMethodChoices.TRACING_INTEGRATION.value
     attrs[RESPAN_LOG_TYPE] = log_type
-    attrs[GEN_AI_SYSTEM] = STRANDS_SYSTEM_NAME
     attrs[SpanAttributes.TRACELOOP_ENTITY_NAME] = entity_name
     attrs[SpanAttributes.TRACELOOP_ENTITY_PATH] = entity_path
     attrs.pop(SpanAttributes.TRACELOOP_SPAN_KIND, None)
@@ -654,7 +669,7 @@ def _enrich_task_span(
     span: ReadableSpan,
     attrs: dict[str, Any],
 ) -> None:
-    operation_name = attrs.get(GEN_AI_OPERATION_NAME)
+    operation_name = attrs.get(gen_ai.GEN_AI_OPERATION_NAME)
     entity_name = safe_text(
         operation_name if isinstance(operation_name, str) else span.name
     )
@@ -669,6 +684,23 @@ def _enrich_task_span(
         input_messages=_extract_input_messages(span=span, attrs=attrs),
         output_messages=_extract_output_messages(span=span, attrs=attrs),
     )
+    for name, event_attrs in _get_events(span):
+        if name in {"memory.query", "memory.content"} and "content" in event_attrs:
+            attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = json_dumps(
+                _safe_json_loads(event_attrs["content"])
+            )
+        elif name == "memory.results" and "content" in event_attrs:
+            attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = json_dumps(
+                _safe_json_loads(event_attrs["content"])
+            )
+    if (
+        isinstance(operation_name, str)
+        and operation_name.startswith("memory.")
+        and attrs.get("content") is not None
+    ):
+        attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = json_dumps(
+            _safe_json_loads(attrs.pop("content"))
+        )
 
 
 def _enrich_chat_span(
@@ -688,7 +720,9 @@ def _enrich_chat_span(
         attrs[SpanAttributes.LLM_REQUEST_MODEL] = safe_text(model)
     tool_definitions = _extract_tool_definitions(attrs) or inherited_tool_definitions
     if tool_definitions:
-        attrs[SpanAttributes.LLM_REQUEST_FUNCTIONS] = json_dumps(tool_definitions)
+        attrs[SpanAttributes.LLM_REQUEST_FUNCTIONS] = json_dumps(
+            tool_definitions, complete=True
+        )
 
     input_messages = _extract_input_messages(span=span, attrs=attrs)
     output_messages = _extract_output_messages(span=span, attrs=attrs)
@@ -709,6 +743,13 @@ def _enrich_chat_span(
             prefix=_GEN_AI_COMPLETION_PREFIX,
             messages=output_messages,
         )
+    provider = attrs.get(SpanAttributes.LLM_SYSTEM)
+    if provider in (None, STRANDS_SYSTEM_NAME):
+        provider = attrs.get(gen_ai.GEN_AI_PROVIDER_NAME)
+    if provider == STRANDS_SYSTEM_NAME:
+        attrs.pop(SpanAttributes.LLM_SYSTEM, None)
+    elif provider:
+        attrs[SpanAttributes.LLM_SYSTEM] = safe_text(provider)
     _set_usage_attrs(attrs=attrs)
 
 
@@ -735,19 +776,22 @@ def _enrich_tool_span(
         entity_path=tool_name,
     )
 
-    tool_arguments = _extract_tool_event_payload(
-        span=span,
-        event_name=STRANDS_EVENT_TOOL_MESSAGE,
-        attr_name="content",
-    )
-    tool_result = _extract_tool_event_payload(
-        span=span,
-        event_name=STRANDS_EVENT_CHOICE,
-        attr_name="message",
-    )
+    tool_arguments = attrs.get(gen_ai.GEN_AI_TOOL_CALL_ARGUMENTS)
+    if tool_arguments is None:
+        tool_arguments = _extract_tool_event_payload(
+            span=span,
+            event_name=STRANDS_EVENT_TOOL_MESSAGE,
+            attr_name="content",
+        )
+    tool_result = attrs.get(gen_ai.GEN_AI_TOOL_CALL_RESULT)
+    if tool_result is None:
+        tool_result = _extract_tool_event_payload(
+            span=span,
+            event_name=STRANDS_EVENT_CHOICE,
+            attr_name="message",
+        )
     tool_input_payload = {
         "name": tool_name,
-        "id": attrs.get(STRANDS_TOOL_CALL_ID_ATTR) or "",
         "arguments": to_jsonable(_safe_json_loads(tool_arguments)),
     }
     attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = json_dumps(tool_input_payload)
@@ -775,7 +819,7 @@ def _strip_raw_attrs(attrs: dict[str, Any], log_type: str) -> dict[str, Any]:
             if key not in STRANDS_NON_LLM_ATTRS_TO_STRIP
             and key
             not in {
-                GEN_AI_SYSTEM,
+                SpanAttributes.LLM_SYSTEM,
                 SpanAttributes.LLM_REQUEST_TYPE,
                 SpanAttributes.LLM_REQUEST_MODEL,
                 SpanAttributes.LLM_USAGE_PROMPT_TOKENS,
@@ -787,53 +831,56 @@ def _strip_raw_attrs(attrs: dict[str, Any], log_type: str) -> dict[str, Any]:
     return attrs
 
 
-def _preserve_bounded_error(span: ReadableSpan, attrs: dict[str, Any]) -> None:
+def _preserve_bounded_error(
+    span: ReadableSpan, attrs: dict[str, Any], allowed: bool
+) -> None:
     status = getattr(span, "status", None)
-    if getattr(status, "status_code", None) is not StatusCode.ERROR:
-        return
-
-    description = safe_text(
-        getattr(status, "description", None) or "Strands operation failed"
-    )
-    response_status = attrs.get("http.response.status_code")
-    attrs["status_code"] = (
-        response_status
-        if isinstance(response_status, int) and 400 <= response_status <= 599
-        else 500
-    )
-    attrs["error.message"] = description
-    attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = json_dumps(
-        {"status": "error", "message": description}
-    )
-    if hasattr(span, "_status"):
+    if getattr(status, "status_code", None) is StatusCode.ERROR and hasattr(
+        span, "_status"
+    ):
+        description = (
+            safe_text(getattr(status, "description", None)) if allowed else None
+        )
         span._status = Status(StatusCode.ERROR, description)
 
 
-def _drop_consumed_native_events(span: ReadableSpan) -> None:
+def _drop_consumed_native_events(span: ReadableSpan, allowed: bool) -> None:
+    events = []
+    for name, attributes in _get_events(span):
+        if name.startswith(("gen_ai.", "memory.")):
+            continue
+        events.append(
+            Event(name=name, attributes=filter_attributes(attributes, allowed))
+        )
     if hasattr(span, "_events"):
-        span._events = ()
-        return
-    try:
-        span.events = ()
-    except (AttributeError, TypeError):
-        pass
+        span._events = tuple(events)
+    else:
+        try:
+            span.events = tuple(events)
+        except (AttributeError, TypeError):
+            pass
 
 
 def enrich_strands_agents_span(
     span: ReadableSpan,
     *,
     inherited_tool_definitions: list[dict[str, Any]] | None = None,
+    capture_content: bool = True,
 ) -> None:
     original_attrs = getattr(span, "_attributes", None)
     if original_attrs is None:
         return
 
     attrs = dict(original_attrs)
+    allowed = capture_content and content_enabled()
     if not is_strands_agents_span(span=span, attrs=attrs):
         return
 
     log_type = _extract_log_type(span=span, attrs=attrs)
     if log_type is None:
+        span._attributes = filter_attributes(attrs, allowed)
+        _preserve_bounded_error(span, attrs, allowed)
+        _drop_consumed_native_events(span, allowed)
         return
 
     if log_type == LOG_TYPE_AGENT:
@@ -850,43 +897,137 @@ def enrich_strands_agents_span(
         _enrich_tool_span(span=span, attrs=attrs)
 
     attrs = _strip_raw_attrs(attrs=attrs, log_type=log_type)
-    _preserve_bounded_error(span, attrs)
+    attrs = filter_attributes(attrs, allowed)
+    _preserve_bounded_error(span, attrs, allowed)
     span._attributes = attrs
-    _drop_consumed_native_events(span)
+    _drop_consumed_native_events(span, allowed)
 
 
 class StrandsAgentsSpanProcessor(SpanProcessor):
-    """Normalize Strands Agents spans into Respan's OTLP conventions."""
+    """Translate only native Strands spans, with state scoped to their span IDs."""
 
-    def __init__(self) -> None:
-        self._tool_definitions_by_trace: dict[int, list[dict[str, Any]]] = {}
+    def __init__(self, *, include_tool_definitions: bool = True) -> None:
+        self._states: dict[tuple[int, int], dict[str, Any]] = {}
+        self._lock = RLock()
+        self._include_tool_definitions = include_tool_definitions
+
+    @staticmethod
+    def _key(span: Any) -> tuple[int, int]:
+        context = span.get_span_context()
+        return context.trace_id, context.span_id
+
+    def register_native(
+        self, span: Any, allowed: bool, attrs: Mapping[str, Any]
+    ) -> None:
+        parent = getattr(span, "parent", None)
+        with self._lock:
+            inherited = (
+                self._states.get((parent.trace_id, parent.span_id), {})
+                if parent
+                else {}
+            )
+            definitions = (
+                _extract_tool_definitions(attrs)
+                if allowed and self._include_tool_definitions
+                else None
+            )
+            definitions = (
+                definitions or inherited.get("definitions")
+                if allowed and self._include_tool_definitions
+                else None
+            )
+            self._states[self._key(span)] = {
+                "allowed": allowed,
+                "definitions": definitions,
+                "provider": inherited.get("provider"),
+                "streaming": inherited.get("streaming"),
+            }
+
+    def set_model(self, span: Any, model: Any) -> None:
+        module = type(model).__module__
+        provider = (
+            module.removeprefix("strands.models.").split(".")[0]
+            if module.startswith("strands.models.")
+            else None
+        )
+        provider = {"openai_responses": "openai", "azure_openai": "openai"}.get(
+            provider, provider
+        )
+        config = getattr(model, "config", {})
+        streaming = None
+        if module == "strands.models.openai":
+            streaming = bool(
+                config.get("stream", config.get("params", {}).get("stream", True))
+            )
+        if module == "strands.models.openai_responses":
+            streaming = True
+        with self._lock:
+            state = self._states.get(self._key(span))
+            if state is not None:
+                state.update(provider=provider, streaming=streaming)
+
+    def record_provider_usage(
+        self, span: Any, usage: Any, input_name: str, output_name: str
+    ) -> None:
+        with self._lock:
+            state = self._states.get(self._key(span))
+            if state is not None:
+                state["actual_usage"] = {
+                    gen_ai.GEN_AI_USAGE_INPUT_TOKENS: getattr(usage, input_name, None),
+                    gen_ai.GEN_AI_USAGE_OUTPUT_TOKENS: getattr(
+                        usage, output_name, None
+                    ),
+                    SpanAttributes.GEN_AI_USAGE_TOTAL_TOKENS: getattr(
+                        usage, "total_tokens", None
+                    ),
+                }
+
+    def owns(self, span: Any) -> bool:
+        with self._lock:
+            return self._key(span) in self._states
+
+    def content_allowed(self, span: Any) -> bool:
+        with self._lock:
+            return bool(self._states.get(self._key(span), {}).get("allowed", False))
 
     def on_start(self, span: Any, parent_context: Any = None) -> None:
-        try:
-            attrs = dict(getattr(span, "attributes", None) or {})
-            definitions = _extract_tool_definitions(attrs)
-            context = span.get_span_context()
-            if definitions and context.is_valid:
-                self._tool_definitions_by_trace[context.trace_id] = definitions
-        except Exception:
-            logger.debug("Failed to cache Strands tool definitions", exc_info=True)
+        pass
 
     def on_end(self, span: ReadableSpan) -> None:
+        with self._lock:
+            state = self._states.pop(self._key(span), {})
         try:
-            context = span.get_span_context()
-            inherited = self._tool_definitions_by_trace.get(context.trace_id)
+            if _extract_log_type(span, span.attributes or {}) == LOG_TYPE_CHAT:
+                attrs = dict(span.attributes or {})
+                if "actual_usage" in state:
+                    for key in (
+                        gen_ai.GEN_AI_USAGE_INPUT_TOKENS,
+                        gen_ai.GEN_AI_USAGE_OUTPUT_TOKENS,
+                        SpanAttributes.GEN_AI_USAGE_TOTAL_TOKENS,
+                        SpanAttributes.LLM_USAGE_PROMPT_TOKENS,
+                        SpanAttributes.LLM_USAGE_COMPLETION_TOKENS,
+                        SpanAttributes.LLM_USAGE_TOTAL_TOKENS,
+                    ):
+                        attrs.pop(key, None)
+                    for key, value in state["actual_usage"].items():
+                        if type(value) is int and value >= 0:
+                            attrs[key] = value
+                if state.get("provider"):
+                    attrs[SpanAttributes.LLM_SYSTEM] = state["provider"]
+                if state.get("streaming") is not None:
+                    attrs[SpanAttributes.GEN_AI_IS_STREAMING] = state["streaming"]
+                span._attributes = attrs
             enrich_strands_agents_span(
                 span=span,
-                inherited_tool_definitions=inherited,
+                inherited_tool_definitions=state.get("definitions"),
+                capture_content=state.get("allowed", False),
             )
-            attrs = dict(getattr(span, "attributes", None) or {})
-            if _extract_log_type(span, attrs) == LOG_TYPE_AGENT:
-                self._tool_definitions_by_trace.pop(context.trace_id, None)
         except Exception:
-            logger.exception("Failed to enrich Strands Agents span")
+            logger.debug("Failed to enrich Strands Agents span", exc_info=True)
 
     def shutdown(self) -> None:
-        self._tool_definitions_by_trace.clear()
+        with self._lock:
+            self._states.clear()
 
     def force_flush(self, timeout_millis: int = 30000) -> bool:
         return True
