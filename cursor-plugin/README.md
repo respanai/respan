@@ -48,7 +48,7 @@ out is what keeps discovery working.
 
 The skill lives in exactly one place: `respan/skills/` at the monorepo root.
 `scripts/build-plugins.mjs` copies it into `cursor-plugin/skills/respan/` at
-build time and prepends the YAML frontmatter a plugin skill needs. Cursor and
+build time, frontmatter included. Cursor and
 Claude Code agree on the skill format (`skills/<name>/SKILL.md` with `name` +
 `description` frontmatter), so both plugins consume the same source unchanged.
 

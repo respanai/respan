@@ -767,8 +767,8 @@ export abstract class SetupBaseCommand extends BaseCommand {
     this.log('');
 
     const setupPrompt = mode === 'gateway'
-      ? 'Help me set up the Respan gateway: fetch and follow https://respan.ai/docs/agent-setup.md'
-      : 'Help me set up Respan tracing: fetch and follow https://respan.ai/docs/agent-setup.md';
+      ? 'Help me set up the Respan gateway: fetch and follow https://www.respan.ai/docs/documentation/agent-setup.md'
+      : 'Help me set up Respan tracing: fetch and follow https://www.respan.ai/docs/documentation/agent-setup.md';
 
     if (tool === 'cursor') {
       this.log('');
