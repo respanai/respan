@@ -4,11 +4,12 @@ version = "0.1.0"
 description = "Respan instrumentation for Vercel AI SDK for Python"
 authors = ["Respan <team@respan.ai>"]
 license = "Apache-2.0"
+readme = "README.md"
 packages = [{ include = "respan_instrumentation_vercel", from = "src" }]
 
 [tool.poetry.dependencies]
 python = ">=3.12,<3.14"
-ai = { version = ">=0.7.0,<0.8.0", extras = ["otel"] }
+ai = { version = ">=0.7.0,<0.9.0", extras = ["otel"] }
 respan-tracing = ">=2.20.0"
 respan-sdk = ">=2.7.6"
 opentelemetry-semantic-conventions-ai = ">=0.5.1"

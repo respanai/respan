@@ -16,6 +16,7 @@ from ai import experimental_telemetry as telemetry
 from ai.experimental_telemetry.otel import OtelAdapter
 from opentelemetry import context, trace
 from opentelemetry.semconv_ai import SpanAttributes
+from pydantic import BaseModel
 from respan_sdk.constants.llm_logging import (
     LOG_TYPE_EMBEDDING,
     LOG_TYPE_TASK,
@@ -40,7 +41,6 @@ _OPERATIONS = (
     ("audio", "generate_audio", "generate_audio", LOG_TYPE_TASK),
     ("transcriptions", "transcribe", "transcribe", LOG_TYPE_TASK),
     ("reranking", "rerank", "rerank", LOG_TYPE_TASK),
-    ("evaluation", "experimental_evaluate", "evaluate", LOG_TYPE_TASK),
 )
 
 
@@ -210,12 +210,19 @@ class VercelInstrumentor:
         tracer = trace.get_tracer(
             "respan.instrumentation.vercel", tracer_provider=provider
         )
-        for module_name, function_name, kind, log_type in _OPERATIONS:
+        # AI SDK 0.8 moved evaluation into the experimental namespace.
+        evaluation = (
+            ("evaluation", "experimental_evaluate", "evaluate", LOG_TYPE_TASK)
+            if hasattr(ai.ops, "experimental_evaluate")
+            else ("experimental.evaluation", "evaluate", "evaluate", LOG_TYPE_TASK)
+        )
+        for module_name, function_name, kind, log_type in (*_OPERATIONS, evaluation):
             module = importlib.import_module(f"ai.ops.{module_name}")
+            public_module = importlib.import_module(module.__package__)
             original = getattr(module, function_name)
             wrapper = self._wrap_operation(original, tracer, kind, log_type)
             cls._current_wrappers[kind] = wrapper
-            for owner in (module, ai.ops):
+            for owner in (module, public_module):
                 previous = getattr(owner, function_name)
                 setattr(owner, function_name, wrapper)
                 cls._patches.append((owner, function_name, previous, wrapper))
@@ -246,7 +253,13 @@ class VercelInstrumentor:
                 input_payload = None
                 if capture:
                     inputs = {
-                        key: value
+                        key: (
+                            value.model_json_schema()
+                            if key == "output_type"
+                            and isinstance(value, type)
+                            and issubclass(value, BaseModel)
+                            else value
+                        )
                         for key, value in bound.arguments.items()
                         if key != "model"
                     }

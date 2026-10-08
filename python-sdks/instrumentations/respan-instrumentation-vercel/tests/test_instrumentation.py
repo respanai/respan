@@ -19,6 +19,18 @@ from opentelemetry.semconv_ai import SpanAttributes
 from respan_instrumentation_vercel import VercelInstrumentor
 from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
 
+_EVALUATION_OPS = getattr(ai.ops, "experimental", ai.ops)
+_EVALUATE_NAME = (
+    "experimental_evaluate" if hasattr(ai.ops, "experimental_evaluate") else "evaluate"
+)
+_QUESTION = getattr(_EVALUATION_OPS, "NoulQuestion", None) or ai.ops.BooleanQuestion
+
+
+def operation_function(name):
+    if name == "evaluate":
+        return getattr(_EVALUATION_OPS, _EVALUATE_NAME)
+    return getattr(ai.ops, name)
+
 
 @pytest.fixture
 def setup():
@@ -157,6 +169,8 @@ class OperationProvider(Provider):
         return ai.ops.Item(value=[ai.ops.RankedDocument(index=1, score=0.9)])
 
     async def evaluate(self, model, state, questions, *, params):
+        if hasattr(ai.ops, "experimental"):
+            return ai.ops.Item(value={"correct": {"noul": 0.95}})
         return ai.ops.Item(
             value=ai.ops.Evaluation(
                 answers={"correct": ai.ops.BooleanAnswer(probability=0.95)}
@@ -173,8 +187,8 @@ class OperationProvider(Provider):
         ("transcribe", [b"audio"]),
         ("rerank", [["low", "high"], "high"]),
         (
-            "experimental_evaluate",
-            ["4 is even", {"correct": ai.ops.BooleanQuestion(instructions="correct?")}],
+            "evaluate",
+            ["4 is even", {"correct": _QUESTION(instructions="correct?")}],
         ),
     ],
 )
@@ -184,7 +198,7 @@ async def test_non_chat_operations_preserve_results_without_chat_coercion(
     _, _, exporter = setup
     from respan_instrumentation_vercel._translator import json_value
 
-    result = await getattr(ai.ops, operation)(
+    result = await operation_function(operation)(
         ai.Model(id="media-test", provider=OperationProvider()), *arguments
     )
     (span,) = exporter.get_finished_spans()
@@ -601,8 +615,8 @@ async def test_wrapped_content_requires_permission_at_start_and_end(
         ("transcribe", [b"audio"], "task"),
         ("rerank", [["low", "high"], "high"], "task"),
         (
-            "experimental_evaluate",
-            ["4 is even", {"correct": ai.ops.BooleanQuestion(instructions="correct?")}],
+            "evaluate",
+            ["4 is even", {"correct": _QUESTION(instructions="correct?")}],
             "task",
         ),
     ],
@@ -618,7 +632,7 @@ async def test_operation_dict_sink_defers_export_and_replays_full_content(
 
     _, provider, exporter = setup
     model = ai.Model(id="operation-test", provider=OperationProvider())
-    await getattr(ai.ops, operation)(model, *arguments)
+    await operation_function(operation)(model, *arguments)
     (direct,) = exporter.get_finished_spans()
     exporter.clear()
     sink = telemetry.DictSink()
@@ -627,7 +641,7 @@ async def test_operation_dict_sink_defers_export_and_replays_full_content(
         telemetry.span("serialized workflow") as parent,
     ):
         parent.trace_attrs["caller"] = "preserved"
-        result = await getattr(ai.ops, operation)(model, *arguments)
+        result = await operation_function(operation)(model, *arguments)
         assert exporter.get_finished_spans() == ()
     payload = json.loads(
         json.dumps([s.model_dump(mode="json") for s in sink.finished_spans])
@@ -779,3 +793,41 @@ async def test_deferred_sink_failures_do_not_change_operation_result(setup):
         )
     assert result.value == [[0.1, 0.2]]
     assert exporter.get_finished_spans() == ()
+
+
+@pytest.mark.skipif(
+    not hasattr(ai.ops, "experimental"), reason="AI SDK 0.8 typed evaluation"
+)
+async def test_typed_evaluation_preserves_answers_and_both_public_aliases(setup):
+    from ai.ops.experimental import NoulAnswer, NoulQuestion, evaluation
+    from pydantic import BaseModel
+
+    plugin, _, exporter = setup
+
+    class Questions(BaseModel):
+        correct: NoulQuestion
+
+    class Answers(BaseModel):
+        correct: NoulAnswer
+
+    assert ai.ops.experimental.evaluate is evaluation.evaluate
+    retained = ai.ops.experimental.evaluate
+    model = ai.Model(id="evaluation-test", provider=OperationProvider())
+    questions = Questions(correct=NoulQuestion(instructions="Is this correct?"))
+    result = await retained(model, "4 is even", questions, output_type=Answers)
+    assert isinstance(result.value, Answers)
+    assert result.value.correct.noul == 0.95
+    (span,) = exporter.get_finished_spans()
+    attrs = span.attributes
+    assert attrs[RESPAN_LOG_TYPE] == "task"
+    assert json.loads(attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]) == {
+        "correct": {"type": "noul", "noul": 0.95}
+    }
+    captured = json.loads(attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT])
+    assert captured["state"] == "4 is even"
+    assert captured["output_type"] == Answers.model_json_schema()
+    plugin.deactivate()
+    assert ai.ops.experimental.evaluate is evaluation.evaluate
+    assert ai.ops.experimental.evaluate is not retained
+    await retained(model, "4 is even", questions, output_type=Answers)
+    assert len(exporter.get_finished_spans()) == 1
