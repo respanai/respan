@@ -56,7 +56,7 @@ openai_client = instructor.from_provider("openai/gpt-4o-mini")
 
 # Check if Anthropic is available
 try:
-    anthropic_client = instructor.from_provider("anthropic/claude-3-5-haiku-20241022")
+    anthropic_client = instructor.from_provider("anthropic/claude-haiku-4-5-20251001")
     ANTHROPIC_AVAILABLE = True
 except Exception as e:
     print(f"⚠️ Anthropic not available: {e}")

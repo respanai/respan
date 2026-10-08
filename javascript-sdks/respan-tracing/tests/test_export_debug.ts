@@ -34,7 +34,7 @@ try {
         { name: 'export_debug_workflow', version: 1 },
         async () => {
             const message = await anthropic.messages.create({
-                model: 'claude-3-haiku-20240307',
+                model: 'claude-haiku-4-5-20251001',
                 max_tokens: 50,
                 messages: [{ role: 'user', content: 'Say test' }]
             });

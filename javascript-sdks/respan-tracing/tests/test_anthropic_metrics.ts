@@ -44,7 +44,7 @@ const testAnthropicMetrics = async () => {
                 console.log('[Test] Inside workflow, creating message...');
                 
                 const message = await anthropic.messages.create({
-                    model: 'claude-3-haiku-20240307',
+                    model: 'claude-haiku-4-5-20251001',
                     max_tokens: 100,
                     messages: [
                         { role: 'user', content: 'Say hello in 10 words or less.' }
