@@ -1,4 +1,4 @@
-"""Serialize builtins and known native Qdrant storage without user hooks."""
+"""Serialize builtins and known native Milvus storage without user hooks."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import json
 import math
 import re
 import types
+from enum import Enum
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -98,21 +99,23 @@ def native_storage(value: Any, base: type) -> dict | None:
 
 
 _NATIVE_BASES = None
-_ENUM_BASES = None
+_ENUM_BASES = (Enum,)
 _PROTO_TYPES = ()
 
 
 def initialize_native_types():
-    global _NATIVE_BASES, _ENUM_BASES, _PROTO_TYPES
+    global _NATIVE_BASES, _PROTO_TYPES
     if _NATIVE_BASES is not None:
         return
     import importlib
-    from enum import Enum
 
-    bases, enums = [], []
+    bases = []
     for name in (
-        "qdrant_client.http.models.models",
-        "qdrant_client.fastembed_common",
+        "pymilvus.client.abstract",
+        "pymilvus.client.types",
+        "pymilvus.orm.schema",
+        "pymilvus.milvus_client.index",
+        "pymilvus.milvus_client.optimize_task",
     ):
         try:
             module = importlib.import_module(name)
@@ -121,54 +124,66 @@ def initialize_native_types():
         for value in vars(module).values():
             if isinstance(value, type):
                 data = type.__dict__["__dict__"].__get__(value, type(value))
-                if type(data.get("__module__")) is str and data["__module__"] == name:
-                    if issubclass(value, Enum):
-                        enums.append(value)
-                    else:
-                        bases.append(value)
-    _NATIVE_BASES, _ENUM_BASES = tuple(bases), tuple(enums)
-    from google.protobuf.message import Message
-    from qdrant_client import grpc
-
-    _PROTO_TYPES = tuple(
-        value
-        for value in vars(grpc).values()
-        if isinstance(value, type)
-        and any(
-            base is Message
-            for base in type.__dict__["__mro__"].__get__(value, type(value))
-        )
-    )
+                if data.get("__module__") == name:
+                    bases.append(value)
+    _NATIVE_BASES = tuple(bases)
+    protos = []
+    for name in ("schema_pb2", "common_pb2", "milvus_pb2"):
+        module = importlib.import_module("pymilvus.grpc_gen." + name)
+        for value in vars(module).values():
+            if isinstance(value, type):
+                namespace = type.__dict__["__dict__"].__get__(value, type(value))
+                if namespace.get("__module__") in (name, module.__name__):
+                    protos.append(value)
+    _PROTO_TYPES = tuple(protos)
 
 
 def native_dict(value):
     if type(value) is dict:
         return value
     initialize_native_types()
-    from pydantic import BaseModel
-
     for base in _NATIVE_BASES:
         data = native_storage(value, base)
         if data is not None:
-            if any(
-                t is BaseModel
-                for t in type.__dict__["__mro__"].__get__(base, type(base))
-            ):
-                result = dict(native_storage(value, BaseModel) or data)
-                descriptor = (
-                    type.__dict__["__dict__"]
-                    .__get__(BaseModel, type(BaseModel))
-                    .get("__pydantic_extra__")
-                )
-                if any(
-                    type(descriptor) is item
-                    for item in (types.GetSetDescriptorType, types.MemberDescriptorType)
-                ):
-                    extra = descriptor.__get__(value, BaseModel)
-                    if type(extra) is dict:
-                        result.update(extra)
-                return result
             return data
+    return None
+
+
+def native_extra(value):
+    from pymilvus.client import types as native
+
+    for name in ("HybridExtraList", "ExtraList"):
+        base = vars(native).get(name)
+        if base is not None:
+            data = native_storage(value, base)
+            if data is not None:
+                extra = data.get("extra")
+                return json_value(extra)
+    return None
+
+
+def native_list(value):
+    """Copy native eager storage; decode lazy fields on an owned SDK shadow."""
+    from pymilvus.client import types as native
+
+    hybrid = vars(native).get("HybridExtraList")
+    if hybrid is not None:
+        data = native_storage(value, hybrid)
+        if data is not None:
+            originals = list(list.__iter__(value))
+            if not all(type(row) is dict for row in originals):
+                return None
+            rows = [dict(row) for row in originals]
+            shadow = hybrid(
+                data.get("_lazy_field_data", []),
+                rows,
+                dynamic_fields=data.get("_dynamic_fields"),
+                strict_float32=data.get("_strict_float32", False),
+            )
+            return list(hybrid.__iter__(shadow))
+    extra = vars(native).get("ExtraList")
+    if extra is not None and native_storage(value, extra) is not None:
+        return list(list.__iter__(value))
     return None
 
 
@@ -223,28 +238,7 @@ def json_value(
         return value if math.isfinite(value) else None
     if type(value) is str:
         return redact_text(value)
-    from datetime import date, datetime, timezone
-    from zoneinfo import ZoneInfo
-
-    if type(value) is date:
-        return date.isoformat(value)
-    if type(value) is datetime:
-        tz = datetime.tzinfo.__get__(value)
-        if tz is None or type(tz) is timezone or type(tz) is ZoneInfo:
-            return datetime.isoformat(value)
-        return None
-    if type(value) is bytes:
-        try:
-            return redact_text(bytes.decode(value, "utf-8"))
-        except UnicodeDecodeError:
-            return {"bytes_hex": bytes.hex(value)}
     initialize_native_types()
-    if any(type(value) is item for item in _PROTO_TYPES):
-        from google.protobuf.json_format import MessageToDict
-
-        return json_value(
-            MessageToDict(value, preserving_proto_field_name=True), seen=seen
-        )
     for base in _ENUM_BASES:
         data = native_storage(value, base)
         if data is not None:
@@ -280,6 +274,20 @@ def json_value(
         return None
     active.add(id(value))
     try:
+        rows = native_list(value)
+        if rows is not None:
+            return [json_value(item, seen=active) for item in rows]
+        from pymilvus.client import types as native
+
+        omit_zero = vars(native).get("OmitZeroDict")
+        if omit_zero is not None and native_storage(value, omit_zero) is not None:
+            value = dict(dict.items(value))
+        if any(type(value) is native_type for native_type in _PROTO_TYPES):
+            from google.protobuf.json_format import MessageToDict
+
+            return json_value(
+                MessageToDict(value, preserving_proto_field_name=True), seen=active
+            )
         data = native_dict(value)
         if data is not None:
             is_schema = schema or _schema(data)

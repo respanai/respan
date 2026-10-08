@@ -1,630 +1,610 @@
-"""Native Weaviate v4 collection instrumentation for Respan."""
+"""Observe released native LanceDB operations and Arrow values with real OTel."""
 
+# ruff: noqa: BLE001 -- telemetry faults never alter native behavior.
 from __future__ import annotations
 
+import contextvars
+import functools
 import importlib
+import importlib.metadata
 import inspect
-import json
-import logging
-import math
-import re
-from collections.abc import Mapping, Sequence
-from contextvars import ContextVar
-from dataclasses import asdict, is_dataclass
-from enum import Enum
-from importlib import metadata
-from itertools import islice
-from numbers import Real
-from threading import RLock
-from typing import Any, ClassVar
+import threading
+import types
+import weakref
 
-from opentelemetry import trace
-from opentelemetry.instrumentation.utils import unwrap
-from opentelemetry.semconv.trace import SpanAttributes as OTelSpanAttributes
+from opentelemetry import context, trace
+from opentelemetry.attributes import BoundedAttributes
+from opentelemetry.sdk.util import BoundedList
+from opentelemetry.semconv._incubating.attributes.error_attributes import ERROR_MESSAGE
+from opentelemetry.semconv.attributes.db_attributes import (
+    DB_COLLECTION_NAME,
+    DB_NAMESPACE,
+    DB_OPERATION_NAME,
+    DB_SYSTEM_NAME,
+)
+from opentelemetry.semconv.attributes.error_attributes import ERROR_TYPE
+from opentelemetry.semconv.attributes.http_attributes import HTTP_RESPONSE_STATUS_CODE
 from opentelemetry.semconv_ai import SpanAttributes
-from opentelemetry.trace import SpanKind, Status, StatusCode
-from respan_sdk.constants import ERROR_MESSAGE_ATTR
-from respan_sdk.constants.llm_logging import LOG_TYPE_TASK
-from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
+from opentelemetry.trace import Status, StatusCode
+from respan_sdk.constants.span_attributes import (
+    RESPAN_LOG_TYPE,
+    RESPAN_METADATA,
+    RESPAN_PROMPT,
+    RESPAN_SPAN_ATTRIBUTES_MAP,
+)
 from respan_tracing.core.tracer import RespanTracer
-from wrapt import wrap_function_wrapper
+from respan_tracing.utils.span_factory import _PROPAGATED_ATTRIBUTES
+from weaviate import exceptions as native_exceptions
 
-from respan_instrumentation_weaviate._constants import (
-    MAX_ATTRIBUTE_CHARS,
-    MAX_PREVIEW_ITEMS,
-    WEAVIATE_INSTRUMENTATION_NAME,
-    WEAVIATE_PATCH_SPECS,
-    PatchSpec,
+from ._constants import WEAVIATE_PATCH_SPECS
+from ._policy import (
+    CREATING_CALL,
+    AncestorPolicy,
+    span_key,
+    suppressed,
+)
+from ._serialization import (
+    REDACTED,
+    json_dumps,
+    native_storage,
+    register_native_types,
+    safe_exception_message,
+    safe_text,
+    safe_type_name,
+    sensitive_key,
+    to_jsonable,
 )
 
-logger = logging.getLogger(__name__)
-_SCOPE_NAME = "respan-instrumentation-weaviate"
-try:
-    _SCOPE_VERSION = metadata.version(_SCOPE_NAME)
-except metadata.PackageNotFoundError:
-    _SCOPE_VERSION = "0.1.0"
-
-
-_VECTOR_KEY_PARTS = ("embedding", "vector")
-_SENSITIVE_KEY = re.compile(
-    r"(^|[._-])(api[_-]?key|authorization|cookie|password|secret|token)([._-]|$)",
-    re.IGNORECASE,
-)
-_ASSIGNMENT_SECRET = re.compile(
-    r"(?i)([a-z0-9_.-]*(?:api[_-]?key|authorization|cookie|password|secret|token))"
-    r"\s*[:=]\s*([^\s,;]+)"
+_NATIVE_ERRORS = tuple(
+    value
+    for value in vars(native_exceptions).values()
+    if isinstance(value, type) and issubclass(value, BaseException)
 )
 
-
-def _safe_text(value: Any, *, max_bytes: int = 4_000) -> str:
-    if isinstance(value, str):
-        text = _ASSIGNMENT_SECRET.sub(
-            lambda match: f"{match.group(1)}=[REDACTED]",
-            value,
-        )
-    elif value is None or isinstance(value, (bool, int)):
-        text = json.dumps(value)
-    elif isinstance(value, float) and math.isfinite(value):
-        text = str(value)
-    else:
-        text = f"<{type(value).__name__[:120]}>"
-    if len(text.encode()) <= max_bytes:
-        return text
-    low, high, best = 0, len(text), ""
-    while low <= high:
-        middle = (low + high) // 2
-        candidate = f"{text[:middle]}…[truncated]"
-        if len(candidate.encode()) <= max_bytes:
-            best = candidate
-            low = middle + 1
-        else:
-            high = middle - 1
-    return best or "[truncated]"
+_LOCK = threading.RLock()
+_ACTIVATION_COUNT = 0
+_ENABLED = False
+_CAPTURE_CONTENT = True
+_PROVIDER = None
+_POLICIES = weakref.WeakKeyDictionary()
+_PATCHES = []
+_PENDING = weakref.WeakSet()
+_ACTIVE_CALL = contextvars.ContextVar("respan_weaviate_active_call", default=False)
 
 
-def _safe_exception_message(exc: BaseException) -> str:
-    try:
-        args = exc.args
-    except BaseException:  # noqa: BLE001
-        args = ()
-    details = [
-        _safe_text(item, max_bytes=1_000)
-        for item in args[:4]
-        if item is None or isinstance(item, (str, bool, int, float))
-    ]
-    name = type(exc).__name__[:120]
-    return _safe_text(
-        f"{name}: {'; '.join(filter(None, details))}" if details else name
-    )
-
-
-def _provider_status_code(exc: BaseException) -> int:
-    candidates: list[Any] = []
-    for owner in (exc,):
-        for name in ("status_code", "status"):
-            try:
-                candidates.append(getattr(owner, name, None))
-            except BaseException:
-                logger.debug("Ignored unsafe Weaviate exception status", exc_info=True)
-                continue
-    try:
-        response = getattr(exc, "response", None)
-    except BaseException:
-        logger.debug("Ignored unsafe Weaviate exception response", exc_info=True)
-        response = None
-    if response is not None:
-        for name in ("status_code", "status"):
-            try:
-                candidates.append(getattr(response, name, None))
-            except BaseException:
-                logger.debug("Ignored unsafe Weaviate response status", exc_info=True)
-                continue
-    for value in candidates:
-        if (
-            isinstance(value, int)
-            and not isinstance(value, bool)
-            and 400 <= value <= 599
-        ):
-            return value
-    return 500
-
-
-def _is_numeric_vector(value: Any) -> bool:
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
-        return False
-    try:
-        return all(
-            isinstance(item, Real)
-            and not isinstance(item, bool)
-            and (not isinstance(item, float) or math.isfinite(item))
-            for item in value
-        )
-    except BaseException:
-        logger.debug("Ignored unsafe Weaviate vector iterator", exc_info=True)
-        return False
-
-
-def _is_vector_key(value: str) -> bool:
-    normalized = value.lower()
-    return any(part in normalized for part in _VECTOR_KEY_PARTS)
-
-
-def _jsonable(
-    value: Any,
-    *,
-    depth: int = 0,
-    vector_context: bool = False,
-    preserved_vector: list[bool] | None = None,
-) -> Any:
-    preserved_vector = preserved_vector if preserved_vector is not None else [False]
-    if value is None or isinstance(value, (int, bool)):
-        return value
-    if isinstance(value, float):
-        return value if math.isfinite(value) else _safe_text(value)
-    if isinstance(value, str):
-        return _safe_text(value, max_bytes=16_000)
-    if depth > 7 and not (vector_context or _is_numeric_vector(value)):
-        return {"type": type(value).__name__[:120], "truncated": True}
-    if isinstance(value, bytes):
-        return {"type": "bytes", "length": len(value)}
-    if isinstance(value, Enum):
-        return _jsonable(
-            value.value,
-            depth=depth + 1,
-            vector_context=vector_context,
-            preserved_vector=preserved_vector,
-        )
-    if is_dataclass(value) and not isinstance(value, type):
-        return _jsonable(
-            asdict(value),
-            depth=depth + 1,
-            vector_context=vector_context,
-            preserved_vector=preserved_vector,
-        )
-    if isinstance(value, Mapping):
-        result: dict[str, Any] = {}
-        omitted = 0
-        regular_items = 0
-        for key, item in value.items():
-            key_text = _safe_text(key, max_bytes=256)
-            item_is_vector = vector_context or _is_vector_key(key_text)
-            if not item_is_vector and regular_items >= MAX_PREVIEW_ITEMS:
-                omitted += 1
-                continue
-            regular_items += int(not item_is_vector)
-            result[key_text] = (
-                "[REDACTED]"
-                if _SENSITIVE_KEY.search(key_text)
-                else _jsonable(
-                    item,
-                    depth=depth + 1,
-                    vector_context=item_is_vector,
-                    preserved_vector=preserved_vector,
-                )
-            )
-        if omitted:
-            result["__truncated__"] = omitted
-        return result
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        preserve_all = vector_context or _is_numeric_vector(value)
-        if preserve_all:
-            preserved_vector[0] = True
-        source = value if preserve_all else islice(iter(value), MAX_PREVIEW_ITEMS + 1)
-        items = [
-            _jsonable(
-                item,
-                depth=depth + 1,
-                vector_context=vector_context,
-                preserved_vector=preserved_vector,
-            )
-            for item in source
-        ]
-        if preserve_all:
-            return items
-        if len(items) > MAX_PREVIEW_ITEMS:
-            return {
-                "items": items[:MAX_PREVIEW_ITEMS],
-                "truncated": True,
-            }
-        return items
-    for method_name in ("model_dump", "to_dict", "dict", "to_json", "tolist"):
-        method = getattr(value, method_name, None)
-        if not callable(method):
-            continue
-        try:
-            return _jsonable(
-                method(),
-                depth=depth + 1,
-                vector_context=vector_context,
-                preserved_vector=preserved_vector,
-            )
-        except Exception:
-            logger.debug("Ignored unsafe Weaviate model conversion", exc_info=True)
-            continue
-    public_values = getattr(value, "__dict__", None)
-    if isinstance(public_values, dict):
-        return _jsonable(
-            {
-                key: item
-                for key, item in public_values.items()
-                if not key.startswith("_") and not callable(item)
-            },
-            depth=depth + 1,
-            vector_context=vector_context,
-            preserved_vector=preserved_vector,
-        )
-    return {"type": type(value).__name__[:120]}
-
-
-def _json_dumps_impl(value: Any) -> str:
-    preserved_vector = [False]
-    text = json.dumps(
-        _jsonable(value, preserved_vector=preserved_vector),
-        ensure_ascii=False,
-        sort_keys=True,
-        allow_nan=False,
-    )
-    if preserved_vector[0] or len(text.encode()) <= MAX_ATTRIBUTE_CHARS:
-        return text
-    low, high, best = 0, len(text), ""
-    while low <= high:
-        middle = (low + high) // 2
-        candidate = json.dumps(
-            {"preview": text[:middle], "truncated": True},
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        if len(candidate.encode()) <= MAX_ATTRIBUTE_CHARS:
-            best = candidate
-            low = middle + 1
-        else:
-            high = middle - 1
-    return best or '{"truncated":true}'
-
-
-def _json_dumps(value: Any) -> str:
-    try:
-        return _json_dumps_impl(value)
-    except BaseException:
-        logger.debug("Failed to serialize Weaviate telemetry", exc_info=True)
-        return json.dumps({"type": type(value).__name__[:120], "unavailable": True})
-
-
-def _instance_identity(instance: Any) -> dict[str, str]:
-    identity: dict[str, str] = {}
-    for source, target in (
-        ("name", "collection_name"),
-        ("_name", "collection_name"),
-        ("tenant", "tenant"),
-        ("_tenant", "tenant"),
-    ):
-        try:
-            value = getattr(instance, source, None)
-        except BaseException:
-            logger.debug("Ignored unsafe Weaviate identity field", exc_info=True)
-            continue
-        if value is not None and target not in identity:
-            identity[target] = _safe_text(value, max_bytes=1_000)
-    return identity
-
-
-def _call_input(
-    label: str,
-    operation: str,
-    instance: Any,
-    wrapped: Any,
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-) -> dict[str, Any]:
-    try:
-        bound = inspect.signature(wrapped).bind_partial(*args, **kwargs)
-        arguments = {
-            key: value for key, value in bound.arguments.items() if key != "self"
-        }
-    except (TypeError, ValueError):
-        arguments = {"args": list(args), "kwargs": kwargs}
+def _base(operation):
     return {
-        "operation": f"{label}.{operation}",
-        **_instance_identity(instance),
-        **arguments,
+        RESPAN_LOG_TYPE: "task",
+        DB_SYSTEM_NAME: "weaviate",
+        DB_OPERATION_NAME: operation.rsplit(".", 1)[-1],
     }
 
 
-class WeaviateInstrumentor:
-    """Trace Weaviate v4 sync and async collection operations."""
-
-    name = WEAVIATE_INSTRUMENTATION_NAME
-    _patches_applied = False
-    _activation_count = 0
-    _patched_targets: ClassVar[list[tuple[type, str]]] = []
-    _installed_targets: ClassVar[dict[tuple[type, str], Any]] = {}
-    _lock = RLock()
-    _capture_content_config: bool | None = None
-    _active_call: ContextVar[bool] = ContextVar(
-        "respan_weaviate_active_call",
-        default=False,
+def _tracing_enabled():
+    instance = RespanTracer._instance
+    if instance is None:
+        return True
+    return (
+        type(instance) is RespanTracer
+        and object.__getattribute__(instance, "__dict__").get("is_enabled") is True
     )
 
-    def __init__(self, *, capture_content: bool = True) -> None:
-        self._capture_content = capture_content
-        self._is_instrumented = False
 
-    @staticmethod
-    def _tracing_enabled() -> bool:
-        tracer = getattr(RespanTracer, "_instance", None)
-        return tracer is None or bool(getattr(tracer, "is_enabled", True))
+def _provider():
+    return _PROVIDER if _PROVIDER is not None else trace.get_tracer_provider()
 
-    def _set_start_attributes(
-        self,
-        span: Any,
-        label: str,
-        operation: str,
-        instance: Any,
-        wrapped: Any,
-        args: tuple[Any, ...],
-        kwargs: dict[str, Any],
-        has_parent: bool,
-    ) -> None:
-        operation_name = f"{label}.{operation}"
-        entity_name = f"weaviate.{operation_name}"
-        span.set_attribute(RESPAN_LOG_TYPE, LOG_TYPE_TASK)
-        span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_NAME, entity_name)
-        span.set_attribute(
-            SpanAttributes.TRACELOOP_ENTITY_PATH,
-            entity_name if has_parent else "",
+
+def _policy():
+    provider = _provider()
+    with _LOCK:
+        policy = _POLICIES.get(provider)
+        if policy is None:
+            if not callable(getattr(provider, "add_span_processor", None)):
+                return None
+            policy = AncestorPolicy(_CAPTURE_CONTENT)
+            _POLICIES[provider] = policy
+            try:
+                provider.add_span_processor(policy)
+                processor = getattr(provider, "_active_span_processor", None)
+                if processor is not None:
+                    processor._span_processors = (
+                        policy,
+                        *(
+                            item
+                            for item in processor._span_processors
+                            if item is not policy
+                        ),
+                    )
+            except BaseException:
+                _remove_policies()
+                raise
+        policy.setting = _CAPTURE_CONTENT
+        policy.enabled = True
+        return policy
+
+
+def _attempt(fn, default=None):
+    try:
+        return fn()
+    except BaseException:
+        return default
+
+
+def _propagated_attributes():
+    # The released bridge calls str() on metadata. Read the same canonical
+    # ContextVar without invoking arbitrary customer formatting hooks.
+    values = _PROPAGATED_ATTRIBUTES.get()
+    result = {}
+    if type(values) is not dict:
+        return result
+    for key, value in values.items():
+        if type(key) is not str or key not in RESPAN_SPAN_ATTRIBUTES_MAP:
+            continue
+        target = RESPAN_SPAN_ATTRIBUTES_MAP[key]
+        if target == RESPAN_METADATA and type(value) is dict:
+            for name, item in value.items():
+                if type(name) is str:
+                    cleaned = REDACTED if sensitive_key(name) else to_jsonable(item)
+                    result[f"{target}.{safe_text(name)}"] = (
+                        cleaned if type(cleaned) is str else json_dumps(cleaned)
+                    )
+        elif target == RESPAN_PROMPT:
+            result[target] = json_dumps(value)
+        elif any(type(value) is kind for kind in (str, bool, int, float)):
+            result[target] = to_jsonable(value)
+    return result
+
+
+def _restore_context(ambient):
+    if context.get_current() is ambient:
+        return
+    _attempt(lambda: context._RUNTIME_CONTEXT.attach(ambient))
+    if context.get_current() is not ambient:
+        state = object.__getattribute__(context._RUNTIME_CONTEXT, "__dict__")
+        for candidate in state.values():
+            if type(candidate) is contextvars.ContextVar:
+                candidate.set(ambient)
+                break
+
+
+class _Call:
+    def __init__(self, kwargs, *, name, operation):
+        self.span = None
+        self.creation_name = name
+        self.policy = None
+        self.finished = False
+        self.failed = False
+        self.operation = operation
+        self.chunks = []
+        self.content = set()
+        self.cleanups = []
+        self.propagated = {}
+        self.priority = {}
+        self.base = _base(operation)
+        self.base[SpanAttributes.TRACELOOP_ENTITY_NAME] = name
+        self.base[SpanAttributes.TRACELOOP_ENTITY_PATH] = (
+            "" if not trace.get_current_span().get_span_context().is_valid else name
         )
-        span.set_attribute(OTelSpanAttributes.DB_SYSTEM, "weaviate")
-        span.set_attribute(OTelSpanAttributes.DB_OPERATION, operation_name)
-        if self._capture_content:
-            span.set_attribute(
-                SpanAttributes.TRACELOOP_ENTITY_INPUT,
-                _json_dumps(
-                    _call_input(
-                        label,
-                        operation,
-                        instance,
-                        wrapped,
-                        args,
-                        kwargs,
-                    )
-                ),
+        _PENDING.add(self)
+        self.policy = _policy()
+        creation_token = CREATING_CALL.set(self)
+        try:
+            self.span = (
+                _provider()
+                .get_tracer(
+                    "weaviate",
+                    importlib.metadata.version("respan-instrumentation-weaviate"),
+                )
+                .start_span(name, kind=trace.SpanKind.CLIENT, attributes=self.base)
+            )
+        finally:
+            CREATING_CALL.reset(creation_token)
+        if self.recording() and self.allowed():
+            self.propagated = _propagated_attributes()
+            self.set_attributes(
+                {SpanAttributes.TRACELOOP_ENTITY_INPUT: json_dumps(kwargs)}
             )
 
-    def _set_error(self, span: Any, exc: BaseException) -> None:
-        message = _safe_exception_message(exc)
-        status_code = _provider_status_code(exc)
-        span.record_exception(RuntimeError(message))
-        span.set_status(Status(StatusCode.ERROR, message))
-        span.set_attribute("status_code", status_code)
-        span.set_attribute(OTelSpanAttributes.HTTP_STATUS_CODE, status_code)
-        span.set_attribute(ERROR_MESSAGE_ATTR, message)
-        if self._capture_content:
-            span.set_attribute(
-                SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
-                _json_dumps({"error": type(exc).__name__, "message": message}),
+    def __del__(self):
+        try:
+            if not getattr(self, "finished", True):
+                if self.recording() and self.chunks:
+                    _observe(self, lambda: self.output(self.chunks))
+                self.finish(completed=False)
+        except BaseException:  # noqa: S110 - GC telemetry must not affect native resources.
+            pass
+
+    def recording(self):
+        return self.span is not None and bool(_attempt(self.span.is_recording, False))
+
+    def scrub(self, readable=None):
+        self.chunks.clear()
+        self.propagated.clear()
+        self.priority.clear()
+        attributes = getattr(self.span, "_attributes", None)
+        structural = set(self.base) | {ERROR_TYPE}
+        if type(attributes) is BoundedAttributes:
+            attributes = object.__getattribute__(attributes, "_dict")
+        if attributes is not None:
+            for key in list(attributes):
+                if key not in structural:
+                    _attempt(lambda key=key: attributes.pop(key, None))
+        if getattr(self.span, "_events", None) is not None:
+            self.span._events = BoundedList(0)
+        if readable is not None:
+            readable._attributes = types.MappingProxyType(
+                {
+                    key: value
+                    for key, value in (readable.attributes or {}).items()
+                    if key in structural
+                }
             )
+            readable._events = ()
+            readable._status = Status(readable.status.status_code)
+        status = getattr(self.span, "status", None)
+        if status is not None:
+            self.span._status = Status(status.status_code)
 
-    def _trace_sync(
-        self,
-        label: str,
-        operation: str,
-        wrapped: Any,
-        instance: Any,
-        args: tuple[Any, ...],
-        kwargs: dict[str, Any],
-    ) -> Any:
-        active_call = type(self)._active_call
-        if active_call.get():
-            return wrapped(*args, **kwargs)
-        token = active_call.set(True)
-        try:
-            parent_context = trace.get_current_span().get_span_context()
-            has_parent = bool(getattr(parent_context, "is_valid", False))
-            tracer = trace.get_tracer(_SCOPE_NAME, _SCOPE_VERSION)
-            with tracer.start_as_current_span(
-                f"weaviate.{label}.{operation}",
-                kind=SpanKind.CLIENT,
-            ) as span:
-                self._set_start_attributes(
-                    span,
-                    label,
-                    operation,
-                    instance,
-                    wrapped,
-                    args,
-                    kwargs,
-                    has_parent,
+    def allowed(self, *, honor_suppression=True):
+        if self.failed and self.policy is not None:
+            self.policy._deny_chain(span_key(self.span))
+        value = (
+            not self.failed
+            and self.policy is not None
+            and self.policy.observe(self.span, honor_suppression=honor_suppression)
+        )
+        if not value:
+            self.scrub()
+        return value
+
+    def set_attributes(self, values):
+        priority = {
+            SpanAttributes.TRACELOOP_ENTITY_INPUT,
+            SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+            RESPAN_LOG_TYPE,
+            f"{RESPAN_METADATA}.weaviate.request",
+            f"{RESPAN_METADATA}.weaviate.result",
+        }
+        for key, value in values.items():
+            if key not in priority:
+                self.content.add(key)
+                self.span.set_attribute(key, value)
+        # Reassert structure/propagation after indexed convenience fields. Full
+        # native JSON is last under the SDK's own attribute-count bounds.
+        for key, value in {**self.base, **self.propagated}.items():
+            self.content.add(key)
+            self.span.set_attribute(key, value)
+        self.priority.update(
+            {key: value for key, value in values.items() if key in priority}
+        )
+        for key, value in self.priority.items():
+            self.content.add(key)
+            self.span.set_attribute(key, value)
+
+    def capture(self, response):
+        if self.recording() and self.allowed():
+            self.chunks.append(response)
+
+    def output(self, response):
+        if self.recording() and self.allowed():
+            values = {SpanAttributes.TRACELOOP_ENTITY_OUTPUT: json_dumps(response)}
+            self.set_attributes(values)
+
+    def error(self, exc):
+        if not self.recording():
+            return
+        allowed = self.allowed()
+        message = (
+            safe_exception_message(exc)
+            if allowed
+            and any(
+                type(exc) is kind
+                for kind in (
+                    ValueError,
+                    RuntimeError,
+                    TypeError,
+                    OSError,
+                    KeyError,
+                    *_NATIVE_ERRORS,
                 )
-                try:
-                    result = wrapped(*args, **kwargs)
-                except BaseException as exc:
-                    self._set_error(span, exc)
-                    raise
-                span.set_status(Status(StatusCode.OK))
-                if self._capture_content:
-                    span.set_attribute(
-                        SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
-                        _json_dumps(result),
-                    )
-                return result
-        finally:
-            active_call.reset(token)
+            )
+            else None
+        )
+        self.span.set_status(Status(StatusCode.ERROR, message))
+        self.span.set_attribute(ERROR_TYPE, safe_type_name(exc))
+        if any(type(exc) is kind for kind in _NATIVE_ERRORS):
+            raw = BaseException.__dict__["__dict__"].__get__(exc)
+            code = raw.get("_status_code")
+            if type(code) is int and 400 <= code <= 599:
+                self.span.set_attribute(HTTP_RESPONSE_STATUS_CODE, code)
+        if message is not None:
+            self.content.add(ERROR_MESSAGE)
+            self.span.set_attribute(ERROR_MESSAGE, message)
 
-    async def _trace_async(
-        self,
-        label: str,
-        operation: str,
-        wrapped: Any,
-        instance: Any,
-        args: tuple[Any, ...],
-        kwargs: dict[str, Any],
-    ) -> Any:
-        active_call = type(self)._active_call
-        if active_call.get():
-            return await wrapped(*args, **kwargs)
-        token = active_call.set(True)
+    def attach(self):
+        ambient = context.get_current()
         try:
-            parent_context = trace.get_current_span().get_span_context()
-            has_parent = bool(getattr(parent_context, "is_valid", False))
-            tracer = trace.get_tracer(_SCOPE_NAME, _SCOPE_VERSION)
-            with tracer.start_as_current_span(
-                f"weaviate.{label}.{operation}",
-                kind=SpanKind.CLIENT,
-            ) as span:
-                self._set_start_attributes(
-                    span,
-                    label,
-                    operation,
-                    instance,
-                    wrapped,
-                    args,
-                    kwargs,
-                    has_parent,
+            token = (
+                context.attach(trace.set_span_in_context(self.span))
+                if self.recording()
+                else None
+            )
+        except BaseException:
+            _attempt(lambda: _restore_context(ambient))
+            raise
+        return token, ambient
+
+    def detach(self, state):
+        if state is None:
+            return
+        token, ambient = state
+        if not self.finished:
+            _attempt(lambda: self.allowed(honor_suppression=False))
+        if token is not None:
+            try:
+                context.detach(token)
+            except BaseException:
+                _attempt(lambda: context._RUNTIME_CONTEXT.detach(token))
+        _attempt(lambda: _restore_context(ambient))
+
+    def finish(self, error=None, *, completed=True):
+        if self.finished:
+            return
+        self.finished = True
+        if self.recording():
+            if (
+                error is None
+                and completed
+                and self.span.status.status_code is StatusCode.UNSET
+            ):
+                _attempt(lambda: self.span.set_status(Status(StatusCode.OK)))
+            elif error is not None:
+                _attempt(lambda: self.error(error))
+            if not _attempt(lambda: self.allowed(honor_suppression=False), False):
+                _attempt(self.scrub)
+            ambient = context.get_current()
+            try:
+                _attempt(self.span.end)
+            finally:
+                _attempt(lambda: _restore_context(ambient))
+        for cleanup in reversed(self.cleanups):
+            _attempt(cleanup)
+        self.cleanups.clear()
+        self.chunks.clear()
+        self.content.clear()
+        self.propagated.clear()
+        self.priority.clear()
+        if self.policy is not None and self.span is not None:
+            self.policy.calls.pop(span_key(self.span), None)
+        self.policy = None
+        _PENDING.discard(self)
+
+
+def _observe(call, fn, *, keep_context=False):
+    ambient = context.get_current()
+    try:
+        return fn()
+    except BaseException:
+        call.failed = True
+        _attempt(call.scrub)
+        _attempt(lambda: _restore_context(ambient))
+        return None
+    finally:
+        if not keep_context:
+            if not call.finished and call.policy is not None and call.span is not None:
+                _attempt(
+                    lambda: call.policy.observe(call.span, honor_suppression=False)
                 )
-                try:
-                    result = await wrapped(*args, **kwargs)
-                except BaseException as exc:
-                    self._set_error(span, exc)
-                    raise
-                span.set_status(Status(StatusCode.OK))
-                if self._capture_content:
-                    span.set_attribute(
-                        SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
-                        _json_dumps(result),
+            _attempt(lambda: _restore_context(ambient))
+
+
+def _remove_policies():
+    for provider, policy in list(_POLICIES.items()):
+        policy.enabled = False
+        processor = getattr(provider, "_active_span_processor", None)
+        if processor is not None:
+            _attempt(
+                lambda processor=processor, policy=policy: setattr(
+                    processor,
+                    "_span_processors",
+                    tuple(p for p in processor._span_processors if p is not policy),
+                )
+            )
+        policy.clear()
+    _POLICIES.clear()
+
+
+def _identity(instance):
+    raw = native_storage(instance)
+    if type(raw) is not dict:
+        return {}
+    result = {}
+    for source, target in (
+        ("name", "collection"),
+        ("_name", "collection"),
+        ("_tenant", "tenant"),
+    ):
+        value = raw.get(source)
+        if type(value) is str and target not in result:
+            result[target] = safe_text(value)
+    return result
+
+
+def _start(instance, args, kwargs, operation):
+    ambient = context.get_current()
+    if not _ENABLED or _ACTIVE_CALL.get() or not _tracing_enabled() or suppressed():
+        return None
+    call = object.__new__(_Call)
+    try:
+        # Arguments are converted only after recording and privacy eligibility.
+        _Call.__init__(call, {}, name=f"weaviate.{operation}", operation=operation)
+        if call.recording() and call.allowed():
+            identity = _identity(instance)
+            if "collection" in identity:
+                call.base[DB_COLLECTION_NAME] = identity["collection"]
+            if "tenant" in identity:
+                call.base[DB_NAMESPACE] = identity["tenant"]
+            call.set_attributes(
+                {
+                    SpanAttributes.TRACELOOP_ENTITY_INPUT: json_dumps(
+                        {
+                            "operation": operation,
+                            **identity,
+                            "args": args,
+                            "kwargs": kwargs,
+                        }
                     )
+                }
+            )
+        return call
+    except BaseException:
+        call.failed = True
+        _attempt(lambda: call.scrub())
+        _attempt(lambda: call.finish(completed=False))
+        return None
+    finally:
+        _attempt(lambda: _restore_context(ambient))
+
+
+def _wrap(original, operation, asynchronous):
+    if asynchronous:
+
+        @functools.wraps(original)
+        async def wrapped(instance, *args, **kwargs):
+            call = _start(instance, args, kwargs, operation)
+            if call is None:
+                return await original(instance, *args, **kwargs)
+            token = _ACTIVE_CALL.set(True)
+            state = _observe(call, call.attach, keep_context=True)
+            try:
+                result = await original(instance, *args, **kwargs)
+            except BaseException as error:
+                _observe(call, lambda error=error: call.finish(error))
+                raise
+            else:
+                _observe(call, lambda: call.output(result))
+                _observe(call, call.finish)
                 return result
-        finally:
-            active_call.reset(token)
+            finally:
+                _observe(call, lambda: call.detach(state), keep_context=True)
+                _ACTIVE_CALL.reset(token)
 
-    def _patch_spec(self, spec: PatchSpec) -> list[tuple[type, str]]:
+        return wrapped
+
+    @functools.wraps(original)
+    def wrapped(instance, *args, **kwargs):
+        call = _start(instance, args, kwargs, operation)
+        if call is None:
+            return original(instance, *args, **kwargs)
+        token = _ACTIVE_CALL.set(True)
+        state = _observe(call, call.attach, keep_context=True)
         try:
-            module = importlib.import_module(spec.module)
-            target_class = getattr(module, spec.class_name)
-        except (ImportError, AttributeError):
-            return []
+            result = original(instance, *args, **kwargs)
+        except BaseException as error:
+            _observe(call, lambda error=error: call.finish(error))
+            raise
+        else:
+            _observe(call, lambda: call.output(result))
+            _observe(call, call.finish)
+            return result
+        finally:
+            _observe(call, lambda: call.detach(state), keep_context=True)
+            _ACTIVE_CALL.reset(token)
 
-        patched: list[tuple[type, str]] = []
-        for operation in spec.methods:
-            if not callable(getattr(target_class, operation, None)):
+    return wrapped
+
+
+def _targets():
+    found = set()
+    for spec in WEAVIATE_PATCH_SPECS:
+        module = importlib.import_module(spec.module)
+        owner = getattr(module, spec.class_name, None)
+        if owner is None:
+            continue
+        for name in spec.methods:
+            key = owner, name
+            if key in found:
                 continue
+            original = getattr(owner, name, None)
+            if not callable(original):
+                continue
+            found.add(key)
+            present = name in vars(owner)
+            yield owner, name, original, present, f"{spec.label}.{name}", spec.is_async
 
-            def traced(
-                wrapped: Any,
-                instance: Any,
-                args: tuple[Any, ...],
-                kwargs: dict[str, Any],
-                *,
-                _label: str = spec.label,
-                _operation: str = operation,
-                _is_async: bool = spec.is_async,
-            ) -> Any:
-                if _is_async:
-                    return self._trace_async(
-                        _label,
-                        _operation,
-                        wrapped,
-                        instance,
-                        args,
-                        kwargs,
+
+def _restore():
+    for owner, name, original, wrapper, present in reversed(_PATCHES):
+        if inspect.getattr_static(owner, name, None) is wrapper:
+            if present:
+                _attempt(
+                    lambda owner=owner, name=name, original=original: setattr(
+                        owner, name, original
                     )
-                return self._trace_sync(
-                    _label,
-                    _operation,
-                    wrapped,
-                    instance,
-                    args,
-                    kwargs,
                 )
+            else:
+                _attempt(lambda owner=owner, name=name: delattr(owner, name))
+    _PATCHES.clear()
+    _remove_policies()
 
-            # Use the already imported module object. Importing a dotted private
-            # Weaviate module a second time can re-enter the package's broad
-            # ``weaviate.__init__`` import graph during startup.
-            wrap_function_wrapper(
-                module,
-                f"{spec.class_name}.{operation}",
-                traced,
-            )
-            patched.append((target_class, operation))
-            type(self)._installed_targets[(target_class, operation)] = (
-                inspect.getattr_static(target_class, operation)
-            )
-        return patched
 
-    def activate(self) -> None:
-        """Patch supported Weaviate v4 managers."""
-        cls = type(self)
-        with cls._lock:
-            if self._is_instrumented or not self._tracing_enabled():
+class WeaviateInstrumentor:
+    """Trace native Weaviate v4 sync and async manager operations."""
+
+    name = "weaviate"
+
+    def __init__(self, *, capture_content=True):
+        self._is_instrumented = False
+        self._capture_content = capture_content is True
+
+    def activate(self, *, tracer_provider=None, capture_content=None):
+        global _ENABLED, _CAPTURE_CONTENT, _PROVIDER, _ACTIVATION_COUNT
+        setting = (
+            self._capture_content
+            if capture_content is None
+            else capture_content is True
+        )
+        with _LOCK:
+            if self._is_instrumented or not _tracing_enabled():
                 return
-            if cls._patches_applied:
-                if cls._capture_content_config != self._capture_content:
-                    raise ValueError(
-                        "Weaviate instrumentation is already active with different capture_content"
-                    )
-                cls._activation_count += 1
+            if _ACTIVATION_COUNT:
+                if tracer_provider is not _PROVIDER or setting is not _CAPTURE_CONTENT:
+                    raise ValueError("Weaviate instrumentation configuration conflict")
+                _ACTIVATION_COUNT += 1
                 self._is_instrumented = True
                 return
-
-            patched_targets: list[tuple[type, str]] = []
+            _PROVIDER = tracer_provider
+            _CAPTURE_CONTENT = setting
             try:
-                for spec in WEAVIATE_PATCH_SPECS:
-                    patched_targets.extend(self._patch_spec(spec))
+                targets = list(_targets())
+                register_native_types()
+                _policy()
+                for owner, name, original, present, operation, asynchronous in targets:
+                    wrapper = _wrap(original, operation, asynchronous)
+                    _PATCHES.append((owner, name, original, wrapper, present))
+                    setattr(owner, name, wrapper)
             except BaseException:
-                for target_class, operation in reversed(patched_targets):
-                    if inspect.getattr_static(
-                        target_class,
-                        operation,
-                        None,
-                    ) is cls._installed_targets.get((target_class, operation)):
-                        unwrap(target_class, operation)
-                    cls._installed_targets.pop((target_class, operation), None)
+                _restore()
+                _PROVIDER = None
                 raise
+            _ENABLED = True
+            _ACTIVATION_COUNT = 1
+            self._is_instrumented = True
 
-            self._is_instrumented = bool(patched_targets)
-            cls._patches_applied = self._is_instrumented
-            cls._activation_count = int(self._is_instrumented)
-            cls._patched_targets = patched_targets
-            cls._capture_content_config = (
-                self._capture_content if self._is_instrumented else None
-            )
-            if not self._is_instrumented:
-                logger.warning("Weaviate instrumentation found no supported v4 methods")
-
-    def deactivate(self) -> None:
-        """Remove Weaviate patches after the final active instance stops."""
-        cls = type(self)
-        with cls._lock:
+    def deactivate(self):
+        global _ENABLED, _ACTIVATION_COUNT, _PROVIDER
+        with _LOCK:
             if not self._is_instrumented:
                 return
             self._is_instrumented = False
-            cls._activation_count = max(cls._activation_count - 1, 0)
-            if cls._activation_count:
+            _ACTIVATION_COUNT -= 1
+            if _ACTIVATION_COUNT:
                 return
-            for target_class, operation in reversed(cls._patched_targets):
-                try:
-                    if inspect.getattr_static(
-                        target_class,
-                        operation,
-                        None,
-                    ) is cls._installed_targets.get((target_class, operation)):
-                        unwrap(target_class, operation)
-                except Exception:
-                    logger.debug(
-                        "Failed to unwrap Weaviate %s.%s",
-                        target_class.__name__,
-                        operation,
-                        exc_info=True,
-                    )
-                finally:
-                    cls._installed_targets.pop((target_class, operation), None)
-            cls._patched_targets = []
-            cls._patches_applied = False
-            cls._capture_content_config = None
+            _ENABLED = False
+            for call in list(_PENDING):
+                _observe(call, lambda call=call: call.finish(completed=False))
+            _restore()
+            _PROVIDER = None
 
-    def instrument(self) -> None:
-        """OpenTelemetry-style alias for :meth:`activate`."""
-        self.activate()
-
-    def uninstrument(self) -> None:
-        """OpenTelemetry-style alias for :meth:`deactivate`."""
-        self.deactivate()
+    instrument = activate
+    uninstrument = deactivate

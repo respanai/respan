@@ -1,0 +1,9 @@
+{
+  "summary": "Support current Milvus, pgvector, Qdrant, and Weaviate Python APIs with complete sampled content and native lifecycle handling",
+  "packages": {
+    "respan-instrumentation-milvus": "minor",
+    "respan-instrumentation-pgvector": "minor",
+    "respan-instrumentation-qdrant": "minor",
+    "respan-instrumentation-weaviate": "minor"
+  }
+}

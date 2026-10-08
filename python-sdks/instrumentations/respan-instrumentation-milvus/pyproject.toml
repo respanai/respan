@@ -12,14 +12,18 @@ packages = [
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
 respan-tracing = "^2.17.0"
-respan-sdk = ">=2.6.1"
+respan-sdk = ">=2.6.26"
 pymilvus = ">=2.4.1,<4.0.0"
-opentelemetry-semantic-conventions-ai = ">=0.4.1"
+opentelemetry-semantic-conventions-ai = ">=0.5.1"
+opentelemetry-instrumentation-milvus = ">=0.54.0"
+opentelemetry-api = ">=1.38.0"
+opentelemetry-sdk = ">=1.38.0"
+opentelemetry-semantic-conventions = ">=0.59b0"
 wrapt = ">=1.16.0"
 
 [tool.poetry.group.dev.dependencies]
-milvus-lite = "3.2.0"
-pymilvus = "3.0.1"
+milvus-lite = ">=3.2.1,<4"
+pymilvus = ">=2.4.1,<4"
 pytest = ">=8.4.0,<10.0.0"
 
 [tool.poetry.plugins."respan.instrumentations"]

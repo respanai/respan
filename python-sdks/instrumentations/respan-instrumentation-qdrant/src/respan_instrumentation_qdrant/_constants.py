@@ -59,6 +59,15 @@ QDRANT_OPERATIONS = (
     "scroll",
     "search_matrix_offsets",
     "search_matrix_pairs",
+    "search",
+    "search_batch",
+    "search_groups",
+    "recommend",
+    "recommend_batch",
+    "recommend_groups",
+    "discover",
+    "discover_batch",
+    "upload_records",
     "set_payload",
     "update_collection",
     "update_collection_aliases",
@@ -66,16 +75,4 @@ QDRANT_OPERATIONS = (
     "upload_collection",
     "upload_points",
     "upsert",
-)
-
-MAX_ATTRIBUTE_CHARS = 16_000
-MAX_PREVIEW_ITEMS = 64
-MAX_SERIALIZATION_DEPTH = 8
-MAX_STRING_BYTES = 4_000
-SENSITIVE_KEY_PARTS = (
-    "api_key",
-    "authorization",
-    "password",
-    "secret",
-    "token",
 )
