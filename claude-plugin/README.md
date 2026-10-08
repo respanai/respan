@@ -40,8 +40,7 @@ directory, so `respanai/respan` resolves as a marketplace on its own:
     ├── .mcp.json           # connects the hosted MCP server at mcp.respan.ai
     └── skills/
         └── respan/         # GENERATED — do not hand-edit
-            ├── SKILL.md
-            └── references/*.md
+            └── SKILL.md
 ```
 
 > The sibling `cursor-plugin/` packages the same skill for Cursor. Both are
@@ -51,7 +50,7 @@ directory, so `respanai/respan` resolves as a marketplace on its own:
 
 The skill lives in exactly one place: `respan/skills/` at the monorepo root.
 `scripts/build-plugins.mjs` copies it into each plugin's `skills/respan/` at
-build time and prepends the YAML frontmatter a plugin skill needs. This mirrors
+build time, frontmatter included. This mirrors
 the CLI's `generate:skill-refs` step — one skill, assembled into each
 distribution (CLI bundle, this plugin, and the Cursor plugin in
 `../cursor-plugin/`, which uses the identical skill format). **Never edit

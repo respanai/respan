@@ -1,0 +1,6 @@
+{
+  "summary": "The `respan` skill installed by `respan setup` is now a single SKILL.md that links to the Respan docs for each task, with no `references/*.md`. The launched agent now fetches and follows `https://respan.ai/docs/agent-setup.md`.",
+  "packages": {
+    "@respan/cli": "patch"
+  }
+}

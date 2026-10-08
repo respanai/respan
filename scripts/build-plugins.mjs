@@ -8,11 +8,12 @@
 //
 //   node scripts/build-plugins.mjs
 //
-// Both plugins consume the same SKILL.md and the same references/*.md. Claude
-// Code and Cursor agree on the skill format (a `skills/<name>/SKILL.md` with
-// `name` + `description` frontmatter), so the only per-target difference today
-// is the destination directory. Add new targets to TARGETS below.
-import { cpSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+// Every plugin consumes the same SKILL.md, which links to the Respan docs for
+// each task (the content lives in the docs, so there are no references/*.md).
+// Claude Code, Cursor, and ChatGPT agree on the skill format (a
+// `skills/<name>/SKILL.md` with `name` + `description` frontmatter), so the only
+// per-target difference today is the destination directory. Add new targets to TARGETS below.
+import { mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -27,32 +28,15 @@ const TARGETS = [
   join(repoRoot, 'chatgpt-plugin', 'skills', 'respan'), // ChatGPT and Codex
 ];
 
-// The shared SKILL.md carries no YAML frontmatter (the CLI embeds it as raw
-// text). A plugin skill needs a `name` + `description` to be discoverable, so
-// we prepend one here without touching the shared source.
-const FRONTMATTER = `---
-name: respan
-description: >-
-  Respan for LLM observability. Use to set up tracing or the gateway, manage
-  prompts (create/version/deploy), run evals, experiments, and datasets, or
-  work with traces and logs. Trigger for any Respan platform task or when
-  instrumenting an app to send telemetry to Respan.
----
-`;
-
-// SKILL.md gets frontmatter prepended, body preserved exactly.
-const body = readFileSync(join(sharedSkill, 'SKILL.md'), 'utf8');
+// SKILL.md carries its own frontmatter (name + description), so every target
+// gets the same file, byte for byte.
+const skillMd = readFileSync(join(sharedSkill, 'SKILL.md'), 'utf8');
 
 for (const destSkill of TARGETS) {
   rmSync(destSkill, { recursive: true, force: true });
   mkdirSync(destSkill, { recursive: true });
 
-  // references/*.md are copied verbatim — SKILL.md links to them relatively.
-  cpSync(join(sharedSkill, 'references'), join(destSkill, 'references'), {
-    recursive: true,
-  });
-
-  writeFileSync(join(destSkill, 'SKILL.md'), FRONTMATTER + '\n' + body);
+  writeFileSync(join(destSkill, 'SKILL.md'), skillMd);
 
   console.log(`Built plugin skill -> ${destSkill}`);
 }
