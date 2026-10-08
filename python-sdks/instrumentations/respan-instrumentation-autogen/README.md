@@ -1,162 +1,111 @@
 # respan-instrumentation-autogen
 
-Respan instrumentation for modern AutoGen AgentChat and the legacy `autogen`
-API. The default `AutoGenInstrumentor()` wraps OpenInference's AgentChat
-instrumentor. Select `AutoGenInstrumentor(api="legacy")` for legacy
-`ConversableAgent`, `AssistantAgent`, `UserProxyAgent`, and `GroupChat` workflows.
-Both paths translate OpenInference spans into Respan's canonical attributes.
+Trace AutoGen AgentChat assistants, teams, tools and OpenAI model clients with
+Respan. Select `api="legacy"` for the separately supported `autogen` namespace.
+The adapter uses OpenInference's serializers and content configuration, and owns
+reversible SDK method wrappers that preserve iterator context and lifecycle.
 
-## Configuration
-
-### 1. Install
+## Install and use
 
 ```bash
 pip install respan-ai respan-instrumentation-autogen
 ```
 
-### 2. Set Environment Variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `RESPAN_API_KEY` | Yes | Your Respan API key. Authenticates gateway requests and trace export. |
-| `RESPAN_BASE_URL` | No | Defaults to `https://api.respan.ai/api`. |
-| `RESPAN_MODEL` | No | Defaults to `gpt-4o-mini`. |
-
-## Quickstart
-
 ```python
 import asyncio
 import os
-
-from dotenv import load_dotenv
-
-load_dotenv()
-
 from autogen_agentchat.agents import AssistantAgent
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 from respan import Respan
 from respan_instrumentation_autogen import AutoGenInstrumentor
 
-respan_api_key = os.environ["RESPAN_API_KEY"]
-respan_base_url = os.getenv("RESPAN_BASE_URL", "https://api.respan.ai/api")
-respan_model = os.getenv("RESPAN_MODEL", "gpt-4o-mini")
-
-respan = Respan(
-    api_key=respan_api_key,
-    base_url=respan_base_url,
+runtime = Respan(
+    api_key=os.environ["RESPAN_API_KEY"],
+    is_auto_instrument=False,
     instrumentations=[AutoGenInstrumentor()],
 )
 
-model_client = OpenAIChatCompletionClient(
-    model=respan_model,
-    api_key=respan_api_key,
-    base_url=respan_base_url,
-)
 
-
-async def main() -> None:
-    agent = AssistantAgent(
-        name="assistant",
-        model_client=model_client,
-        system_message="You are a helpful assistant.",
+async def main():
+    model = OpenAIChatCompletionClient(
+        model="gpt-4o-mini", api_key=os.environ["OPENAI_API_KEY"]
     )
-    result = await agent.run(task="Write one sentence about recursive functions.")
-    print(result.messages[-1].content)
-    await model_client.close()
-    respan.flush()
+    try:
+        result = await AssistantAgent("assistant", model_client=model).run(
+            task="Explain tracing in one sentence."
+        )
+        print(result.messages[-1].content)
+    finally:
+        await model.close()
+        runtime.shutdown()
 
 
 asyncio.run(main())
 ```
 
-## Legacy `autogen` (Agent-E and auto-news)
+Provider credentials and trace-export credentials are configured separately.
+Configure `base_url` on the model client when using a provider-compatible endpoint.
 
-Select the extra matching the application's installed SDK. The distributions
-share the `autogen` import namespace; do not combine the two extras in one
-environment. Modern AgentChat dependencies remain installed for compatibility
-with existing users, but legacy mode does not activate the AgentChat patches.
+## Compatibility and coverage
+
+- Microsoft AutoGen AgentChat/Core/Ext **0.5.1 through 0.7.5**, with matching
+  AgentChat/Ext versions and OpenInference AgentChat **0.1.21** or compatible 0.1.x.
+- Declared AutoGen 0.4.0 support was not resolvable: every published OI AgentChat
+  release requires AutoGen >=0.5.0, and its current runtime check requires >=0.5.1.
+  The package now declares that verified floor instead of an untestable range.
+- Assistants retain native `TaskResult`/`Response` and structured output types.
+  Completed agent spans end before `run()` returns. Teams retain their logical
+  agent/model/tool hierarchy while duplicate Core message-bus spans are filtered.
+- OpenAI/Azure OpenAI `create` and `create_stream` preserve arguments, result
+  identity and streaming chunks. Streams expose `__anext__`, `asend`, `athrow`
+  and `aclose`, bind their creation context, close underlying SDK generators and
+  do not leave the consumer inside an instrumentation span.
+- Tools retain real call IDs, complete schemas, zero/false results, failure state
+  and tool-result history. Latest `AgentTool` nested calls are covered; that API
+  is absent from the minimum SDK.
+- Actual usage is retained; missing/invalid counts are omitted. Error responses
+  are never invented. Errors use OTel status plus canonical error fields; actual
+  OpenAI HTTP response status is preserved without top-level shortcut aliases.
+- AgentChat has no embedding client boundary. Configure the provider or vector
+  database's instrumentor for embedding/memory operations. Other provider model
+  clients require their own provider instrumentation for model-call spans.
+
+`TRACELOOP_TRACE_CONTENT=false`, the runtime content context, and OpenInference
+`TraceConfig` are respected. Stream privacy is captured when the iterator is
+created, even when consumed later. OTel suppression is scoped. Multiple owners
+share patches and processors until the last deactivation; conflicting owner
+settings raise `ValueError`. Foreign wrappers are preserved and old owned
+wrappers become inert. Activation failures restore partial patches.
+
+## Legacy autogen
+
+The extras intentionally preserve the old APIs; they do not select the latest
+packages named `pyautogen` or `autogen`. Microsoft no longer publishes the newer
+`pyautogen` namespace. These distributions share `import autogen`; install only
+one family per environment.
 
 ```bash
-# auto-news's exact pin requires Python 3.11 (pyautogen 0.2.2 requires <3.12).
+# Exact pyautogen 0.2.2 minimum requires Python 3.11.
 pip install respan-ai 'respan-instrumentation-autogen[legacy-pyautogen]' \
-  'pyautogen==0.2.2' 'openai==1.109.1' respan-instrumentation-openai
+  'pyautogen==0.2.2' 'openai==1.109.1'
 
-# In a separate environment, for Agent-E's autogen 0.7 API:
+# Separate environment: autogen 0.7 is a matching pyautogen metapackage.
 pip install respan-ai 'respan-instrumentation-autogen[legacy-autogen]' \
-  'autogen==0.7.6' 'openai==1.109.1' respan-instrumentation-openai
+  'autogen==0.7.6' 'openai==1.109.1'
 ```
 
-`AutoGenInstrumentor()` continues to target modern AgentChat; select
-`api="legacy"` explicitly. Legacy mode records sync and async chat,
-reply, and function execution spans. Add the provider's instrumentor to record
-actual LLM requests, responses, model names, and usage. A function result is
-always tool content, including results containing an `assistant` role.
+Use `AutoGenInstrumentor(api="legacy")`. The supported families remain
+`pyautogen>=0.2.2,<0.3` and `autogen>=0.7,<0.8`. Sync/async chats, replies,
+GroupChat and function execution use the upstream AG2 wrappers with legacy
+argument/result adaptation. Native return values, including `None` from
+pyautogen 0.2.2 chats, are unchanged. Function results are tool content even when
+containing an `assistant` role. Compose a provider instrumentor for actual
+legacy model-call spans.
 
-```python
-import os
+Run the requirements files in `tests/` in separate environments. Real SDK
+fixtures cover both legacy families with OpenAI 1.109.1 and OI AG2 0.1.11;
+provider roundtrips use deterministic HTTP transports. Full application-specific
+dependency pins must still resolve independently.
 
-from autogen import AssistantAgent, UserProxyAgent
-from respan import Respan
-from respan_instrumentation_autogen import AutoGenInstrumentor
-from respan_instrumentation_openai import OpenAIInstrumentor
-
-respan = Respan(
-    api_key=os.environ["RESPAN_API_KEY"],
-    is_auto_instrument=False,
-    instrumentations=[AutoGenInstrumentor(api="legacy"), OpenAIInstrumentor()],
-)
-assistant = AssistantAgent(
-    "assistant",
-    llm_config={
-        "model": "gpt-4o-mini",
-        "api_key": os.environ["OPENAI_API_KEY"],
-        "cache_seed": None,
-    },
-)
-user = UserProxyAgent(
-    "user",
-    llm_config=False,
-    human_input_mode="NEVER",
-    code_execution_config=False,
-    max_consecutive_auto_reply=0,
-)
-user.initiate_chat(assistant, message="Write one sentence about the news.")
-respan.flush()
-```
-
-The same setup supports `await user.a_initiate_chat(...)`. Respan's runtime
-propagates context into AutoGen's executor threads so provider spans stay under
-their calling agent. Return values remain the SDK's own values, including
-`None` from pyautogen 0.2.2 chats. The adapter also preserves function failure
-results and marks their tool spans as errors.
-
-The legacy dependency contract is `pyautogen>=0.2.2,<0.3` or
-`autogen>=0.7,<0.8`. Real SDK fixtures cover pyautogen 0.2.2 (auto-news) and
-autogen 0.7.6 (Agent-E's API family), with OpenAI 1.109.1 and OpenInference AG2
-0.1.6. These are integration compatibility tests, not full application runs.
-For example, Agent-E's separate `pydantic==2.6.2` pin must still be reconciled
-with the application's Respan SDK dependency before installing the full app.
-
-## Offline compatibility tests
-
-Run each legacy requirements file in its own virtual environment. Use Python
-3.11 for the exact pyautogen 0.2.2 fixture:
-
-```bash
-pip install -e . -r tests/requirements-legacy-pyautogen.txt
-python -m pytest tests -q
-
-# Separate environment:
-pip install -e . -r tests/requirements-legacy-autogen.txt
-python -m pytest tests -q
-```
-
-The fixtures execute the installed SDK's chats, GroupChat dispatch, synchronous
-and asynchronous functions, error paths, suppression, and repeated activation.
-The model roundtrip uses the actual legacy OpenAI wrapper and OpenAI client
-with a deterministic HTTP transport; no API keys or model service are needed.
-
-## Further Reading
-
-See the [Respan example projects](https://github.com/respanai/respan-example-projects)
-for runnable scripts.
+The paired [AutoGen examples](https://github.com/respanai/respan-example-projects/tree/main/python/tracing/autogen)
+cover the modern suite and both legacy environments without provider network calls.

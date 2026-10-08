@@ -3,15 +3,16 @@
 import hashlib
 import json
 import logging
+from threading import RLock
 from typing import Any
 from uuid import UUID
 
-from opentelemetry import trace
-from opentelemetry.semconv.resource import ResourceAttributes
-from opentelemetry.semconv_ai import SpanAttributes as TLSpanAttributes
-from opentelemetry.sdk.trace.export import SpanProcessor
-from opentelemetry.trace import SpanContext
 from openinference.semconv.trace import SpanAttributes as OISpanAttributes
+from opentelemetry import trace
+from opentelemetry.sdk.trace.export import SpanProcessor
+from opentelemetry.semconv.attributes.service_attributes import SERVICE_NAME
+from opentelemetry.semconv_ai import SpanAttributes as TLSpanAttributes
+from opentelemetry.trace import SpanContext
 from respan_instrumentation_openinference import OpenInferenceTranslator
 from respan_sdk.constants.span_attributes import (
     RESPAN_CUSTOMER_PARAMS_ID,
@@ -28,13 +29,9 @@ from respan_tracing.core.tracer import RespanTracer
 logger = logging.getLogger(__name__)
 
 AGENTSPEC_INSTRUMENTATION_NAME = "agentspec"
-_ORIGINAL_ON_LLM_END_ATTR = "_respan_original_on_llm_end"
-_ORIGINAL_ON_LLM_END_ASYNC_ATTR = "_respan_original_on_llm_end_async"
-_USAGE_PATCHED_ATTR = "_respan_usage_patched"
-TRACELOOP_WORKFLOW_NAME = TLSpanAttributes.TRACELOOP_WORKFLOW_NAME
-TRACELOOP_ENTITY_INPUT = TLSpanAttributes.TRACELOOP_ENTITY_INPUT
-TRACELOOP_ENTITY_OUTPUT = TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT
-OI_SESSION_ID = OISpanAttributes.SESSION_ID
+_LOCK = RLock()
+_OWNER = None
+_OWNERS = 0
 PROMPT_PREFIX = f"{TLSpanAttributes.LLM_PROMPTS}."
 COMPLETION_PREFIX = f"{TLSpanAttributes.LLM_COMPLETIONS}."
 
@@ -60,13 +57,9 @@ _OFF_CONTRACT_ALIASES = {
 
 
 def _coerce_token_count(value: Any) -> int | None:
-    if value is None or isinstance(value, bool):
-        return None
-    try:
-        token_count = int(value)
-    except (TypeError, ValueError):
-        return None
-    return token_count if token_count >= 0 else None
+    from ._callbacks import token_count
+
+    return token_count(value)
 
 
 def _first_token_count(mapping: dict[str, Any], *keys: str) -> int | None:
@@ -130,110 +123,15 @@ def _extract_langchain_usage(response: Any) -> tuple[int | None, int | None]:
 
 
 def _patch_agentspec_langgraph_usage() -> None:
-    try:
-        import pyagentspec.adapters.langgraph.tracing as agentspec_tracing
-    except ImportError:
-        return
+    from ._callbacks import install
 
-    handler_class = getattr(
-        agentspec_tracing,
-        "AgentSpecLlmCallbackHandler",
-        None,
-    ) or getattr(agentspec_tracing, "AgentSpecCallbackHandler", None)
-    if handler_class is None or getattr(handler_class, _USAGE_PATCHED_ATTR, False):
-        return
-
-    original_on_llm_end = getattr(handler_class, "on_llm_end", None)
-    original_on_llm_end_async = getattr(handler_class, "on_llm_end_async", None)
-
-    if original_on_llm_end is None and original_on_llm_end_async is None:
-        return
-
-    def build_response_event(self, response, run_id_str):
-        span = self.agentspec_spans_registry.get(run_id_str)
-        if not isinstance(span, agentspec_tracing.AgentSpecLlmGenerationSpan):
-            raise RuntimeError("LLM span not started; on_chat_model_start must run first")
-
-        message_id, content, tool_calls = (
-            agentspec_tracing._extract_message_content_and_tool_calls(response)
-        )
-        input_tokens, output_tokens = _extract_langchain_usage(response)
-        event = agentspec_tracing.AgentSpecLlmGenerationResponse(
-            llm_config=self.llm_config,
-            request_id=run_id_str,
-            completion_id=message_id,
-            content=content,
-            tool_calls=tool_calls,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-        )
-        return span, event
-
-    def on_llm_end(self, response, *, run_id, parent_run_id=None, **kwargs):
-        del parent_run_id, kwargs
-        run_id_str = str(run_id)
-        span, event = build_response_event(self, response, run_id_str)
-        self._add_event(run_id_str, span, event)
-        self._end_span(run_id_str, span)
-        self.agentspec_spans_registry.pop(run_id_str, None)
-        self.messages_in_process.pop(run_id_str, None)
-
-    async def on_llm_end_async(
-        self,
-        response,
-        *,
-        run_id,
-        parent_run_id=None,
-        **kwargs,
-    ):
-        del parent_run_id, kwargs
-        run_id_str = str(run_id)
-        span, event = build_response_event(self, response, run_id_str)
-        await self._add_event_async(run_id_str, span, event)
-        await self._end_span_async(run_id_str, span)
-        self.agentspec_spans_registry.pop(run_id_str, None)
-        self.messages_in_process.pop(run_id_str, None)
-
-    if original_on_llm_end is not None:
-        setattr(handler_class, _ORIGINAL_ON_LLM_END_ATTR, original_on_llm_end)
-        handler_class.on_llm_end = on_llm_end
-    if original_on_llm_end_async is not None:
-        setattr(
-            handler_class,
-            _ORIGINAL_ON_LLM_END_ASYNC_ATTR,
-            original_on_llm_end_async,
-        )
-        handler_class.on_llm_end_async = on_llm_end_async
-    setattr(handler_class, _USAGE_PATCHED_ATTR, True)
+    install()
 
 
 def _restore_agentspec_langgraph_usage_patch() -> None:
-    try:
-        import pyagentspec.adapters.langgraph.tracing as agentspec_tracing
-    except ImportError:
-        return
+    from ._callbacks import restore
 
-    handler_class = getattr(
-        agentspec_tracing,
-        "AgentSpecLlmCallbackHandler",
-        None,
-    ) or getattr(agentspec_tracing, "AgentSpecCallbackHandler", None)
-    if handler_class is None or not getattr(handler_class, _USAGE_PATCHED_ATTR, False):
-        return
-
-    original_on_llm_end = getattr(handler_class, _ORIGINAL_ON_LLM_END_ATTR, None)
-    if original_on_llm_end is not None:
-        handler_class.on_llm_end = original_on_llm_end
-        delattr(handler_class, _ORIGINAL_ON_LLM_END_ATTR)
-    original_on_llm_end_async = getattr(
-        handler_class,
-        _ORIGINAL_ON_LLM_END_ASYNC_ATTR,
-        None,
-    )
-    if original_on_llm_end_async is not None:
-        handler_class.on_llm_end_async = original_on_llm_end_async
-        delattr(handler_class, _ORIGINAL_ON_LLM_END_ASYNC_ATTR)
-    setattr(handler_class, _USAGE_PATCHED_ATTR, False)
+    restore()
 
 
 def _trace_id_from_session_id(session_id: Any) -> int | None:
@@ -258,7 +156,7 @@ def _has_content(value: Any) -> bool:
 
 
 def _parse_structured_value(value: Any) -> Any:
-    if not isinstance(value, str):
+    if not isinstance(value, str) or not value.lstrip().startswith(("{", "[")):
         return value
     try:
         return json.loads(value)
@@ -308,6 +206,7 @@ class _TranslatedProcessorChain(SpanProcessor):
         self._processors = processors
         self._workflow_name = workflow_name
         self._trace_state: dict[int, dict[str, Any]] = {}
+        self._lock = RLock()
 
     @staticmethod
     def _replace_trace_id(context: Any, trace_id: int) -> SpanContext:
@@ -325,7 +224,9 @@ class _TranslatedProcessorChain(SpanProcessor):
         if attributes is None or not callable(get_span_context):
             return None
 
-        trace_id = _trace_id_from_session_id(attributes.get(OI_SESSION_ID))
+        trace_id = _trace_id_from_session_id(
+            attributes.get(OISpanAttributes.SESSION_ID)
+        )
         if trace_id is None:
             return None
 
@@ -344,28 +245,28 @@ class _TranslatedProcessorChain(SpanProcessor):
             return False
 
         attrs = dict(attributes)
-        state = self._trace_state.setdefault(trace_id, {})
+        span_id = span.get_span_context().span_id
+        trace_state = self._trace_state.setdefault(trace_id, {})
+        state = trace_state.setdefault(span_id, {})
         log_type = attrs.get(RESPAN_LOG_TYPE)
         is_root = getattr(span, "parent", None) is None
 
-        input_value = attrs.get(TRACELOOP_ENTITY_INPUT)
-        output_value = attrs.get(TRACELOOP_ENTITY_OUTPUT)
+        input_value = attrs.get(TLSpanAttributes.TRACELOOP_ENTITY_INPUT)
+        output_value = attrs.get(TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT)
         if log_type == "chat":
-            if not _has_content(input_value):
-                prompt_messages = _indexed_messages(attrs, PROMPT_PREFIX)
-                if prompt_messages:
-                    input_value = json.dumps(prompt_messages, separators=(",", ":"))
-                    attrs[TRACELOOP_ENTITY_INPUT] = input_value
-            if not _has_content(output_value):
-                completion_messages = _indexed_messages(attrs, COMPLETION_PREFIX)
-                if completion_messages:
-                    output_payload: Any = (
-                        completion_messages[0]
-                        if len(completion_messages) == 1
-                        else completion_messages
-                    )
-                    output_value = json.dumps(output_payload, separators=(",", ":"))
-                    attrs[TRACELOOP_ENTITY_OUTPUT] = output_value
+            prompt_messages = _indexed_messages(attrs, PROMPT_PREFIX)
+            if prompt_messages:
+                input_value = json.dumps(prompt_messages, separators=(",", ":"))
+                attrs[TLSpanAttributes.TRACELOOP_ENTITY_INPUT] = input_value
+            completion_messages = _indexed_messages(attrs, COMPLETION_PREFIX)
+            if completion_messages:
+                output_payload: Any = (
+                    completion_messages[0]
+                    if len(completion_messages) == 1
+                    else completion_messages
+                )
+                output_value = json.dumps(output_payload, separators=(",", ":"))
+                attrs[TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT] = output_value
             if _has_content(input_value) and "input" not in state:
                 state["input"] = input_value
             if _has_content(output_value):
@@ -379,17 +280,51 @@ class _TranslatedProcessorChain(SpanProcessor):
             if key.startswith(f"{RESPAN_METADATA}."):
                 propagation[key] = value
 
-        if log_type == "agent" or is_root:
+        if log_type in {"agent", "workflow"} or is_root:
             if not _has_content(input_value) and "input" in state:
-                attrs[TRACELOOP_ENTITY_INPUT] = state["input"]
+                attrs[TLSpanAttributes.TRACELOOP_ENTITY_INPUT] = state["input"]
             if not _has_content(output_value) and "output" in state:
-                attrs[TRACELOOP_ENTITY_OUTPUT] = state["output"]
+                attrs[TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT] = state["output"]
         if is_root:
             for key, value in propagation.items():
                 attrs.setdefault(key, value)
 
+        if not getattr(span, "_respan_agentspec_capture", True):
+            for key in list(attrs):
+                if key in {
+                    TLSpanAttributes.TRACELOOP_ENTITY_INPUT,
+                    TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+                    TLSpanAttributes.LLM_REQUEST_FUNCTIONS,
+                } or key.startswith((PROMPT_PREFIX, COMPLETION_PREFIX)):
+                    attrs.pop(key, None)
+        # Raw AgentSpec dumps can include full agent configuration and sensitive
+        # fields. Export only normalized namespaces, never that vendor payload.
+        if log_type:
+            attrs = {
+                key: value
+                for key, value in attrs.items()
+                if key.startswith(
+                    ("gen_ai.", "llm.", "traceloop.", "respan.", "error.", "http.")
+                )
+            }
         for key in _OFF_CONTRACT_ALIASES:
             attrs.pop(key, None)
+        parent = getattr(span, "parent", None)
+        if parent is not None:
+            parent_state = trace_state.setdefault(parent.span_id, {})
+            for key in ("input", "output"):
+                value = attrs.get(
+                    TLSpanAttributes.TRACELOOP_ENTITY_INPUT
+                    if key == "input"
+                    else TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT
+                )
+                if _has_content(value):
+                    if key == "input":
+                        parent_state.setdefault(key, value)
+                    else:
+                        parent_state[key] = value
+            parent_state.setdefault("propagation", {}).update(propagation)
+        trace_state.pop(span_id, None)
 
         span._attributes = attrs
         return is_root
@@ -400,13 +335,15 @@ class _TranslatedProcessorChain(SpanProcessor):
 
         attributes = getattr(span, "_attributes", None)
         if attributes is not None:
-            if attributes.get(TRACELOOP_WORKFLOW_NAME) is None:
-                attributes[TRACELOOP_WORKFLOW_NAME] = self._workflow_name
+            if attributes.get(TLSpanAttributes.TRACELOOP_WORKFLOW_NAME) is None:
+                attributes[TLSpanAttributes.TRACELOOP_WORKFLOW_NAME] = (
+                    self._workflow_name
+                )
             return
 
         set_attribute = getattr(span, "set_attribute", None)
         if callable(set_attribute):
-            set_attribute(TRACELOOP_WORKFLOW_NAME, self._workflow_name)
+            set_attribute(TLSpanAttributes.TRACELOOP_WORKFLOW_NAME, self._workflow_name)
 
     def on_start(self, span, parent_context=None) -> None:
         self._normalize_trace_id(span)
@@ -418,7 +355,11 @@ class _TranslatedProcessorChain(SpanProcessor):
         trace_id = self._normalize_trace_id(span)
         self._set_workflow_name(span)
         self._translator.on_end(span)
-        is_root = self._enrich_span_contract(span, trace_id)
+        span._attributes.update(getattr(span, "_respan_agentspec_extra", {}))
+        with self._lock:
+            is_root = self._enrich_span_contract(span, trace_id)
+        if hasattr(span, "_events"):
+            span._events = ()
         for processor in self._processors:
             processor.on_end(span=span)
         if is_root and trace_id is not None:
@@ -427,7 +368,7 @@ class _TranslatedProcessorChain(SpanProcessor):
     def shutdown(self) -> None:
         # This chain borrows processors owned by the active tracer provider.
         # AgentSpec deactivation must not shut down Respan's global pipeline.
-        return None
+        self._trace_state.clear()
 
     def force_flush(self, timeout_millis: int = 30000) -> bool:
         results = []
@@ -470,6 +411,8 @@ class AgentSpecInstrumentor:
         self._workflow_name = workflow_name
         self._trace = None
         self._is_instrumented = False
+        self._processor = None
+        self._provider = None
 
     @staticmethod
     def _is_respan_tracing_enabled() -> bool:
@@ -483,10 +426,32 @@ class AgentSpecInstrumentor:
         attributes = getattr(resource, "attributes", None)
         if not attributes:
             return None
-        workflow_name = attributes.get(ResourceAttributes.SERVICE_NAME)
-        return workflow_name if isinstance(workflow_name, str) and workflow_name else None
+        workflow_name = attributes.get(SERVICE_NAME)
+        return (
+            workflow_name if isinstance(workflow_name, str) and workflow_name else None
+        )
 
     def activate(self) -> None:
+        global _OWNER, _OWNERS
+        with _LOCK:
+            if self._is_instrumented:
+                return
+            if _OWNER is not None:
+                if (self._mask_sensitive_information, self._workflow_name) != (
+                    _OWNER._mask_sensitive_information,
+                    _OWNER._workflow_name,
+                ) or trace.get_tracer_provider() is not _OWNER._provider:
+                    raise ValueError(
+                        "Active AgentSpec instrumentors must share provider and configuration"
+                    )
+                self._is_instrumented = True
+                _OWNERS += 1
+                return
+            self._activate()
+            if self._is_instrumented:
+                _OWNER, _OWNERS = self, 1
+
+    def _activate(self) -> None:
         """Instrument AgentSpec via OpenInference and Respan's translator."""
         if self._is_instrumented:
             return
@@ -498,9 +463,11 @@ class AgentSpecInstrumentor:
             return
 
         try:
-            from openinference.instrumentation.agentspec import OpenInferenceSpanProcessor
-            from pyagentspec.tracing.trace import Trace, get_trace
+            from openinference.instrumentation.agentspec import (
+                OpenInferenceSpanProcessor,
+            )
             from pyagentspec.tracing.spans import RootSpan
+            from pyagentspec.tracing.trace import Trace, get_trace
         except ImportError as exc:
             logger.warning(
                 "Failed to activate AgentSpec instrumentation - missing dependency: %s",
@@ -514,12 +481,15 @@ class AgentSpecInstrumentor:
             )
             return
 
+        from pyagentspec.tracing.spans import span as native_spans
+
+        previous_stack = native_spans.get_active_span_stack()
         try:
             _patch_agentspec_langgraph_usage()
             tracer_provider = trace.get_tracer_provider()
             resource = getattr(tracer_provider, "resource", None)
-            workflow_name = (
-                self._workflow_name or self._workflow_name_from_resource(resource)
+            workflow_name = self._workflow_name or self._workflow_name_from_resource(
+                resource
             )
             translator = OpenInferenceTranslator()
             processors = tuple(
@@ -532,11 +502,17 @@ class AgentSpecInstrumentor:
                 processors=processors,
                 workflow_name=workflow_name,
             )
-            agentspec_processor = OpenInferenceSpanProcessor(
+            from ._processor import make_processor
+
+            agentspec_processor = make_processor(
+                OpenInferenceSpanProcessor,
+                provider=tracer_provider,
                 otel_span_processor=processor_chain,
                 resource=resource,
                 mask_sensitive_information=self._mask_sensitive_information,
             )
+            self._processor = agentspec_processor
+            self._provider = tracer_provider
             self._trace = Trace(
                 name=workflow_name,
                 root_span=RootSpan(name=workflow_name) if workflow_name else None,
@@ -547,18 +523,36 @@ class AgentSpecInstrumentor:
             self._is_instrumented = True
             logger.info("AgentSpec instrumentation activated")
         except Exception:
+            from pyagentspec.tracing import trace as native_trace
+
+            if native_trace.get_trace() is self._trace:
+                native_trace._TRACE.set(None)
+                native_spans._ACTIVE_SPAN_STACK.set(previous_stack)
+            _restore_agentspec_langgraph_usage_patch()
+            if self._processor is not None:
+                self._processor.shutdown()
+                self._processor = None
             self._trace = None
             self._is_instrumented = False
             logger.exception("Failed to activate AgentSpec instrumentation")
 
     def deactivate(self) -> None:
-        """Deactivate the instrumentation."""
-        if self._is_instrumented and self._trace is not None:
+        global _OWNER, _OWNERS
+        with _LOCK:
+            if not self._is_instrumented:
+                return
+            self._is_instrumented = False
+            _OWNERS -= 1
+            if _OWNERS:
+                return
+            owner, _OWNER = _OWNER, None
             try:
-                self._trace._end()
-            except Exception:
-                logger.exception("Failed to deactivate AgentSpec instrumentation")
-        _restore_agentspec_langgraph_usage_patch()
-        self._trace = None
-        self._is_instrumented = False
-        logger.info("AgentSpec instrumentation deactivated")
+                if owner._trace is not None:
+                    owner._trace._end()
+            finally:
+                if owner._processor is not None:
+                    owner._processor.shutdown()
+                _restore_agentspec_langgraph_usage_patch()
+                owner._trace = None
+                owner._processor = None
+                owner._provider = None

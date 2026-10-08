@@ -35,18 +35,28 @@ class _LegacyChatWrapper(_ChatWrapper):
         @wraps(wrapped)
         def with_result(*call_args: Any, **call_kwargs: Any) -> Any:
             result = wrapped(*call_args, **call_kwargs)
-            recipient = call_kwargs.get("recipient", call_args[0] if call_args else None)
-            return _ChatResult(result, instance, recipient) if result is None else result
+            recipient = call_kwargs.get(
+                "recipient", call_args[0] if call_args else None
+            )
+            return (
+                _ChatResult(result, instance, recipient) if result is None else result
+            )
 
         result = super().__call__(with_result, instance, args, kwargs)
         return result.result if isinstance(result, _ChatResult) else result
 
-    async def async_call(self, wrapped: Any, instance: Any, args: Any, kwargs: Any) -> Any:
+    async def async_call(
+        self, wrapped: Any, instance: Any, args: Any, kwargs: Any
+    ) -> Any:
         @wraps(wrapped)
         async def with_result(*call_args: Any, **call_kwargs: Any) -> Any:
             result = await wrapped(*call_args, **call_kwargs)
-            recipient = call_kwargs.get("recipient", call_args[0] if call_args else None)
-            return _ChatResult(result, instance, recipient) if result is None else result
+            recipient = call_kwargs.get(
+                "recipient", call_args[0] if call_args else None
+            )
+            return (
+                _ChatResult(result, instance, recipient) if result is None else result
+            )
 
         result = await super().async_call(with_result, instance, args, kwargs)
         return result.result if isinstance(result, _ChatResult) else result
@@ -55,7 +65,10 @@ class _LegacyChatWrapper(_ChatWrapper):
 class _LegacyReplyWrapper(_ReplyWrapper):
     def _span(self, instance: Any, method: str, bound: Any) -> Any:
         if bound.get("messages") is None:
-            bound = {**bound, "messages": instance.chat_messages.get(bound.get("sender"), [])}
+            bound = {
+                **bound,
+                "messages": instance.chat_messages.get(bound.get("sender"), []),
+            }
         return super()._span(instance, method, bound)
 
 
@@ -89,7 +102,9 @@ class LegacyAutoGenInstrumentor(AG2Instrumentor):
 
     def _check_dependency_conflicts(self) -> Any:
         requirements = ("pyautogen>=0.2.2,<0.3", "autogen>=0.7,<0.8")
-        conflicts = [get_dependency_conflicts([requirement]) for requirement in requirements]
+        conflicts = [
+            get_dependency_conflicts([requirement]) for requirement in requirements
+        ]
         return None if any(conflict is None for conflict in conflicts) else conflicts[0]
 
     def _instrument(self, **kwargs: Any) -> None:
@@ -97,7 +112,9 @@ class LegacyAutoGenInstrumentor(AG2Instrumentor):
         from autogen import ConversableAgent
 
         if AG2Instrumentor().is_instrumented_by_opentelemetry:
-            raise RuntimeError("Deactivate the existing AG2 instrumentor before activating legacy AutoGen")
+            raise RuntimeError(
+                "Deactivate the existing AG2 instrumentor before activating legacy AutoGen"
+            )
 
         installed = []
         for distribution in ("pyautogen", "autogen", "ag2"):
@@ -135,12 +152,16 @@ class LegacyAutoGenInstrumentor(AG2Instrumentor):
             "execute_function": tool,
             "a_execute_function": tool.async_call,
         }
-        self._original_methods = {name: getattr_static(ConversableAgent, name) for name in wrappers}
+        self._original_methods = {
+            name: getattr_static(ConversableAgent, name) for name in wrappers
+        }
         self._installed_methods = {}
         self._generation = {"enabled": False}
         try:
             for name, wrapper in wrappers.items():
-                wrap_function_wrapper(ConversableAgent, name, _gate(wrapper, self._generation))
+                wrap_function_wrapper(
+                    ConversableAgent, name, _gate(wrapper, self._generation)
+                )
                 self._installed_methods[name] = getattr_static(ConversableAgent, name)
             self._generation["enabled"] = True
         except BaseException:
@@ -156,7 +177,9 @@ class LegacyAutoGenInstrumentor(AG2Instrumentor):
         if generation := getattr(self, "_generation", None):
             generation["enabled"] = False
         for name, original in getattr(self, "_original_methods", {}).items():
-            if getattr_static(ConversableAgent, name) is self._installed_methods.get(name):
+            if getattr_static(ConversableAgent, name) is self._installed_methods.get(
+                name
+            ):
                 setattr(ConversableAgent, name, original)
         self._original_methods = {}
         self._installed_methods = {}

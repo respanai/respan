@@ -1,18 +1,17 @@
-import asyncio
 import logging
 import sys
+from contextvars import ContextVar
 from types import ModuleType, SimpleNamespace
+from typing import ClassVar
 
 import pytest
 from opentelemetry.trace import SpanContext, TraceFlags
-
-from respan_instrumentation_agentspec import AgentSpecInstrumentor
-from respan_instrumentation_agentspec import _instrumentation
+from respan_instrumentation_agentspec import AgentSpecInstrumentor, _instrumentation
 from respan_instrumentation_agentspec._instrumentation import (
     AGENTSPEC_INSTRUMENTATION_NAME,
-    _TranslatedProcessorChain,
     _extract_langchain_usage,
     _patch_agentspec_langgraph_usage,
+    _TranslatedProcessorChain,
 )
 from respan_sdk.constants.span_attributes import (
     RESPAN_CUSTOMER_PARAMS_ID,
@@ -60,7 +59,7 @@ def _install_fake_modules(monkeypatch):
     active_trace = {"trace": None}
 
     class FakeOpenInferenceSpanProcessor:
-        created = []
+        created: ClassVar[list] = []
 
         def __init__(self, **kwargs):
             self.kwargs = kwargs
@@ -71,7 +70,7 @@ def _install_fake_modules(monkeypatch):
             self.did_shutdown = True
 
     class FakeTrace:
-        created = []
+        created: ClassVar[list] = []
 
         def __init__(self, **kwargs):
             self.kwargs = kwargs
@@ -101,7 +100,9 @@ def _install_fake_modules(monkeypatch):
 
     openinference_module = ModuleType("openinference")
     openinference_instrumentation_module = ModuleType("openinference.instrumentation")
-    openinference_agentspec_module = ModuleType("openinference.instrumentation.agentspec")
+    openinference_agentspec_module = ModuleType(
+        "openinference.instrumentation.agentspec"
+    )
     openinference_agentspec_module.OpenInferenceSpanProcessor = (
         FakeOpenInferenceSpanProcessor
     )
@@ -114,6 +115,10 @@ def _install_fake_modules(monkeypatch):
     pyagentspec_trace_module.Trace = FakeTrace
     pyagentspec_trace_module.get_trace = get_trace
     pyagentspec_spans_module.RootSpan = FakeRootSpan
+    native_spans = ModuleType("pyagentspec.tracing.spans.span")
+    native_spans._ACTIVE_SPAN_STACK = ContextVar("fake_stack", default=())
+    native_spans.get_active_span_stack = native_spans._ACTIVE_SPAN_STACK.get
+    pyagentspec_spans_module.span = native_spans
     pyagentspec_tracing_module.trace = pyagentspec_trace_module
     pyagentspec_tracing_module.spans = pyagentspec_spans_module
     pyagentspec_module.tracing = pyagentspec_tracing_module
@@ -167,6 +172,11 @@ def _install_fake_modules(monkeypatch):
 def reset_tracer():
     RespanTracer.reset_instance()
     yield
+    if _instrumentation._OWNER is not None:
+        _instrumentation._OWNER._is_instrumented = True
+        _instrumentation._OWNERS = 1
+        _instrumentation._OWNER.deactivate()
+    _instrumentation._restore_agentspec_langgraph_usage_patch()
     RespanTracer.reset_instance()
 
 
@@ -294,15 +304,13 @@ def test_translated_processor_chain_preserves_full_trace_id_and_enriches_boundar
         '{"role":"assistant","content":"hi"}'
     )
     for boundary in (agent, root):
-        assert boundary._attributes["traceloop.entity.input"].endswith("hello\"}]")
-        assert boundary._attributes["traceloop.entity.output"].endswith("hi\"}")
+        assert boundary._attributes["traceloop.entity.input"].endswith('hello"}]')
+        assert boundary._attributes["traceloop.entity.output"].endswith('hi"}')
     assert root._attributes[RESPAN_CUSTOMER_PARAMS_ID] == "agentspec-user"
     assert root._attributes[RESPAN_THREADS_ID] == "agentspec-thread"
     assert root._attributes[RESPAN_TRACE_GROUP_ID] == "agentspec-group"
     assert root._attributes[RESPAN_SPAN_CUSTOM_ID] == "agentspec-custom"
-    assert root._attributes[f"{RESPAN_METADATA}.scenario"] == (
-        "propagated_attributes"
-    )
+    assert root._attributes[f"{RESPAN_METADATA}.scenario"] == ("propagated_attributes")
     assert RESPAN_SPAN_TOOLS not in chat._attributes
     assert "tools" not in chat._attributes
     assert chain._trace_state == {}
@@ -343,119 +351,31 @@ def test_extract_langchain_usage_from_llm_output_token_usage():
     assert _extract_langchain_usage(response) == (12, 5)
 
 
-def test_patch_agentspec_langgraph_usage_adds_tokens_to_sync_and_async_events(
-    monkeypatch,
-):
-    class FakeSpan:
-        def __init__(self):
-            self.events = []
-            self.did_end = False
+def test_callback_wrapper_preserves_native_return_and_usage_scope(monkeypatch):
+    import pyagentspec.adapters.langgraph.tracing as module
+    from respan_instrumentation_agentspec._callbacks import _CAPTURE
 
-    class FakeResponseEvent:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-
-    class FakeCallbackHandler:
-        def __init__(self):
-            self.llm_config = "fake-llm-config"
-            self.agentspec_spans_registry = {"run-1": FakeSpan()}
-            self.messages_in_process = {"run-1": object()}
-
-        def _add_event(self, run_id_str, span, event):
-            span.events.append((run_id_str, event))
-
-        def _end_span(self, run_id_str, span):
-            span.did_end = True
-
-        async def _add_event_async(self, run_id_str, span, event):
-            self._add_event(run_id_str, span, event)
-
-        async def _end_span_async(self, run_id_str, span):
-            self._end_span(run_id_str, span)
-
-        def on_llm_end(self, response, *, run_id, parent_run_id=None, **kwargs):
-            raise AssertionError("original handler should be replaced")
-
-        async def on_llm_end_async(
-            self,
-            response,
-            *,
-            run_id,
-            parent_run_id=None,
-            **kwargs,
-        ):
-            raise AssertionError("original async handler should be replaced")
-
-    def extract_message_content_and_tool_calls(response):
-        return "message-1", "hello", []
-
-    fake_module = ModuleType("pyagentspec.adapters.langgraph.tracing")
-    fake_module.AgentSpecLlmCallbackHandler = FakeCallbackHandler
-    fake_module.AgentSpecLlmGenerationSpan = FakeSpan
-    fake_module.AgentSpecLlmGenerationResponse = FakeResponseEvent
-    fake_module._extract_message_content_and_tool_calls = (
-        extract_message_content_and_tool_calls
+    cls = getattr(
+        module, "AgentSpecLlmCallbackHandler", module.AgentSpecCallbackHandler
     )
-    fake_pyagentspec = ModuleType("pyagentspec")
-    fake_adapters = ModuleType("pyagentspec.adapters")
-    fake_langgraph = ModuleType("pyagentspec.adapters.langgraph")
-    fake_langgraph.tracing = fake_module
-    fake_adapters.langgraph = fake_langgraph
-    fake_pyagentspec.adapters = fake_adapters
-    monkeypatch.setitem(sys.modules, "pyagentspec", fake_pyagentspec)
-    monkeypatch.setitem(sys.modules, "pyagentspec.adapters", fake_adapters)
-    monkeypatch.setitem(sys.modules, "pyagentspec.adapters.langgraph", fake_langgraph)
-    monkeypatch.setitem(
-        sys.modules,
-        "pyagentspec.adapters.langgraph.tracing",
-        fake_module,
-    )
+    seen = []
+    sentinel = object()
 
+    def original(self, response, **kwargs):
+        seen.append(_CAPTURE.get())
+        return sentinel
+
+    monkeypatch.setattr(cls, "on_llm_end", original)
     _patch_agentspec_langgraph_usage()
-
-    handler = FakeCallbackHandler()
-    span = handler.agentspec_spans_registry["run-1"]
     response = SimpleNamespace(
-        generations=[
-            [
-                SimpleNamespace(
-                    message=SimpleNamespace(
-                        usage_metadata={
-                            "input_tokens": 7,
-                            "output_tokens": 3,
-                        },
-                        response_metadata={},
-                    )
-                )
-            ]
-        ],
-        llm_output={},
+        generations=[],
+        llm_output={"token_usage": {"prompt_tokens": 0, "completion_tokens": 3}},
     )
-
-    handler.on_llm_end(response, run_id="run-1")
-
-    event = span.events[0][1]
-    assert event.kwargs["input_tokens"] == 7
-    assert event.kwargs["output_tokens"] == 3
-    assert event.kwargs["content"] == "hello"
-    assert span.did_end is True
-    assert handler.agentspec_spans_registry == {}
-    assert handler.messages_in_process == {}
-
-    async_handler = FakeCallbackHandler()
-    async_span = async_handler.agentspec_spans_registry["run-1"]
-    asyncio.run(
-        async_handler.on_llm_end_async(
-            response,
-            run_id="run-1",
-        )
-    )
-
-    async_event = async_span.events[0][1]
-    assert async_event.kwargs["input_tokens"] == 7
-    assert async_event.kwargs["output_tokens"] == 3
-    assert async_span.did_end is True
-    assert async_handler.agentspec_spans_registry == {}
+    assert cls.on_llm_end(SimpleNamespace(), response, run_id="fixture-run") is sentinel
+    assert seen[0]["usage"] == {"input_tokens": 0, "output_tokens": 3}
+    assert seen[0]["response_id"] is None
+    assert seen[0]["finish_reason"] is None
+    assert _CAPTURE.get() is None
 
 
 def test_activate_starts_agentspec_trace_with_translated_processor_chain(monkeypatch):

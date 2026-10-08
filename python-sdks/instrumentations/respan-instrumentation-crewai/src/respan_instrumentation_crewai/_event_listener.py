@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
-from collections.abc import Mapping, Sequence
 import functools
+import json
 import logging
 import threading
-from typing import Any
 import weakref
+from collections import OrderedDict
+from collections.abc import Mapping, Sequence
+from typing import Any, ClassVar
 
 from crewai.events.event_bus import CrewAIEventsBus, crewai_event_bus
+from crewai.events.types import flow_events
 from crewai.events.types.agent_events import (
     AgentExecutionCompletedEvent,
     AgentExecutionErrorEvent,
@@ -52,7 +54,6 @@ from opentelemetry.semconv._incubating.attributes import (
     gen_ai_attributes as GenAIAttributes,
 )
 from opentelemetry.semconv_ai import LLMRequestTypeValues, SpanAttributes
-
 from respan_sdk.constants.llm_logging import (
     LOG_TYPE_AGENT,
     LOG_TYPE_CHAT,
@@ -71,6 +72,13 @@ from respan_instrumentation_crewai._event_assembler import (
     CrewAIEventAssembler,
     SpanEndSpec,
     SpanStartSpec,
+)
+from respan_instrumentation_crewai._policy import (
+    CONTENT_POLICY_ATTRIBUTE,
+    ENABLED_POLICY_ATTRIBUTE,
+    EVENT_CONTENT,
+    TOOL_CALL_ID_ATTRIBUTE,
+    content_allowed,
 )
 from respan_instrumentation_crewai._serialization import (
     json_attribute,
@@ -211,14 +219,9 @@ def _crew_start_spec(source: Any, event: CrewKickoffStartedEvent) -> SpanStartSp
 
 def _task_start_spec(source: Any, event: TaskStartedEvent) -> SpanStartSpec:
     task = _task_from_event(event) or source
-    task_name = (
-        _text(
-            getattr(task, "name", None)
-            or getattr(event, "task_name", None)
-            or getattr(task, "description", None)
-        )
-        or "Task"
-    )
+    # The SDK fills event.task_name from description for unnamed tasks. Keep
+    # that prompt in content fields instead of making it a span identifier.
+    task_name = _text(getattr(task, "name", None)) or "Task"
     task_id = _task_id(event) or _text(getattr(task, "id", None))
     input_value = {
         "description": getattr(task, "description", None),
@@ -275,7 +278,45 @@ def _lite_agent_start_spec(event: LiteAgentExecutionStartedEvent) -> SpanStartSp
     )
 
 
-def _tool_start_spec(event: ToolUsageStartedEvent) -> SpanStartSpec:
+def _tool_call_id(source: Any, event: Any) -> str | None:
+    explicit = _text(getattr(event, "tool_call_id", None))
+    if explicit:
+        return explicit
+    # CrewAgentExecutor exposes its current assistant message. The native tool
+    # event omits the ID, so correlate only an unambiguous exact argument match.
+    messages = getattr(source, "messages", None)
+    if not isinstance(messages, list) or not messages:
+        return None
+    message = next(
+        (
+            item
+            for item in reversed(messages)
+            if isinstance(item, Mapping) and item.get("role") == "assistant"
+        ),
+        None,
+    )
+    if message is None:
+        return None
+    matches = []
+    for call in message.get("tool_calls", ()) or ():
+        if not isinstance(call, Mapping):
+            continue
+        function = call.get("function") or {}
+        arguments = function.get("arguments")
+        try:
+            parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
+        except (ValueError, TypeError):
+            continue
+        if (
+            function.get("name") == event.tool_name
+            and parsed == event.tool_args
+            and call.get("id")
+        ):
+            matches.append(str(call["id"]))
+    return matches[0] if len(matches) == 1 else None
+
+
+def _tool_start_spec(source: Any, event: ToolUsageStartedEvent) -> SpanStartSpec:
     tool_name = _text(getattr(event, "tool_name", None)) or "Tool"
     tool_args = getattr(event, "tool_args", None)
     attributes = _base_attributes(
@@ -284,6 +325,13 @@ def _tool_start_spec(event: ToolUsageStartedEvent) -> SpanStartSpec:
         entity_path=f"tool.{tool_name}",
         input_value={"name": tool_name, "arguments": tool_args},
     )
+    call_id = (
+        getattr(event, TOOL_CALL_ID_ATTRIBUTE)
+        if hasattr(event, TOOL_CALL_ID_ATTRIBUTE)
+        else _tool_call_id(source, event)
+    )
+    if call_id:
+        attributes[GenAIAttributes.GEN_AI_TOOL_CALL_ID] = call_id
     return SpanStartSpec(
         name=_span_name(tool_name, "tool"),
         attributes=attributes,
@@ -378,8 +426,9 @@ class CrewAIEventListener:
     """Own CrewAI event subscriptions and translate them directly to Respan."""
 
     _token_patch_lock = threading.RLock()
-    _token_patch_originals: dict[type[Any], Any] = {}
-    _token_patch_wrappers: dict[type[Any], Any] = {}
+    _token_patch_originals: ClassVar[dict[type[Any], Any]] = {}
+    _token_patch_wrappers: ClassVar[dict[type[Any], Any]] = {}
+    _token_patch_states: ClassVar[dict[type[Any], dict[str, bool]]] = {}
     _token_patch_listeners: weakref.WeakSet[CrewAIEventListener] = weakref.WeakSet()
 
     def __init__(self, tracer_provider: trace.TracerProvider | None = None) -> None:
@@ -395,19 +444,52 @@ class CrewAIEventListener:
         self._usage_by_call_id: OrderedDict[str, dict[str, int]] = OrderedDict()
         self._usage_lock = threading.RLock()
         self._is_shutdown = False
+        self._emit_original = None
+        self._emit_wrapper = None
         try:
+            self._install_emission_policy()
             self._setup_listeners()
             self._install_token_usage_patch()
         except Exception:
             self.shutdown()
             raise
 
+    def _install_emission_policy(self) -> None:
+        original = self._event_bus.emit
+        self._emit_original = original
+
+        @functools.wraps(original)
+        def emit(source, event, *args, **kwargs):
+            if not self._is_shutdown:
+                try:
+                    object.__setattr__(
+                        event, CONTENT_POLICY_ATTRIBUTE, content_allowed()
+                    )
+                    object.__setattr__(
+                        event, ENABLED_POLICY_ATTRIBUTE, is_instrumentation_enabled()
+                    )
+                    if isinstance(event, ToolUsageStartedEvent):
+                        object.__setattr__(
+                            event, TOOL_CALL_ID_ATTRIBUTE, _tool_call_id(source, event)
+                        )
+                except Exception:
+                    logger.debug(
+                        "Could not capture CrewAI emission policy", exc_info=True
+                    )
+            return original(source, event, *args, **kwargs)
+
+        self._emit_wrapper = emit
+        self._event_bus.emit = emit
+
     def _register(self, event_type: type[Any], handler: Any) -> None:
         @functools.wraps(handler)
         def safe_handler(source: Any, event: Any) -> None:
             with self._lifecycle_lock:
-                if self._is_shutdown or not is_instrumentation_enabled():
+                if self._is_shutdown:
                     return
+                token = EVENT_CONTENT.set(
+                    getattr(event, CONTENT_POLICY_ATTRIBUTE, content_allowed())
+                )
                 try:
                     handler(source, event)
                 except Exception:
@@ -415,6 +497,8 @@ class CrewAIEventListener:
                         "Failed to translate CrewAI event %s",
                         getattr(event, "type", type(event).__name__),
                     )
+                finally:
+                    EVENT_CONTENT.reset(token)
 
         registered = self._event_bus.on(event_type)(safe_handler)
         self._handlers.append((event_type, registered))
@@ -439,14 +523,22 @@ class CrewAIEventListener:
             (LLMCallStartedEvent, self._on_llm_started),
             (LLMCallCompletedEvent, self._on_llm_completed),
             (LLMCallFailedEvent, self._on_llm_failed),
-            (FlowStartedEvent, self._on_transparent_started),
-            (FlowFinishedEvent, self._on_transparent_completed),
-            (MethodExecutionStartedEvent, self._on_transparent_started),
-            (MethodExecutionFinishedEvent, self._on_transparent_completed),
-            (MethodExecutionFailedEvent, self._on_transparent_completed),
+            (FlowStartedEvent, self._on_flow_started),
+            (FlowFinishedEvent, self._on_flow_completed),
+            (MethodExecutionStartedEvent, self._on_method_started),
+            (MethodExecutionFinishedEvent, self._on_flow_completed),
+            (MethodExecutionFailedEvent, self._on_flow_failed),
         )
         for event_type, handler in registrations:
             self._register(event_type, handler)
+        for name, handler in (
+            ("FlowFailedEvent", self._on_flow_failed),
+            ("FlowPausedEvent", self._on_flow_completed),
+            ("MethodExecutionPausedEvent", self._on_flow_completed),
+        ):
+            event_type = getattr(flow_events, name, None)
+            if event_type is not None:
+                self._register(event_type, handler)
 
     @staticmethod
     def _token_usage_patch_targets() -> tuple[type[Any], ...]:
@@ -493,25 +585,31 @@ class CrewAIEventListener:
                 if original is None:
                     continue
 
+                state = {"active": True}
+                cls._token_patch_states[target_class] = state
+
                 @functools.wraps(original)
                 def patched(
                     instance: Any,
                     usage_data: Mapping[str, Any],
                     *args: Any,
                     __original: Any = original,
+                    __state: dict[str, bool] = state,
                     **kwargs: Any,
-                ) -> None:
-                    __original(instance, usage_data, *args, **kwargs)
-                    if is_instrumentation_enabled():
-                        cls._notify_token_usage(usage_data)
+                ) -> Any:
+                    result = __original(instance, usage_data, *args, **kwargs)
+                    if __state["active"] and is_instrumentation_enabled():
+                        try:
+                            cls._notify_token_usage(usage_data)
+                        except Exception:
+                            logger.debug(
+                                "Could not capture CrewAI usage", exc_info=True
+                            )
+                    return result
 
                 cls._token_patch_originals[target_class] = original
                 cls._token_patch_wrappers[target_class] = patched
-                setattr(
-                    target_class,
-                    "_track_token_usage_internal",
-                    patched,
-                )
+                target_class._track_token_usage_internal = patched
 
     def _install_token_usage_patch(self) -> None:
         type(self)._install_token_usage_patch_for_listener(self)
@@ -522,6 +620,9 @@ class CrewAIEventListener:
             cls._token_patch_listeners.discard(self)
             if cls._token_patch_listeners:
                 return
+            for state in cls._token_patch_states.values():
+                state["active"] = False
+            cls._token_patch_states.clear()
             for target_class, original in list(cls._token_patch_originals.items()):
                 wrapper = cls._token_patch_wrappers.get(target_class)
                 if (
@@ -533,11 +634,7 @@ class CrewAIEventListener:
                     )
                     is wrapper
                 ):
-                    setattr(
-                        target_class,
-                        "_track_token_usage_internal",
-                        original,
-                    )
+                    target_class._track_token_usage_internal = original
             cls._token_patch_originals.clear()
             cls._token_patch_wrappers.clear()
 
@@ -676,7 +773,7 @@ class CrewAIEventListener:
         )
 
     def _on_tool_started(self, source: Any, event: ToolUsageStartedEvent) -> None:
-        self._assembler.start_span(event, _tool_start_spec(event))
+        self._assembler.start_span(event, _tool_start_spec(source, event))
 
     def _on_tool_completed(
         self,
@@ -685,7 +782,10 @@ class CrewAIEventListener:
     ) -> None:
         self._assembler.end_span(
             event,
-            SpanEndSpec(output=getattr(event, "output", None)),
+            SpanEndSpec(
+                output=getattr(event, "output", None),
+                error=_text(getattr(getattr(event, "failure", None), "message", None)),
+            ),
         )
 
     def _on_tool_failed(self, source: Any, event: ToolUsageErrorEvent) -> None:
@@ -718,6 +818,9 @@ class CrewAIEventListener:
                 self._consume_token_usage(call_id, getattr(event, "usage", None))
             )
         )
+        response_id = _text(getattr(event, "response_id", None))
+        if response_id:
+            attributes[GenAIAttributes.GEN_AI_RESPONSE_ID] = response_id
         finish_reason = _text(getattr(event, "finish_reason", None))
         if finish_reason:
             attributes[SpanAttributes.LLM_RESPONSE_FINISH_REASON] = finish_reason
@@ -738,11 +841,66 @@ class CrewAIEventListener:
             correlation_keys=((correlation_key,) if correlation_key else ()),
         )
 
-    def _on_transparent_started(self, source: Any, event: Any) -> None:
-        self._assembler.open_scope(event)
+    @staticmethod
+    def _is_user_flow(source: Any) -> bool:
+        return not type(source).__module__.startswith(("crewai.", "crewai_core."))
 
-    def _on_transparent_completed(self, source: Any, event: Any) -> None:
-        self._assembler.close_scope(event)
+    def _on_flow_started(self, source: Any, event: Any) -> None:
+        if not self._is_user_flow(source):
+            self._assembler.open_scope(event)
+            return
+        name = _text(event.flow_name) or "Flow"
+        self._assembler.start_span(
+            event,
+            SpanStartSpec(
+                name=_span_name(name, "workflow"),
+                attributes=_base_attributes(
+                    log_type=LOG_TYPE_WORKFLOW,
+                    entity_name=name,
+                    entity_path="",
+                    input_value=getattr(event, "inputs", None),
+                    workflow_name=name,
+                ),
+            ),
+        )
+
+    def _on_method_started(self, source: Any, event: Any) -> None:
+        if not self._is_user_flow(source):
+            self._assembler.open_scope(event)
+            return
+        name = _text(event.method_name) or "method"
+        self._assembler.start_span(
+            event,
+            SpanStartSpec(
+                name=_span_name(name, "task"),
+                attributes=_base_attributes(
+                    log_type=LOG_TYPE_TASK,
+                    entity_name=name,
+                    entity_path=f"flow.{name}",
+                    input_value={
+                        "params": getattr(event, "params", None),
+                        "state": getattr(event, "state", None),
+                    },
+                ),
+            ),
+        )
+
+    def _on_flow_completed(self, source: Any, event: Any) -> None:
+        if not self._is_user_flow(source):
+            self._assembler.close_scope(event)
+            return
+        self._assembler.end_span(
+            event, SpanEndSpec(output=getattr(event, "result", None))
+        )
+
+    def _on_flow_failed(self, source: Any, event: Any) -> None:
+        if not self._is_user_flow(source):
+            self._assembler.close_scope(event)
+            return
+        self._assembler.end_span(
+            event,
+            SpanEndSpec(error=_text(getattr(event, "error", None)) or "Flow failed"),
+        )
 
     def shutdown(self) -> None:
         """Unregister handlers, restore CrewAI, and close unfinished spans."""
@@ -750,6 +908,11 @@ class CrewAIEventListener:
             if self._is_shutdown:
                 return
             self._is_shutdown = True
+            if (
+                self._emit_wrapper is not None
+                and self._event_bus.emit is self._emit_wrapper
+            ):
+                self._event_bus.emit = self._emit_original
             for event_type, handler in self._handlers:
                 try:
                     self._event_bus.off(event_type, handler)

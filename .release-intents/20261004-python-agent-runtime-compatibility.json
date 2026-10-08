@@ -1,0 +1,9 @@
+{
+  "summary": "Support current CrewAI, AutoGen, AgentScope and AgentSpec Python runtimes",
+  "packages": {
+    "respan-instrumentation-crewai": "minor",
+    "respan-instrumentation-autogen": "minor",
+    "respan-instrumentation-agentscope": "minor",
+    "respan-instrumentation-agentspec": "minor"
+  }
+}

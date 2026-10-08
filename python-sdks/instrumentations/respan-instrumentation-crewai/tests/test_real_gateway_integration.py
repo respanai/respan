@@ -1,5 +1,4 @@
 # The API endpoint must be configured before CrewAI imports its provider stack.
-# ruff: noqa: E402
 
 import os
 
@@ -23,13 +22,12 @@ os.environ["OPENAI_BASE_URL"] = respan_base_url
 from crewai import Agent, Crew, Task
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.semconv_ai import SpanAttributes
+from respan_instrumentation_crewai import CrewAIInstrumentor
 from respan_sdk.constants.llm_logging import LOG_TYPE_CHAT
 from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
 from respan_tracing import RespanTelemetry
 from respan_tracing.core.tracer import RespanTracer
 from respan_tracing.testing import InMemorySpanExporter
-
-from respan_instrumentation_crewai import CrewAIInstrumentor
 
 
 def test_real_crewai_gateway_pipeline_exports_spans():

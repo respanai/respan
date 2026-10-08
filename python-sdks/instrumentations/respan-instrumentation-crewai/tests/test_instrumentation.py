@@ -2,9 +2,7 @@ import logging
 import threading
 
 import pytest
-
-from respan_instrumentation_crewai import CrewAIInstrumentor
-from respan_instrumentation_crewai import _event_listener
+from respan_instrumentation_crewai import CrewAIInstrumentor, _event_listener
 from respan_tracing.core.tracer import RespanTracer
 
 
@@ -52,7 +50,7 @@ def test_activate_and_deactivate_are_idempotent(monkeypatch):
     assert CrewAIInstrumentor._active_owner is None
 
 
-def test_only_one_instrumentor_instance_can_subscribe(monkeypatch):
+def test_instances_share_one_subscription_until_final_deactivation(monkeypatch):
     created = []
 
     class FakeListener:
@@ -71,7 +69,11 @@ def test_only_one_instrumentor_instance_can_subscribe(monkeypatch):
 
     assert len(created) == 1
     assert first._is_instrumented is True
-    assert second._is_instrumented is False
+    assert second._is_instrumented is True
+    first.deactivate()
+    assert second._is_instrumented is True
+    second.deactivate()
+    assert CrewAIInstrumentor._active_owner is None
 
 
 def test_activate_skips_when_respan_tracing_is_disabled(monkeypatch, caplog):

@@ -13,6 +13,7 @@ Environment variables:
 """
 
 import os
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -34,7 +35,7 @@ respan = Respan(
     instrumentations=[CrewAIInstrumentor()],
 )
 
-from crewai import Agent, Task, Crew
+from crewai import Agent, Crew, Task
 from crewai.tools import tool
 
 

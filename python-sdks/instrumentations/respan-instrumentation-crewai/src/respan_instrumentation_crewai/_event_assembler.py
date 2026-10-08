@@ -2,25 +2,29 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
 import logging
 import threading
 import time
+from collections import OrderedDict
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from typing import Any
 
 from opentelemetry import context as context_api
 from opentelemetry import trace
 from opentelemetry.context import Context
+from opentelemetry.semconv._incubating.attributes.error_attributes import ERROR_MESSAGE
 from opentelemetry.semconv_ai import SpanAttributes
 from opentelemetry.trace import Status, StatusCode
-
-from respan_sdk.constants import ERROR_MESSAGE_ATTR
 
 from respan_instrumentation_crewai._constants import (
     MAX_BUFFERED_ENTRIES,
     MAX_OPEN_SPAN_AGE_SECONDS,
+)
+from respan_instrumentation_crewai._policy import (
+    content_allowed,
+    event_enabled,
+    strip_content,
 )
 from respan_instrumentation_crewai._serialization import json_attribute
 
@@ -43,6 +47,7 @@ class SpanEndSpec:
     """Everything learned when a CrewAI operation finishes."""
 
     output: Any = None
+    capture_content: bool = field(default_factory=content_allowed)
     error: str | None = None
     attributes: dict[str, Any] = field(default_factory=dict)
 
@@ -51,6 +56,8 @@ class SpanEndSpec:
 class _ParentInfo:
     context: Context
     workflow_name: str | None = None
+    capture_content: bool = True
+    enabled: bool = True
 
 
 @dataclass
@@ -139,6 +146,7 @@ class CrewAIEventAssembler:
             )
         return _ParentInfo(
             context=current_context,
+            capture_content=content_allowed(),
             workflow_name=str(workflow_name) if workflow_name else None,
         )
 
@@ -214,7 +222,7 @@ class CrewAIEventAssembler:
 
     def _mark_abandoned(self, entry: _OpenSpan, message: str) -> None:
         try:
-            entry.span.set_attribute(ERROR_MESSAGE_ATTR, message)
+            entry.span.set_attribute(ERROR_MESSAGE, message)
             entry.span.set_status(Status(StatusCode.ERROR, message))
             entry.span.end()
         except Exception:
@@ -357,6 +365,12 @@ class CrewAIEventAssembler:
             else:
                 queued = False
                 parent_info = parent_info or ambient_parent
+                parent_info = replace(
+                    parent_info,
+                    capture_content=parent_info.capture_content
+                    and ambient_parent.capture_content,
+                    enabled=parent_info.enabled and event_enabled(event),
+                )
 
                 if is_scope:
                     if event_id in self._pending_scope_ends:
@@ -373,19 +387,29 @@ class CrewAIEventAssembler:
                     )
                 else:
                     attributes = dict(spec.attributes)
+                    if not parent_info.capture_content:
+                        strip_content(attributes)
                     if parent_info.workflow_name:
                         attributes.setdefault(
                             SpanAttributes.TRACELOOP_WORKFLOW_NAME,
                             parent_info.workflow_name,
                         )
 
-                    span = self._tracer.start_span(
-                        spec.name,
-                        context=parent_info.context,
-                        attributes=attributes,
-                        start_time=self._start_time_ns(event),
-                        record_exception=False,
-                        set_status_on_exception=False,
+                    span = (
+                        self._tracer.start_span(
+                            spec.name,
+                            context=parent_info.context,
+                            attributes=attributes,
+                            start_time=self._start_time_ns(event),
+                            record_exception=False,
+                            set_status_on_exception=False,
+                        )
+                        if parent_info.enabled
+                        else trace.NonRecordingSpan(
+                            trace.get_current_span(
+                                parent_info.context
+                            ).get_span_context()
+                        )
                     )
                     span_context = trace.set_span_in_context(span, parent_info.context)
                     workflow_name = attributes.get(
@@ -393,6 +417,8 @@ class CrewAIEventAssembler:
                     )
                     span_info = _ParentInfo(
                         context=span_context,
+                        capture_content=parent_info.capture_content,
+                        enabled=parent_info.enabled,
                         workflow_name=(
                             str(workflow_name)
                             if workflow_name
@@ -533,15 +559,27 @@ class CrewAIEventAssembler:
     ) -> None:
         span = entry.span
         try:
-            if spec.output is not None:
+            if not span.is_recording():
+                return
+            allowed = (
+                entry.parent_info.capture_content
+                and spec.capture_content
+                and content_allowed()
+            )
+            if not allowed:
+                strip_content(span._attributes)
+            if allowed and spec.output is not None:
                 span.set_attribute(
                     SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
                     json_attribute(spec.output),
                 )
             if spec.attributes:
-                span.set_attributes(spec.attributes)
+                attributes = dict(spec.attributes)
+                if not allowed:
+                    strip_content(attributes)
+                span.set_attributes(attributes)
             if spec.error:
-                span.set_attribute(ERROR_MESSAGE_ATTR, spec.error)
+                span.set_attribute(ERROR_MESSAGE, spec.error)
                 span.set_status(Status(StatusCode.ERROR, spec.error))
             else:
                 span.set_status(StatusCode.OK)

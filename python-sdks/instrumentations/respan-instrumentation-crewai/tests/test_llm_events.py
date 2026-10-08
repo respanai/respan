@@ -1,10 +1,10 @@
 """No-network regression coverage for native CrewAI lifecycle translation."""
 
-from datetime import datetime, timezone
 import json
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
-from crewai import Agent, Crew, LLM, Task
+from crewai import LLM, Agent, Crew, Task
 from crewai.events.event_bus import crewai_event_bus
 from crewai.events.types.agent_events import (
     AgentExecutionCompletedEvent,
@@ -39,9 +39,9 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
 from opentelemetry.semconv._incubating.attributes import (
     gen_ai_attributes as GenAIAttributes,
 )
+from opentelemetry.semconv._incubating.attributes.error_attributes import ERROR_MESSAGE
 from opentelemetry.semconv_ai import LLMRequestTypeValues, SpanAttributes
 from pydantic import BaseModel
-
 from respan_instrumentation_crewai import CrewAIInstrumentor
 from respan_instrumentation_crewai import _event_assembler as assembler_module
 from respan_instrumentation_crewai._event_assembler import (
@@ -56,7 +56,6 @@ from respan_instrumentation_crewai._serialization import (
     normalize_tool_definitions,
     set_message_attributes,
 )
-from respan_sdk.constants import ERROR_MESSAGE_ATTR
 from respan_sdk.constants.llm_logging import (
     LOG_TYPE_AGENT,
     LOG_TYPE_CHAT,
@@ -439,7 +438,7 @@ def test_native_listener_marks_failed_lifecycles(monkeypatch):
         for span in spans:
             attributes = span.attributes or {}
             assert span.status.status_code.name == "ERROR"
-            assert attributes[ERROR_MESSAGE_ATTR].endswith("boom")
+            assert attributes[ERROR_MESSAGE].endswith("boom")
     finally:
         _finish_tracing(tracer_provider, instrumentor, original_token_hook)
 
@@ -713,15 +712,14 @@ def test_suppressed_token_hook_does_not_buffer_usage(monkeypatch):
     tracer_provider, _, instrumentor, original_token_hook = _setup_tracing(monkeypatch)
     try:
         _, _, _, llm = _entities()
-        with llm_call_context():
-            with suppress_instrumentation():
-                llm._track_token_usage_internal(
-                    {
-                        "prompt_tokens": 5,
-                        "completion_tokens": 2,
-                        "total_tokens": 7,
-                    }
-                )
+        with llm_call_context(), suppress_instrumentation():
+            llm._track_token_usage_internal(
+                {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 2,
+                    "total_tokens": 7,
+                }
+            )
         assert instrumentor._listener._usage_by_call_id == {}
     finally:
         _finish_tracing(tracer_provider, instrumentor, original_token_hook)

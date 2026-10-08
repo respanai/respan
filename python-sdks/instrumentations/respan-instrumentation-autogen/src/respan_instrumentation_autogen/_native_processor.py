@@ -8,29 +8,20 @@ from threading import Lock
 from typing import Any
 
 from openinference.semconv.trace import (
-    MessageAttributes,
-    OpenInferenceSpanKindValues,
     SpanAttributes as OISpanAttributes,
 )
 from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor
 from opentelemetry.semconv_ai import SpanAttributes as TLSpanAttributes
 
-
 AUTOGEN_CORE_SCOPE_NAME = "autogen-core"
 AUTOGEN_RUNTIME_SCOPE_PREFIX = "autogen "
-AUTOGEN_OPENINFERENCE_SCOPE_NAME = (
-    "openinference.instrumentation.autogen_agentchat"
-)
+AUTOGEN_OPENINFERENCE_SCOPE_NAME = "openinference.instrumentation.autogen_agentchat"
 AUTOGEN_OPERATION_INVOKE_AGENT = "invoke_agent"
 AUTOGEN_OPERATION_EXECUTE_TOOL = "execute_tool"
 
-_OI_INPUT_MESSAGE_PREFIX = "llm.input_messages."
+_OI_INPUT_MESSAGE_PREFIX = f"{OISpanAttributes.LLM_INPUT_MESSAGES}."
 _FUNCTION_RESULT_RE = re.compile(
     r"^llm\.input_messages\.(\d+)\.(?:message\.)?function\.(\d+)$"
-)
-_OI_FIRST_OUTPUT_CONTENT = (
-    f"{OISpanAttributes.LLM_OUTPUT_MESSAGES}.0."
-    f"{MessageAttributes.MESSAGE_CONTENT}"
 )
 
 
@@ -89,9 +80,7 @@ def _normalize_function_result_messages(attrs: dict[str, Any]) -> None:
             continue
         message_index = int(match.group(1))
         result_index = int(match.group(2))
-        results_by_message.setdefault(message_index, []).append(
-            (result_index, result)
-        )
+        results_by_message.setdefault(message_index, []).append((result_index, result))
         raw_result_keys.append(key)
 
     for message_index, indexed_results in results_by_message.items():
@@ -109,7 +98,7 @@ def _normalize_function_result_messages(attrs: dict[str, Any]) -> None:
             result = results[0]
             call_id = result.get("call_id")
             name = result.get("name")
-            canonical_prefix = f"gen_ai.prompt.{message_index}"
+            canonical_prefix = f"{TLSpanAttributes.LLM_PROMPTS}.{message_index}"
             if call_id not in (None, ""):
                 attrs[f"{canonical_prefix}.tool_call_id"] = str(call_id)
             if name not in (None, ""):
@@ -117,23 +106,6 @@ def _normalize_function_result_messages(attrs: dict[str, Any]) -> None:
 
     for key in raw_result_keys:
         attrs.pop(key, None)
-
-
-def _agent_output_from_llm_attrs(attrs: dict[str, Any]) -> str | None:
-    content = attrs.get(_OI_FIRST_OUTPUT_CONTENT)
-    if content not in (None, ""):
-        return json.dumps(
-            {"content": content, "role": "assistant"},
-            default=str,
-            separators=(",", ":"),
-        )
-
-    output = attrs.get(OISpanAttributes.OUTPUT_VALUE)
-    if output in (None, ""):
-        return None
-    if isinstance(output, str):
-        return output
-    return json.dumps(output, default=str, separators=(",", ":"))
 
 
 class AutoGenNativeSpanProcessor(SpanProcessor):
@@ -149,10 +121,12 @@ class AutoGenNativeSpanProcessor(SpanProcessor):
 
     def __init__(self) -> None:
         self._native_export_parents: dict[int, Any] = {}
-        self._agent_outputs: dict[int, str] = {}
+        self.enabled = True
         self._lock = Lock()
 
     def on_start(self, span: Any, parent_context: Any = None) -> None:
+        if not self.enabled:
+            return
         parent = _get_parent(span)
         parent_id = getattr(parent, "span_id", None)
 
@@ -169,28 +143,11 @@ class AutoGenNativeSpanProcessor(SpanProcessor):
                     self._native_export_parents[span_id] = export_parent
 
     def on_end(self, span: ReadableSpan) -> None:
+        if not self.enabled:
+            return
         scope_name = _get_scope_name(span)
         if scope_name == AUTOGEN_OPENINFERENCE_SCOPE_NAME:
             attrs = dict(getattr(span, "_attributes", None) or {})
-            span_kind = attrs.get(OISpanAttributes.OPENINFERENCE_SPAN_KIND)
-
-            if span_kind == OpenInferenceSpanKindValues.LLM.value:
-                agent_id = getattr(_get_parent(span), "span_id", None)
-                output = _agent_output_from_llm_attrs(attrs)
-                if isinstance(agent_id, int) and agent_id and output is not None:
-                    with self._lock:
-                        self._agent_outputs[agent_id] = output
-            elif span_kind == OpenInferenceSpanKindValues.AGENT.value:
-                span_id = _get_span_id(span)
-                if span_id is not None:
-                    with self._lock:
-                        output = self._agent_outputs.pop(span_id, None)
-                    if output is not None:
-                        attrs.setdefault(
-                            TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT,
-                            output,
-                        )
-
             _normalize_function_result_messages(attrs)
             span._attributes = attrs
             return
@@ -210,7 +167,52 @@ class AutoGenNativeSpanProcessor(SpanProcessor):
     def shutdown(self) -> None:
         with self._lock:
             self._native_export_parents.clear()
-            self._agent_outputs.clear()
 
     def force_flush(self, timeout_millis: int = 30000) -> bool:
+        return True
+
+
+class AutoGenPrivacyProcessor(SpanProcessor):
+    """Apply the call's content policy after the shared OI translator."""
+
+    def __init__(self):
+        self._content = {}
+        self._lock = Lock()
+
+    def on_start(self, span, parent_context=None):
+        if _get_scope_name(span) not in (
+            AUTOGEN_OPENINFERENCE_SCOPE_NAME,
+            "openinference.instrumentation.ag2",
+        ):
+            return
+        from respan_instrumentation_autogen._modern import capture_content
+
+        with self._lock:
+            self._content[_get_span_id(span)] = capture_content(parent_context)
+
+    def on_end(self, span):
+        with self._lock:
+            allowed = self._content.pop(_get_span_id(span), True)
+        if allowed:
+            return
+        attrs = dict(span.attributes)
+        for key in tuple(attrs):
+            if key in (
+                TLSpanAttributes.TRACELOOP_ENTITY_INPUT,
+                TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+                TLSpanAttributes.LLM_REQUEST_FUNCTIONS,
+            ) or key.startswith(
+                (
+                    TLSpanAttributes.LLM_PROMPTS + ".",
+                    TLSpanAttributes.LLM_COMPLETIONS + ".",
+                )
+            ):
+                attrs.pop(key, None)
+        span._attributes = attrs
+
+    def shutdown(self):
+        with self._lock:
+            self._content.clear()
+
+    def force_flush(self, timeout_millis=30000):
         return True

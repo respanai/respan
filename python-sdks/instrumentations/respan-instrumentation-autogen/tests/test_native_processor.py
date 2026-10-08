@@ -3,13 +3,6 @@ from types import SimpleNamespace
 
 from opentelemetry.attributes import BoundedAttributes
 from opentelemetry.trace import SpanContext, TraceFlags
-from opentelemetry.semconv_ai import SpanAttributes as TLSpanAttributes
-from openinference.semconv.trace import (
-    MessageAttributes,
-    OpenInferenceSpanKindValues,
-    SpanAttributes as OISpanAttributes,
-)
-
 from respan_instrumentation_autogen._native_processor import (
     AUTOGEN_CORE_SCOPE_NAME,
     AUTOGEN_OPENINFERENCE_SCOPE_NAME,
@@ -177,78 +170,6 @@ def test_function_result_history_is_preserved_canonically() -> None:
     assert json.loads(span._attributes["gen_ai.prompt.2.content"])["content"] == (
         "tracing-api: about 155 ms"
     )
-
-
-def test_final_llm_output_is_promoted_to_owning_agent() -> None:
-    processor = AutoGenNativeSpanProcessor()
-    workflow = _context(10)
-    agent = _make_span(
-        {OISpanAttributes.OPENINFERENCE_SPAN_KIND: "AGENT"},
-        scope_name=AUTOGEN_OPENINFERENCE_SCOPE_NAME,
-        span_id=20,
-        parent=workflow,
-    )
-    llm = _make_span(
-        {
-            OISpanAttributes.OPENINFERENCE_SPAN_KIND: (
-                OpenInferenceSpanKindValues.LLM.value
-            ),
-            (
-                f"{OISpanAttributes.LLM_OUTPUT_MESSAGES}.0."
-                f"{MessageAttributes.MESSAGE_CONTENT}"
-            ): "final answer",
-        },
-        scope_name=AUTOGEN_OPENINFERENCE_SCOPE_NAME,
-        span_id=30,
-        parent=agent.context,
-    )
-
-    processor.on_end(llm)
-    processor.on_end(agent)
-
-    assert json.loads(
-        agent._attributes[TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT]
-    ) == {"content": "final answer", "role": "assistant"}
-    assert processor._agent_outputs == {}
-
-
-def test_latest_llm_output_wins_for_tool_reflection_agent() -> None:
-    processor = AutoGenNativeSpanProcessor()
-    agent = _make_span(
-        {OISpanAttributes.OPENINFERENCE_SPAN_KIND: "AGENT"},
-        scope_name=AUTOGEN_OPENINFERENCE_SCOPE_NAME,
-        span_id=20,
-        parent=_context(10),
-    )
-    tool_request = _make_span(
-        {
-            OISpanAttributes.OPENINFERENCE_SPAN_KIND: "LLM",
-            OISpanAttributes.OUTPUT_VALUE: "tool request",
-        },
-        scope_name=AUTOGEN_OPENINFERENCE_SCOPE_NAME,
-        span_id=30,
-        parent=agent.context,
-    )
-    final_llm = _make_span(
-        {
-            OISpanAttributes.OPENINFERENCE_SPAN_KIND: "LLM",
-            (
-                f"{OISpanAttributes.LLM_OUTPUT_MESSAGES}.0."
-                f"{MessageAttributes.MESSAGE_CONTENT}"
-            ): "reflected answer",
-        },
-        scope_name=AUTOGEN_OPENINFERENCE_SCOPE_NAME,
-        span_id=31,
-        parent=agent.context,
-    )
-
-    processor.on_end(tool_request)
-    processor.on_end(final_llm)
-    processor.on_end(agent)
-
-    assert json.loads(
-        agent._attributes[TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT]
-    )["content"] == "reflected answer"
 
 
 def test_processor_ignores_unrelated_scope() -> None:

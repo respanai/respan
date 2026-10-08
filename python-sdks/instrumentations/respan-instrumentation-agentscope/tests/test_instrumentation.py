@@ -1,15 +1,13 @@
 import asyncio
 import json
 import sys
-from types import ModuleType
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
+from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
 from opentelemetry.semconv_ai import SpanAttributes
-
-from respan_sdk.constants import ERROR_MESSAGE_ATTR
-from respan_instrumentation_agentscope import AgentScopeInstrumentor
-from respan_instrumentation_agentscope import _instrumentation
+from opentelemetry.trace import StatusCode
+from respan_instrumentation_agentscope import AgentScopeInstrumentor, _instrumentation
 from respan_instrumentation_agentscope._instrumentation import (
     AGENTSCOPE_AGENT_MODULE,
     AGENTSCOPE_MODEL_MODULE,
@@ -199,6 +197,9 @@ class FakeToolkit:
 def reset_tracer():
     RespanTracer.reset_instance()
     yield
+    for patch in list(_instrumentation._PATCHES.values()):
+        for owner in list(patch.owners):
+            owner.deactivate()
     RespanTracer.reset_instance()
 
 
@@ -206,13 +207,16 @@ def reset_tracer():
 def captured_spans(monkeypatch):
     spans = []
 
-    def fake_build_readable_span(**kwargs):
-        span = SimpleNamespace(**kwargs)
-        spans.append(span)
-        return span
+    class Collector(SpanProcessor):
+        def on_end(self, span):
+            spans.append(span)
 
-    monkeypatch.setattr(_instrumentation, "build_readable_span", fake_build_readable_span)
-    monkeypatch.setattr(_instrumentation, "inject_span", lambda span: True)
+    provider = TracerProvider()
+    provider.add_span_processor(Collector())
+    monkeypatch.setattr(
+        _instrumentation, "_tracer", lambda: provider.get_tracer("test")
+    )
+
     return spans
 
 
@@ -226,6 +230,9 @@ def _install_fake_agentscope_modules(monkeypatch):
     model_module.ChatModelBase = FakeChatModelBase
     tool_module.Toolkit = FakeToolkit
 
+    monkeypatch.setitem(
+        sys.modules, "agentscope.embedding", ModuleType("agentscope.embedding")
+    )
     agentscope_module.agent = agent_module
     agentscope_module.model = model_module
     agentscope_module.tool = tool_module
@@ -272,7 +279,9 @@ def test_activate_specific_instances_does_not_patch_classes(monkeypatch):
     original_agent_reply = fake_modules.agent_class.reply
     agent = FakeAgent()
 
-    instrumentor = AgentScopeInstrumentor(agent=agent, instrument_models=False, instrument_tools=False)
+    instrumentor = AgentScopeInstrumentor(
+        agent=agent, instrument_models=False, instrument_tools=False
+    )
     instrumentor.activate()
 
     assert agent.reply is not original_agent_reply
@@ -293,6 +302,7 @@ def test_activate_patches_multiple_custom_model_classes_once():
     instrumentor = AgentScopeInstrumentor(
         agent=object(),
         models=[first_model, duplicate_class_model, second_model],
+        instrument_embeddings=False,
         instrument_tools=False,
     )
     instrumentor.activate()
@@ -330,7 +340,9 @@ def test_activate_skips_when_respan_tracing_is_disabled(monkeypatch, caplog):
 
 def test_agent_reply_emits_agent_span(captured_spans):
     agent = FakeAgent()
-    instrumentor = AgentScopeInstrumentor(agent=agent, instrument_models=False, instrument_tools=False)
+    instrumentor = AgentScopeInstrumentor(
+        agent=agent, instrument_models=False, instrument_tools=False
+    )
     instrumentor.activate()
 
     result = asyncio.run(agent.reply(FakeMsg(content="Draft a plan.")))
@@ -349,7 +361,9 @@ def test_agent_reply_emits_agent_span(captured_spans):
 
 def test_agent_reply_stream_emits_after_consumption(captured_spans):
     agent = FakeAgent()
-    instrumentor = AgentScopeInstrumentor(agent=agent, instrument_models=False, instrument_tools=False)
+    instrumentor = AgentScopeInstrumentor(
+        agent=agent, instrument_models=False, instrument_tools=False
+    )
     instrumentor.activate()
 
     async def collect():
@@ -358,22 +372,27 @@ def test_agent_reply_stream_emits_after_consumption(captured_spans):
     result = asyncio.run(collect())
 
     assert len(result) == 2
-    assert captured_spans[0].attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] == "Streamed plan."
+    assert (
+        captured_spans[0].attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]
+        == "Streamed plan."
+    )
 
 
 def test_agent_failure_emits_error_span(captured_spans):
     agent = FakeFailingAgent()
-    instrumentor = AgentScopeInstrumentor(agent=agent, instrument_models=False, instrument_tools=False)
+    instrumentor = AgentScopeInstrumentor(
+        agent=agent, instrument_models=False, instrument_tools=False
+    )
     instrumentor.activate()
 
     with pytest.raises(RuntimeError, match="agent failed"):
         asyncio.run(agent.reply(FakeMsg(content="Fail.")))
 
     assert len(captured_spans) == 1
-    assert captured_spans[0].status_code == 500
-    assert captured_spans[0].error_message == "agent failed"
-    assert captured_spans[0].attributes["status_code"] == 500
-    assert captured_spans[0].attributes[ERROR_MESSAGE_ATTR] == "agent failed"
+    assert captured_spans[0].status.status_code is StatusCode.ERROR
+    assert captured_spans[0].status.description == "agent failed"
+    assert "status_code" not in captured_spans[0].attributes
+    assert SpanAttributes.TRACELOOP_ENTITY_OUTPUT not in captured_spans[0].attributes
     _assert_no_banned_aliases(captured_spans[0].attributes)
 
 
@@ -409,7 +428,10 @@ def test_model_call_emits_canonical_chat_span(captured_spans):
     assert attrs[f"{PROMPT_PREFIX}0.role"] == "user"
     assert attrs[f"{PROMPT_PREFIX}0.content"] == "Use a tool."
     assert attrs[f"{COMPLETION_PREFIX}0.role"] == "assistant"
-    assert json.loads(attrs[f"{COMPLETION_PREFIX}0.tool_calls"])[0]["function"]["name"] == "lookup_weather"
+    assert (
+        json.loads(attrs[f"{COMPLETION_PREFIX}0.tool_calls"])[0]["function"]["name"]
+        == "lookup_weather"
+    )
     assert SpanAttributes.LLM_REQUEST_FUNCTIONS in attrs
     _assert_no_banned_aliases(attrs)
 
@@ -446,7 +468,7 @@ def test_model_call_handles_keyerror_getattr_sdk_objects(captured_spans):
     assert attrs["gen_ai.usage.output_tokens"] == 4
 
     opaque = FakeKeyErrorProxy()
-    assert _instrumentation._object_to_dict(opaque) == {"value": opaque}
+    assert _instrumentation.attrs._object_to_dict(opaque) == {"value": opaque}
 
 
 def test_toolkit_call_tool_emits_tool_span(captured_spans):
@@ -469,7 +491,7 @@ def test_toolkit_call_tool_emits_tool_span(captured_spans):
         '{"name":"lookup_weather","arguments":"{\\"city\\":\\"Tokyo\\"}"}'
     )
     assert attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] == "sunny"
-    assert attrs["agentscope.tool.call.id"] == "call_1"
+    assert attrs["gen_ai.tool.call.id"] == "call_1"
     _assert_no_banned_aliases(attrs)
 
 
@@ -486,10 +508,14 @@ def test_model_and_tool_spans_parent_to_active_agent_context(captured_spans):
 
     asyncio.run(agent.reply(FakeMsg(content="Start.")))
 
-    agent_span = next(span for span in captured_spans if span.name == "agentscope.agent")
-    model_span = next(span for span in captured_spans if span.name == "agentscope.model_call")
+    agent_span = next(
+        span for span in captured_spans if span.name == "agentscope.agent"
+    )
+    model_span = next(
+        span for span in captured_spans if span.name == "agentscope.model_call"
+    )
     tool_span = next(span for span in captured_spans if span.name == "agentscope.tool")
-    assert model_span.trace_id == agent_span.trace_id
-    assert tool_span.trace_id == agent_span.trace_id
-    assert model_span.parent_id == agent_span.span_id
-    assert tool_span.parent_id == agent_span.span_id
+    assert model_span.context.trace_id == agent_span.context.trace_id
+    assert tool_span.context.trace_id == agent_span.context.trace_id
+    assert model_span.parent.span_id == agent_span.context.span_id
+    assert tool_span.parent.span_id == agent_span.context.span_id

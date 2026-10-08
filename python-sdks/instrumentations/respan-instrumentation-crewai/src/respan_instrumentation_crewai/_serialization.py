@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Mapping, Sequence
 import json
+import logging
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from opentelemetry.semconv_ai import SpanAttributes
 
 from respan_instrumentation_crewai._constants import ASSISTANT_ROLE, USER_ROLE
+
+logger = logging.getLogger(__name__)
 
 
 def _structured_value(value: Any, *, parse_tool_strings: bool = False) -> Any:
@@ -41,6 +44,7 @@ def _structured_value(value: Any, *, parse_tool_strings: bool = False) -> Any:
         try:
             dumped = method()
         except Exception:
+            logger.debug("Could not serialize CrewAI payload field", exc_info=True)
             continue
         if isinstance(dumped, Mapping):
             return _structured_value(
@@ -87,6 +91,7 @@ def json_attribute(value: Any) -> str:
             separators=(",", ":"),
         )
     except Exception:
+        logger.debug("Could not encode CrewAI payload", exc_info=True)
         return json.dumps(str(value), ensure_ascii=False, separators=(",", ":"))
 
 
@@ -184,6 +189,7 @@ def _mapping_view(value: Any) -> dict[str, Any] | None:
         try:
             dumped = method()
         except Exception:
+            logger.debug("Could not serialize CrewAI payload field", exc_info=True)
             continue
         if isinstance(dumped, Mapping):
             return dict(dumped)
@@ -193,6 +199,7 @@ def _mapping_view(value: Any) -> dict[str, Any] | None:
         try:
             field_value = getattr(value, field_name)
         except Exception:
+            logger.debug("Could not serialize CrewAI payload field", exc_info=True)
             continue
         if field_value is not None:
             fields[field_name] = field_value
@@ -385,6 +392,11 @@ def normalize_token_usage(usage: Mapping[str, Any] | None) -> dict[str, int]:
         details = normalized_source.get(details_key)
         if cached_tokens is None and isinstance(details, Mapping):
             cached_tokens = first_int(details, "cached_tokens", "cache_read")
+
+    for details_key in ("completion_tokens_details", "output_tokens_details"):
+        details = normalized_source.get(details_key)
+        if reasoning_tokens is None and isinstance(details, Mapping):
+            reasoning_tokens = first_int(details, "reasoning_tokens")
 
     if total_tokens is None and (
         prompt_tokens is not None or completion_tokens is not None
