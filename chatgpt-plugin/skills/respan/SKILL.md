@@ -9,44 +9,34 @@ description: >-
 
 # Respan
 
-Use the Respan CLI and SDK for LLM observability — tracing, evals, prompts, datasets, and gateway routing.
+Respan is an AI gateway with built-in observability. This skill points you to the Respan docs page for each task. The docs are the source of truth: fetch the page and follow it, and don't rely on memory for Respan package names, APIs, or URLs. Every page below is markdown.
 
-## When To Use
+## Set up Respan in a project
 
-- **Set up tracing** (instrument your app to capture LLM calls — install + decorators, propagation, processors) → read [references/tracing.md](references/tracing.md)
-- **Set up gateway** (route LLM calls through the Respan proxy — wiring + model switching, fallbacks, caching) → read [references/gateway.md](references/gateway.md)
-- **Prompt management** (create, version, deploy) → read [references/prompts.md](references/prompts.md)
-- **Evals** (datasets, evaluators, experiments) → read [references/evals.md](references/evals.md)
-- **Monitors & automation** (alerts, online evals, webhooks) → read [references/monitors.md](references/monitors.md)
+To set up tracing or the gateway, fetch and follow `https://respan.ai/docs/agent-setup.md`. It covers the API key, finds the right integration page, and verifies the setup with the Respan CLI.
 
-Tracing and gateway are separate setups — configure one at a time, never both in the same pass.
+## Docs by task
 
-## Core Principles
+| Task | Page |
+|------|------|
+| Set up tracing or the gateway | `https://respan.ai/docs/agent-setup.md` |
+| Trace an app with the Respan SDK | `https://respan.ai/docs/documentation/features/tracing/quickstart.md` |
+| Trace or route a specific framework or LLM SDK | Find its page in `https://respan.ai/docs/llms.txt`. Integration pages are labeled **(tracing)** or **(gateway)**. |
+| Route LLM calls through the gateway | `https://respan.ai/docs/documentation/features/gateway/gateway-quickstart.md` |
+| Gateway retries and fallbacks | `https://respan.ai/docs/documentation/features/gateway/retries.md` |
+| Gateway caching | `https://respan.ai/docs/documentation/features/gateway/caching.md` |
+| Gateway limits | `https://respan.ai/docs/documentation/features/gateway/limits.md` |
+| Models the gateway serves | `https://respan.ai/docs/documentation/features/gateway/models-catalog.md` |
+| Prompt management | `https://respan.ai/docs/documentation/features/prompt-management/prompt-management-quickstart.md` |
+| Monitors and notifications | `https://respan.ai/docs/documentation/features/monitoring/monitors.md` |
+| Inspect spans and traces | `https://respan.ai/docs/documentation/features/observe/view-debug-traces.md` |
+| Custom IDs and attributes | `https://respan.ai/docs/documentation/features/observe/custom-ids.md` |
+| API keys | `https://respan.ai/docs/documentation/admin/respan-api-keys.md` |
+| Provider keys | `https://respan.ai/docs/documentation/admin/llm-provider-keys.md` |
+| Respan CLI | `https://respan.ai/docs/documentation/cli.md` |
+| Respan MCP server | `https://respan.ai/docs/documentation/mcp.md` |
+| Anything else, including the API reference | `https://respan.ai/docs/llms.txt` |
 
-1. **Read the reference first.** Each reference file has the exact setup steps, API patterns, MCP tools, and CLI commands.
-2. **Use MCP tools** for platform operations (prompts, datasets, evaluators, experiments, traces, logs).
-3. **Use CLI** when MCP is not available: `respan traces list`, `respan prompts list`, etc.
-4. **Fetch docs** for integration-specific details not covered in references.
+## Work with Respan data
 
-## Quick Reference
-
-| Task | Reference / Command |
-|------|--------------------|
-| Set up tracing (steps + decorators, propagation) | [references/tracing.md](references/tracing.md) |
-| Set up gateway (steps + features) | [references/gateway.md](references/gateway.md) |
-| Prompt management | [references/prompts.md](references/prompts.md) |
-| Evals & experiments | [references/evals.md](references/evals.md) |
-| Monitors & automation | [references/monitors.md](references/monitors.md) |
-| List traces | `respan traces list --limit 10` |
-| View a trace | `respan traces get <id>` |
-| Check auth | `respan auth status` |
-
-## Documentation Access
-
-Any doc page can be fetched as markdown:
-`https://respan.ai/docs/integrations/openai-sdk.md`
-`https://respan.ai/docs/sdks/typescript-sdk/overview.md`
-
-Full docs index: `https://www.respan.ai/docs/llms.txt`
-
-Platform: `https://platform.respan.ai`
+To read traces and logs or manage prompts, use the Respan MCP server's tools when they're available. Otherwise, use the Respan CLI, such as `respan traces list` or `respan logs list`. The CLI page lists every command.

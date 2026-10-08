@@ -36,8 +36,7 @@ directory, so `respanai/respan` resolves as a marketplace on its own:
     │   └── logo.svg        # marketplace logo (128×128 tile)
     └── skills/
         └── respan/         # GENERATED — do not hand-edit
-            ├── SKILL.md
-            └── references/*.md
+            └── SKILL.md
 ```
 
 `plugin.json` deliberately declares **no** component paths. Cursor auto-discovers

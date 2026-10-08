@@ -40,8 +40,7 @@ directory, so `respanai/respan` resolves as a marketplace on its own:
     ├── .mcp.json           # connects the hosted MCP server at mcp.respan.ai
     └── skills/
         └── respan/         # GENERATED — do not hand-edit
-            ├── SKILL.md
-            └── references/*.md
+            └── SKILL.md
 ```
 
 > The sibling `cursor-plugin/` packages the same skill for Cursor. Both are

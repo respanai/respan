@@ -25,13 +25,6 @@ import {
   isBinaryInstalled,
 } from './agents.js';
 import { getSkillMd } from './skill-content.js';
-import {
-  TRACING_MD,
-  GATEWAY_MD,
-  PROMPTS_MD,
-  EVALS_MD,
-  MONITORS_MD,
-} from './skill-refs.generated.js';
 
 export type SetupMode = 'tracing' | 'gateway';
 
@@ -726,20 +719,14 @@ export abstract class SetupBaseCommand extends BaseCommand {
 
     const writeSkillTo = (baseDir: string) => {
       const skillDir = path.join(baseDir, 'respan');
-      const refsDir = path.join(skillDir, 'references');
-      // Wipe a prior install so docs we've since renamed or removed (e.g. the
-      // old tracing-setup.md / gateway-setup.md / setup.md) don't linger as
-      // orphans — but only when the dir is genuinely ours (see above).
+      // Wipe a prior install so files we've since removed (e.g. the old
+      // references/*.md) don't linger as orphans — but only when the dir is
+      // genuinely ours (see above).
       if (isManagedSkillDir(skillDir)) {
         fs.rmSync(skillDir, { recursive: true, force: true });
       }
-      ensureDir(refsDir);
+      ensureDir(skillDir);
       writeTextFile(path.join(skillDir, 'SKILL.md'), getSkillMd());
-      writeTextFile(path.join(refsDir, 'tracing.md'), TRACING_MD);
-      writeTextFile(path.join(refsDir, 'gateway.md'), GATEWAY_MD);
-      writeTextFile(path.join(refsDir, 'prompts.md'), PROMPTS_MD);
-      writeTextFile(path.join(refsDir, 'evals.md'), EVALS_MD);
-      writeTextFile(path.join(refsDir, 'monitors.md'), MONITORS_MD);
     };
 
     // Write to ~/.agents/skills/ (Cursor, Codex, Gemini CLI, OpenCode)
@@ -780,8 +767,8 @@ export abstract class SetupBaseCommand extends BaseCommand {
     this.log('');
 
     const setupPrompt = mode === 'gateway'
-      ? 'Use the /respan skill to set up Respan gateway routing in this project. Read gateway.md from the skill and follow the Setup steps to route the detected framework through the gateway.'
-      : 'Use the /respan skill to set up Respan SDK tracing in this project. Read tracing.md from the skill and follow the Setup steps.';
+      ? 'Help me set up the Respan gateway: fetch and follow https://respan.ai/docs/agent-setup.md'
+      : 'Help me set up Respan tracing: fetch and follow https://respan.ai/docs/agent-setup.md';
 
     if (tool === 'cursor') {
       this.log('');

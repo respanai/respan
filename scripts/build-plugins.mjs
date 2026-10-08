@@ -8,11 +8,12 @@
 //
 //   node scripts/build-plugins.mjs
 //
-// Both plugins consume the same SKILL.md and the same references/*.md. Claude
-// Code and Cursor agree on the skill format (a `skills/<name>/SKILL.md` with
-// `name` + `description` frontmatter), so the only per-target difference today
-// is the destination directory. Add new targets to TARGETS below.
-import { cpSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+// Every plugin consumes the same SKILL.md, which links to the Respan docs for
+// each task (the content lives in the docs, so there are no references/*.md).
+// Claude Code and Cursor agree on the skill format (a `skills/<name>/SKILL.md`
+// with `name` + `description` frontmatter), so the only per-target difference
+// today is the destination directory. Add new targets to TARGETS below.
+import { mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -46,11 +47,6 @@ const body = readFileSync(join(sharedSkill, 'SKILL.md'), 'utf8');
 for (const destSkill of TARGETS) {
   rmSync(destSkill, { recursive: true, force: true });
   mkdirSync(destSkill, { recursive: true });
-
-  // references/*.md are copied verbatim — SKILL.md links to them relatively.
-  cpSync(join(sharedSkill, 'references'), join(destSkill, 'references'), {
-    recursive: true,
-  });
 
   writeFileSync(join(destSkill, 'SKILL.md'), FRONTMATTER + '\n' + body);
 
