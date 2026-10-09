@@ -1,0 +1,8 @@
+{
+  "summary": "Support current Writer, OpenRouter, and Pi JavaScript APIs with canonical native spans and privacy-safe lifecycle handling",
+  "packages": {
+    "@respan/instrumentation-writer": "minor",
+    "@respan/instrumentation-openrouter": "minor",
+    "@respan/instrumentation-pi": "minor"
+  }
+}

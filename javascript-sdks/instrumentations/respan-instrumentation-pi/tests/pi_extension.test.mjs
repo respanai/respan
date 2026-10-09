@@ -1,9 +1,13 @@
+import { BasicTracerProvider } from "@opentelemetry/sdk-trace-base";
 import assert from "node:assert/strict";
 import test from "node:test";
 
 import { trace } from "@opentelemetry/api";
 
-import respanPiExtension, { SHUTDOWN_FLUSH_TIMEOUT_MS, createRespanPiExtension } from "../dist/extension.js";
+import respanPiExtension, {
+  SHUTDOWN_FLUSH_TIMEOUT_MS,
+  createRespanPiExtension,
+} from "../dist/extension.js";
 
 function createFakePi() {
   const handlers = new Map();
@@ -35,7 +39,10 @@ function createFakeCtx() {
     hasUI: true,
     mode: "tui",
     model: { id: "claude-sonnet-4-5", provider: "anthropic" },
-    sessionManager: { getSessionId: () => "sess-ext", getSessionFile: () => undefined },
+    sessionManager: {
+      getSessionId: () => "sess-ext",
+      getSessionFile: () => undefined,
+    },
     ui: {
       setStatus(key, text) {
         statuses.push([key, text]);
@@ -123,7 +130,10 @@ function withStubbedTracerProvider(onEnd, fn) {
     configurable: true,
     writable: true,
     value() {
-      return { activeSpanProcessor: { onEnd } };
+      return {
+        getTracer: (...args) => new BasicTracerProvider().getTracer(...args),
+        activeSpanProcessor: { onEnd },
+      };
     },
   });
   return Promise.resolve()
@@ -174,7 +184,13 @@ test("enabled config initializes once, flushes after runs and shuts down on quit
   assert.equal(calls.initialize, 0);
 
   // The tracer handlers and the lifecycle handlers are both registered.
-  for (const event of ["session_start", "before_agent_start", "agent_end", "session_shutdown", "message_end"]) {
+  for (const event of [
+    "session_start",
+    "before_agent_start",
+    "agent_end",
+    "session_shutdown",
+    "message_end",
+  ]) {
     assert.ok(pi.handlers.has(event), `handler for ${event}`);
   }
 
@@ -186,7 +202,11 @@ test("enabled config initializes once, flushes after runs and shuts down on quit
 
   await pi.emit("agent_end", { messages: [] }, ctx);
   assert.equal(calls.flush, 1);
-  await pi.emit("session_compact", { compactionEntry: { summary: "s" }, reason: "manual", willRetry: false }, ctx);
+  await pi.emit(
+    "session_compact",
+    { compactionEntry: { summary: "s" }, reason: "manual", willRetry: false },
+    ctx,
+  );
   assert.equal(calls.flush, 2);
   await pi.emit("session_tree", { newLeafId: "a", oldLeafId: "b" }, ctx);
   assert.equal(calls.flush, 3);
@@ -204,38 +224,63 @@ test("enabled config initializes once, flushes after runs and shuts down on quit
 test("disabled config registers only session_start and never creates Respan", async () => {
   const { factory, calls } = createFakeRespanFactory();
   const pi = createFakePi();
-  createRespanPiExtension({ config: { enabled: false }, createRespan: factory })(pi);
+  createRespanPiExtension({
+    config: { enabled: false },
+    createRespan: factory,
+  })(pi);
   assert.deepEqual([...pi.handlers.keys()], ["session_start"]);
   assert.equal(calls.options.length, 0);
 
   const ctx = createFakeCtx();
   await pi.emit("session_start", { reason: "startup" }, ctx);
-  assert.deepEqual(ctx.statuses, [["respan", "Respan: tracing off (run `respan integrate pi`)"]]);
+  assert.deepEqual(ctx.statuses, [
+    ["respan", "Respan: tracing off (run `respan integrate pi`)"],
+  ]);
   await pi.emit("session_start", { reason: "startup" }, undefined); // no ctx → no throw
 
   // An API key is required even when enabled is true.
   const noKey = createFakePi();
-  createRespanPiExtension({ config: { enabled: true }, createRespan: factory })(noKey);
+  createRespanPiExtension({ config: { enabled: true }, createRespan: factory })(
+    noKey,
+  );
   assert.deepEqual([...noKey.handlers.keys()], ["session_start"]);
   assert.equal(calls.options.length, 0);
 });
 
 test("handlers never throw when Respan rejects", async () => {
-  const { factory, calls } = createFakeRespanFactory({ rejectInitialize: true });
+  const { factory, calls } = createFakeRespanFactory({
+    rejectInitialize: true,
+  });
   const pi = createFakePi();
-  createRespanPiExtension({ config: { enabled: true, apiKey: "sk-test" }, createRespan: factory })(pi);
+  createRespanPiExtension({
+    config: { enabled: true, apiKey: "sk-test" },
+    createRespan: factory,
+  })(pi);
   const ctx = createFakeCtx();
   await pi.emit("session_start", { reason: "startup" }, ctx);
   assert.equal(calls.initialize, 1);
-  assert.deepEqual(ctx.statuses.at(-1), ["respan", "Respan: tracing unavailable: no network"]);
+  assert.deepEqual(ctx.statuses.at(-1), [
+    "respan",
+    "Respan: tracing unavailable: no network",
+  ]);
   await pi.emit("agent_end", { messages: [] }, ctx);
-  assert.equal(calls.flush, 0, "flush is skipped when tracing never initialized");
+  assert.equal(
+    calls.flush,
+    0,
+    "flush is skipped when tracing never initialized",
+  );
   await pi.emit("session_shutdown", { reason: "quit" }, ctx);
   assert.equal(calls.shutdown, 0);
 
-  const flushFail = createFakeRespanFactory({ rejectFlush: true, rejectShutdown: true });
+  const flushFail = createFakeRespanFactory({
+    rejectFlush: true,
+    rejectShutdown: true,
+  });
   const pi2 = createFakePi();
-  createRespanPiExtension({ config: { enabled: true, apiKey: "sk-test" }, createRespan: flushFail.factory })(pi2);
+  createRespanPiExtension({
+    config: { enabled: true, apiKey: "sk-test" },
+    createRespan: flushFail.factory,
+  })(pi2);
   const ctx2 = createFakeCtx();
   await pi2.emit("session_start", { reason: "startup" }, ctx2);
   await pi2.emit("agent_end", { messages: [] }, ctx2);
@@ -277,10 +322,18 @@ test("exports never block pi: run-end flushes run in the background, shutdown is
   // These handlers resolve although every flush is still in flight (an
   // awaited flush would never let pi.emit() resolve here).
   await pi.emit("agent_end", { messages: [] }, ctx);
-  await pi.emit("session_compact", { compactionEntry: { summary: "s" }, reason: "manual", willRetry: false }, ctx);
+  await pi.emit(
+    "session_compact",
+    { compactionEntry: { summary: "s" }, reason: "manual", willRetry: false },
+    ctx,
+  );
   await pi.emit("session_tree", { newLeafId: "a", oldLeafId: "b" }, ctx);
   assert.equal(deferred.calls.flush, 3);
-  assert.equal(deferred.pending.length, 3, "flushes were started and are still pending");
+  assert.equal(
+    deferred.pending.length,
+    3,
+    "flushes were started and are still pending",
+  );
 
   // session_shutdown waits for the final export, but never longer than the bound.
   // A real pi process always has live handles; keep the loop alive here so the
@@ -292,7 +345,11 @@ test("exports never block pi: run-end flushes run in the background, shutdown is
   clearInterval(keepAlive);
   assert.ok(elapsed >= 40 && elapsed < 2000, `bounded wait, took ${elapsed}ms`);
   assert.equal(deferred.calls.flush, 4);
-  assert.equal(deferred.calls.shutdown, 0, "shutdown() was not reached while the flush hung");
+  assert.equal(
+    deferred.calls.shutdown,
+    0,
+    "shutdown() was not reached while the flush hung",
+  );
   assert.deepEqual(ctx.statuses.at(-1), ["respan", undefined]);
 
   // Once the export completes, the shutdown proceeds in the background.
@@ -311,8 +368,12 @@ test("Respan's console chatter is filtered while pi's own console output passes 
   await withStubbedTracerProvider(
     // What @respan/tracing prints on EVERY injected span regardless of logLevel.
     (span) => {
-      console.debug(`[Respan Debug] Processing enriched Respan span: ${span.name}`);
-      console.log(`[Respan] Sending span "${span.name}" to processor "default"`);
+      console.debug(
+        `[Respan Debug] Processing enriched Respan span: ${span.name}`,
+      );
+      console.log(
+        `[Respan] Sending span "${span.name}" to processor "default"`,
+      );
       received.push(span);
     },
     async () => {
@@ -343,9 +404,17 @@ test("Respan's console chatter is filtered while pi's own console output passes 
         })(pi);
         const ctx = createFakeCtx();
         await pi.emit("session_start", { reason: "startup" }, ctx);
-        await pi.emit("before_agent_start", { prompt: "hi", systemPrompt: "sys" }, ctx);
+        await pi.emit(
+          "before_agent_start",
+          { prompt: "hi", systemPrompt: "sys" },
+          ctx,
+        );
         await pi.emit("agent_start", {}, ctx);
-        await pi.emit("context", { messages: [{ role: "user", content: "hi" }] }, ctx);
+        await pi.emit(
+          "context",
+          { messages: [{ role: "user", content: "hi" }] },
+          ctx,
+        );
         await pi.emit(
           "message_end",
           {
@@ -359,7 +428,11 @@ test("Respan's console chatter is filtered while pi's own console output passes 
           ctx,
         );
         await pi.emit("agent_end", { messages: [] }, ctx);
-        assert.equal(received.length, 2, "chat and agent spans reached the processor");
+        assert.equal(
+          received.length,
+          2,
+          "chat and agent spans reached the processor",
+        );
         assert.deepEqual(stdout, [], "no [Respan …] line reached stdout");
 
         // Everything else is forwarded untouched, even while flushes are in flight.
@@ -373,7 +446,11 @@ test("Respan's console chatter is filtered while pi's own console output passes 
         await pi.emit("session_shutdown", { reason: "quit" }, ctx);
         assert.equal(calls.shutdown, 1);
         console.log("after quit");
-        assert.deepEqual(stdout, ["pi output\n", "[other] extension output\n", "after quit\n"]);
+        assert.deepEqual(stdout, [
+          "pi output\n",
+          "[other] extension output\n",
+          "after quit\n",
+        ]);
       } finally {
         process.stdout.write = originalStdoutWrite;
         process.stderr.write = originalStderrWrite;
@@ -387,8 +464,14 @@ test("each factory invocation with an injected Respan gets its own runtime", asy
   const second = createFakeRespanFactory();
   const piA = createFakePi();
   const piB = createFakePi();
-  createRespanPiExtension({ config: { enabled: true, apiKey: "sk-a" }, createRespan: first.factory })(piA);
-  createRespanPiExtension({ config: { enabled: true, apiKey: "sk-a" }, createRespan: second.factory })(piB);
+  createRespanPiExtension({
+    config: { enabled: true, apiKey: "sk-a" },
+    createRespan: first.factory,
+  })(piA);
+  createRespanPiExtension({
+    config: { enabled: true, apiKey: "sk-a" },
+    createRespan: second.factory,
+  })(piB);
   await piA.emit("session_start", { reason: "startup" }, createFakeCtx());
   await piB.emit("session_start", { reason: "startup" }, createFakeCtx());
   assert.equal(first.calls.initialize, 1);
@@ -420,16 +503,36 @@ test("initializes eagerly without session_start (SDK sessions) and flushes on be
 test("after each run the TUI shows a link to the trace (Respan cloud only)", async () => {
   const { platformTraceUrl } = await import("../dist/extension.js");
   assert.equal(
-    platformTraceUrl("https://api.respan.ai", "0123456789abcdef0123456789abcdef"),
+    platformTraceUrl(
+      "https://api.respan.ai",
+      "0123456789abcdef0123456789abcdef",
+    ),
     "https://platform.respan.ai/platform/traces?trace_unique_id=0123456789abcdef0123456789abcdef",
   );
-  assert.equal(platformTraceUrl("https://api.respan.ai/api", "0123456789abcdef0123456789abcdef").startsWith("https://platform.respan.ai/"), true);
-  assert.equal(platformTraceUrl("https://respan.internal.example.com/api", "0123456789abcdef0123456789abcdef"), undefined);
+  assert.equal(
+    platformTraceUrl(
+      "https://api.respan.ai/api",
+      "0123456789abcdef0123456789abcdef",
+    ).startsWith("https://platform.respan.ai/"),
+    true,
+  );
+  assert.equal(
+    platformTraceUrl(
+      "https://respan.internal.example.com/api",
+      "0123456789abcdef0123456789abcdef",
+    ),
+    undefined,
+  );
   assert.equal(platformTraceUrl(undefined, "not-a-trace-id"), undefined);
 
   const { factory } = createFakeRespanFactory({ activate: true });
   const extension = createRespanPiExtension({
-    config: { enabled: true, apiKey: "sk-test", baseURL: "https://api.respan.ai", debug: false },
+    config: {
+      enabled: true,
+      apiKey: "sk-test",
+      baseURL: "https://api.respan.ai",
+      debug: false,
+    },
     createRespan: factory,
     log: () => {},
   });
@@ -437,16 +540,24 @@ test("after each run the TUI shows a link to the trace (Respan cloud only)", asy
   extension(pi);
   const widgets = [];
   const ctx = createFakeCtx();
-  ctx.ui.setWidget = (key, lines, options) => widgets.push([key, lines, options]);
+  ctx.ui.setWidget = (key, lines, options) =>
+    widgets.push([key, lines, options]);
   await pi.emit("session_start", { reason: "startup" }, ctx);
-  await pi.emit("before_agent_start", { prompt: "hi", systemPrompt: "sys" }, ctx);
+  await pi.emit(
+    "before_agent_start",
+    { prompt: "hi", systemPrompt: "sys" },
+    ctx,
+  );
   await pi.emit("agent_start", {}, ctx);
   await pi.emit("agent_end", { messages: [] }, ctx);
 
   const shown = widgets.find(([key, lines]) => key === "respan-trace" && lines);
   assert.ok(shown, "trace link widget was set");
   assert.match(shown[1][0], /Respan trace \(turn 1\)/);
-  assert.match(shown[1][1], /^https:\/\/platform\.respan\.ai\/platform\/traces\?trace_unique_id=[0-9a-f]{32}$/);
+  assert.match(
+    shown[1][1],
+    /^https:\/\/platform\.respan\.ai\/platform\/traces\?trace_unique_id=[0-9a-f]{32}$/,
+  );
   assert.deepEqual(shown[2], { placement: "belowEditor" });
 
   await pi.emit("session_shutdown", { reason: "quit" }, ctx);

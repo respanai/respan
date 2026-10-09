@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 
+import { BasicTracerProvider } from "@opentelemetry/sdk-trace-base";
 import { ROOT_CONTEXT, context, trace } from "@opentelemetry/api";
 import {
   ATTR_GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
@@ -10,19 +11,32 @@ import {
 } from "@opentelemetry/semantic-conventions/incubating";
 import { propagateAttributes } from "@respan/tracing";
 // Internal module on purpose: asserts the name the platform actually displays.
-import { semanticSpanNameForSpan } from "@respan/tracing/dist/processor/spanName.js";
+import {
+  semanticSpanNameForSpan,
+  transformReadableSpanName,
+} from "@respan/tracing/dist/processor/spanName.js";
 
-import { PiInstrumentor, PiSessionTracer, createPiExtension, sessionTraceId } from "../dist/index.js";
+import {
+  PiInstrumentor,
+  PiSessionTracer,
+  createPiExtension,
+  sessionTraceId,
+} from "../dist/index.js";
 
 const captureState = { spans: [] };
+const metadata = (span) =>
+  JSON.parse(span.attributes["respan.metadata"] ?? "{}");
 const originalGetTracerProvider = trace.getTracerProvider.bind(trace);
 
+const nativeProvider = new BasicTracerProvider();
 test.before(() => {
+  trace.setGlobalTracerProvider(nativeProvider);
   Object.defineProperty(trace, "getTracerProvider", {
     configurable: true,
     writable: true,
     value() {
       return {
+        getTracer: (...args) => nativeProvider.getTracer(...args),
         activeSpanProcessor: {
           onEnd(span) {
             captureState.spans.push(span);
@@ -34,6 +48,7 @@ test.before(() => {
 });
 
 test.after(() => {
+  trace.disable();
   Object.defineProperty(trace, "getTracerProvider", {
     configurable: true,
     writable: true,
@@ -57,12 +72,18 @@ function createFakePi() {
         {
           name: "bash",
           description: "Run a shell command",
-          parameters: { type: "object", properties: { command: { type: "string" } } },
+          parameters: {
+            type: "object",
+            properties: { command: { type: "string" } },
+          },
         },
         {
           name: "read",
           description: "Read a file",
-          parameters: { type: "object", properties: { path: { type: "string" } } },
+          parameters: {
+            type: "object",
+            properties: { path: { type: "string" } },
+          },
         },
       ];
     },
@@ -103,7 +124,12 @@ function createFakeSession(sessionId, messages = []) {
   return {
     sessionId,
     sessionFile: `/tmp/pi-sdk/${sessionId}.jsonl`,
-    model: { id: "gpt-5", provider: "openai", name: "GPT-5", api: "openai-responses" },
+    model: {
+      id: "gpt-5",
+      provider: "openai",
+      name: "GPT-5",
+      api: "openai-responses",
+    },
     thinkingLevel: "low",
     messages,
     subscribe(listener) {
@@ -129,7 +155,13 @@ function usage(overrides = {}) {
     cacheWrite: 1,
     reasoning: 1,
     totalTokens: 11,
-    cost: { input: 0.002, output: 0.004, cacheRead: 0.001, cacheWrite: 0.003, total: 0.01 },
+    cost: {
+      input: 0.002,
+      output: 0.004,
+      cacheRead: 0.001,
+      cacheWrite: 0.003,
+      total: 0.01,
+    },
     ...overrides,
   };
 }
@@ -140,7 +172,12 @@ const assistantWithTool = {
   content: [
     { type: "thinking", thinking: "Let me look." },
     { type: "text", text: "Listing files." },
-    { type: "toolCall", id: "call-1", name: "bash", arguments: { command: "ls" } },
+    {
+      type: "toolCall",
+      id: "call-1",
+      name: "bash",
+      arguments: { command: "ls" },
+    },
   ],
   api: "anthropic-messages",
   provider: "anthropic",
@@ -165,16 +202,31 @@ const assistantFinal = {
   provider: "anthropic",
   model: "claude-sonnet-4-5",
   responseId: "resp-2",
-  usage: usage({ input: 7, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 11, reasoning: undefined }),
+  usage: usage({
+    input: 7,
+    output: 4,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 11,
+    reasoning: undefined,
+  }),
   stopReason: "stop",
   timestamp: 4,
 };
 
-async function replayRun(pi, ctx, { toolOutput = "README.md", shutdown = true } = {}) {
+async function replayRun(
+  pi,
+  ctx,
+  { toolOutput = "README.md", shutdown = true } = {},
+) {
   await pi.emit("session_start", { reason: "startup" }, ctx);
   await pi.emit(
     "before_agent_start",
-    { prompt: "Inspect the repo", systemPrompt: "You are pi", systemPromptOptions: {} },
+    {
+      prompt: "Inspect the repo",
+      systemPrompt: "You are pi",
+      systemPromptOptions: {},
+    },
     ctx,
   );
   await pi.emit("agent_start", {}, ctx);
@@ -188,8 +240,17 @@ async function replayRun(pi, ctx, { toolOutput = "README.md", shutdown = true } 
   await pi.emit(
     "message_update",
     {
-      message: { ...assistantWithTool, content: [{ type: "text", text: "Listing" }], stopReason: "pending" },
-      assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Listing", partial: {} },
+      message: {
+        ...assistantWithTool,
+        content: [{ type: "text", text: "Listing" }],
+        stopReason: "pending",
+      },
+      assistantMessageEvent: {
+        type: "text_delta",
+        contentIndex: 0,
+        delta: "Listing",
+        partial: {},
+      },
     },
     ctx,
   );
@@ -204,19 +265,45 @@ async function replayRun(pi, ctx, { toolOutput = "README.md", shutdown = true } 
     {
       toolCallId: "call-1",
       toolName: "bash",
-      result: { content: [{ type: "text", text: toolOutput }], details: { truncated: false } },
+      result: {
+        content: [{ type: "text", text: toolOutput }],
+        details: { truncated: false },
+      },
       isError: false,
     },
     ctx,
   );
-  await pi.emit("turn_end", { turnIndex: 0, message: assistantWithTool, toolResults: [toolResultMessage] }, ctx);
-  await pi.emit("context", { messages: [userMessage, assistantWithTool, toolResultMessage] }, ctx);
+  await pi.emit(
+    "turn_end",
+    {
+      turnIndex: 0,
+      message: assistantWithTool,
+      toolResults: [toolResultMessage],
+    },
+    ctx,
+  );
+  await pi.emit(
+    "context",
+    { messages: [userMessage, assistantWithTool, toolResultMessage] },
+    ctx,
+  );
   await pi.emit("turn_start", { turnIndex: 1, timestamp: Date.now() }, ctx);
   await pi.emit("message_end", { message: assistantFinal }, ctx);
-  await pi.emit("turn_end", { turnIndex: 1, message: assistantFinal, toolResults: [] }, ctx);
+  await pi.emit(
+    "turn_end",
+    { turnIndex: 1, message: assistantFinal, toolResults: [] },
+    ctx,
+  );
   await pi.emit(
     "agent_end",
-    { messages: [userMessage, assistantWithTool, toolResultMessage, assistantFinal] },
+    {
+      messages: [
+        userMessage,
+        assistantWithTool,
+        toolResultMessage,
+        assistantFinal,
+      ],
+    },
     ctx,
   );
   if (shutdown) {
@@ -230,12 +317,26 @@ test("steers: user messages delivered into a running turn become steer spans and
   instrumentor.activate();
   const pi = createFakePi();
   instrumentor.extension(pi);
-  const ctx = createFakeCtx({ sessionId: "3f2504e0-4f89-11d3-9a0c-0305e82c3399" });
-  const steerOne = { role: "user", content: [{ type: "text", text: "New email: reschedule 43878" }], timestamp: Date.now() };
-  const steerTwo = { role: "user", content: "One more: ignore the first", timestamp: Date.now() };
+  const ctx = createFakeCtx({
+    sessionId: "3f2504e0-4f89-11d3-9a0c-0305e82c3399",
+  });
+  const steerOne = {
+    role: "user",
+    content: [{ type: "text", text: "New email: reschedule 43878" }],
+    timestamp: Date.now(),
+  };
+  const steerTwo = {
+    role: "user",
+    content: "One more: ignore the first",
+    timestamp: Date.now(),
+  };
 
   await pi.emit("session_start", { reason: "startup" }, ctx);
-  await pi.emit("before_agent_start", { prompt: "Inspect the repo", systemPrompt: "You are pi" }, ctx);
+  await pi.emit(
+    "before_agent_start",
+    { prompt: "Inspect the repo", systemPrompt: "You are pi" },
+    ctx,
+  );
   await pi.emit("agent_start", {}, ctx);
   await pi.emit("turn_start", { turnIndex: 0 }, ctx);
   // pi emits the run's own prompt first: that one is NOT a steer.
@@ -243,20 +344,45 @@ test("steers: user messages delivered into a running turn become steer spans and
   await pi.emit("message_end", { message: userMessage }, ctx);
   await pi.emit("context", { messages: [userMessage] }, ctx);
   await pi.emit("message_end", { message: assistantWithTool }, ctx);
-  await pi.emit("tool_execution_start", { toolCallId: "call-1", toolName: "bash", args: { command: "ls" } }, ctx);
   await pi.emit(
-    "tool_execution_end",
-    { toolCallId: "call-1", toolName: "bash", result: { content: [{ type: "text", text: "README.md" }] }, isError: false },
+    "tool_execution_start",
+    { toolCallId: "call-1", toolName: "bash", args: { command: "ls" } },
     ctx,
   );
-  await pi.emit("turn_end", { turnIndex: 0, message: assistantWithTool, toolResults: [toolResultMessage] }, ctx);
+  await pi.emit(
+    "tool_execution_end",
+    {
+      toolCallId: "call-1",
+      toolName: "bash",
+      result: { content: [{ type: "text", text: "README.md" }] },
+      isError: false,
+    },
+    ctx,
+  );
+  await pi.emit(
+    "turn_end",
+    {
+      turnIndex: 0,
+      message: assistantWithTool,
+      toolResults: [toolResultMessage],
+    },
+    ctx,
+  );
   // Delivered at the tool boundary.
   await pi.emit("turn_start", { turnIndex: 1 }, ctx);
   await pi.emit("message_start", { message: steerOne }, ctx);
   await pi.emit("message_end", { message: steerOne }, ctx);
-  await pi.emit("context", { messages: [userMessage, assistantWithTool, toolResultMessage, steerOne] }, ctx);
+  await pi.emit(
+    "context",
+    { messages: [userMessage, assistantWithTool, toolResultMessage, steerOne] },
+    ctx,
+  );
   await pi.emit("message_end", { message: assistantFinal }, ctx);
-  await pi.emit("turn_end", { turnIndex: 1, message: assistantFinal, toolResults: [] }, ctx);
+  await pi.emit(
+    "turn_end",
+    { turnIndex: 1, message: assistantFinal, toolResults: [] },
+    ctx,
+  );
   // Delivered when the agent was about to stop: the run continues.
   await pi.emit("turn_start", { turnIndex: 2 }, ctx);
   await pi.emit("message_start", { message: steerTwo }, ctx);
@@ -264,7 +390,9 @@ test("steers: user messages delivered into a running turn become steer spans and
   await pi.emit("message_end", { message: assistantFinal }, ctx);
   await pi.emit("agent_end", { messages: [] }, ctx);
 
-  const steers = captureState.spans.filter((span) => span.name.endsWith(".steer"));
+  const steers = captureState.spans.filter((span) =>
+    span.name.endsWith(".steer"),
+  );
   assert.equal(steers.length, 2);
   const [agent] = spansByLogType("agent");
   assert.equal(agent.name, "pi.turn-1.agent");
@@ -272,21 +400,29 @@ test("steers: user messages delivered into a running turn become steer spans and
     assert.equal(parentSpanId(steer), agent.spanContext().spanId);
     assert.equal(steer.spanContext().traceId, agent.spanContext().traceId);
     assert.equal(steer.attributes["respan.entity.log_type"], "task");
-    assert.equal(steer.attributes["respan.metadata.steered_into_turn"], 1);
+    assert.equal(metadata(steer)["steered_into_turn"], 1);
     assertNoBannedAliases(steer);
   }
   assert.equal(steers[0].name, "pi.turn-2.steer");
   // What the platform shows after the exporter's semantic renaming.
   assert.equal(semanticSpanNameForSpan(agent), "agent.turn-1");
-  assert.equal(semanticSpanNameForSpan(steers[0]), "steer.turn-2");
-  assert.equal(semanticSpanNameForSpan(steers[1]), "steer.turn-3");
-  assert.equal(steers[0].attributes["respan.metadata.turn_number"], 2);
-  assert.equal(steers[0].attributes["respan.metadata.delivered_after"], "tool_results");
+  assert.equal(semanticSpanNameForSpan(steers[0]), "task");
+  assert.equal(
+    transformReadableSpanName(steers[0], "legacy").name,
+    "pi.turn-2.steer",
+  );
+  assert.equal(semanticSpanNameForSpan(steers[1]), "task");
+  assert.equal(
+    transformReadableSpanName(steers[1], "legacy").name,
+    "pi.turn-3.steer",
+  );
+  assert.equal(metadata(steers[0])["turn_number"], 2);
+  assert.equal(metadata(steers[0])["delivered_after"], "tool_results");
   assert.deepEqual(JSON.parse(steers[0].attributes["traceloop.entity.input"]), [
     { role: "user", content: "New email: reschedule 43878" },
   ]);
   assert.equal(steers[1].name, "pi.turn-3.steer");
-  assert.equal(steers[1].attributes["respan.metadata.delivered_after"], "assistant_reply");
+  assert.equal(metadata(steers[1])["delivered_after"], "assistant_reply");
 
   // The turn span lists everything the user fed the run, and counts the steers.
   assert.deepEqual(JSON.parse(agent.attributes["traceloop.entity.input"]), [
@@ -294,27 +430,38 @@ test("steers: user messages delivered into a running turn become steer spans and
     { role: "user", content: "New email: reschedule 43878" },
     { role: "user", content: "One more: ignore the first" },
   ]);
-  assert.equal(agent.attributes["respan.metadata.steer_count"], 2);
+  assert.equal(metadata(agent)["steer_count"], 2);
   // Only the LLM call that first sees a steer is flagged (filter: after_steer = true).
   const chats = spansByLogType("chat");
   assert.equal(chats.length, 3);
-  assert.equal(chats[0].attributes["respan.metadata.after_steer"], undefined);
-  assert.equal(chats[1].attributes["respan.metadata.after_steer"], "true");
-  assert.equal(chats[1].attributes["respan.metadata.steer_turn_numbers"], "2");
-  assert.equal(chats[2].attributes["respan.metadata.after_steer"], "true");
-  assert.equal(chats[2].attributes["respan.metadata.steer_turn_numbers"], "3");
+  assert.equal(metadata(chats[0])["after_steer"], undefined);
+  assert.equal(metadata(chats[1])["after_steer"], "true");
+  assert.equal(metadata(chats[1])["steer_turn_numbers"], "2");
+  assert.equal(metadata(chats[2])["after_steer"], "true");
+  assert.equal(metadata(chats[2])["steer_turn_numbers"], "3");
 
   // Without session history the next run continues after the steers: turn 4.
   captureState.spans = [];
-  await pi.emit("before_agent_start", { prompt: "Next email", systemPrompt: "You are pi" }, ctx);
+  await pi.emit(
+    "before_agent_start",
+    { prompt: "Next email", systemPrompt: "You are pi" },
+    ctx,
+  );
   await pi.emit("agent_start", {}, ctx);
-  await pi.emit("message_start", { message: { role: "user", content: "Next email" } }, ctx);
+  await pi.emit(
+    "message_start",
+    { message: { role: "user", content: "Next email" } },
+    ctx,
+  );
   await pi.emit("message_end", { message: assistantFinal }, ctx);
   await pi.emit("agent_end", { messages: [] }, ctx);
   const [next] = spansByLogType("agent");
   assert.equal(next.name, "pi.turn-4.agent");
-  assert.equal(next.attributes["respan.metadata.steer_count"], undefined);
-  assert.equal(captureState.spans.filter((span) => span.name.endsWith(".steer")).length, 0);
+  assert.equal(metadata(next)["steer_count"], undefined);
+  assert.equal(
+    captureState.spans.filter((span) => span.name.endsWith(".steer")).length,
+    0,
+  );
   instrumentor.deactivate();
 });
 
@@ -337,7 +484,9 @@ test("steers: subscribe mode (attach) records a steer delivered through session 
   session.emit({ type: "agent_end", messages: [] });
   detach();
 
-  const steers = captureState.spans.filter((span) => span.name.endsWith(".steer"));
+  const steers = captureState.spans.filter((span) =>
+    span.name.endsWith(".steer"),
+  );
   assert.equal(steers.length, 1);
   const [agent] = spansByLogType("agent");
   assert.equal(parentSpanId(steers[0]), agent.spanContext().spanId);
@@ -351,7 +500,9 @@ test("steers: subscribe mode (attach) records a steer delivered through session 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 function spansByLogType(logType, spans = captureState.spans) {
-  return spans.filter((span) => span.attributes["respan.entity.log_type"] === logType);
+  return spans.filter(
+    (span) => span.attributes["respan.entity.log_type"] === logType,
+  );
 }
 
 function spanByLogType(logType, spans = captureState.spans) {
@@ -377,7 +528,10 @@ function assertNoBannedAliases(span) {
   assert.equal(span.attributes.has_tool_calls, undefined);
   if (span.attributes["respan.entity.log_type"] === "tool") {
     for (const key of Object.keys(span.attributes)) {
-      assert.ok(!key.startsWith("gen_ai.tool."), `tool span must not carry ${key}`);
+      assert.ok(
+        !key.startsWith("gen_ai.tool.") || key === "gen_ai.tool.call.id",
+        `tool span must not carry ${key}`,
+      );
     }
   }
 }
@@ -413,15 +567,23 @@ class SyncContextManager {
 
 function assertCommonContract(span) {
   assert.equal(span.attributes["respan.entity.log_method"], "ts_tracing");
-  assert.equal(span.attributes["telemetry.sdk.name"], "@respan/instrumentation-pi");
+  assert.equal(
+    span.attributes["telemetry.sdk.name"],
+    "@respan/instrumentation-pi",
+  );
   assert.equal(
     span.attributes["telemetry.sdk.version"],
-    JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version,
+    JSON.parse(
+      readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+    ).version,
   );
   assert.equal(span.instrumentationScope.name, "@respan/instrumentation-pi");
   assert.equal(typeof span.attributes["traceloop.entity.name"], "string");
   assert.equal(typeof span.attributes["traceloop.entity.path"], "string");
-  assert.equal(span.attributes["respan.trace.trace_group_identifier"] !== undefined, true);
+  assert.equal(
+    span.attributes["respan.trace.trace_group_identifier"] !== undefined,
+    true,
+  );
   assertNoBannedAliases(span);
 }
 
@@ -461,10 +623,19 @@ test("extension replay emits canonical agent/chat/tool spans", async () => {
   const traceId = agentSpan.spanContext().traceId;
   for (const span of captureState.spans) {
     assert.equal(span.spanContext().traceId, traceId);
-    assert.equal(span.attributes["respan.threads.thread_identifier"], "sess-123");
-    assert.equal(span.attributes["respan.sessions.session_identifier"], "sess-123");
+    assert.equal(
+      span.attributes["respan.threads.thread_identifier"],
+      "sess-123",
+    );
+    assert.equal(
+      span.attributes["respan.sessions.session_identifier"],
+      "sess-123",
+    );
     // The trace group is the pi session id too, so the traces of a resumed session group together.
-    assert.equal(span.attributes["respan.trace.trace_group_identifier"], "sess-123");
+    assert.equal(
+      span.attributes["respan.trace.trace_group_identifier"],
+      "sess-123",
+    );
     assertCommonContract(span);
   }
 
@@ -475,26 +646,32 @@ test("extension replay emits canonical agent/chat/tool spans", async () => {
   assert.equal(agentSpan.attributes["traceloop.workflow.name"], "pi");
   // Naming hints: the exporter displays the span as `agent.turn-1`.
   assert.equal(agentSpan.attributes["respan.internal.span_name.kind"], "agent");
-  assert.equal(agentSpan.attributes["respan.internal.span_name.detail"], "turn-1");
-  assert.equal(agentSpan.attributes["respan.metadata.turn_number"], 1);
+  assert.equal(
+    agentSpan.attributes["respan.internal.span_name.detail"],
+    "turn-1",
+  );
+  assert.equal(metadata(agentSpan)["turn_number"], 1);
   assert.deepEqual(JSON.parse(agentSpan.attributes["traceloop.entity.input"]), [
     { role: "user", content: "Inspect the repo" },
   ]);
-  assert.equal(agentSpan.attributes["traceloop.entity.output"], "The repo has a README.");
+  assert.equal(
+    agentSpan.attributes["traceloop.entity.output"],
+    "The repo has a README.",
+  );
   assert.equal(agentSpan.attributes.status_code, undefined);
-  assert.equal(agentSpan.attributes["respan.metadata.agent_name"], "pi");
+  assert.equal(metadata(agentSpan)["agent_name"], "pi");
   // Structural span: the model lives on the chat spans only.
   assert.equal(agentSpan.attributes["gen_ai.request.model"], undefined);
-  assert.equal(agentSpan.attributes["respan.metadata.turn_count"], 2);
-  assert.equal(agentSpan.attributes["respan.metadata.tool_call_count"], 1);
-  assert.equal(agentSpan.attributes["respan.metadata.stop_reason"], "stop");
-  assert.equal(agentSpan.attributes["respan.metadata.thinking_level"], "medium");
-  assert.equal(agentSpan.attributes["respan.metadata.cwd"], "/tmp/pi-demo");
+  assert.equal(metadata(agentSpan)["turn_count"], 2);
+  assert.equal(metadata(agentSpan)["tool_call_count"], 1);
+  assert.equal(metadata(agentSpan)["stop_reason"], "stop");
+  assert.equal(metadata(agentSpan)["thinking_level"], "medium");
+  assert.equal(metadata(agentSpan)["cwd"], "/tmp/pi-demo");
   assert.equal(
-    agentSpan.attributes["respan.metadata.session_file"],
+    metadata(agentSpan)["session_file"],
     "/tmp/pi-demo/.pi/sessions/sess-123.jsonl",
   );
-  assert.equal(agentSpan.attributes["respan.metadata.continuation"], undefined);
+  assert.equal(metadata(agentSpan)["continuation"], undefined);
   assert.ok(agentSpan.startTime[0] <= agentSpan.endTime[0]);
 
   // Chat 1
@@ -509,14 +686,20 @@ test("extension replay emits canonical agent/chat/tool spans", async () => {
   assert.equal(chat1.attributes["gen_ai.prompt.1.content"], "Inspect the repo");
   assert.equal(chat1.attributes["gen_ai.prompt.2.role"], undefined);
   assert.equal(chat1.attributes["gen_ai.completion.0.role"], "assistant");
-  assert.equal(chat1.attributes["gen_ai.completion.0.content"], "Listing files.");
-  assert.deepEqual(JSON.parse(chat1.attributes["gen_ai.completion.0.tool_calls"]), [
-    {
-      id: "call-1",
-      type: "function",
-      function: { name: "bash", arguments: "{\"command\":\"ls\"}" },
-    },
-  ]);
+  assert.equal(
+    chat1.attributes["gen_ai.completion.0.content"],
+    "Listing files.",
+  );
+  assert.deepEqual(
+    JSON.parse(chat1.attributes["gen_ai.completion.0.tool_calls"]),
+    [
+      {
+        id: "call-1",
+        type: "function",
+        function: { name: "bash", arguments: '{"command":"ls"}' },
+      },
+    ],
+  );
   const chat1Output = JSON.parse(chat1.attributes["traceloop.entity.output"]);
   assert.equal(chat1Output.role, "assistant");
   assert.equal(chat1Output.content, "Listing files.");
@@ -532,16 +715,19 @@ test("extension replay emits canonical agent/chat/tool spans", async () => {
   // `gen_ai.usage.cache_creation.input_tokens` in 1.43.0) — the keys the
   // backend reads for cache-aware cost; the `llm.usage.*` alias is kept too.
   assert.equal(chat1.attributes[ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS], 3);
-  assert.equal(chat1.attributes[ATTR_GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS], 1);
-  assert.equal(chat1.attributes["respan.metadata.reasoning_tokens"], 1);
-  assert.equal(chat1.attributes["respan.metadata.estimated_cost_usd"], 0.01);
-  assert.equal(typeof chat1.attributes["respan.metadata.time_to_first_token_ms"], "number");
-  assert.equal(chat1.attributes["respan.metadata.stop_reason"], "toolUse");
-  assert.equal(chat1.attributes["respan.metadata.response_id"], "resp-1");
-  assert.equal(chat1.attributes["respan.metadata.turn_index"], 0);
-  assert.equal(chat1.attributes["respan.metadata.api"], "anthropic-messages");
-  assert.equal(chat1.attributes["respan.metadata.prompt_capture"], "delta");
-  assert.equal(chat1.attributes["respan.metadata.prompt_message_offset"], 0);
+  assert.equal(
+    chat1.attributes[ATTR_GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS],
+    1,
+  );
+  assert.equal(metadata(chat1)["reasoning_tokens"], 1);
+  assert.equal(metadata(chat1)["estimated_cost_usd"], 0.01);
+  assert.equal(typeof metadata(chat1)["time_to_first_token_ms"], "number");
+  assert.equal(metadata(chat1)["stop_reason"], "toolUse");
+  assert.equal(metadata(chat1)["response_id"], "resp-1");
+  assert.equal(metadata(chat1)["turn_index"], 0);
+  assert.equal(metadata(chat1)["api"], "anthropic-messages");
+  assert.equal(metadata(chat1)["prompt_capture"], "delta");
+  assert.equal(metadata(chat1)["prompt_message_offset"], 0);
   const functions = JSON.parse(chat1.attributes["llm.request.functions"]);
   assert.equal(functions.length, 2);
   assert.deepEqual(
@@ -557,20 +743,23 @@ test("extension replay emits canonical agent/chat/tool spans", async () => {
     {
       id: "call-1",
       type: "function",
-      function: { name: "bash", arguments: "{\"command\":\"ls\"}" },
+      function: { name: "bash", arguments: '{"command":"ls"}' },
     },
   ]);
   assert.equal(chat2.attributes["gen_ai.prompt.1.role"], "tool");
   assert.equal(chat2.attributes["gen_ai.prompt.1.content"], "README.md");
   assert.equal(chat2.attributes["gen_ai.prompt.2.role"], undefined);
-  assert.equal(chat2.attributes["respan.metadata.prompt_message_offset"], 1);
-  assert.equal(chat2.attributes["gen_ai.completion.0.content"], "The repo has a README.");
+  assert.equal(metadata(chat2)["prompt_message_offset"], 1);
+  assert.equal(
+    chat2.attributes["gen_ai.completion.0.content"],
+    "The repo has a README.",
+  );
   assert.equal(chat2.attributes["gen_ai.completion.0.tool_calls"], undefined);
   assert.equal(chat2.attributes["gen_ai.usage.prompt_tokens"], 7);
   assert.equal(chat2.attributes[ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS], 0);
   assert.equal(chat2.attributes["llm.usage.total_tokens"], 11);
-  assert.equal(chat2.attributes["respan.metadata.time_to_first_token_ms"], undefined);
-  assert.equal(chat2.attributes["respan.metadata.turn_index"], 1);
+  assert.equal(metadata(chat2)["time_to_first_token_ms"], undefined);
+  assert.equal(metadata(chat2)["turn_index"], 1);
   const chat2Input = JSON.parse(chat2.attributes["traceloop.entity.input"]);
   assert.equal(chat2Input.length, 2);
   assert.equal(chat2Input[1].tool_call_id, "call-1");
@@ -583,16 +772,19 @@ test("extension replay emits canonical agent/chat/tool spans", async () => {
     name: "bash",
     arguments: { command: "ls" },
   });
-  assert.equal(toolSpan.attributes["traceloop.entity.output"], "README.md");
-  assert.equal(toolSpan.attributes["respan.metadata.tool_call_id"], "call-1");
-  assert.equal(toolSpan.attributes["respan.metadata.skill_name"], undefined);
+  assert.equal(
+    JSON.parse(toolSpan.attributes["traceloop.entity.output"]).content[0].text,
+    "README.md",
+  );
+  assert.equal(toolSpan.attributes["gen_ai.tool.call.id"], "call-1");
+  assert.equal(metadata(toolSpan)["skill_name"], undefined);
   assert.equal(toolSpan.attributes.status_code, undefined);
 
   // session_shutdown(quit) dropped the extension tracer.
   assert.equal(instrumentor.activeSessionCount, 0);
 });
 
-test("defaults: full context on every chat span, system prompt once per run, no truncation", async () => {
+test("defaults: full context and system prompt on every chat span, no truncation", async () => {
   captureState.spans = [];
   const instrumentor = new PiInstrumentor();
   instrumentor.activate();
@@ -602,47 +794,61 @@ test("defaults: full context on every chat span, system prompt once per run, no 
   await replayRun(pi, createFakeCtx(), { toolOutput: longOutput });
 
   const [chat1, chat2] = spansByLogType("chat");
-  assert.equal(chat1.attributes["respan.metadata.prompt_capture"], "full");
+  assert.equal(metadata(chat1)["prompt_capture"], "full");
   // First chat span of the run carries the system prompt, then the user prompt.
   assert.equal(chat1.attributes["gen_ai.prompt.0.role"], "system");
   assert.equal(chat1.attributes["gen_ai.prompt.0.content"], "You are pi");
   assert.equal(chat1.attributes["gen_ai.prompt.1.role"], "user");
   assert.equal(chat1.attributes["gen_ai.prompt.2.role"], undefined);
-  // Later chat spans record the whole context again (not repeated system prompt).
-  assert.equal(chat2.attributes["respan.metadata.prompt_capture"], "full");
-  assert.equal(chat2.attributes["respan.metadata.prompt_message_offset"], 0);
-  assert.equal(chat2.attributes["gen_ai.prompt.0.role"], "user");
-  assert.equal(chat2.attributes["gen_ai.prompt.0.content"], "Inspect the repo");
-  assert.equal(chat2.attributes["gen_ai.prompt.1.role"], "assistant");
-  assert.equal(chat2.attributes["gen_ai.prompt.2.role"], "tool");
-  assert.equal(chat2.attributes["gen_ai.prompt.3.role"], undefined);
-  assert.equal(JSON.parse(chat2.attributes["traceloop.entity.input"]).length, 3);
+  // Every full-context chat includes the system prompt used for that request.
+  assert.equal(metadata(chat2)["prompt_capture"], "full");
+  assert.equal(metadata(chat2)["prompt_message_offset"], 0);
+  assert.equal(chat2.attributes["gen_ai.prompt.0.role"], "system");
+  assert.equal(chat2.attributes["gen_ai.prompt.0.content"], "You are pi");
+  assert.equal(chat2.attributes["gen_ai.prompt.1.role"], "user");
+  assert.equal(chat2.attributes["gen_ai.prompt.1.content"], "Inspect the repo");
+  assert.equal(chat2.attributes["gen_ai.prompt.2.role"], "assistant");
+  assert.equal(chat2.attributes["gen_ai.prompt.3.role"], "tool");
+  assert.equal(chat2.attributes["gen_ai.prompt.4.role"], undefined);
+  assert.equal(
+    JSON.parse(chat2.attributes["traceloop.entity.input"]).length,
+    4,
+  );
   // Nothing is truncated by default.
   const toolSpan = spanByLogType("tool");
-  assert.equal(toolSpan.attributes["traceloop.entity.output"], longOutput);
+  assert.equal(
+    JSON.parse(toolSpan.attributes["traceloop.entity.output"]).content[0].text,
+    longOutput,
+  );
   for (const span of captureState.spans) {
-    assert.equal(span.attributes["respan.metadata.truncated"], undefined);
+    assert.equal(metadata(span)["truncated"], undefined);
     assertCommonContract(span);
   }
 });
 
 test("promptCapture: delta records only the messages appended since the previous LLM call", async () => {
   captureState.spans = [];
-  const instrumentor = new PiInstrumentor({ promptCapture: "delta", captureSystemPrompt: false });
+  const instrumentor = new PiInstrumentor({
+    promptCapture: "delta",
+    captureSystemPrompt: false,
+  });
   instrumentor.activate();
   const pi = createFakePi();
   instrumentor.extension(pi);
   await replayRun(pi, createFakeCtx());
 
   const [chat1, chat2] = spansByLogType("chat");
-  assert.equal(chat1.attributes["respan.metadata.prompt_capture"], "delta");
+  assert.equal(metadata(chat1)["prompt_capture"], "delta");
   assert.equal(chat1.attributes["gen_ai.prompt.0.role"], "user");
   assert.equal(chat1.attributes["gen_ai.prompt.1.role"], undefined);
-  assert.equal(chat2.attributes["respan.metadata.prompt_message_offset"], 1);
+  assert.equal(metadata(chat2)["prompt_message_offset"], 1);
   assert.equal(chat2.attributes["gen_ai.prompt.0.role"], "assistant");
   assert.equal(chat2.attributes["gen_ai.prompt.1.role"], "tool");
   assert.equal(chat2.attributes["gen_ai.prompt.2.role"], undefined);
-  assert.equal(JSON.parse(chat2.attributes["traceloop.entity.input"]).length, 2);
+  assert.equal(
+    JSON.parse(chat2.attributes["traceloop.entity.input"]).length,
+    2,
+  );
   for (const span of captureState.spans) {
     assertCommonContract(span);
   }
@@ -659,13 +865,12 @@ test("captured strings are truncated only when maxContentChars is set", async ()
 
   const toolSpan = spanByLogType("tool");
   const output = toolSpan.attributes["traceloop.entity.output"];
-  const suffix = " …[truncated 14000 chars]";
-  assert.equal(output.length, 16000 + suffix.length);
-  assert.ok(output.endsWith(suffix));
-  assert.ok(output.startsWith("xxxx"));
-  assert.equal(toolSpan.attributes["respan.metadata.truncated"], true);
+  assert.match(output, / …\[truncated \d+ chars\]$/);
+  assert.ok(output.startsWith('{"content":'));
+  assert.ok(output.length > 16000);
+  assert.equal(metadata(toolSpan)["truncated"], true);
   const chatSpan = spanByLogType("chat");
-  assert.equal(chatSpan.attributes["respan.metadata.truncated"], undefined);
+  assert.equal(metadata(chatSpan)["truncated"], undefined);
   for (const span of captureState.spans) {
     assertCommonContract(span);
   }
@@ -680,10 +885,14 @@ test("captured strings are truncated only when maxContentChars is set", async ()
   const agentSpan = spanByLogType("agent");
   const input = JSON.parse(agentSpan.attributes["traceloop.entity.input"]);
   assert.equal(input[0].content, "Inspect th …[truncated 6 chars]");
-  assert.equal(agentSpan.attributes["respan.metadata.truncated"], true);
+  assert.equal(metadata(agentSpan)["truncated"], true);
   const smallChat = spanByLogType("chat");
   // prompt.0 is the (10-char) system prompt; the user prompt at index 1 is truncated.
-  assert.ok(smallChat.attributes["gen_ai.prompt.1.content"].endsWith("…[truncated 6 chars]"));
+  assert.ok(
+    smallChat.attributes["gen_ai.prompt.1.content"].endsWith(
+      "…[truncated 6 chars]",
+    ),
+  );
 
   captureState.spans = [];
   const unlimited = new PiInstrumentor({ maxContentChars: 0 });
@@ -691,8 +900,12 @@ test("captured strings are truncated only when maxContentChars is set", async ()
   const unlimitedPi = createFakePi();
   unlimited.extension(unlimitedPi);
   await replayRun(unlimitedPi, createFakeCtx(), { toolOutput: longOutput });
-  assert.equal(spanByLogType("tool").attributes["traceloop.entity.output"], longOutput);
-  assert.equal(spanByLogType("tool").attributes["respan.metadata.truncated"], undefined);
+  assert.equal(
+    JSON.parse(spanByLogType("tool").attributes["traceloop.entity.output"])
+      .content[0].text,
+    longOutput,
+  );
+  assert.equal(metadata(spanByLogType("tool"))["truncated"], undefined);
 });
 
 test("multiple attached sessions produce independent traces", () => {
@@ -734,8 +947,14 @@ test("multiple attached sessions produce independent traces", () => {
   s2.emit({ type: "message_start", message: user2 });
   s2.emit({ type: "message_end", message: user2 });
   s2Messages.push(user2);
-  s1.emit({ type: "message_start", message: { ...reply1, content: [], stopReason: "pending" } });
-  s2.emit({ type: "message_start", message: { ...reply2, content: [], stopReason: "pending" } });
+  s1.emit({
+    type: "message_start",
+    message: { ...reply1, content: [], stopReason: "pending" },
+  });
+  s2.emit({
+    type: "message_start",
+    message: { ...reply2, content: [], stopReason: "pending" },
+  });
   s1.emit({ type: "message_end", message: reply1 });
   s1Messages.push(reply1);
   s2.emit({ type: "message_end", message: reply2 });
@@ -747,7 +966,9 @@ test("multiple attached sessions produce independent traces", () => {
 
   assert.equal(captureState.spans.length, 4);
   const bySession = (id) =>
-    captureState.spans.filter((span) => span.attributes["respan.threads.thread_identifier"] === id);
+    captureState.spans.filter(
+      (span) => span.attributes["respan.threads.thread_identifier"] === id,
+    );
   const spansA = bySession("session-a");
   const spansB = bySession("session-b");
   assert.equal(spansA.length, 2);
@@ -759,13 +980,34 @@ test("multiple attached sessions produce independent traces", () => {
   assert.ok(spansB.every((span) => span.spanContext().traceId === traceB));
   assert.equal(parentSpanId(spanByLogType("agent", spansA)), undefined);
   assert.equal(parentSpanId(spanByLogType("agent", spansB)), undefined);
-  assert.equal(spanByLogType("agent", spansA).attributes["traceloop.entity.output"], "Done A");
-  assert.equal(spanByLogType("agent", spansB).attributes["traceloop.entity.output"], "Done B");
-  assert.equal(spanByLogType("chat", spansA).attributes["gen_ai.prompt.0.content"], "Task A");
-  assert.equal(spanByLogType("chat", spansB).attributes["gen_ai.prompt.0.content"], "Task B");
-  assert.equal(spanByLogType("chat", spansB).attributes["gen_ai.system"], "openai");
-  assert.equal(spanByLogType("chat", spansB).attributes["gen_ai.request.model"], "gpt-5");
-  assert.equal(spanByLogType("agent", spansB).attributes["gen_ai.request.model"], undefined);
+  assert.equal(
+    spanByLogType("agent", spansA).attributes["traceloop.entity.output"],
+    "Done A",
+  );
+  assert.equal(
+    spanByLogType("agent", spansB).attributes["traceloop.entity.output"],
+    "Done B",
+  );
+  assert.equal(
+    spanByLogType("chat", spansA).attributes["gen_ai.prompt.0.content"],
+    "Task A",
+  );
+  assert.equal(
+    spanByLogType("chat", spansB).attributes["gen_ai.prompt.0.content"],
+    "Task B",
+  );
+  assert.equal(
+    spanByLogType("chat", spansB).attributes["gen_ai.system"],
+    "openai",
+  );
+  assert.equal(
+    spanByLogType("chat", spansB).attributes["gen_ai.request.model"],
+    "gpt-5",
+  );
+  assert.equal(
+    spanByLogType("agent", spansB).attributes["gen_ai.request.model"],
+    undefined,
+  );
   for (const span of captureState.spans) {
     assertCommonContract(span);
   }
@@ -787,9 +1029,17 @@ test("error paths: assistant errors, tool errors, retries, and shutdown mid-run"
   instrumentor.extension(pi);
   const ctx = createFakeCtx();
   await pi.emit("session_start", { reason: "startup" }, ctx);
-  await pi.emit("before_agent_start", { prompt: "Break", systemPrompt: "sys" }, ctx);
+  await pi.emit(
+    "before_agent_start",
+    { prompt: "Break", systemPrompt: "sys" },
+    ctx,
+  );
   await pi.emit("agent_start", {}, ctx);
-  await pi.emit("context", { messages: [{ role: "user", content: "Break" }] }, ctx);
+  await pi.emit(
+    "context",
+    { messages: [{ role: "user", content: "Break" }] },
+    ctx,
+  );
   await pi.emit("turn_start", { turnIndex: 0 }, ctx);
   const failed = {
     ...assistantFinal,
@@ -798,7 +1048,11 @@ test("error paths: assistant errors, tool errors, retries, and shutdown mid-run"
     errorMessage: "overloaded_error",
   };
   await pi.emit("message_end", { message: failed }, ctx);
-  await pi.emit("tool_execution_start", { toolCallId: "call-x", toolName: "bash", args: { command: "false" } }, ctx);
+  await pi.emit(
+    "tool_execution_start",
+    { toolCallId: "call-x", toolName: "bash", args: { command: "false" } },
+    ctx,
+  );
   await pi.emit(
     "tool_execution_end",
     {
@@ -812,14 +1066,17 @@ test("error paths: assistant errors, tool errors, retries, and shutdown mid-run"
   await pi.emit("agent_end", { messages: [] }, ctx);
 
   const chatSpan = spanByLogType("chat");
-  assert.equal(chatSpan.attributes.status_code, 500);
+  assert.equal(chatSpan.status.code, 2);
   assert.equal(chatSpan.attributes["error.message"], "overloaded_error");
   assert.equal(chatSpan.status.code, 2);
   const toolSpan = spanByLogType("tool");
-  assert.equal(toolSpan.attributes.status_code, 500);
+  assert.equal(toolSpan.status.code, 2);
   assert.equal(toolSpan.attributes["error.message"], "exit status 1");
-  assert.equal(spanByLogType("agent").attributes.status_code, 500);
-  assert.equal(spanByLogType("agent").attributes["error.message"], "overloaded_error");
+  assert.equal(spanByLogType("agent").status.code, 2);
+  assert.equal(
+    spanByLogType("agent").attributes["error.message"],
+    "overloaded_error",
+  );
   assert.equal(parentSpanId(spanByLogType("agent")), undefined);
   for (const span of captureState.spans) {
     assertCommonContract(span);
@@ -835,26 +1092,45 @@ test("error paths: assistant errors, tool errors, retries, and shutdown mid-run"
   session.emit({ type: "message_start", message: prompt });
   session.emit({ type: "message_end", message: prompt });
   session.messages.push(prompt);
-  session.emit({ type: "message_end", message: { ...failed, stopReason: "error", errorMessage: "rate limited" } });
+  session.emit({
+    type: "message_end",
+    message: { ...failed, stopReason: "error", errorMessage: "rate limited" },
+  });
   session.emit({ type: "agent_end", messages: [prompt], willRetry: true });
   assert.equal(spansByLogType("agent").length, 0);
   assert.equal(spansByLogType("chat").length, 1);
   session.emit({ type: "agent_start" });
   session.emit({ type: "turn_start" });
-  session.emit({ type: "message_start", message: { ...assistantFinal, content: [], stopReason: "pending" } });
+  session.emit({
+    type: "message_start",
+    message: { ...assistantFinal, content: [], stopReason: "pending" },
+  });
   session.emit({ type: "message_end", message: assistantFinal });
   session.messages.push(assistantFinal);
-  session.emit({ type: "agent_end", messages: [prompt, assistantFinal], willRetry: false });
+  session.emit({
+    type: "agent_end",
+    messages: [prompt, assistantFinal],
+    willRetry: false,
+  });
   assert.equal(spansByLogType("agent").length, 1);
   const retryChats = spansByLogType("chat");
   assert.equal(retryChats.length, 2);
-  assert.equal(retryChats[0].attributes.status_code, 500);
+  assert.equal(retryChats[0].status.code, 2);
   assert.equal(retryChats[1].attributes.status_code, undefined);
   const retryTrace = spanByLogType("agent").spanContext().traceId;
-  assert.ok(retryChats.every((span) => span.spanContext().traceId === retryTrace));
+  assert.ok(
+    retryChats.every((span) => span.spanContext().traceId === retryTrace),
+  );
   assert.equal(spanByLogType("agent").attributes.status_code, undefined);
-  assert.equal(spanByLogType("agent").attributes["traceloop.entity.output"], "The repo has a README.");
-  assert.equal(JSON.parse(spanByLogType("agent").attributes["traceloop.entity.input"])[0].content, "Retry me");
+  assert.equal(
+    spanByLogType("agent").attributes["traceloop.entity.output"],
+    "The repo has a README.",
+  );
+  assert.equal(
+    JSON.parse(spanByLogType("agent").attributes["traceloop.entity.input"])[0]
+      .content,
+    "Retry me",
+  );
   for (const span of captureState.spans) {
     assertCommonContract(span);
   }
@@ -866,29 +1142,50 @@ test("error paths: assistant errors, tool errors, retries, and shutdown mid-run"
   instrumentor.extension(pi2);
   const ctx2 = createFakeCtx({ sessionId: "sess-shutdown" });
   await pi2.emit("session_start", { reason: "startup" }, ctx2);
-  await pi2.emit("before_agent_start", { prompt: "Long task", systemPrompt: "sys" }, ctx2);
+  await pi2.emit(
+    "before_agent_start",
+    { prompt: "Long task", systemPrompt: "sys" },
+    ctx2,
+  );
   await pi2.emit("agent_start", {}, ctx2);
-  await pi2.emit("context", { messages: [{ role: "user", content: "Long task" }] }, ctx2);
+  await pi2.emit(
+    "context",
+    { messages: [{ role: "user", content: "Long task" }] },
+    ctx2,
+  );
   await pi2.emit("turn_start", { turnIndex: 0 }, ctx2);
-  await pi2.emit("tool_execution_start", { toolCallId: "call-y", toolName: "bash", args: { command: "sleep 10" } }, ctx2);
+  await pi2.emit(
+    "tool_execution_start",
+    { toolCallId: "call-y", toolName: "bash", args: { command: "sleep 10" } },
+    ctx2,
+  );
   await pi2.emit("session_shutdown", { reason: "quit" }, ctx2);
 
   const shutdownAgent = spanByLogType("agent");
   assert.equal(parentSpanId(shutdownAgent), undefined);
-  assert.equal(shutdownAgent.attributes.status_code, 500);
+  assert.equal(shutdownAgent.status.code, 2);
   assert.equal(
     shutdownAgent.attributes["error.message"],
     "Session shut down before the agent run completed",
   );
   const interruptedChat = spanByLogType("chat");
-  assert.equal(interruptedChat.attributes.status_code, 500);
-  assert.equal(interruptedChat.attributes["error.message"], "Interrupted before completion");
+  assert.equal(interruptedChat.status.code, 2);
+  assert.equal(
+    interruptedChat.attributes["error.message"],
+    "Interrupted before completion",
+  );
   assert.equal(interruptedChat.attributes["gen_ai.prompt.0.content"], "sys");
-  assert.equal(interruptedChat.attributes["gen_ai.prompt.1.content"], "Long task");
+  assert.equal(
+    interruptedChat.attributes["gen_ai.prompt.1.content"],
+    "Long task",
+  );
   const interruptedTool = spanByLogType("tool");
-  assert.equal(interruptedTool.attributes.status_code, 500);
-  assert.equal(interruptedTool.attributes["error.message"], "Interrupted before completion");
-  assert.equal(spanByLogType("agent").attributes["respan.metadata.tool_call_count"], 1);
+  assert.equal(interruptedTool.status.code, 2);
+  assert.equal(
+    interruptedTool.attributes["error.message"],
+    "Interrupted before completion",
+  );
+  assert.equal(metadata(spanByLogType("agent"))["tool_call_count"], 1);
   for (const span of captureState.spans) {
     assertCommonContract(span);
   }
@@ -905,7 +1202,11 @@ test("compaction spans: root trace outside a run, child of agent inside a run", 
 
   await pi.emit(
     "session_before_compact",
-    { preparation: { tokensBefore: 120000, firstKeptEntryId: "e9" }, reason: "manual", willRetry: false },
+    {
+      preparation: { tokensBefore: 120000, firstKeptEntryId: "e9" },
+      reason: "manual",
+      willRetry: false,
+    },
     ctx,
   );
   await pi.emit(
@@ -930,55 +1231,118 @@ test("compaction spans: root trace outside a run, child of agent inside a run", 
   assert.equal(standalone.attributes["respan.entity.log_type"], "task");
   assert.equal(standalone.attributes["traceloop.entity.name"], "compaction");
   assert.equal(parentSpanId(standalone), undefined);
-  assert.equal(standalone.attributes["respan.sessions.session_identifier"], "sess-compact");
-  assert.equal(standalone.attributes["respan.metadata.reason"], "manual");
-  assert.deepEqual(JSON.parse(standalone.attributes["traceloop.entity.input"]), {
-    reason: "manual",
-    willRetry: false,
-    tokensBefore: 120000,
-  });
-  const standaloneOutput = JSON.parse(standalone.attributes["traceloop.entity.output"]);
+  assert.equal(
+    standalone.attributes["respan.sessions.session_identifier"],
+    "sess-compact",
+  );
+  assert.equal(metadata(standalone)["reason"], "manual");
+  assert.deepEqual(
+    JSON.parse(standalone.attributes["traceloop.entity.input"]),
+    {
+      reason: "manual",
+      willRetry: false,
+      tokensBefore: 120000,
+    },
+  );
+  const standaloneOutput = JSON.parse(
+    standalone.attributes["traceloop.entity.output"],
+  );
   assert.equal(standaloneOutput.summary, "We inspected the repo.");
   assert.equal(standaloneOutput.tokensBefore, 120000);
   assert.equal(standaloneOutput.firstKeptEntryId, "e9");
   assert.equal(standalone.attributes.status_code, undefined);
 
   captureState.spans = [];
-  await pi.emit("before_agent_start", { prompt: "Continue", systemPrompt: "sys" }, ctx);
+  await pi.emit(
+    "before_agent_start",
+    { prompt: "Continue", systemPrompt: "sys" },
+    ctx,
+  );
   await pi.emit("agent_start", {}, ctx);
-  await pi.emit("session_before_compact", { preparation: { tokensBefore: 90000 }, reason: "threshold", willRetry: false }, ctx);
+  await pi.emit(
+    "session_before_compact",
+    {
+      preparation: { tokensBefore: 90000 },
+      reason: "threshold",
+      willRetry: false,
+    },
+    ctx,
+  );
   await pi.emit(
     "session_compact",
-    { compactionEntry: { summary: "Summary", firstKeptEntryId: "e20", tokensBefore: 90000 }, reason: "threshold", willRetry: false },
+    {
+      compactionEntry: {
+        summary: "Summary",
+        firstKeptEntryId: "e20",
+        tokensBefore: 90000,
+      },
+      reason: "threshold",
+      willRetry: false,
+    },
     ctx,
   );
   await pi.emit("agent_end", { messages: [] }, ctx);
-  const compaction = captureState.spans.find((span) => span.name === "pi.compaction");
+  const compaction = captureState.spans.find(
+    (span) => span.name === "pi.compaction",
+  );
   const agentSpan = spanByLogType("agent");
   assert.ok(compaction);
   assert.equal(parentSpanId(compaction), agentSpan.spanContext().spanId);
-  assert.equal(compaction.spanContext().traceId, agentSpan.spanContext().traceId);
+  assert.equal(
+    compaction.spanContext().traceId,
+    agentSpan.spanContext().traceId,
+  );
 
   // Failed / aborted compactions
   captureState.spans = [];
-  await pi.emit("session_before_compact", { preparation: { tokensBefore: 1 }, reason: "overflow", willRetry: true }, ctx);
   await pi.emit(
-    "session_compact_failed",
-    { reason: "overflow", errorMessage: "summarizer timed out", aborted: false, willRetry: true },
+    "session_before_compact",
+    { preparation: { tokensBefore: 1 }, reason: "overflow", willRetry: true },
     ctx,
   );
-  await pi.emit("session_before_compact", { preparation: { tokensBefore: 1 }, reason: "manual", willRetry: false }, ctx);
-  await pi.emit("session_compact_failed", { reason: "manual", aborted: true, willRetry: false }, ctx);
+  await pi.emit(
+    "session_compact_failed",
+    {
+      reason: "overflow",
+      errorMessage: "summarizer timed out",
+      aborted: false,
+      willRetry: true,
+    },
+    ctx,
+  );
+  await pi.emit(
+    "session_before_compact",
+    { preparation: { tokensBefore: 1 }, reason: "manual", willRetry: false },
+    ctx,
+  );
+  await pi.emit(
+    "session_compact_failed",
+    { reason: "manual", aborted: true, willRetry: false },
+    ctx,
+  );
   assert.equal(captureState.spans.length, 2);
-  assert.equal(captureState.spans[0].attributes.status_code, 500);
-  assert.equal(captureState.spans[0].attributes["error.message"], "summarizer timed out");
-  assert.equal(captureState.spans[1].attributes["error.message"], "Compaction aborted");
+  assert.equal(captureState.spans[0].status.code, 2);
+  assert.equal(
+    captureState.spans[0].attributes["error.message"],
+    "summarizer timed out",
+  );
+  assert.equal(
+    captureState.spans[1].attributes["error.message"],
+    "Compaction aborted",
+  );
 
   // Branch summary
   captureState.spans = [];
   await pi.emit(
     "session_before_tree",
-    { preparation: { targetId: "e3", oldLeafId: "e12", userWantsSummary: true, label: "alt" } },
+    {
+      preparation: {
+        targetId: "e3",
+        oldLeafId: "e12",
+        userWantsSummary: true,
+        label: "alt",
+      },
+    },
     ctx,
   );
   await pi.emit(
@@ -986,7 +1350,13 @@ test("compaction spans: root trace outside a run, child of agent inside a run", 
     {
       newLeafId: "e13",
       oldLeafId: "e12",
-      summaryEntry: { type: "branch_summary", id: "b1", parentId: "e3", fromId: "e12", summary: "Abandoned branch did X." },
+      summaryEntry: {
+        type: "branch_summary",
+        id: "b1",
+        parentId: "e3",
+        fromId: "e12",
+        summary: "Abandoned branch did X.",
+      },
     },
     ctx,
   );
@@ -1020,37 +1390,68 @@ test("skill usage is detected from read of SKILL.md and the skill tool", async (
   instrumentor.extension(pi);
   const ctx = createFakeCtx();
   await pi.emit("session_start", { reason: "startup" }, ctx);
-  await pi.emit("before_agent_start", { prompt: "Review", systemPrompt: "sys" }, ctx);
+  await pi.emit(
+    "before_agent_start",
+    { prompt: "Review", systemPrompt: "sys" },
+    ctx,
+  );
   await pi.emit("agent_start", {}, ctx);
   await pi.emit(
     "tool_execution_start",
-    { toolCallId: "r1", toolName: "read", args: { path: "/home/dev/.pi/agent/skills/review/SKILL.md" } },
+    {
+      toolCallId: "r1",
+      toolName: "read",
+      args: { path: "/home/dev/.pi/agent/skills/review/SKILL.md" },
+    },
     ctx,
   );
   await pi.emit(
     "tool_execution_end",
-    { toolCallId: "r1", toolName: "read", result: { content: [{ type: "text", text: "# Review skill" }] }, isError: false },
+    {
+      toolCallId: "r1",
+      toolName: "read",
+      result: { content: [{ type: "text", text: "# Review skill" }] },
+      isError: false,
+    },
     ctx,
   );
-  await pi.emit("tool_execution_start", { toolCallId: "r2", toolName: "read", args: { path: "/repo/README.md" } }, ctx);
   await pi.emit(
-    "tool_execution_end",
-    { toolCallId: "r2", toolName: "read", result: { content: [{ type: "text", text: "readme" }] }, isError: false },
+    "tool_execution_start",
+    { toolCallId: "r2", toolName: "read", args: { path: "/repo/README.md" } },
     ctx,
   );
-  await pi.emit("tool_execution_start", { toolCallId: "s1", toolName: "skill", args: { name: "deploy" } }, ctx);
   await pi.emit(
     "tool_execution_end",
-    { toolCallId: "s1", toolName: "skill", result: { content: [{ type: "text", text: "ok" }] }, isError: false },
+    {
+      toolCallId: "r2",
+      toolName: "read",
+      result: { content: [{ type: "text", text: "readme" }] },
+      isError: false,
+    },
+    ctx,
+  );
+  await pi.emit(
+    "tool_execution_start",
+    { toolCallId: "s1", toolName: "skill", args: { name: "deploy" } },
+    ctx,
+  );
+  await pi.emit(
+    "tool_execution_end",
+    {
+      toolCallId: "s1",
+      toolName: "skill",
+      result: { content: [{ type: "text", text: "ok" }] },
+      isError: false,
+    },
     ctx,
   );
   await pi.emit("agent_end", { messages: [] }, ctx);
 
   const toolSpans = spansByLogType("tool");
   assert.equal(toolSpans.length, 3);
-  assert.equal(toolSpans[0].attributes["respan.metadata.skill_name"], "review");
-  assert.equal(toolSpans[1].attributes["respan.metadata.skill_name"], undefined);
-  assert.equal(toolSpans[2].attributes["respan.metadata.skill_name"], "deploy");
+  assert.equal(metadata(toolSpans[0])["skill_name"], "review");
+  assert.equal(metadata(toolSpans[1])["skill_name"], undefined);
+  assert.equal(metadata(toolSpans[2])["skill_name"], "deploy");
   assert.equal(toolSpans[0].name, "read.tool");
   for (const span of captureState.spans) {
     assertCommonContract(span);
@@ -1059,7 +1460,11 @@ test("skill usage is detected from read of SKILL.md and the skill tool", async (
 
 test("attach() subscribe mode traces a session and deactivate() unsubscribes", () => {
   captureState.spans = [];
-  const instrumentor = new PiInstrumentor({ workflowName: "mail-agent", agentName: "triage", promptCapture: "delta" });
+  const instrumentor = new PiInstrumentor({
+    workflowName: "mail-agent",
+    agentName: "triage",
+    promptCapture: "delta",
+  });
   instrumentor.activate();
   const session = createFakeSession("sdk-session", []);
   const detach = instrumentor.attach(session, {
@@ -1078,7 +1483,12 @@ test("attach() subscribe mode traces a session and deactivate() unsubscribes", (
   session.emit({ type: "turn_start" });
   session.emit({ type: "message_end", message: assistantWithTool });
   session.messages.push(assistantWithTool);
-  session.emit({ type: "tool_execution_start", toolCallId: "call-1", toolName: "bash", args: { command: "ls" } });
+  session.emit({
+    type: "tool_execution_start",
+    toolCallId: "call-1",
+    toolName: "bash",
+    args: { command: "ls" },
+  });
   session.emit({
     type: "tool_execution_end",
     toolCallId: "call-1",
@@ -1086,13 +1496,24 @@ test("attach() subscribe mode traces a session and deactivate() unsubscribes", (
     result: { content: [{ type: "text", text: "README.md" }], details: {} },
     isError: false,
   });
-  session.emit({ type: "turn_end", message: assistantWithTool, toolResults: [toolResultMessage] });
+  session.emit({
+    type: "turn_end",
+    message: assistantWithTool,
+    toolResults: [toolResultMessage],
+  });
   session.messages.push(toolResultMessage);
   session.emit({ type: "turn_start" });
-  session.emit({ type: "message_start", message: { ...assistantFinal, content: [], stopReason: "pending" } });
+  session.emit({
+    type: "message_start",
+    message: { ...assistantFinal, content: [], stopReason: "pending" },
+  });
   session.emit({ type: "message_end", message: assistantFinal });
   session.messages.push(assistantFinal);
-  session.emit({ type: "agent_end", messages: session.messages, willRetry: false });
+  session.emit({
+    type: "agent_end",
+    messages: session.messages,
+    willRetry: false,
+  });
 
   assert.equal(captureState.spans.length, 4);
   const agentSpan = spanByLogType("agent");
@@ -1101,28 +1522,49 @@ test("attach() subscribe mode traces a session and deactivate() unsubscribes", (
   assert.equal(agentSpan.name, "triage.turn-1.agent");
   assert.equal(parentSpanId(agentSpan), undefined);
   assert.equal(agentSpan.attributes["traceloop.workflow.name"], "mail-agent");
-  assert.equal(agentSpan.attributes["respan.metadata.agent_name"], "triage");
+  assert.equal(metadata(agentSpan)["agent_name"], "triage");
   // The trace group is the pi session id, not the workflow name.
-  assert.equal(agentSpan.attributes["respan.trace.trace_group_identifier"], "sdk-session");
+  assert.equal(
+    agentSpan.attributes["respan.trace.trace_group_identifier"],
+    "sdk-session",
+  );
   assert.deepEqual(JSON.parse(agentSpan.attributes["traceloop.entity.input"]), [
     { role: "user", content: "Hello from SDK" },
   ]);
-  assert.equal(agentSpan.attributes["traceloop.entity.output"], "The repo has a README.");
-  assert.equal(agentSpan.attributes["respan.metadata.continuation"], undefined);
+  assert.equal(
+    agentSpan.attributes["traceloop.entity.output"],
+    "The repo has a README.",
+  );
+  assert.equal(metadata(agentSpan)["continuation"], undefined);
   assert.equal(chat1.attributes["gen_ai.prompt.0.role"], "user");
   assert.equal(chat1.attributes["gen_ai.prompt.0.content"], "Hello from SDK");
-  assert.equal(chat1.attributes["gen_ai.completion.0.content"], "Listing files.");
+  assert.equal(
+    chat1.attributes["gen_ai.completion.0.content"],
+    "Listing files.",
+  );
   assert.equal(chat1.attributes["gen_ai.usage.prompt_tokens"], 9);
   assert.equal(chat2.attributes["gen_ai.prompt.0.role"], "assistant");
   assert.equal(chat2.attributes["gen_ai.prompt.1.role"], "tool");
   assert.equal(chat2.attributes["gen_ai.prompt.2.role"], undefined);
-  assert.equal(chat2.attributes["respan.metadata.prompt_message_offset"], 1);
-  assert.equal(toolSpan.attributes["traceloop.entity.output"], "README.md");
+  assert.equal(metadata(chat2)["prompt_message_offset"], 1);
+  assert.equal(
+    JSON.parse(toolSpan.attributes["traceloop.entity.output"]).content[0].text,
+    "README.md",
+  );
   for (const span of captureState.spans) {
-    assert.equal(span.attributes["respan.threads.thread_identifier"], "email-chain-42");
-    assert.equal(span.attributes["respan.sessions.session_identifier"], "sdk-session");
-    assert.equal(span.attributes["respan.customer_params.customer_identifier"], "cust-1");
-    assert.equal(span.attributes["respan.metadata.mailbox"], "inbox");
+    assert.equal(
+      span.attributes["respan.threads.thread_identifier"],
+      "email-chain-42",
+    );
+    assert.equal(
+      span.attributes["respan.sessions.session_identifier"],
+      "sdk-session",
+    );
+    assert.equal(
+      span.attributes["respan.customer_params.customer_identifier"],
+      "cust-1",
+    );
+    assert.equal(metadata(span)["mailbox"], "inbox");
     assert.equal(span.spanContext().traceId, agentSpan.spanContext().traceId);
     assertCommonContract(span);
   }
@@ -1156,19 +1598,33 @@ test("continuation runs without a prompt reuse the last prompt", async () => {
   captureState.spans = [];
   // e.g. an auto-retry in extension mode: agent_start without before_agent_start
   await pi.emit("agent_start", {}, ctx);
-  await pi.emit("context", { messages: [userMessage, assistantWithTool, toolResultMessage, assistantFinal] }, ctx);
+  await pi.emit(
+    "context",
+    {
+      messages: [
+        userMessage,
+        assistantWithTool,
+        toolResultMessage,
+        assistantFinal,
+      ],
+    },
+    ctx,
+  );
   await pi.emit("turn_start", { turnIndex: 0 }, ctx);
   await pi.emit("message_end", { message: assistantFinal }, ctx);
   await pi.emit("agent_end", { messages: [] }, ctx);
   const agentSpan = spanByLogType("agent");
-  assert.equal(agentSpan.attributes["respan.metadata.continuation"], true);
+  assert.equal(metadata(agentSpan)["continuation"], true);
   assert.deepEqual(JSON.parse(agentSpan.attributes["traceloop.entity.input"]), [
     { role: "user", content: "Inspect the repo" },
   ]);
   // First LLM call of a run captures from the last user message onward.
   const chatSpan = spanByLogType("chat");
-  assert.equal(chatSpan.attributes["respan.metadata.prompt_message_offset"], 0);
-  assert.equal(JSON.parse(chatSpan.attributes["traceloop.entity.input"]).length, 4);
+  assert.equal(metadata(chatSpan)["prompt_message_offset"], 0);
+  assert.equal(
+    JSON.parse(chatSpan.attributes["traceloop.entity.input"]).length,
+    4,
+  );
   for (const span of captureState.spans) {
     assertCommonContract(span);
   }
@@ -1181,7 +1637,10 @@ test("traceScope: session shares one trace across runs; run scope gives one trac
   assert.equal(sessionTraceId(uuid), expectedTraceId);
   assert.equal(sessionTraceId(uuid.toUpperCase()), expectedTraceId);
   // … anything else to a SHA-256 prefix (collision-safe, unlike a repeated short hash).
-  const hashed = createHash("sha256").update("sess-123").digest("hex").slice(0, 32);
+  const hashed = createHash("sha256")
+    .update("sess-123")
+    .digest("hex")
+    .slice(0, 32);
   assert.equal(sessionTraceId("sess-123"), hashed);
   assert.match(hashed, /^[0-9a-f]{32}$/);
 
@@ -1198,7 +1657,10 @@ test("traceScope: session shares one trace across runs; run scope gives one trac
   // Two runs → two parentless agent (turn) roots (distinct span ids) in ONE trace.
   const agents = spansByLogType("agent");
   assert.equal(agents.length, 2);
-  assert.notEqual(agents[0].spanContext().spanId, agents[1].spanContext().spanId);
+  assert.notEqual(
+    agents[0].spanContext().spanId,
+    agents[1].spanContext().spanId,
+  );
   for (const agent of agents) {
     assert.equal(parentSpanId(agent), undefined);
     assert.equal(agent.spanContext().traceId, expectedTraceId);
@@ -1226,7 +1688,11 @@ test("traceScope: session shares one trace across runs; run scope gives one trac
   );
   await pi.emit(
     "session_compact",
-    { compactionEntry: { summary: "s", tokensBefore: 10 }, reason: "manual", willRetry: false },
+    {
+      compactionEntry: { summary: "s", tokensBefore: 10 },
+      reason: "manual",
+      willRetry: false,
+    },
     ctx,
   );
   assert.equal(captureState.spans.length, 1);
@@ -1237,7 +1703,9 @@ test("traceScope: session shares one trace across runs; run scope gives one trac
   captureState.spans = [];
   const hashedPi = createFakePi();
   instrumentor.extension(hashedPi);
-  await replayRun(hashedPi, createFakeCtx({ sessionId: "sess-123" }), { shutdown: false });
+  await replayRun(hashedPi, createFakeCtx({ sessionId: "sess-123" }), {
+    shutdown: false,
+  });
   assert.equal(captureState.spans.length, 4);
   for (const span of captureState.spans) {
     assert.equal(span.spanContext().traceId, hashed);
@@ -1256,7 +1724,10 @@ test("traceScope: session shares one trace across runs; run scope gives one trac
   await replayRun(runPi, runCtx, { shutdown: false });
   const runAgents = spansByLogType("agent");
   assert.equal(runAgents.length, 2);
-  assert.notEqual(runAgents[0].spanContext().traceId, runAgents[1].spanContext().traceId);
+  assert.notEqual(
+    runAgents[0].spanContext().traceId,
+    runAgents[1].spanContext().traceId,
+  );
   assert.notEqual(runAgents[0].spanContext().traceId, expectedTraceId);
 });
 
@@ -1278,17 +1749,27 @@ test("run scope nests under an active OTEL span; session scope always emits a ro
       session.emit({ type: "message_start", message: prompt });
       session.emit({ type: "message_end", message: prompt });
       session.messages.push(prompt);
-      session.emit({ type: "agent_end", messages: session.messages, willRetry: false });
+      session.emit({
+        type: "agent_end",
+        messages: session.messages,
+        willRetry: false,
+      });
     };
 
     captureState.spans = [];
     const runScoped = new PiInstrumentor({ traceScope: "run" });
     runScoped.activate();
-    const nested = createFakeSession("3f2504e0-4f89-11d3-9a0c-0305e82c3301", []);
+    const nested = createFakeSession(
+      "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+      [],
+    );
     const detachNested = runScoped.attach(nested);
     context.with(activeContext, () => runPrompt(nested));
     const nestedAgent = spanByLogType("agent");
-    assert.equal(nestedAgent.spanContext().traceId, "0af7651916cd43dd8448eb211c80319c");
+    assert.equal(
+      nestedAgent.spanContext().traceId,
+      "0af7651916cd43dd8448eb211c80319c",
+    );
     assert.equal(parentSpanId(nestedAgent), "b7ad6b7169203331");
     detachNested();
 
@@ -1299,7 +1780,10 @@ test("run scope nests under an active OTEL span; session scope always emits a ro
     const detachRoot = sessionScoped.attach(root);
     context.with(activeContext, () => runPrompt(root));
     const rootAgent = spanByLogType("agent");
-    assert.equal(rootAgent.spanContext().traceId, "3f2504e04f8911d39a0c0305e82c3301");
+    assert.equal(
+      rootAgent.spanContext().traceId,
+      "3f2504e04f8911d39a0c0305e82c3301",
+    );
     assert.equal(parentSpanId(rootAgent), undefined);
     detachRoot();
   } finally {
@@ -1337,17 +1821,26 @@ test("deactivate() closes open runs before it stops emitting", async () => {
   assert.equal(instrumentor.activeSessionCount, 0);
   const agentSpan = spanByLogType("agent");
   const toolSpan = spanByLogType("tool");
-  assert.ok(agentSpan && toolSpan, "root agent and interrupted tool spans were emitted");
-  assert.equal(agentSpan.attributes.status_code, 500);
+  assert.ok(
+    agentSpan && toolSpan,
+    "root agent and interrupted tool spans were emitted",
+  );
+  assert.equal(agentSpan.status.code, 2);
   assert.equal(
     agentSpan.attributes["error.message"],
     "Session shut down before the agent run completed",
   );
-  assert.equal(toolSpan.attributes["error.message"], "Interrupted before completion");
+  assert.equal(
+    toolSpan.attributes["error.message"],
+    "Interrupted before completion",
+  );
   assert.equal(parentSpanId(agentSpan), undefined);
   assert.equal(parentSpanId(toolSpan), agentSpan.spanContext().spanId);
-  assert.equal(spanByLogType("chat").spanContext().traceId, agentSpan.spanContext().traceId);
-  assert.equal(agentSpan.attributes["respan.metadata.tool_call_count"], 1);
+  assert.equal(
+    spanByLogType("chat").spanContext().traceId,
+    agentSpan.spanContext().traceId,
+  );
+  assert.equal(metadata(agentSpan)["tool_call_count"], 1);
   for (const span of captureState.spans) {
     assertCommonContract(span);
   }
@@ -1360,14 +1853,25 @@ test("deactivate() closes open runs before it stops emitting", async () => {
   ext.extension(pi);
   const ctx = createFakeCtx({ sessionId: "sess-deactivate" });
   await pi.emit("session_start", { reason: "startup" }, ctx);
-  await pi.emit("before_agent_start", { prompt: "Long task", systemPrompt: "sys" }, ctx);
+  await pi.emit(
+    "before_agent_start",
+    { prompt: "Long task", systemPrompt: "sys" },
+    ctx,
+  );
   await pi.emit("agent_start", {}, ctx);
-  await pi.emit("context", { messages: [{ role: "user", content: "Long task" }] }, ctx);
+  await pi.emit(
+    "context",
+    { messages: [{ role: "user", content: "Long task" }] },
+    ctx,
+  );
   await pi.emit("turn_start", { turnIndex: 0 }, ctx);
   ext.deactivate();
   assert.equal(spansByLogType("agent").length, 1);
-  assert.equal(spanByLogType("agent").attributes.status_code, 500);
-  assert.equal(spanByLogType("chat").attributes["error.message"], "Interrupted before completion");
+  assert.equal(spanByLogType("agent").status.code, 2);
+  assert.equal(
+    spanByLogType("chat").attributes["error.message"],
+    "Interrupted before completion",
+  );
   // Nothing is emitted afterwards.
   captureState.spans = [];
   await pi.emit("agent_end", { messages: [] }, ctx);
@@ -1376,11 +1880,19 @@ test("deactivate() closes open runs before it stops emitting", async () => {
 
 test("a retry that never happens closes the run on auto_retry_end / agent_settled", () => {
   captureState.spans = [];
-  const instrumentor = new PiInstrumentor({ traceScope: "run", promptCapture: "delta" });
+  const instrumentor = new PiInstrumentor({
+    traceScope: "run",
+    promptCapture: "delta",
+  });
   instrumentor.activate();
   const session = createFakeSession("retry-abandoned", []);
   const detach = instrumentor.attach(session);
-  const failed = { ...assistantFinal, content: [], stopReason: "error", errorMessage: "overloaded_error" };
+  const failed = {
+    ...assistantFinal,
+    content: [],
+    stopReason: "error",
+    errorMessage: "overloaded_error",
+  };
 
   const prompt1 = { role: "user", content: "First", timestamp: 1 };
   session.emit({ type: "agent_start" });
@@ -1389,15 +1901,24 @@ test("a retry that never happens closes the run on auto_retry_end / agent_settle
   session.emit({ type: "message_end", message: prompt1 });
   session.messages.push(prompt1);
   session.emit({ type: "message_end", message: failed });
-  session.emit({ type: "agent_end", messages: [prompt1, failed], willRetry: true });
+  session.emit({
+    type: "agent_end",
+    messages: [prompt1, failed],
+    willRetry: true,
+  });
   assert.equal(spansByLogType("agent").length, 0);
   // The caller aborts during the backoff: pi cancels the retry and settles.
-  session.emit({ type: "auto_retry_end", success: false, attempt: 1, finalError: "Retry cancelled" });
+  session.emit({
+    type: "auto_retry_end",
+    success: false,
+    attempt: 1,
+    finalError: "Retry cancelled",
+  });
   session.emit({ type: "agent_settled" });
   assert.equal(spansByLogType("agent").length, 1);
   const first = spanByLogType("agent");
   assert.equal(first.name, "pi.turn-1.agent");
-  assert.equal(first.attributes.status_code, 500);
+  assert.equal(first.status.code, 2);
   assert.equal(first.attributes["error.message"], "Retry cancelled");
   assert.deepEqual(JSON.parse(first.attributes["traceloop.entity.input"]), [
     { role: "user", content: "First" },
@@ -1411,10 +1932,17 @@ test("a retry that never happens closes the run on auto_retry_end / agent_settle
   session.emit({ type: "message_start", message: prompt2 });
   session.emit({ type: "message_end", message: prompt2 });
   session.messages.push(prompt2);
-  session.emit({ type: "message_start", message: { ...assistantFinal, content: [], stopReason: "pending" } });
+  session.emit({
+    type: "message_start",
+    message: { ...assistantFinal, content: [], stopReason: "pending" },
+  });
   session.emit({ type: "message_end", message: assistantFinal });
   session.messages.push(assistantFinal);
-  session.emit({ type: "agent_end", messages: session.messages, willRetry: false });
+  session.emit({
+    type: "agent_end",
+    messages: session.messages,
+    willRetry: false,
+  });
   session.emit({ type: "agent_settled" });
   assert.equal(spansByLogType("agent").length, 1);
   const second = spanByLogType("agent");
@@ -1425,8 +1953,11 @@ test("a retry that never happens closes the run on auto_retry_end / agent_settle
   assert.deepEqual(JSON.parse(second.attributes["traceloop.entity.input"]), [
     { role: "user", content: "Second" },
   ]);
-  assert.equal(spanByLogType("chat").attributes["gen_ai.prompt.0.content"], "Second");
-  assert.equal(spanByLogType("agent").attributes["respan.metadata.turn_count"], 1);
+  assert.equal(
+    spanByLogType("chat").attributes["gen_ai.prompt.0.content"],
+    "Second",
+  );
+  assert.equal(metadata(spanByLogType("agent"))["turn_count"], 1);
 
   // agent_settled alone (no auto_retry_end) also closes a run kept open by willRetry,
   // and is a no-op without an open run.
@@ -1453,31 +1984,39 @@ test("the tool catalog on chat spans is capped like every other captured string"
     {
       name: "mcp_search",
       description: "d".repeat(5000),
-      parameters: { type: "object", properties: { q: { type: "string", description: "p".repeat(5000) } } },
+      parameters: {
+        type: "object",
+        properties: { q: { type: "string", description: "p".repeat(5000) } },
+      },
     },
   ];
   instrumentor.extension(pi);
   await replayRun(pi, createFakeCtx(), { shutdown: false });
   const chat = spanByLogType("chat");
   const functions = chat.attributes["llm.request.functions"];
-  assert.ok(functions.length < 300, `capped catalog, got ${functions.length} chars`);
+  assert.ok(
+    functions.length < 300,
+    `capped catalog, got ${functions.length} chars`,
+  );
   assert.ok(functions.includes(" …[truncated "));
   assert.ok(functions.startsWith('[{"name":"mcp_search"'));
-  assert.equal(chat.attributes["respan.metadata.truncated"], true);
+  assert.equal(metadata(chat)["truncated"], true);
 
   // Small catalogs are untouched.
   captureState.spans = [];
   const plain = new PiInstrumentor({ maxContentChars: 200 });
   plain.activate();
   const plainPi = createFakePi();
-  plainPi.getAllTools = () => [{ name: "bash", description: "Run", parameters: { type: "object" } }];
+  plainPi.getAllTools = () => [
+    { name: "bash", description: "Run", parameters: { type: "object" } },
+  ];
   plain.extension(plainPi);
   await replayRun(plainPi, createFakeCtx(), { shutdown: false });
   const plainChat = spanByLogType("chat");
   assert.deepEqual(JSON.parse(plainChat.attributes["llm.request.functions"]), [
     { name: "bash", description: "Run", parameters: { type: "object" } },
   ]);
-  assert.equal(plainChat.attributes["respan.metadata.truncated"], undefined);
+  assert.equal(metadata(plainChat)["truncated"], undefined);
 });
 
 test("respan.propagateAttributes() overrides correlation for a run", () => {
@@ -1502,20 +2041,36 @@ test("respan.propagateAttributes() overrides correlation for a run", () => {
         session.emit({ type: "message_start", message: prompt });
         session.emit({ type: "message_end", message: prompt });
         session.messages.push(prompt);
-        session.emit({ type: "message_start", message: { ...assistantFinal, content: [], stopReason: "pending" } });
+        session.emit({
+          type: "message_start",
+          message: { ...assistantFinal, content: [], stopReason: "pending" },
+        });
         session.emit({ type: "message_end", message: assistantFinal });
         session.messages.push(assistantFinal);
-        session.emit({ type: "agent_end", messages: session.messages, willRetry: false });
+        session.emit({
+          type: "agent_end",
+          messages: session.messages,
+          willRetry: false,
+        });
       },
     );
     assert.equal(captureState.spans.length, 2);
     for (const span of captureState.spans) {
-      assert.equal(span.attributes["respan.threads.thread_identifier"], "email-chain-7");
-      assert.equal(span.attributes["respan.sessions.session_identifier"], "propagated-session");
-      assert.equal(span.attributes["respan.customer_params.customer_identifier"], "cust-7");
-      assert.equal(span.attributes["respan.metadata.mailbox"], "billing");
+      assert.equal(
+        span.attributes["respan.threads.thread_identifier"],
+        "email-chain-7",
+      );
+      assert.equal(
+        span.attributes["respan.sessions.session_identifier"],
+        "propagated-session",
+      );
+      assert.equal(
+        span.attributes["respan.customer_params.customer_identifier"],
+        "cust-7",
+      );
+      assert.equal(metadata(span)["mailbox"], "billing");
       // Explicit tracer metadata wins over propagated metadata.
-      assert.equal(span.attributes["respan.metadata.source"], "sdk");
+      assert.equal(metadata(span)["source"], "sdk");
       assertCommonContract(span);
     }
 
@@ -1525,13 +2080,21 @@ test("respan.propagateAttributes() overrides correlation for a run", () => {
     session.emit({ type: "agent_end", messages: [], willRetry: false });
     assert.equal(captureState.spans.length, 1);
     for (const span of captureState.spans) {
-      assert.equal(span.attributes["respan.threads.thread_identifier"], "propagated-session");
-      assert.equal(span.attributes["respan.customer_params.customer_identifier"], undefined);
+      assert.equal(
+        span.attributes["respan.threads.thread_identifier"],
+        "propagated-session",
+      );
+      assert.equal(
+        span.attributes["respan.customer_params.customer_identifier"],
+        undefined,
+      );
     }
 
     // Explicit attach() overrides win over propagated values.
     detach();
-    const pinned = instrumentor.attach(session, { threadIdentifier: "pinned-thread" });
+    const pinned = instrumentor.attach(session, {
+      threadIdentifier: "pinned-thread",
+    });
     captureState.spans = [];
     propagateAttributes({ thread_identifier: "ignored" }, () => {
       session.emit({ type: "agent_start" });
@@ -1539,7 +2102,10 @@ test("respan.propagateAttributes() overrides correlation for a run", () => {
     });
     assert.equal(captureState.spans.length, 1);
     for (const span of captureState.spans) {
-      assert.equal(span.attributes["respan.threads.thread_identifier"], "pinned-thread");
+      assert.equal(
+        span.attributes["respan.threads.thread_identifier"],
+        "pinned-thread",
+      );
     }
     pinned();
   } finally {
@@ -1565,7 +2131,10 @@ test("registry contract and tracer sink", () => {
 
     // A tracer with an explicit sink works without a tracer provider.
     const sink = [];
-    const tracer = new PiSessionTracer({ emit: (span) => sink.push(span), workflowName: "custom" });
+    const tracer = new PiSessionTracer({
+      emit: (span) => sink.push(span),
+      workflowName: "custom",
+    });
     tracer.setSession({ sessionId: "direct" });
     tracer.onBeforeAgentStart({ prompt: "hi", systemPrompt: "sys" });
     tracer.onAgentStart();
@@ -1575,7 +2144,10 @@ test("registry contract and tracer sink", () => {
     assert.equal(sink.length, 2);
     assert.equal(sink[1].name, "pi.turn-1.agent");
     assert.equal(sink[1].attributes["traceloop.workflow.name"], "custom");
-    assert.equal(sink[1].attributes["respan.threads.thread_identifier"], "direct");
+    assert.equal(
+      sink[1].attributes["respan.threads.thread_identifier"],
+      "direct",
+    );
     for (const span of sink) {
       assertCommonContract(span);
     }
@@ -1592,9 +2164,12 @@ function sessionEntry(role, content) {
 function assertTurn(span, agentName, turnNumber) {
   assert.equal(span.attributes["respan.entity.log_type"], "agent");
   assert.equal(span.name, `${agentName}.turn-${turnNumber}.agent`);
-  assert.equal(span.attributes["respan.metadata.turn_number"], turnNumber);
+  assert.equal(metadata(span)["turn_number"], turnNumber);
   assert.equal(span.attributes["respan.internal.span_name.kind"], "agent");
-  assert.equal(span.attributes["respan.internal.span_name.detail"], `turn-${turnNumber}`);
+  assert.equal(
+    span.attributes["respan.internal.span_name.detail"],
+    `turn-${turnNumber}`,
+  );
   assert.equal(span.attributes["traceloop.entity.name"], agentName);
   assert.equal(span.attributes["traceloop.entity.path"], "");
 }
@@ -1616,7 +2191,11 @@ test("turn numbering: extension mode counts the user messages on the session bra
     { type: "compaction", id: "c1", summary: "…" },
   ];
   // getEntries() holds abandoned branches too; getBranch() must win.
-  const entries = [...branch, sessionEntry("user", "Abandoned"), sessionEntry("user", "Also abandoned")];
+  const entries = [
+    ...branch,
+    sessionEntry("user", "Abandoned"),
+    sessionEntry("user", "Also abandoned"),
+  ];
   const ctx = createFakeCtx({
     sessionManager: {
       getSessionId: () => "sess-resumed",
@@ -1677,7 +2256,9 @@ test("turn numbering: a prompt already appended to the session is not counted tw
 
   // A different last prompt is a new turn.
   captureState.spans = [];
-  branch.push(sessionEntry("assistant", [{ type: "text", text: "Third answer" }]));
+  branch.push(
+    sessionEntry("assistant", [{ type: "text", text: "Third answer" }]),
+  );
   branch.push(sessionEntry("user", "Something else"));
   await replayRun(pi, ctx, { shutdown: false });
   assertTurn(spanByLogType("agent"), "pi", 5);
@@ -1685,17 +2266,28 @@ test("turn numbering: a prompt already appended to the session is not counted tw
   // The same prompt sent again after an answer ("continue" twice in a row) is
   // a new turn: only a user message that is the LAST message counts as appended.
   captureState.spans = [];
-  branch.push(sessionEntry("assistant", [{ type: "text", text: "Fourth answer" }]));
+  branch.push(
+    sessionEntry("assistant", [{ type: "text", text: "Fourth answer" }]),
+  );
   branch.push(sessionEntry("user", "Inspect the repo"));
-  branch.push(sessionEntry("assistant", [{ type: "text", text: "Fifth answer" }]));
-  branch.push({ type: "model_change", provider: "anthropic", modelId: "claude-sonnet-4-5" });
+  branch.push(
+    sessionEntry("assistant", [{ type: "text", text: "Fifth answer" }]),
+  );
+  branch.push({
+    type: "model_change",
+    provider: "anthropic",
+    modelId: "claude-sonnet-4-5",
+  });
   await replayRun(pi, ctx, { shutdown: false });
   assertTurn(spanByLogType("agent"), "pi", 6);
 });
 
 test("turn numbering: without session history, consecutive runs count up within the tracer", async () => {
   captureState.spans = [];
-  const instrumentor = new PiInstrumentor({ traceScope: "run", agentName: "helper" });
+  const instrumentor = new PiInstrumentor({
+    traceScope: "run",
+    agentName: "helper",
+  });
   instrumentor.activate();
   const pi = createFakePi();
   instrumentor.extension(pi);
@@ -1708,7 +2300,10 @@ test("turn numbering: without session history, consecutive runs count up within 
   assertTurn(turns[0], "helper", 1);
   assertTurn(turns[1], "helper", 2);
   // Run scope: each turn is its own trace.
-  assert.notEqual(turns[0].spanContext().traceId, turns[1].spanContext().traceId);
+  assert.notEqual(
+    turns[0].spanContext().traceId,
+    turns[1].spanContext().traceId,
+  );
 
   // A bare tracer counts the same way; an explicit turnNumber wins over the count.
   const sink = [];
@@ -1730,7 +2325,7 @@ test("turn numbering: without session history, consecutive runs count up within 
   tracer.onAgentStart();
   tracer.onAgentEnd({ messages: [] });
   assertTurn(sink[4], "pi", 10);
-  assert.equal(sink[4].attributes["respan.metadata.continuation"], true);
+  assert.equal(metadata(sink[4])["continuation"], true);
 });
 
 test("turn numbering: subscribe mode counts the user messages of session.messages", () => {
@@ -1740,7 +2335,11 @@ test("turn numbering: subscribe mode counts the user messages of session.message
   const history = () => [
     { role: "user", content: "Earlier question", timestamp: 1 },
     { ...assistantFinal, content: [{ type: "text", text: "Earlier answer" }] },
-    { role: "user", content: [{ type: "text", text: "Another question" }], timestamp: 3 },
+    {
+      role: "user",
+      content: [{ type: "text", text: "Another question" }],
+      timestamp: 3,
+    },
     { ...assistantFinal, content: [{ type: "text", text: "Another answer" }] },
   ];
   const session = createFakeSession("sdk-turns", history());
@@ -1753,10 +2352,17 @@ test("turn numbering: subscribe mode counts the user messages of session.message
   session.emit({ type: "message_start", message: prompt });
   session.emit({ type: "message_end", message: prompt });
   session.messages.push(prompt);
-  session.emit({ type: "message_start", message: { ...assistantFinal, content: [], stopReason: "pending" } });
+  session.emit({
+    type: "message_start",
+    message: { ...assistantFinal, content: [], stopReason: "pending" },
+  });
   session.emit({ type: "message_end", message: assistantFinal });
   session.messages.push(assistantFinal);
-  session.emit({ type: "agent_end", messages: session.messages, willRetry: false });
+  session.emit({
+    type: "agent_end",
+    messages: session.messages,
+    willRetry: false,
+  });
   assert.equal(captureState.spans.length, 2);
   const third = spanByLogType("agent");
   assertTurn(third, "pi", 3);
@@ -1771,7 +2377,11 @@ test("turn numbering: subscribe mode counts the user messages of session.message
   session.emit({ type: "message_start", message: next });
   session.emit({ type: "message_end", message: next });
   session.messages.push(next);
-  session.emit({ type: "agent_end", messages: session.messages, willRetry: false });
+  session.emit({
+    type: "agent_end",
+    messages: session.messages,
+    willRetry: false,
+  });
   assertTurn(spanByLogType("agent"), "pi", 4);
   detach();
 
@@ -1851,7 +2461,12 @@ test("spans produced before activate() are buffered and emitted on activation", 
   instrumentor.activate();
   assert.equal(captureState.spans.length, 4);
   const names = captureState.spans.map((span) => span.name).sort();
-  assert.deepEqual(names, ["bash.tool", "pi.chat", "pi.chat", "pi.turn-1.agent"]);
+  assert.deepEqual(names, [
+    "bash.tool",
+    "pi.chat",
+    "pi.chat",
+    "pi.turn-1.agent",
+  ]);
   for (const span of captureState.spans) {
     assertCommonContract(span);
   }
@@ -1871,11 +2486,17 @@ test("git metadata of the working directory lands on the turn span and onRunEnd 
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "pi-git-"));
   let hasGit = true;
   try {
-    const git = (...args) => execFileSync("git", args, { cwd: repo, stdio: "pipe" });
+    const git = (...args) =>
+      execFileSync("git", args, { cwd: repo, stdio: "pipe" });
     git("init", "-q", "-b", "main");
     git("config", "user.email", "t@example.com");
     git("config", "user.name", "t");
-    git("remote", "add", "origin", "https://user:secret@github.com/acme/repo.git");
+    git(
+      "remote",
+      "add",
+      "origin",
+      "https://user:secret@github.com/acme/repo.git",
+    );
     fs.writeFileSync(path.join(repo, "a.txt"), "a");
     git("add", "a.txt");
     git("commit", "-q", "-m", "init");
@@ -1888,12 +2509,18 @@ test("git metadata of the working directory lands on the turn span and onRunEnd 
   const meta = gitMetadataFor(repo);
   assert.equal(meta.branch, "main");
   assert.match(meta.commit, /^[0-9a-f]{40}$/);
-  assert.equal(meta.repository, "https://github.com/acme/repo.git", "credentials stripped");
+  assert.equal(
+    meta.repository,
+    "https://github.com/acme/repo.git",
+    "credentials stripped",
+  );
   assert.equal(gitMetadataFor(path.join(os.tmpdir())), undefined);
 
   captureState.spans = [];
   const runs = [];
-  const instrumentor = new PiInstrumentor({ onRunEnd: (info) => runs.push(info) });
+  const instrumentor = new PiInstrumentor({
+    onRunEnd: (info) => runs.push(info),
+  });
   instrumentor.activate();
   const pi = createFakePi();
   instrumentor.extension(pi);
@@ -1902,9 +2529,12 @@ test("git metadata of the working directory lands on the turn span and onRunEnd 
   await replayRun(pi, ctx);
 
   const turn = spanByLogType("agent");
-  assert.equal(turn.attributes["respan.metadata.git_branch"], "main");
-  assert.equal(turn.attributes["respan.metadata.git_commit"], meta.commit);
-  assert.equal(turn.attributes["respan.metadata.git_repository"], "https://github.com/acme/repo.git");
+  assert.equal(metadata(turn)["git_branch"], "main");
+  assert.equal(metadata(turn)["git_commit"], meta.commit);
+  assert.equal(
+    metadata(turn)["git_repository"],
+    "https://github.com/acme/repo.git",
+  );
   assert.equal(runs.length, 1);
   assert.equal(runs[0].turnNumber, 1);
   assert.equal(runs[0].sessionId, "sess-123");

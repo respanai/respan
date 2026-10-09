@@ -21,14 +21,26 @@ const respan = new Respan({
 await respan.initialize();
 ```
 
-pi has no global patch point: its runtime hands lifecycle events to
+The published Pi SDK hands lifecycle events to
 extensions (`pi.on(...)`) and to SDK subscribers (`session.subscribe(...)`).
 `PiInstrumentor` exposes both as adapters over one translator
 (`PiSessionTracer`), so the trace shape is identical whichever way you wire it.
 
+Supported published SDKs start at `@earendil-works/pi-coding-agent` **0.74.0**, the first release under this namespace; the current validation target is **1.1.0**. Released companions start at `@respan/respan-sdk` **1.2.0** (naming hints) and `@respan/tracing` **1.3.0** (OpenTelemetry 2 readable-span APIs and flush).
+
+The standalone official `@earendil-works/pi-telemetry` 1.1.0 package provides a vendor-neutral contract, in-memory reference and conformance tests. It supplies no OpenTelemetry exporter, and the published agent-core/coding-agent 1.1.0 packages do not expose its `telemetryContext` plumbing. This integration therefore uses the published native subscriptions and extensions.
+
+Content capture observes canonical `CONTEXT_KEY_ALLOW_TRACE_CONTENT` from `@traceloop/ai-semantic-conventions`, parent/readable `allow_trace_content=false`, general OpenTelemetry suppression, and the environment upper bounds `RESPAN_TRACE_CONTENT=false` and `TRACELOOP_TRACE_CONTENT=false`. An observed veto stays false through later changes, processor replacement, queueing, deactivation and reactivation. Denied spans retain safe model, usage and native identity fields while omitting payloads, free-form metadata, events and status messages. Customer getters, serializers, iterators and proxy traps are not used to copy telemetry data.
+
+Every owned span consults the configured OpenTelemetry SDK sampler before capture. Deterministic session trace IDs require the SDK's sampler boundary rather than creating a second native probe span. The integration recognizes the installed OpenTelemetry 2.10 and 2.12 tracer identities; an unknown provider/private ABI fails closed. Initialize a supported OpenTelemetry provider before activating the instrumentor.
+
+For extensions, a shared observer on the official `ExtensionRunner.createContext` records exact SDK getter identities and returns the native context unchanged. The last deactivation restores its method if it still owns the patch. This allows native lazy contexts while leaving customer-defined accessors passive.
+
+Metadata is exported in the canonical JSON attribute `respan.metadata`. References such as `respan.metadata.turn_number` below describe fields inside that object, not separate dotted attributes.
+
 ## Trace shape
 
-By default one trace per **agent run** (one user prompt → `agent_end`). Each
+By default one trace per **Pi session**; each agent run adds a root to that trace. Each
 run is one root agent span named `<agentName>.turn-<n>.agent` — n is the
 prompt's 1-based number within the pi session, like Braintrust's "Turn n" —
 and displayed as `agent.turn-<n>`. All runs of a pi session share the same
@@ -42,7 +54,7 @@ pi.turn-1.agent (agent)                         one per agent run, shown as agen
 │     prompts, completion, tool_calls, usage, TTFT, cost
 ├── bash.tool (tool)                            one per tool execution
 ├── read.tool (tool)                            skill usage detected from SKILL.md
-├── pi.turn-2.steer (task)                      a user message steered into the running turn, shown as steer.turn-2
+├── pi.turn-2.steer (task)                      a user message steered into the running turn, shown as task
 ├── pi.chat (chat)
 └── pi.compaction (task)                        when compaction happens mid-run
 
@@ -61,7 +73,7 @@ a new process; without a session manager the tracer counts runs itself.
 When a message is delivered into a run that is already working — pi's
 `session.steer()` / `followUp()`, or typing while the agent streams — pi
 injects it at the next tool boundary and the run carries on. The message gets
-its own span under the turn, displayed as `steer.turn-<n>`, at the moment it was delivered, so it is
+its own span under the turn, displayed as `task` (legacy name: `<agent>.turn-<n>.steer`), at the moment it was delivered, so it is
 visible in the tree instead of only as the last input item of the next LLM
 call. It is also appended to the turn span's input, and the turn span carries
 `respan.metadata.steer_count`. The first LLM call that sees the steered
@@ -105,7 +117,7 @@ pi -e ./node_modules/@respan/instrumentation-pi/dist/extension.js
 The package declares `"pi": { "extensions": ["./dist/extension.js"] }`, so pi
 loads the extension automatically after `pi install`. In the interactive TUI
 the footer shows `Respan: tracing` while active, `Respan: tracing off (run
-\`respan integrate pi\`)` when no API key was found, or `Respan: tracing
+\`respan integrate pi\`)`when no API key was found, or`Respan: tracing
 unavailable: <reason>` if initialization failed. pi keeps running in all three
 cases. After each prompt a widget below the editor shows a link to its trace on the platform (Respan cloud only).
 
@@ -113,12 +125,12 @@ cases. After each prompt a widget below the editor shows a link to its trace on 
 
 Configuration is resolved once per pi process, in this order (later wins):
 
-| Priority | Source | Notes |
-|---|---|---|
-| 1 (lowest) | defaults | tracing on when an API key resolves, `workflowName` `pi`, `agentName` `pi` |
-| 2 | `~/.pi/agent/respan.json` | global, non-secret settings |
-| 3 | `<cwd>/.pi/respan.json` | project settings, merged over global |
-| 4 (highest) | environment variables | see below |
+| Priority    | Source                    | Notes                                                                      |
+| ----------- | ------------------------- | -------------------------------------------------------------------------- |
+| 1 (lowest)  | defaults                  | tracing on when an API key resolves, `workflowName` `pi`, `agentName` `pi` |
+| 2           | `~/.pi/agent/respan.json` | global, non-secret settings                                                |
+| 3           | `<cwd>/.pi/respan.json`   | project settings, merged over global                                       |
+| 4 (highest) | environment variables     | see below                                                                  |
 
 The API key is never stored in these files. It comes from `RESPAN_API_KEY`, or
 — when that is unset — from `~/.respan/credentials.json` (written by
@@ -128,16 +140,16 @@ no base URL is configured. Base URLs are normalized to end with `/api`.
 
 `respan.json` keys (all optional, snake_case):
 
-| Key | Type | Meaning |
-|---|---|---|
-| `enabled` | boolean | Turn tracing on/off (`respan integrate pi --disable` sets `false`) |
-| `base_url` | string | Respan API base URL (self-hosted / EU) |
-| `workflow_name` | string | `traceloop.workflow.name` on every turn span (`span_name` is accepted as an alias) |
-| `agent_name` | string | Agent name: turn spans are named `<agent_name>.turn-<n>.agent` and carry `respan.metadata.agent_name` |
-| `trace_scope` | `"session"` \| `"run"` | One multi-root trace per pi session (default) or one trace per agent run — see [below](#one-trace-per-run-vs-one-trace-per-session) |
-| `customer_id` | string | `respan.customer_params.customer_identifier` on every span |
-| `project_id` | string | Recorded as `respan.metadata.project_id` |
-| `metadata` | object of strings | `respan.metadata.<key>` on every span |
+| Key             | Type                   | Meaning                                                                                                                             |
+| --------------- | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`       | boolean                | Turn tracing on/off (`respan integrate pi --disable` sets `false`)                                                                  |
+| `base_url`      | string                 | Respan API base URL (self-hosted / EU)                                                                                              |
+| `workflow_name` | string                 | `traceloop.workflow.name` on every turn span (`span_name` is accepted as an alias)                                                  |
+| `agent_name`    | string                 | Agent name: turn spans are named `<agent_name>.turn-<n>.agent` and carry `respan.metadata.agent_name`                               |
+| `trace_scope`   | `"session"` \| `"run"` | One multi-root trace per pi session (default) or one trace per agent run — see [below](#one-trace-per-run-vs-one-trace-per-session) |
+| `customer_id`   | string                 | `respan.customer_params.customer_identifier` on every span                                                                          |
+| `project_id`    | string                 | Recorded as `respan.metadata.project_id`                                                                                            |
+| `metadata`      | object of strings      | Fields in the `respan.metadata` JSON object on every span                                                                           |
 
 Example `~/.pi/agent/respan.json`:
 
@@ -152,15 +164,15 @@ Example `~/.pi/agent/respan.json`:
 
 Environment variables:
 
-| Variable | Meaning |
-|---|---|
-| `RESPAN_API_KEY` | API key (highest priority) |
-| `RESPAN_BASE_URL` | API base URL |
-| `RESPAN_PI_TRACING` | `0`/`false`/`off`/`no` disables, `1`/`true`/`on`/`yes` enables (overrides `enabled`) |
-| `RESPAN_CUSTOMER_ID` | Customer identifier |
-| `RESPAN_PROJECT_ID` | Project id (→ `respan.metadata.project_id`) |
-| `RESPAN_PI_TRACE_SCOPE` | `run` or `session` (overrides `trace_scope`) |
-| `RESPAN_PI_DEBUG` | Print diagnostics to stderr (and stop filtering the tracing library's `[Respan …]` console lines) |
+| Variable                | Meaning                                                                                           |
+| ----------------------- | ------------------------------------------------------------------------------------------------- |
+| `RESPAN_API_KEY`        | API key (highest priority)                                                                        |
+| `RESPAN_BASE_URL`       | API base URL                                                                                      |
+| `RESPAN_PI_TRACING`     | `0`/`false`/`off`/`no` disables, `1`/`true`/`on`/`yes` enables (overrides `enabled`)              |
+| `RESPAN_CUSTOMER_ID`    | Customer identifier                                                                               |
+| `RESPAN_PROJECT_ID`     | Project id (→ `respan.metadata.project_id`)                                                       |
+| `RESPAN_PI_TRACE_SCOPE` | `run` or `session` (overrides `trace_scope`)                                                      |
+| `RESPAN_PI_DEBUG`       | Print diagnostics to stderr (and stop filtering the tracing library's `[Respan …]` console lines) |
 
 ## SDK usage
 
@@ -211,7 +223,7 @@ between sessions except the OTEL pipeline.
 ```ts
 const { session } = await createAgentSession();
 const detach = instrumentor.attach(session, {
-  threadIdentifier: emailChainId,        // default: the pi session id
+  threadIdentifier: emailChainId, // default: the pi session id
   customerIdentifier: mailboxOwnerId,
   metadata: { mailbox: "support" },
 });
@@ -253,18 +265,19 @@ Precedence for `respan.threads.thread_identifier` /
 `new PiInstrumentor(options)` (also `createPiExtension(options)` for an
 already-active factory):
 
-| Option | Default | Meaning |
-|---|---|---|
-| `promptCapture` | `"full"` | `"full"` records the whole context the model saw on every chat span; `"delta"` (opt-in) records on each chat span only the messages appended since the previous LLM call of the run (first call: from the run's user prompt onward) — see [Volume](#scale-long-running-sessions-and-resumed-sessions) |
-| `captureSystemPrompt` | `true` | The system prompt is added as `gen_ai.prompt.0` on the **first** chat span of each run (it is identical for every call of the run, so it is not repeated) |
-| `captureReasoning` | `true` | Record assistant thinking blocks in the chat span output (`reasoning`) |
-| `captureToolSpans` | `true` | Emit one tool span per tool execution |
-| `maxContentChars` | `0` (unlimited) | Optional per-string cap for every captured prompt, completion, tool argument/output and reasoning. Nothing is truncated by default; when set, truncated strings end with ` …[truncated N chars]` and the span gets `respan.metadata.truncated = true` |
-| `workflowName` | `"pi"` | `traceloop.workflow.name` on every turn span |
-| `agentName` | `"pi"` | Agent name: the turn span is `<agentName>.turn-<n>.agent` (displayed as `agent.turn-<n>`) and carries `respan.metadata.agent_name` |
-| `traceScope` | `"run"` | `"run"` = one trace per agent run; `"session"` = one multi-root trace per pi session, trace id derived from the session id (see [below](#one-trace-per-run-vs-one-trace-per-session)) |
-| `customerIdentifier` | — | `respan.customer_params.customer_identifier` on every span |
-| `metadata` | — | `respan.metadata.<key>` on every span (string/number/boolean values) |
+| Option                | Default         | Meaning                                                                                                                                                                                                                                                                                               |
+| --------------------- | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `traceContent`        | `true`          | Payload capture; context, parent, environment and sampling vetoes remain upper bounds                                                                                                                                                                                                                 |
+| `promptCapture`       | `"full"`        | `"full"` records the whole context the model saw on every chat span; `"delta"` (opt-in) records on each chat span only the messages appended since the previous LLM call of the run (first call: from the run's user prompt onward) — see [Volume](#scale-long-running-sessions-and-resumed-sessions) |
+| `captureSystemPrompt` | `true`          | Capture system instructions on each full-context chat span, including native transcript sections. Delta capture adds the system prompt on the first chat span.                                                                                                                                        |
+| `captureReasoning`    | `true`          | Record assistant thinking blocks in the chat span output (`reasoning`)                                                                                                                                                                                                                                |
+| `captureToolSpans`    | `true`          | Emit one tool span per tool execution                                                                                                                                                                                                                                                                 |
+| `maxContentChars`     | `0` (unlimited) | Optional per-string cap for every captured prompt, completion, tool argument/output and reasoning. Nothing is truncated by default; when set, truncated strings end with ` …[truncated N chars]` and the span gets `respan.metadata.truncated = true`                                                 |
+| `workflowName`        | `"pi"`          | `traceloop.workflow.name` on every turn span                                                                                                                                                                                                                                                          |
+| `agentName`           | `"pi"`          | Agent name: the turn span is `<agentName>.turn-<n>.agent` (displayed as `agent.turn-<n>`) and carries `respan.metadata.agent_name`                                                                                                                                                                    |
+| `traceScope`          | `"session"`     | `"run"` = one trace per agent run; `"session"` = one multi-root trace per pi session, trace id derived from the session id (see [below](#one-trace-per-run-vs-one-trace-per-session))                                                                                                                 |
+| `customerIdentifier`  | —               | `respan.customer_params.customer_identifier` on every span                                                                                                                                                                                                                                            |
+| `metadata`            | —               | Fields in the `respan.metadata` JSON object on every span (string/number/boolean values)                                                                                                                                                                                                              |
 
 `PiSessionTracer` (exported for advanced use) additionally accepts
 `threadIdentifier`, an `emit` sink and an `enabled` predicate.
@@ -273,19 +286,19 @@ already-active factory):
 
 ## Captured data
 
-| Span | Attributes |
-|---|---|
-| all | `respan.entity.log_type`, `traceloop.entity.name/path`, `respan.threads.thread_identifier`, `respan.sessions.session_identifier`, `respan.trace.trace_group_identifier` (all three = the pi session id), `respan.customer_params.customer_identifier`, `respan.metadata.*`, `telemetry.sdk.name/version`, `status_code` + `error.message` on failures |
-| `<agent>.turn-<n>.agent` | `traceloop.workflow.name`, input `[{role: "user", content: prompt}, ...steered messages]`, output = final assistant text, `respan.metadata.steer_count` when the run was steered, `respan.metadata.agent_name`, `respan.metadata.turn_number`, `respan.metadata.{pi_version, thinking_level, session_file, cwd, turn_count, tool_call_count, stop_reason, continuation}`. A structural span: no `gen_ai.request.model` (the model is on the chat spans) |
-| `pi.chat` | `gen_ai.system` (provider), `llm.request.type = chat`, `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.prompt.N.role/content/tool_calls`, `gen_ai.completion.0.role/content/tool_calls`, `traceloop.entity.input/output` (output carries `reasoning`), `llm.request.functions` (tool definitions, capped at `maxContentChars`), `gen_ai.usage.input_tokens` / `gen_ai.usage.prompt_tokens` (= input + cacheRead + cacheWrite), `gen_ai.usage.output_tokens` / `gen_ai.usage.completion_tokens`, `llm.usage.total_tokens`, `gen_ai.usage.cache_read.input_tokens` / `llm.usage.cache_read_input_tokens`, `gen_ai.usage.cache_creation.input_tokens`, `respan.metadata.{reasoning_tokens, estimated_cost_usd, time_to_first_token_ms, stop_reason, response_id, turn_index, thinking_level, api, prompt_capture, prompt_message_offset}` |
-| `<tool>.tool` | `traceloop.entity.input` = `{name, arguments}`, `traceloop.entity.output` = text output (or `{content, details}` JSON), `respan.metadata.tool_call_id`, `respan.metadata.skill_name` when a `SKILL.md` is read or the `skill` tool is used |
-| `<agent>.turn-<n>.steer` | input `[{role: "user", content: steered message}]`, `respan.metadata.turn_number` (the steer's own number), `respan.metadata.steered_into_turn`, `respan.metadata.steer_index`, `respan.metadata.delivered_after` (`tool_results` \| `assistant_reply` \| `run_start`) |
-| `pi.compaction` | input `{reason, willRetry, tokensBefore}`, output `{summary, tokensBefore, tokensAfter, firstKeptEntryId}` |
-| `pi.branch_summary` | input `{targetId, oldLeafId, label}`, output `{summary, label, id, fromId, ...}` |
-| `<agent>.turn-<n>.agent` (git) | `respan.metadata.git_repository` (remote URL, credentials stripped), `respan.metadata.git_branch`, `respan.metadata.git_commit` of the working directory, cached per directory |
+| Span                           | Attributes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| all                            | `respan.entity.log_type`, `traceloop.entity.name/path`, `respan.threads.thread_identifier`, `respan.sessions.session_identifier`, `respan.trace.trace_group_identifier` (all three = the pi session id), `respan.customer_params.customer_identifier`, `respan.metadata` (JSON), `telemetry.sdk.name/version`, OTel ERROR status and `error.message` on failures                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `<agent>.turn-<n>.agent`       | `traceloop.workflow.name`, input `[{role: "user", content: prompt}, ...steered messages]`, output = final assistant text, `respan.metadata.steer_count` when the run was steered, `respan.metadata.agent_name`, `respan.metadata.turn_number`, `respan.metadata.{pi_version, thinking_level, session_file, cwd, turn_count, tool_call_count, stop_reason, continuation}`. A structural span: no `gen_ai.request.model` (the model is on the chat spans)                                                                                                                                                                                                                                                                                                                                                                                         |
+| `pi.chat`                      | `gen_ai.system` (provider), `llm.request.type = chat`, `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.prompt.N.role/content/tool_calls`, `gen_ai.completion.0.role/content/tool_calls`, `traceloop.entity.input/output` (output carries `reasoning`), `llm.request.functions` (tool definitions, capped at `maxContentChars`), `gen_ai.usage.input_tokens` / `gen_ai.usage.prompt_tokens` (= input + cacheRead + cacheWrite), `gen_ai.usage.output_tokens` / `gen_ai.usage.completion_tokens`, `llm.usage.total_tokens`, `gen_ai.usage.cache_read.input_tokens` / `llm.usage.cache_read_input_tokens`, `gen_ai.usage.cache_creation.input_tokens`, `respan.metadata.{reasoning_tokens, estimated_cost_usd, time_to_first_token_ms, stop_reason, response_id, turn_index, thinking_level, api, prompt_capture, prompt_message_offset}` |
+| `<tool>.tool`                  | `traceloop.entity.input` = `{name, arguments}`, `traceloop.entity.output` = the complete native result JSON (`content`, `details`, `structuredContent`, and any native usage/outcome fields), `gen_ai.tool.call.id`, `respan.metadata.skill_name` when a `SKILL.md` is read or the `skill` tool is used                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `<agent>.turn-<n>.steer`       | input `[{role: "user", content: steered message}]`, `respan.metadata.turn_number` (the steer's own number), `respan.metadata.steered_into_turn`, `respan.metadata.steer_index`, `respan.metadata.delivered_after` (`tool_results` \| `assistant_reply` \| `run_start`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `pi.compaction`                | input `{reason, willRetry, tokensBefore}`, output `{summary, tokensBefore, tokensAfter, firstKeptEntryId}`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `pi.branch_summary`            | input `{targetId, oldLeafId, label}`, output `{summary, label, id, fromId, ...}`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `<agent>.turn-<n>.agent` (git) | `respan.metadata.git_repository` (remote URL, credentials stripped), `respan.metadata.git_branch`, `respan.metadata.git_commit` of the working directory, cached per directory                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 
 Errors: an assistant message with `stopReason` `error`/`aborted` marks its chat
-span (and the run) with `status_code = 500` and `error.message`; a tool result
+span (and the run) with OTel ERROR status and `error.message`; a tool result
 with `isError` marks the tool span; a session shut down mid-run closes the run
 with `Session shut down before the agent run completed` and any in-flight LLM
 call / tool with `Interrupted before completion`. In delta mode
@@ -323,7 +336,7 @@ resumed after days of silence).
   function.
 - **Nothing is dropped by default.** Every chat span records the whole
   context the model saw (`promptCapture: "full"`), the system prompt is
-  recorded once per run (`captureSystemPrompt: true`, first chat span), and no
+  recorded with each full-context chat (`captureSystemPrompt: true`), and no
   string is truncated (`maxContentChars: 0`). Size is handled at ingest by the
   Respan backend, which tiers large span bodies to object storage. Note that
   full capture is quadratic in turn count: a run with N LLM calls re-sends the
@@ -341,21 +354,21 @@ resumed after days of silence).
 
 ## One trace per run vs one trace per session
 
-`traceScope` decides what one Respan *trace* is for a pi session:
+`traceScope` decides what one Respan _trace_ is for a pi session:
 
-| | `"session"` (default) | `"run"` |
-|---|---|---|
-| Trace | one per pi session, shared by every run | one per agent run (user prompt → `agent_end`) |
-| Trace id | derived from the pi session id — the dash-stripped UUID, or a SHA-256 prefix for non-UUID ids (`sessionTraceId(id)`); an active OTEL span is ignored | random, or the active OTEL span's trace when there is one (the run nests under it) |
-| Root spans | one turn span per run; all of them are roots of the same trace (Session > turn-1, turn-2, …) | one turn span (`pi.turn-<n>.agent`) per trace |
-| Compaction / branch summary outside a run | another root of the session trace | root of its own trace |
-| `respan.threads.thread_identifier` / `respan.sessions.session_identifier` | pi session id | pi session id |
+|                                                                           | `"session"` (default)                                                                                                                                | `"run"`                                                                            |
+| ------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| Trace                                                                     | one per pi session, shared by every run                                                                                                              | one per agent run (user prompt → `agent_end`)                                      |
+| Trace id                                                                  | derived from the pi session id — the dash-stripped UUID, or a SHA-256 prefix for non-UUID ids (`sessionTraceId(id)`); an active OTEL span is ignored | random, or the active OTEL span's trace when there is one (the run nests under it) |
+| Root spans                                                                | one turn span per run; all of them are roots of the same trace (Session > turn-1, turn-2, …)                                                         | one turn span (`pi.turn-<n>.agent`) per trace                                      |
+| Compaction / branch summary outside a run                                 | another root of the session trace                                                                                                                    | root of its own trace                                                              |
+| `respan.threads.thread_identifier` / `respan.sessions.session_identifier` | pi session id                                                                                                                                        | pi session id                                                                      |
 
 In session scope the Respan backend groups the roots under a synthetic
 "Trace Root" node ordered by start time, so the run before a pause appears
 before the run after it; the trace's duration spans from the first wake to the
 last, and the trace list shows the latest root's name/input/output with cost
-and tokens summed over all runs. Nothing changes about *when* spans are
+and tokens summed over all runs. Nothing changes about _when_ spans are
 emitted: every run still emits its own spans as it goes, and no span is held
 open across a pause. Turn span ids are random, so runs of one
 session emitted from different processes never collide inside the shared
@@ -384,7 +397,7 @@ attributes come from their canonical sources:
   `gen_ai.usage.cache_read.input_tokens`,
   `gen_ai.usage.cache_creation.input_tokens`).
 - Respan-owned keys (`respan.entity.*`, `respan.threads.*`,
-  `respan.sessions.*`, `respan.metadata.*`, ...) from `@respan/respan-sdk`.
+  `respan.sessions.*`, `respan.metadata` (JSON), ...) from `@respan/respan-sdk`.
 - Tool definitions use `llm.request.functions`; this-turn tool calls use
   `gen_ai.completion.0.tool_calls`; tool spans carry the call in
   `traceloop.entity.input`. Deprecated aliases (`respan.span.tools`,
@@ -488,8 +501,7 @@ Keep `timeout` generous (30 s) so this stays rare.
   `respan integrate pi`.
 - **The extension does not load.** `pi install npm:@respan/instrumentation-pi`
   installs the package under `~/.pi/agent/npm`; run `pi` once and check the
-  Extensions list in the startup banner. The package needs no Node version
-  beyond pi's own (pi 0.84 declares Node >= 22.19).
+  Extensions list in the startup banner. The current Pi 1.1.0 SDK requires Node >= 22.19; these examples and validation use Node 24.
 - **Duplicate LLM spans.** Only one tracer should observe a session: either the
   installed pi package (CLI), `instrumentor.extension` in `extensionFactories`,
   or `instrumentor.attach(session)` — not two of them. Always pass an explicit

@@ -1,111 +1,108 @@
-/**
- * Respan instrumentation plugin for the official Writer TypeScript SDK.
- *
- * Patches `writer-sdk` resource prototypes to emit canonical Respan LLM spans
- * for chat, structured parse, streaming chat, and text completion calls.
- */
-
+/** Native observation of the official Writer SDK's lazy Stainless boundaries. */
+import {
+  registerSpanTransformer,
+  type SpanTransformerRegistration,
+} from "@respan/tracing";
 import { patchWriterMethod, type PatchedMethodTarget } from "./_streaming.js";
-
-export interface WriterInstrumentorOptions {
-  /**
-   * Optional `writer-sdk` module instance. Pass this when an application resolves a
-   * different mutable SDK copy than the instrumentor would import by default.
-   */
+import { observeAncestor, type CaptureOptions } from "./_privacy.js";
+export interface WriterInstrumentorOptions extends CaptureOptions {
   sdkModule?: any;
 }
-
+const patches = new Set<PatchedMethodTarget>();
+const transformer = { onStart: observeAncestor, onEnd: observeAncestor };
 export class WriterInstrumentor {
   public readonly name = "writer";
-
-  private static readonly _sharedState = {
-    activeInstances: 0,
-    patchedTargets: [] as PatchedMethodTarget[],
-  };
-
-  private _isInstrumented = false;
-  private readonly _sdkModule?: any;
-
+  private active = false;
+  private generation = 0;
+  private pending?: Promise<void>;
+  private owned: PatchedMethodTarget[] = [];
+  private registration?: SpanTransformerRegistration;
+  private readonly options: WriterInstrumentorOptions;
   constructor(options: WriterInstrumentorOptions = {}) {
-    this._sdkModule = options.sdkModule;
+    this.options = { ...options };
   }
-
-  async activate(): Promise<void> {
-    if (this._isInstrumented) return;
-
-    const sharedState = WriterInstrumentor._sharedState;
-
+  activate(): Promise<void> {
+    if (this.active) return Promise.resolve();
+    if (this.pending) return this.pending;
+    const generation = ++this.generation;
+    const operation = this.activateGeneration(generation);
+    this.pending = operation;
+    void operation
+      .finally(() => {
+        if (this.pending === operation) this.pending = undefined;
+      })
+      .catch(() => {});
+    return operation;
+  }
+  private async activateGeneration(generation: number): Promise<void> {
+    const sdk = this.options.sdkModule ?? (await import("writer-sdk"));
+    if (generation !== this.generation) return;
+    const Writer = sdk.default ?? sdk.Writer;
+    if (typeof Writer !== "function")
+      throw new Error("Writer constructor not found");
+    const client = new Writer({ apiKey: "respan-placeholder" });
     try {
-      const writerModule = this._sdkModule ?? await import("writer-sdk");
-      const Writer = writerModule.default ?? writerModule.Writer;
-      if (typeof Writer !== "function") {
-        console.warn(
-          "[Respan] Failed to activate Writer instrumentation — compatible Writer constructor not found",
+      for (const [target, method, type] of [
+        [Object.getPrototypeOf(client.chat), "chat", "chat"],
+        [Object.getPrototypeOf(client.chat), "parse", "chat"],
+        [Object.getPrototypeOf(client.completions), "create", "completion"],
+      ] as const) {
+        if (typeof target?.[method] !== "function") continue;
+        let patch = [...patches].find(
+          (p) =>
+            p.target === target &&
+            p.methodName === method &&
+            target[method] === p.wrappedMethod,
         );
-        return;
-      }
-
-      const tempClient = new Writer({ apiKey: "respan-placeholder" });
-      const chatPrototype = Object.getPrototypeOf(tempClient.chat);
-      const completionsPrototype = Object.getPrototypeOf(tempClient.completions);
-
-      const targets: Array<[any, string, "chat" | "completion"]> = [
-        [chatPrototype, "chat", "chat"],
-        [completionsPrototype, "create", "completion"],
-      ];
-
-      for (const [target, methodName, type] of targets) {
-        if (
-          !target ||
-          typeof target[methodName] !== "function" ||
-          sharedState.patchedTargets.some(
-            (patched) => patched.target === target && patched.methodName === methodName,
-          )
-        ) {
-          continue;
+        if (!patch) {
+          patch =
+            patchWriterMethod(target, method, type, new Set()) ?? undefined;
+          if (patch) patches.add(patch);
         }
-
-        const patchedTarget = patchWriterMethod(target, methodName, type);
-        if (patchedTarget) {
-          sharedState.patchedTargets.push(patchedTarget);
+        if (patch) {
+          patch.owners.add(this.options);
+          this.owned.push(patch);
         }
       }
-
-      if (sharedState.patchedTargets.length === 0) {
-        console.warn(
-          "[Respan] Failed to activate Writer instrumentation — no compatible Writer resource methods found",
+      // Raw OTel providers can use the instrumentor too; the registry is optional.
+      try {
+        this.registration = registerSpanTransformer(
+          "@respan/instrumentation-writer",
+          transformer,
         );
-        return;
+      } catch {
+        /* no Respan host */
       }
-
-      sharedState.activeInstances += 1;
-      this._isInstrumented = true;
-    } catch (err) {
-      console.warn("[Respan] Failed to activate Writer instrumentation:", err);
+      this.active = this.owned.length > 0;
+    } catch (error) {
+      this.release();
+      throw error;
     }
   }
-
   deactivate(): void {
-    if (!this._isInstrumented) return;
-
-    const sharedState = WriterInstrumentor._sharedState;
-    sharedState.activeInstances = Math.max(0, sharedState.activeInstances - 1);
-    this._isInstrumented = false;
-
-    if (sharedState.activeInstances > 0 || sharedState.patchedTargets.length === 0) return;
-
-    try {
-      for (const patchedTarget of sharedState.patchedTargets) {
-        patchedTarget.target[patchedTarget.methodName] = patchedTarget.originalMethod;
+    this.generation += 1;
+    this.pending = undefined;
+    if (!this.active) return;
+    this.active = false;
+    this.release();
+  }
+  isActive(): boolean {
+    return this.active;
+  }
+  private release(): void {
+    this.registration?.unregister();
+    this.registration = undefined;
+    for (const patch of this.owned) {
+      patch.owners.delete(this.options);
+      if (patch.owners.size === 0) {
+        if (patch.target[patch.methodName] === patch.wrappedMethod)
+          patch.target[patch.methodName] = patch.originalMethod;
+        patches.delete(patch);
       }
-    } catch {
-      /* ignore */
     }
-
-    sharedState.patchedTargets = [];
+    this.owned = [];
   }
 }
-
 export {
   buildErrorAttrs,
   buildSuccessAttrs,

@@ -28,10 +28,19 @@
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
 
-import { context, isSpanContextValid, trace, type HrTime } from "@opentelemetry/api";
+import {
+  context,
+  ROOT_CONTEXT,
+  isSpanContextValid,
+  SpanStatusCode,
+  trace,
+  type Context,
+  type HrTime,
+} from "@opentelemetry/api";
 import { hrTime } from "@opentelemetry/core";
 import type { ReadableSpan } from "@opentelemetry/sdk-trace-base";
 import {
+  ATTR_GEN_AI_TOOL_CALL_ID,
   ATTR_GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_INPUT_TOKENS,
@@ -45,6 +54,8 @@ import {
   injectSpan,
 } from "@respan/tracing";
 import { SpanAttributes } from "@traceloop/ai-semantic-conventions";
+
+import { PiCapturePolicy, own, safeCopy, safeSpanContext } from "./_capture.js";
 
 import type { PiModelLike, PiToolDefinitionLike } from "./_pi_types.js";
 
@@ -78,6 +89,8 @@ export type PiTraceScope = "run" | "session";
 export type PiMetadataValue = string | number | boolean;
 
 export interface PiTracerOptions {
+  /** Capture payloads unless a parent/context/environment veto disables them. Default true. */
+  traceContent?: boolean;
   /** `traceloop.workflow.name` on the run span. Default `"pi"`. */
   workflowName?: string;
   /** Agent name (`respan.metadata.agent_name`); the run span itself is displayed as `agent.turn-<n>`. Default `"pi"`. */
@@ -100,7 +113,7 @@ export interface PiTracerOptions {
    * the full conversation is still reconstructable from the trace).
    */
   promptCapture?: PiPromptCapture;
-  /** Add the system prompt as `gen_ai.prompt.0` on the FIRST chat span of each run. Default `true`. */
+  /** Capture system instructions on full-context chats; once per run in delta mode. Default true. */
   captureSystemPrompt?: boolean;
   /** Record assistant thinking blocks on chat spans. Default `true`. */
   captureReasoning?: boolean;
@@ -142,6 +155,8 @@ export interface PiRunEndInfo {
 }
 
 export interface PiContextOptions {
+  /** Latest Pi supplies finalized system context after the compatibility context event. */
+  replacePending?: boolean;
   /** LLM request start time (defaults to now). */
   startTime?: HrTime;
 }
@@ -163,6 +178,8 @@ interface PromptMessage {
 }
 
 interface PendingLlm {
+  spanId: string;
+  policy: PiCapturePolicy;
   startTime: HrTime;
   messages: PromptMessage[];
   offset?: number;
@@ -172,6 +189,7 @@ interface PendingLlm {
 }
 
 interface PendingTool {
+  policy: PiCapturePolicy;
   spanId: string;
   startTime: HrTime;
   toolName: string;
@@ -179,12 +197,15 @@ interface PendingTool {
 }
 
 interface PendingTask {
+  policy: PiCapturePolicy;
+  traceContext: { traceId: string; parentSpanId?: string };
   spanId: string;
   startTime: HrTime;
   input: RecordValue;
 }
 
 interface RunState {
+  policy: PiCapturePolicy;
   traceId: string;
   agentSpanId: string;
   parentSpanId?: string;
@@ -219,6 +240,7 @@ interface RunState {
 }
 
 interface SpanRequest {
+  policy?: PiCapturePolicy;
   name: string;
   traceId: string;
   spanId: string;
@@ -293,6 +315,11 @@ export class PiSessionTracer {
   private readonly metadata: Record<string, PiMetadataValue>;
   private readonly emitFn: (span: ReadableSpan) => void;
   private readonly enabledFn: () => boolean;
+  private readonly traceContent: boolean;
+  private policy: PiCapturePolicy;
+  private policyTraceContext?: { traceId: string; parentSpanId?: string };
+  private agentSpanId?: string;
+  private pendingToolDefinitions?: unknown;
   private readonly onRunEndFn?: (info: PiRunEndInfo) => void;
 
   private session: PiSessionInfo = {};
@@ -310,7 +337,8 @@ export class PiSessionTracer {
   private branchSummary?: PendingTask;
 
   constructor(options: PiTracerOptions = {}) {
-    this.workflowName = nonEmptyString(options.workflowName) ?? DEFAULT_WORKFLOW_NAME;
+    this.workflowName =
+      nonEmptyString(options.workflowName) ?? DEFAULT_WORKFLOW_NAME;
     this.agentName = nonEmptyString(options.agentName) ?? DEFAULT_AGENT_NAME;
     this.traceScope = options.traceScope === "run" ? "run" : "session";
     this.promptCapture = options.promptCapture === "delta" ? "delta" : "full";
@@ -323,12 +351,95 @@ export class PiSessionTracer {
     this.metadata = normalizeMetadata(options.metadata);
     this.emitFn = options.emit ?? ((span) => void injectSpan(span));
     this.enabledFn = options.enabled ?? (() => true);
+    this.traceContent = options.traceContent !== false;
+    this.policy = new PiCapturePolicy(this.traceContent, this.enabledFn());
     this.onRunEndFn = options.onRunEnd;
+  }
+
+  /** Internal adapter admission: evaluate policy before inspecting event payloads. */
+  prepareEvent(event: unknown): RecordValue {
+    const kind = own(event, "type");
+
+    const snapshot: RecordValue = {};
+    // Payload references are admitted by the owning run/chat/tool policy below.
+    // Do not traverse them just to dispatch a lifecycle event.
+    for (const field of [
+      ...EVENT_FIELDS,
+      "prompt",
+      "systemPrompt",
+      "messages",
+      "message",
+      "assistantMessageEvent",
+      "args",
+      "result",
+      "preparation",
+      "summaryEntry",
+      "compactionEntry",
+      "summary",
+      "error",
+      "errorMessage",
+      "finalError",
+      "model",
+    ]) {
+      const value = own(event, field);
+      if (value !== undefined) snapshot[field] = value;
+    }
+    return snapshot;
+  }
+
+  get capturesContent(): boolean {
+    this.policy.observe();
+    return this.policy.recording && this.policy.content;
+  }
+
+  private beginPolicy(turnNumber?: unknown): void {
+    if (this.policyTraceContext && !this.run) return;
+    this.policyTraceContext = this.traceContext();
+    this.agentSpanId = ensureSpanId();
+    this.policy = new PiCapturePolicy(this.traceContent, this.enabledFn());
+    this.policy.admit(
+      this.policyTraceContext.traceId,
+      this.agentSpanId,
+      this.samplingContext(),
+      `${this.agentName}.turn-${positiveInteger(turnNumber) ?? this.runCounter + 1}.agent`,
+      {
+        [RespanSpanAttributes.RESPAN_LOG_TYPE]: RespanLogType.AGENT,
+        [SpanAttributes.TRACELOOP_ENTITY_NAME]: this.agentName,
+      },
+    );
+  }
+
+  private samplingContext(): Context {
+    return this.traceScope === "session" && this.session.sessionId
+      ? ROOT_CONTEXT
+      : context.active();
+  }
+  private childPolicy(
+    name: string,
+    spanId: string,
+    logType: RespanLogType,
+  ): PiCapturePolicy {
+    const run = this.run;
+    const policy = new PiCapturePolicy(
+      this.traceContent,
+      this.enabledFn(),
+      run?.policy,
+    );
+    const ids = run ?? this.traceContext();
+    const parent = run?.policy.sampledContext
+      ? trace.setSpanContext(context.active(), run.policy.sampledContext)
+      : this.samplingContext();
+    policy.admit(ids.traceId, spanId, parent, name, {
+      [RespanSpanAttributes.RESPAN_LOG_TYPE]: logType,
+      [SpanAttributes.TRACELOOP_ENTITY_NAME]: name,
+    });
+    return policy;
   }
 
   // ── Session context ─────────────────────────────────────────────────────
 
   setSession(info: PiSessionInfo): void {
+    info = safeCopy(info) ?? {};
     const sessionId = nonEmptyString(info.sessionId);
     const sessionFile = nonEmptyString(info.sessionFile);
     const cwd = nonEmptyString(info.cwd);
@@ -341,6 +452,7 @@ export class PiSessionTracer {
   }
 
   setModel(model: unknown): void {
+    model = safeCopy(model);
     if (!isRecord(model)) {
       return;
     }
@@ -366,6 +478,12 @@ export class PiSessionTracer {
    * must not dwarf the delta-captured prompts.
    */
   setToolDefinitions(tools: unknown): void {
+    const policy = this.run?.pendingLlm.at(-1)?.policy;
+    if (!policy) {
+      this.pendingToolDefinitions = tools;
+      return;
+    }
+    tools = policy.snapshot(tools);
     if (!Array.isArray(tools)) {
       this.toolDefinitionsJson = undefined;
       this.toolDefinitionsTruncated = false;
@@ -377,7 +495,7 @@ export class PiSessionTracer {
       if (!isRecord(tool) || typeof tool.name !== "string" || !tool.name) {
         continue;
       }
-      const definition: PiToolDefinitionLike = { name: tool.name };
+      const definition: PiToolDefinitionLike = { ...tool, name: tool.name };
       if (typeof tool.description === "string") {
         definition.description = capture.text(tool.description);
       }
@@ -388,7 +506,8 @@ export class PiSessionTracer {
     }
     this.toolDefinitionsJson =
       normalized.length > 0 ? capture.text(safeJson(normalized)) : undefined;
-    this.toolDefinitionsTruncated = this.toolDefinitionsJson !== undefined && capture.truncated;
+    this.toolDefinitionsTruncated =
+      this.toolDefinitionsJson !== undefined && capture.truncated;
   }
 
   get sessionId(): string | undefined {
@@ -419,6 +538,8 @@ export class PiSessionTracer {
       // A run was still open (missed agent_end); close it before starting the next.
       this.closeRun();
     }
+    this.beginPolicy(own(event, "turnNumber"));
+    event = this.policy.snapshot(event, EVENT_FIELDS) ?? {};
     const capture = this.capture();
     const prompt = renderContent(event?.prompt, capture);
     this.lastPrompt = prompt;
@@ -436,6 +557,8 @@ export class PiSessionTracer {
     if (this.run) {
       return;
     }
+    this.beginPolicy(own(event, "turnNumber"));
+    event = this.policy.snapshot(event, EVENT_FIELDS) ?? {};
     this.openRun({
       prompt: "",
       promptKnown: false,
@@ -449,11 +572,37 @@ export class PiSessionTracer {
    * this on `context`; subscribe mode calls it with a `session.messages`
    * snapshot when the assistant message starts streaming.
    */
+  prepareLlm(options: PiContextOptions = {}): boolean {
+    const run = this.run;
+    if (!run) return false;
+    let pending = run.pendingLlm.at(-1);
+    if (!pending) {
+      const spanId = ensureSpanId();
+      pending = {
+        spanId,
+        policy: this.childPolicy("pi.chat", spanId, RespanLogType.CHAT),
+        startTime: options.startTime ?? hrTime(),
+        messages: [],
+        truncated: false,
+        turnIndex: run.currentTurnIndex,
+      };
+      run.pendingLlm.push(pending);
+    }
+    pending.policy.observe();
+    return pending.policy.recording && pending.policy.content;
+  }
+
   onContext(messages: unknown, options: PiContextOptions = {}): void {
     const run = this.run;
     if (!run) {
       return;
     }
+    const previous = options.replacePending ? run.pendingLlm.pop() : undefined;
+    const spanId = previous?.spanId ?? ensureSpanId();
+    const policy =
+      previous?.policy ??
+      this.childPolicy("pi.chat", spanId, RespanLogType.CHAT);
+    messages = policy.snapshot(messages) ?? [];
     const list = Array.isArray(messages) ? messages : [];
     const total = list.length;
     let start = 0;
@@ -478,12 +627,19 @@ export class PiSessionTracer {
     }
     run.contextCursor = total;
     run.pendingLlm.push({
-      startTime: options.startTime ?? hrTime(),
+      spanId,
+      policy,
+      startTime: previous?.startTime ?? options.startTime ?? hrTime(),
       messages: converted,
       offset: start,
       truncated: capture.truncated,
       turnIndex: run.currentTurnIndex,
     });
+    if (this.pendingToolDefinitions !== undefined) {
+      const tools = this.pendingToolDefinitions;
+      this.pendingToolDefinitions = undefined;
+      this.setToolDefinitions(tools);
+    }
   }
 
   onTurnStart(event?: { turnIndex?: unknown }): void {
@@ -496,12 +652,21 @@ export class PiSessionTracer {
     run.turnCount += 1;
   }
 
-  onTurnEnd(_event?: { turnIndex?: unknown; message?: unknown; toolResults?: unknown }): void {
+  onTurnEnd(_event?: {
+    turnIndex?: unknown;
+    message?: unknown;
+    toolResults?: unknown;
+  }): void {
     // Turn boundaries are already reflected by the chat/tool spans.
   }
 
   onMessageStart(message: unknown): void {
     const run = this.run;
+    if (run && own(message, "role") === "assistant") {
+      run.assistantMessageStart = hrTime();
+      return;
+    }
+    message = this.policy.snapshot(message, MESSAGE_FIELDS);
     if (!run || !isRecord(message)) {
       return;
     }
@@ -516,7 +681,11 @@ export class PiSessionTracer {
     // Any user message after that — or after the model already answered, for
     // a continuation run that has no prompt message — was queued with
     // `steer()` / `followUp()` and delivered into the running turn.
-    if (run.promptMessageSeen || run.chatCount > 0 || run.pendingLlm.length > 0) {
+    if (
+      run.promptMessageSeen ||
+      run.chatCount > 0 ||
+      run.pendingLlm.length > 0
+    ) {
       this.emitSteerSpan(run, message);
       return;
     }
@@ -532,7 +701,15 @@ export class PiSessionTracer {
     }
   }
 
-  onMessageUpdate(event: { message?: unknown; assistantMessageEvent?: unknown }): void {
+  onMessageUpdate(event: {
+    message?: unknown;
+    assistantMessageEvent?: unknown;
+  }): void {
+    event = {
+      assistantMessageEvent: {
+        type: own(own(event, "assistantMessageEvent"), "type"),
+      },
+    };
     const run = this.run;
     if (!run || run.pendingLlm.length === 0) {
       return;
@@ -555,30 +732,46 @@ export class PiSessionTracer {
 
   onMessageEnd(message: unknown): void {
     const run = this.run;
-    if (!run || !isRecord(message) || message.role !== "assistant") {
+    if (!run || own(message, "role") !== "assistant") {
       return;
     }
+    const fallbackId = ensureSpanId();
     const pending: PendingLlm = run.pendingLlm.shift() ?? {
+      spanId: fallbackId,
+      policy: this.childPolicy("pi.chat", fallbackId, RespanLogType.CHAT),
       startTime: run.assistantMessageStart ?? hrTime(),
       messages: [],
       truncated: false,
       turnIndex: run.currentTurnIndex,
     };
+    message = pending.policy.snapshot(message, MESSAGE_FIELDS);
     run.assistantMessageStart = undefined;
-    this.emitChatSpan(run, pending, message, hrTime());
+    this.emitChatSpan(run, pending, message as RecordValue, hrTime());
   }
 
-  onToolExecutionStart(event: { toolCallId?: unknown; toolName?: unknown; args?: unknown }): void {
+  onToolExecutionStart(event: {
+    toolCallId?: unknown;
+    toolName?: unknown;
+    args?: unknown;
+  }): void {
     const run = this.run;
-    if (!run) {
-      return;
-    }
-    const toolCallId = nonEmptyString(event?.toolCallId) ?? ensureSpanId();
+    if (!run) return;
+    const toolCallId =
+      nonEmptyString(own(event, "toolCallId")) ?? ensureSpanId();
     if (run.pendingTools.has(toolCallId)) {
       return;
     }
+    const spanId = ensureSpanId();
+    const toolName = nonEmptyString(own(event, "toolName")) ?? "tool";
+    const policy = this.childPolicy(
+      `${toolName}.tool`,
+      spanId,
+      RespanLogType.TOOL,
+    );
+    event = policy.snapshot(event, EVENT_FIELDS) ?? {};
     run.pendingTools.set(toolCallId, {
-      spanId: ensureSpanId(),
+      spanId,
+      policy,
       startTime: hrTime(),
       toolName: nonEmptyString(event?.toolName) ?? "tool",
       args: event?.args,
@@ -592,16 +785,24 @@ export class PiSessionTracer {
     isError?: unknown;
   }): void {
     const run = this.run;
-    if (!run) {
-      return;
-    }
-    const toolCallId = nonEmptyString(event?.toolCallId) ?? "";
+    if (!run) return;
+    const toolCallId = nonEmptyString(own(event, "toolCallId")) ?? "";
     const endTime = hrTime();
     const pending = run.pendingTools.get(toolCallId);
     run.pendingTools.delete(toolCallId);
+    const spanId = pending?.spanId ?? ensureSpanId();
+    const policy =
+      pending?.policy ??
+      this.childPolicy(
+        `${nonEmptyString(own(event, "toolName")) ?? "tool"}.tool`,
+        spanId,
+        RespanLogType.TOOL,
+      );
+    event = policy.snapshot(event, EVENT_FIELDS) ?? {};
     run.toolCallCount += 1;
     this.emitToolSpan(run, {
-      spanId: pending?.spanId ?? ensureSpanId(),
+      spanId,
+      policy,
       startTime: pending?.startTime ?? endTime,
       endTime,
       toolCallId,
@@ -613,6 +814,7 @@ export class PiSessionTracer {
   }
 
   onAgentEnd(event?: { messages?: unknown; willRetry?: unknown }): void {
+    event = this.policy.snapshot(event, EVENT_FIELDS);
     if (event?.willRetry === true) {
       return;
     }
@@ -634,6 +836,7 @@ export class PiSessionTracer {
    * its backoff or out of attempts — ends the run with pi's final error.
    */
   onAutoRetryEnd(event?: { success?: unknown; finalError?: unknown }): void {
+    event = this.policy.snapshot(event, EVENT_FIELDS);
     if (event?.success !== false || !this.run) {
       return;
     }
@@ -641,9 +844,24 @@ export class PiSessionTracer {
     this.closeRun(finalError ? { errorMessage: finalError } : undefined);
   }
 
-  onCompactionStart(event?: { reason?: unknown; willRetry?: unknown; tokensBefore?: unknown }): void {
+  onCompactionStart(event?: {
+    reason?: unknown;
+    willRetry?: unknown;
+    tokensBefore?: unknown;
+  }): void {
+    event = safeCopy(event);
+    const spanId = ensureSpanId();
+    const policy = this.childPolicy(
+      "pi.compaction",
+      spanId,
+      RespanLogType.TASK,
+    );
     this.compaction = {
-      spanId: ensureSpanId(),
+      spanId,
+      policy,
+      traceContext: {
+        traceId: policy.sampledContext?.traceId ?? ensureTraceId(),
+      },
       startTime: hrTime(),
       input: compactRecord({
         reason: nonEmptyString(event?.reason),
@@ -664,6 +882,7 @@ export class PiSessionTracer {
     aborted?: unknown;
   }): void {
     const pending = this.compaction;
+    event = (pending?.policy ?? this.policy).snapshot(event, EVENT_FIELDS);
     this.compaction = undefined;
     const endTime = hrTime();
     const capture = this.capture();
@@ -674,7 +893,10 @@ export class PiSessionTracer {
         willRetry: booleanValue(event?.willRetry),
         tokensBefore: integerValue(event?.tokensBefore),
       });
-    const summary = typeof event?.summary === "string" ? capture.text(event.summary) : undefined;
+    const summary =
+      typeof event?.summary === "string"
+        ? capture.text(event.summary)
+        : undefined;
     const output = compactRecord({
       summary,
       tokensBefore: integerValue(event?.tokensBefore),
@@ -683,10 +905,15 @@ export class PiSessionTracer {
     });
     const errorMessage = nonEmptyString(event?.error);
     const aborted = event?.aborted === true;
-    const attrs = this.baseAttrs("compaction", "compaction", RespanLogType.TASK);
+    const attrs = this.baseAttrs(
+      "compaction",
+      "compaction",
+      RespanLogType.TASK,
+    );
     attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safeJson(input);
     attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safeJson(output);
-    const reason = nonEmptyString(event?.reason) ?? nonEmptyString(input.reason);
+    const reason =
+      nonEmptyString(event?.reason) ?? nonEmptyString(input.reason);
     if (reason) {
       attrs[metadataKey("reason")] = reason;
     }
@@ -695,7 +922,8 @@ export class PiSessionTracer {
     }
     this.emitTaskSpan("pi.compaction", pending, attrs, endTime, {
       statusCode: errorMessage || aborted ? 500 : 200,
-      errorMessage: errorMessage ?? (aborted ? COMPACTION_ABORTED_MESSAGE : undefined),
+      errorMessage:
+        errorMessage ?? (aborted ? COMPACTION_ABORTED_MESSAGE : undefined),
     });
   }
 
@@ -705,11 +933,22 @@ export class PiSessionTracer {
     oldLeafId?: unknown;
     label?: unknown;
   }): void {
+    event = safeCopy(event);
     if (event?.userWantsSummary !== true) {
       return;
     }
+    const spanId = ensureSpanId();
+    const policy = this.childPolicy(
+      "pi.branch_summary",
+      spanId,
+      RespanLogType.TASK,
+    );
     this.branchSummary = {
-      spanId: ensureSpanId(),
+      spanId,
+      policy,
+      traceContext: {
+        traceId: policy.sampledContext?.traceId ?? ensureTraceId(),
+      },
       startTime: hrTime(),
       input: compactRecord({
         targetId: nonEmptyString(event?.targetId),
@@ -719,17 +958,27 @@ export class PiSessionTracer {
     };
   }
 
-  onBranchSummaryEnd(event?: { newLeafId?: unknown; oldLeafId?: unknown; summaryEntry?: unknown }): void {
+  onBranchSummaryEnd(event?: {
+    newLeafId?: unknown;
+    oldLeafId?: unknown;
+    summaryEntry?: unknown;
+  }): void {
     const pending = this.branchSummary;
+    event = (pending?.policy ?? this.policy).snapshot(event, EVENT_FIELDS);
     this.branchSummary = undefined;
-    const entry = isRecord(event?.summaryEntry) ? event.summaryEntry : undefined;
+    const entry = isRecord(event?.summaryEntry)
+      ? event.summaryEntry
+      : undefined;
     if (!pending && !entry) {
       return;
     }
     const endTime = hrTime();
     const capture = this.capture();
     const output = compactRecord({
-      summary: typeof entry?.summary === "string" ? capture.text(entry.summary) : undefined,
+      summary:
+        typeof entry?.summary === "string"
+          ? capture.text(entry.summary)
+          : undefined,
       label: nonEmptyString(entry?.label),
       id: nonEmptyString(entry?.id),
       fromId: nonEmptyString(entry?.fromId),
@@ -737,13 +986,21 @@ export class PiSessionTracer {
       newLeafId: nonEmptyString(event?.newLeafId),
       oldLeafId: nonEmptyString(event?.oldLeafId),
     });
-    const attrs = this.baseAttrs("branch_summary", "branch_summary", RespanLogType.TASK);
-    attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safeJson(pending?.input ?? {});
+    const attrs = this.baseAttrs(
+      "branch_summary",
+      "branch_summary",
+      RespanLogType.TASK,
+    );
+    attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safeJson(
+      pending?.input ?? {},
+    );
     attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safeJson(output);
     if (capture.truncated) {
       attrs[metadataKey("truncated")] = true;
     }
-    this.emitTaskSpan("pi.branch_summary", pending, attrs, endTime, { statusCode: 200 });
+    this.emitTaskSpan("pi.branch_summary", pending, attrs, endTime, {
+      statusCode: 200,
+    });
   }
 
   onSessionShutdown(_event?: { reason?: string }): void {
@@ -763,17 +1020,22 @@ export class PiSessionTracer {
     truncated: boolean;
     turnNumber?: number;
   }): void {
-    const { traceId, parentSpanId } = this.traceContext();
+    const { traceId, parentSpanId } =
+      this.policyTraceContext ?? this.traceContext();
     // Turn numbering: the adapter passes the number of prompts already in the
     // session when it can read the session history (so numbering survives a
     // resume in a new process); otherwise count within this tracer.
-    this.runCounter = init.turnNumber && init.turnNumber > 0 ? init.turnNumber : this.runCounter + 1;
+    this.runCounter =
+      init.turnNumber && init.turnNumber > 0
+        ? init.turnNumber
+        : this.runCounter + 1;
     // Random span ids: in session scope several processes (a resumed session)
     // write into one trace, so ids derived from a per-process counter could
     // collide.
     this.run = {
+      policy: this.policy,
       traceId,
-      agentSpanId: ensureSpanId(),
+      agentSpanId: this.agentSpanId ?? ensureSpanId(),
       parentSpanId,
       turnNumber: this.runCounter,
       startTime: hrTime(),
@@ -799,12 +1061,14 @@ export class PiSessionTracer {
       return;
     }
     this.run = undefined;
+    this.policyTraceContext = undefined;
     const endTime = hrTime();
 
     const continuation = !run.promptKnown;
     // Prompt and final text were already truncated when captured.
     const prompt = run.promptKnown ? run.prompt : (this.lastPrompt ?? "");
-    const truncated = run.truncated || (continuation && this.lastPromptTruncated);
+    const truncated =
+      run.truncated || (continuation && this.lastPromptTruncated);
     // The turn's input is everything the user fed this run: the prompt and
     // the messages steered into it while it was working.
     const input = safeJson([
@@ -819,9 +1083,13 @@ export class PiSessionTracer {
     if (reason) {
       statusCode = 500;
       errorMessage = reason.errorMessage;
-    } else if (run.lastStopReason === "error" || run.lastStopReason === "aborted") {
+    } else if (
+      run.lastStopReason === "error" ||
+      run.lastStopReason === "aborted"
+    ) {
       statusCode = 500;
-      errorMessage = run.lastErrorMessage ?? `pi assistant message ${run.lastStopReason}`;
+      errorMessage =
+        run.lastErrorMessage ?? `pi assistant message ${run.lastStopReason}`;
     }
 
     // One run-level span per prompt: the agent span is the trace root (or the
@@ -833,9 +1101,11 @@ export class PiSessionTracer {
     agentAttrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = input;
     agentAttrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = output;
     agentAttrs[SpanAttributes.TRACELOOP_WORKFLOW_NAME] = this.workflowName;
-    agentAttrs[RespanSpanAttributes.RESPAN_METADATA_AGENT_NAME] = this.agentName;
+    agentAttrs[RespanSpanAttributes.RESPAN_METADATA_AGENT_NAME] =
+      this.agentName;
     agentAttrs[RespanSpanAttributes.RESPAN_INTERNAL_SPAN_NAME_KIND] = "agent";
-    agentAttrs[RespanSpanAttributes.RESPAN_INTERNAL_SPAN_NAME_DETAIL] = turnDetail;
+    agentAttrs[RespanSpanAttributes.RESPAN_INTERNAL_SPAN_NAME_DETAIL] =
+      turnDetail;
     setMetadata(agentAttrs, "turn_number", run.turnNumber);
     setMetadata(agentAttrs, "pi_version", this.session.piVersion);
     setMetadata(agentAttrs, "thinking_level", this.thinkingLevel);
@@ -876,6 +1146,7 @@ export class PiSessionTracer {
     for (const [toolCallId, pending] of run.pendingTools) {
       this.emitToolSpan(run, {
         spanId: pending.spanId,
+        policy: pending.policy,
         startTime: pending.startTime,
         endTime,
         toolCallId,
@@ -916,15 +1187,23 @@ export class PiSessionTracer {
     capture.truncated = pending.truncated;
 
     const prompts: PromptMessage[] = [];
-    if (this.captureSystemPrompt && run.chatCount === 1 && run.systemPrompt) {
+    if (
+      this.captureSystemPrompt &&
+      (this.promptCapture === "full" || run.chatCount === 1) &&
+      run.systemPrompt &&
+      !pending.messages.some((message) => message.role === "system")
+    ) {
       prompts.push({ role: "system", content: capture.text(run.systemPrompt) });
     }
     prompts.push(...pending.messages);
 
-    const provider =
-      nonEmptyString(message?.provider) ?? this.model?.provider ?? "pi";
-    const attrs = this.baseAttrs("pi.response", "pi.response", RespanLogType.CHAT);
-    attrs[SpanAttributes.LLM_SYSTEM] = provider.toLowerCase();
+    const provider = nonEmptyString(message?.provider) ?? this.model?.provider;
+    const attrs = this.baseAttrs(
+      "pi.response",
+      "pi.response",
+      RespanLogType.CHAT,
+    );
+    if (provider) attrs[SpanAttributes.LLM_SYSTEM] = provider.toLowerCase();
     attrs[SpanAttributes.LLM_REQUEST_TYPE] = RespanLogType.CHAT;
     const requestModel = nonEmptyString(message?.model) ?? this.model?.id;
     if (requestModel) {
@@ -963,7 +1242,10 @@ export class PiSessionTracer {
       if (toolCalls.length > 0) {
         attrs[`${GEN_AI_COMPLETION_PREFIX}.0.tool_calls`] = safeJson(toolCalls);
       }
-      const output: RecordValue = { role: "assistant", content: completionContent };
+      const output: RecordValue = {
+        role: "assistant",
+        content: completionContent,
+      };
       if (this.captureReasoning && reasoning) {
         output.reasoning = capture.text(reasoning);
       }
@@ -978,7 +1260,8 @@ export class PiSessionTracer {
       setMetadata(attrs, "api", nonEmptyString(message.api));
       if (stopReason === "error" || stopReason === "aborted") {
         statusCode = 500;
-        errorMessage = run.lastErrorMessage ?? `pi assistant message ${stopReason}`;
+        errorMessage =
+          run.lastErrorMessage ?? `pi assistant message ${stopReason}`;
       }
     } else {
       attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = "";
@@ -1019,8 +1302,9 @@ export class PiSessionTracer {
 
     this.emitSpan({
       name: "pi.chat",
+      policy: pending.policy,
       traceId: run.traceId,
-      spanId: ensureSpanId(),
+      spanId: pending.spanId,
       parentId: run.agentSpanId,
       startTime: pending.startTime,
       endTime,
@@ -1034,6 +1318,7 @@ export class PiSessionTracer {
     run: RunState,
     tool: {
       spanId: string;
+      policy: PiCapturePolicy;
       startTime: HrTime;
       endTime: HrTime;
       toolCallId: string;
@@ -1048,16 +1333,23 @@ export class PiSessionTracer {
       return;
     }
     const capture = this.capture();
-    const attrs = this.baseAttrs(tool.toolName, tool.toolName, RespanLogType.TOOL);
+    const attrs = this.baseAttrs(
+      tool.toolName,
+      tool.toolName,
+      RespanLogType.TOOL,
+    );
     attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = capture.text(
       safeJson({
         name: tool.toolName,
         arguments: capture.deep(toSerializable(tool.args) ?? {}),
       }),
     );
-    attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = renderToolResult(tool.result, capture);
+    attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = renderToolResult(
+      tool.result,
+      capture,
+    );
     if (tool.toolCallId) {
-      attrs[metadataKey("tool_call_id")] = tool.toolCallId;
+      attrs[ATTR_GEN_AI_TOOL_CALL_ID] = tool.toolCallId;
     }
     const skillName = detectSkillName(tool.toolName, tool.args);
     if (skillName) {
@@ -1077,6 +1369,7 @@ export class PiSessionTracer {
     }
     this.emitSpan({
       name: `${tool.toolName}.tool`,
+      policy: tool.policy,
       traceId: run.traceId,
       spanId: tool.spanId,
       parentId: run.agentSpanId,
@@ -1097,6 +1390,10 @@ export class PiSessionTracer {
    * number: a turn-1 run with three steers is followed by turn 5.
    */
   private emitSteerSpan(run: RunState, message: RecordValue): void {
+    const spanId = ensureSpanId();
+    const name = `${this.agentName}.turn-${run.turnNumber + run.steers.length + 1}.steer`;
+    const policy = this.childPolicy(name, spanId, RespanLogType.TASK);
+    message = policy.snapshot(message, MESSAGE_FIELDS) ?? {};
     const capture = this.capture();
     const content = renderContent(message.content, capture);
     run.steers.push(content);
@@ -1108,12 +1405,12 @@ export class PiSessionTracer {
     const now = hrTime();
 
     const attrs = this.baseAttrs("steer", "steer", RespanLogType.TASK);
-    attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safeJson([{ role: "user", content }]);
-    // Displayed as `steer.turn-<n>`. The semantic namer only appends a detail
-    // to agent/tool/handoff/llm, but it uses an unrecognized kind verbatim
-    // (dots and hyphens survive), so the number rides in the kind hint. This
-    // works with every released @respan/tracing.
-    attrs[RespanSpanAttributes.RESPAN_INTERNAL_SPAN_NAME_KIND] = `steer.turn-${turnNumber}`;
+    attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safeJson([
+      { role: "user", content },
+    ]);
+    // Steering is a task under the shared semantic naming contract. The
+    // original name and turn metadata retain its identity in legacy views.
+    attrs[RespanSpanAttributes.RESPAN_INTERNAL_SPAN_NAME_KIND] = "task";
     setMetadata(attrs, "turn_number", turnNumber);
     setMetadata(attrs, "steered_into_turn", run.turnNumber);
     setMetadata(attrs, "steer_index", run.steers.length);
@@ -1130,9 +1427,10 @@ export class PiSessionTracer {
       attrs[metadataKey("truncated")] = true;
     }
     this.emitSpan({
-      name: `${this.agentName}.turn-${turnNumber}.steer`,
+      name,
+      policy,
       traceId: run.traceId,
-      spanId: ensureSpanId(),
+      spanId,
       parentId: run.agentSpanId,
       startTime: now,
       endTime: now,
@@ -1156,10 +1454,12 @@ export class PiSessionTracer {
     } else {
       // Outside a run: a root of its own trace (run scope) or another root of
       // the session trace (session scope).
-      ({ traceId, parentSpanId: parentId } = this.traceContext());
+      ({ traceId, parentSpanId: parentId } =
+        pending?.traceContext ?? this.traceContext());
     }
     this.emitSpan({
       name,
+      policy: pending?.policy,
       traceId,
       spanId: pending?.spanId ?? ensureSpanId(),
       parentId,
@@ -1186,13 +1486,21 @@ export class PiSessionTracer {
     }
     const spans = this.pendingSpans.splice(0, this.pendingSpans.length);
     for (const span of spans) {
-      this.emitFn(span);
+      if (this.policy.emit) this.emitFn(span);
     }
     return spans.length;
   }
 
   private emitSpan(request: SpanRequest): void {
-    addStatusAttributes(request.attributes, request.statusCode ?? 200, request.errorMessage);
+    const policy = request.policy ?? this.policy;
+    policy.observe();
+    if (!policy.emit) return;
+    Object.assign(request.attributes, policy.samplingAttributes);
+    addStatusAttributes(
+      request.attributes,
+      request.statusCode ?? 200,
+      request.errorMessage,
+    );
     const span = buildReadableSpan({
       name: request.name,
       traceId: request.traceId,
@@ -1201,11 +1509,19 @@ export class PiSessionTracer {
       startTimeHr: request.startTime,
       endTimeHr: request.endTime,
       attributes: request.attributes,
-      statusCode: request.statusCode,
-      errorMessage: request.errorMessage,
+      errorMessage: undefined,
     }) as ReadableSpan & {
       instrumentationScope?: { name: string; version?: string };
     };
+    Object.assign(span, {
+      status: {
+        code:
+          request.errorMessage || (request.statusCode ?? 0) >= 400
+            ? SpanStatusCode.ERROR
+            : SpanStatusCode.UNSET,
+        ...(request.errorMessage ? { message: request.errorMessage } : {}),
+      },
+    });
     span.instrumentationScope = {
       name: PI_INSTRUMENTATION_NAME,
       version: PACKAGE_VERSION,
@@ -1215,9 +1531,16 @@ export class PiSessionTracer {
     // buildReadableSpan) > the pi session id.
     const merged = span.attributes as Attrs;
     const sessionId = this.session.sessionId;
-    if (merged[RespanSpanAttributes.RESPAN_THREADS_ID] === undefined && sessionId) {
+    if (
+      merged[RespanSpanAttributes.RESPAN_THREADS_ID] === undefined &&
+      sessionId
+    ) {
       merged[RespanSpanAttributes.RESPAN_THREADS_ID] = sessionId;
     }
+    canonicalMetadata(merged);
+    if (policy.sampledContext)
+      Object.assign(span, { spanContext: () => policy.sampledContext });
+    policy.guard(span);
     if (!this.enabledFn()) {
       if (this.pendingSpans.length >= PiSessionTracer.MAX_PENDING_SPANS) {
         this.pendingSpans.shift();
@@ -1228,7 +1551,11 @@ export class PiSessionTracer {
     this.emitFn(span);
   }
 
-  private baseAttrs(entityName: string, entityPath: string, logType: RespanLogType): Attrs {
+  private baseAttrs(
+    entityName: string,
+    entityPath: string,
+    logType: RespanLogType,
+  ): Attrs {
     const attrs: Attrs = {
       [RespanSpanAttributes.RESPAN_LOG_METHOD]: RESPAN_LOG_METHOD_TS_TRACING,
       [RespanSpanAttributes.RESPAN_LOG_TYPE]: logType,
@@ -1250,7 +1577,8 @@ export class PiSessionTracer {
       attrs[RespanSpanAttributes.RESPAN_THREADS_ID] = this.threadIdentifier;
     }
     if (this.customerIdentifier) {
-      attrs[RespanSpanAttributes.RESPAN_CUSTOMER_PARAMS_ID] = this.customerIdentifier;
+      attrs[RespanSpanAttributes.RESPAN_CUSTOMER_PARAMS_ID] =
+        this.customerIdentifier;
     }
     for (const [key, value] of Object.entries(this.metadata)) {
       attrs[metadataKey(key)] = value;
@@ -1259,6 +1587,7 @@ export class PiSessionTracer {
   }
 
   private capture(): ContentCapture {
+    this.policy.observe();
     return new ContentCapture(this.maxContentChars);
   }
 
@@ -1275,13 +1604,19 @@ export class PiSessionTracer {
       return { traceId: sessionTraceId(sessionId) };
     }
     const active = activeSpanContext();
-    return { traceId: ensureTraceId(active?.traceId), parentSpanId: active?.spanId };
+    return {
+      traceId: ensureTraceId(active?.traceId),
+      parentSpanId: active?.spanId,
+    };
   }
 }
 
 // ── Message conversion ────────────────────────────────────────────────────
 
-function convertMessage(message: unknown, capture: ContentCapture): PromptMessage | null {
+function convertMessage(
+  message: unknown,
+  capture: ContentCapture,
+): PromptMessage | null {
   if (typeof message === "string") {
     return { role: "user", content: capture.text(message) };
   }
@@ -1311,6 +1646,16 @@ function convertMessage(message: unknown, capture: ContentCapture): PromptMessag
         prompt.tool_call_id = toolCallId;
       }
       return prompt;
+    }
+    case "system": {
+      const sections = isRecord(message.sections) ? message.sections : {};
+      const content = [
+        renderContent(message.content, capture),
+        ...Object.values(sections).filter((value) => typeof value === "string"),
+      ]
+        .filter((value) => value !== "")
+        .join("\n\n");
+      return { role, content: capture.text(content) };
     }
     default:
       return { role, content: renderContent(message.content, capture) };
@@ -1357,7 +1702,10 @@ function renderBlock(block: unknown): string | undefined {
   }
 }
 
-function renderToolResultContent(content: unknown, capture: ContentCapture): string {
+function renderToolResultContent(
+  content: unknown,
+  capture: ContentCapture,
+): string {
   if (typeof content === "string") {
     return capture.text(content);
   }
@@ -1376,20 +1724,7 @@ function renderToolResult(result: unknown, capture: ContentCapture): string {
   if (typeof result === "string") {
     return capture.text(result);
   }
-  if (result === undefined || result === null) {
-    return "";
-  }
-  if (isRecord(result) && Array.isArray(result.content)) {
-    if (allTextBlocks(result.content)) {
-      return capture.text(joinTextBlocks(result.content, "\n"));
-    }
-    return capture.text(
-      safeJson({
-        content: renderBlocks(result.content),
-        details: capture.deep(toSerializable(result.details)),
-      }),
-    );
-  }
+  if (result === undefined) return "";
   return capture.text(safeJson(capture.deep(toSerializable(result))));
 }
 
@@ -1418,7 +1753,10 @@ function extractResultText(result: unknown): string {
 }
 
 function allTextBlocks(blocks: unknown[]): boolean {
-  return blocks.length > 0 && blocks.every((block) => isRecord(block) && block.type === "text");
+  return (
+    blocks.length > 0 &&
+    blocks.every((block) => isRecord(block) && block.type === "text")
+  );
 }
 
 function joinTextBlocks(content: unknown, separator: string): string {
@@ -1430,7 +1768,11 @@ function joinTextBlocks(content: unknown, separator: string): string {
   }
   const parts: string[] = [];
   for (const block of content) {
-    if (isRecord(block) && block.type === "text" && typeof block.text === "string") {
+    if (
+      isRecord(block) &&
+      block.type === "text" &&
+      typeof block.text === "string"
+    ) {
       parts.push(block.text);
     }
   }
@@ -1443,14 +1785,21 @@ function joinThinkingBlocks(content: unknown): string {
   }
   const parts: string[] = [];
   for (const block of content) {
-    if (isRecord(block) && block.type === "thinking" && typeof block.thinking === "string") {
+    if (
+      isRecord(block) &&
+      block.type === "thinking" &&
+      typeof block.thinking === "string"
+    ) {
       parts.push(block.thinking);
     }
   }
   return parts.join("");
 }
 
-function toolCallsOf(content: unknown, capture: ContentCapture): ToolCallRecord[] {
+function toolCallsOf(
+  content: unknown,
+  capture: ContentCapture,
+): ToolCallRecord[] {
   if (!Array.isArray(content)) {
     return [];
   }
@@ -1464,7 +1813,9 @@ function toolCallsOf(content: unknown, capture: ContentCapture): ToolCallRecord[
       type: "function",
       function: {
         name: nonEmptyString(block.name) ?? "tool",
-        arguments: capture.text(safeJson(toSerializable(block.arguments) ?? {})),
+        arguments: capture.text(
+          safeJson(toSerializable(block.arguments) ?? {}),
+        ),
       },
     });
   }
@@ -1505,7 +1856,9 @@ function detectSkillName(toolName: string, args: unknown): string | undefined {
     return undefined;
   }
   const segments = normalized.split("/");
-  return segments.length >= 2 ? nonEmptyString(segments[segments.length - 2]) : undefined;
+  return segments.length >= 2
+    ? nonEmptyString(segments[segments.length - 2])
+    : undefined;
 }
 
 // ── Attribute helpers ─────────────────────────────────────────────────────
@@ -1518,18 +1871,27 @@ function setMetadata(attrs: Attrs, key: string, value: unknown): void {
   if (value === undefined || value === null || value === "") {
     return;
   }
-  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+  if (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
     attrs[metadataKey(key)] = value;
     return;
   }
   attrs[metadataKey(key)] = safeJson(toSerializable(value));
 }
 
-function addStatusAttributes(attrs: Attrs, statusCode: number, errorMessage?: string): void {
+function addStatusAttributes(
+  attrs: Attrs,
+  statusCode: number,
+  errorMessage?: string,
+): void {
   if (statusCode < 400 && !errorMessage) {
     return;
   }
-  attrs[STATUS_CODE_ATTR] = statusCode >= 400 ? statusCode : 500;
+  // Pi exposes an outcome, not an HTTP response status. Never invent one.
+  delete attrs[STATUS_CODE_ATTR];
   if (errorMessage) {
     attrs[ERROR_MESSAGE_ATTR] = errorMessage;
   }
@@ -1539,18 +1901,26 @@ function addUsageAttributes(attrs: Attrs, usage: unknown): void {
   if (!isRecord(usage)) {
     return;
   }
-  const input = integerValue(usage.input) ?? 0;
-  const output = integerValue(usage.output) ?? 0;
+  const input = integerValue(usage.input);
+  const output = integerValue(usage.output);
   const cacheRead = integerValue(usage.cacheRead);
   const cacheWrite = integerValue(usage.cacheWrite);
-  const promptTokens = input + (cacheRead ?? 0) + (cacheWrite ?? 0);
-  const totalTokens = integerValue(usage.totalTokens) ?? promptTokens + output;
+  const promptTokens =
+    input === undefined
+      ? undefined
+      : input + (cacheRead ?? 0) + (cacheWrite ?? 0);
+  const totalTokens = integerValue(usage.totalTokens);
 
-  attrs[ATTR_GEN_AI_USAGE_INPUT_TOKENS] = promptTokens;
-  attrs[SpanAttributes.LLM_USAGE_PROMPT_TOKENS] = promptTokens;
-  attrs[ATTR_GEN_AI_USAGE_OUTPUT_TOKENS] = output;
-  attrs[SpanAttributes.LLM_USAGE_COMPLETION_TOKENS] = output;
-  attrs[SpanAttributes.LLM_USAGE_TOTAL_TOKENS] = totalTokens;
+  if (promptTokens !== undefined) {
+    attrs[ATTR_GEN_AI_USAGE_INPUT_TOKENS] = promptTokens;
+    attrs[SpanAttributes.LLM_USAGE_PROMPT_TOKENS] = promptTokens;
+  }
+  if (output !== undefined) {
+    attrs[ATTR_GEN_AI_USAGE_OUTPUT_TOKENS] = output;
+    attrs[SpanAttributes.LLM_USAGE_COMPLETION_TOKENS] = output;
+  }
+  if (totalTokens !== undefined)
+    attrs[SpanAttributes.LLM_USAGE_TOTAL_TOKENS] = totalTokens;
   if (cacheRead !== undefined) {
     // Canonical semconv key (read by the backend for cache-aware cost) plus the
     // contract's legacy alias — publish both, like the prompt/completion pairs.
@@ -1571,7 +1941,7 @@ function addUsageAttributes(attrs: Attrs, usage: unknown): void {
 }
 
 function activeSpanContext(): { traceId: string; spanId: string } | undefined {
-  const spanContext = trace.getSpan(context.active())?.spanContext();
+  const spanContext = safeSpanContext(trace.getSpan(context.active()));
   if (!spanContext || !isSpanContextValid(spanContext)) {
     return undefined;
   }
@@ -1595,12 +1965,14 @@ function normalizeMetadata(metadata: unknown): Record<string, PiMetadataValue> {
   if (!isRecord(metadata)) {
     return normalized;
   }
-  for (const [key, value] of Object.entries(metadata)) {
+  for (const [key, value] of Object.entries(safeCopy(metadata) ?? {})) {
     if (!key || value === undefined || value === null) {
       continue;
     }
     normalized[key] =
-      typeof value === "string" || typeof value === "number" || typeof value === "boolean"
+      typeof value === "string" ||
+      typeof value === "number" ||
+      typeof value === "boolean"
         ? value
         : safeJson(toSerializable(value));
   }
@@ -1636,7 +2008,9 @@ function integerValue(value: unknown): number | undefined {
 }
 
 function numberValue(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : undefined;
 }
 
 function booleanValue(value: unknown): boolean | undefined {
@@ -1650,56 +2024,69 @@ function safeJson(value: unknown): string {
     );
     return serialized === undefined ? "" : serialized;
   } catch {
-    return String(value);
+    return "";
   }
 }
 
 function toSerializable(value: unknown): unknown {
-  if (value === null || value === undefined) {
-    return undefined;
-  }
-  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-    return value;
-  }
-  if (typeof value === "bigint") {
-    return value.toString();
-  }
-  if (value instanceof Date) {
-    return value.toISOString();
-  }
-  if (Array.isArray(value)) {
-    return value.map((item) => toSerializable(item) ?? null);
-  }
-  if (typeof value === "object") {
-    const record = value as RecordValue & { toJSON?: () => unknown };
-    if (typeof record.toJSON === "function") {
-      try {
-        return toSerializable(record.toJSON());
-      } catch {
-        // Fall through to shallow structural serialization.
-      }
-    }
-    if (record.type === "image") {
-      return { type: "image", data: imagePlaceholder(record) };
-    }
-    const normalized: RecordValue = {};
-    for (const [key, itemValue] of Object.entries(record)) {
-      if (typeof itemValue === "function" || typeof itemValue === "symbol") {
-        continue;
-      }
-      const serialized = toSerializable(itemValue);
-      if (serialized !== undefined) {
-        normalized[key] = serialized;
-      }
-    }
-    return normalized;
-  }
-  if (typeof value === "function" || typeof value === "symbol") {
-    return undefined;
-  }
-  return String(value);
+  return safeCopy(value);
 }
 
 function isRecord(value: unknown): value is RecordValue {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+const MESSAGE_FIELDS = [
+  "role",
+  "api",
+  "provider",
+  "model",
+  "responseModel",
+  "responseId",
+  "stopReason",
+  "usage",
+  "toolCallId",
+  "toolName",
+  "isError",
+  "timestamp",
+] as const;
+const EVENT_FIELDS = [
+  "type",
+  "turnIndex",
+  "turnNumber",
+  "toolCallId",
+  "toolName",
+  "isError",
+  "willRetry",
+  "success",
+  "reason",
+  "tokensBefore",
+  "tokensAfter",
+  "aborted",
+  "userWantsSummary",
+  "targetId",
+  "oldLeafId",
+  "newLeafId",
+  "firstKeptEntryId",
+  "level",
+] as const;
+
+function canonicalMetadata(attributes: Attrs): void {
+  const key = RespanSpanAttributes.RESPAN_METADATA;
+  let metadata: RecordValue = {};
+  const current = attributes[key];
+  if (typeof current === "string") {
+    try {
+      const parsed = JSON.parse(current);
+      if (isRecord(parsed)) metadata = parsed;
+    } catch {
+      /* malformed metadata is omitted */
+    }
+  }
+  for (const field of Object.keys(attributes)) {
+    if (!field.startsWith(`${key}.`)) continue;
+    metadata[field.slice(key.length + 1)] = attributes[field];
+    delete attributes[field];
+  }
+  if (Object.keys(metadata).length > 0) attributes[key] = safeJson(metadata);
 }

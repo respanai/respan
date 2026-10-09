@@ -1,4 +1,11 @@
-import { hrTime } from "@opentelemetry/core";
+import { context } from "@opentelemetry/api";
+import {
+  data,
+  internalWriterCall,
+  refresh,
+  snapshot,
+  type CaptureOptions,
+} from "./_privacy.js";
 import {
   buildChatCompletionFromStreamState,
   buildCompletionFromStreamState,
@@ -8,287 +15,182 @@ import {
   updateTextStreamState,
 } from "./_helpers.js";
 import {
-  emitOperationError,
-  emitOperationSuccess,
-  emitToolSpansFromMessages,
+  finishOperation,
+  startOperation,
+  type Operation,
   type WriterOperationType,
 } from "./_span_emitter.js";
 
-const STREAM_INSTRUMENTED = Symbol.for("respan.writer.stream.instrumented");
-const PROMISE_PROXY = Symbol.for("respan.writer.promise.proxy");
-
-interface InstrumentationState {
-  handled: boolean;
-}
-
-function emitSuccessOnce(
-  state: InstrumentationState,
-  type: WriterOperationType,
-  body: Record<string, any>,
-  startTime: [number, number],
-  response: unknown,
-): void {
-  if (state.handled) return;
-  state.handled = true;
-  emitOperationSuccess({ type, body, startTime, response });
-}
-
-function emitErrorOnce(
-  state: InstrumentationState,
-  type: WriterOperationType,
-  body: Record<string, any>,
-  startTime: [number, number],
-  error: unknown,
-): void {
-  if (state.handled) return;
-  state.handled = true;
-  emitOperationError({ type, body, startTime, error });
-}
-
-function instrumentAsyncIterableStream(
-  streamResult: any,
-  type: WriterOperationType,
-  body: Record<string, any>,
-  startTime: [number, number],
-  state: InstrumentationState,
-): any {
-  if (
-    !streamResult ||
-    typeof streamResult !== "object" ||
-    streamResult[STREAM_INSTRUMENTED]
-  ) {
-    return streamResult;
+function observeStream(stream: any, op: Operation): void {
+  const nativeFactory = typeof data(stream, "iterator") === "function";
+  const key = nativeFactory ? "iterator" : Symbol.asyncIterator;
+  const factory = stream?.[key];
+  if (typeof factory !== "function") {
+    finishOperation(op, stream);
+    return;
   }
-
-  const originalAsyncIterator = streamResult[Symbol.asyncIterator]?.bind(streamResult);
-  if (typeof originalAsyncIterator !== "function") {
-    emitSuccessOnce(state, type, body, startTime, streamResult);
-    return streamResult;
-  }
-
-  Object.defineProperty(streamResult, STREAM_INSTRUMENTED, {
-    value: true,
-    configurable: true,
-    enumerable: false,
-  });
-
-  const streamState = type === "chat"
-    ? createChatStreamState(body)
-    : createTextStreamState(body);
-
-  const buildResponse = () => type === "chat"
-    ? buildChatCompletionFromStreamState(streamState as ReturnType<typeof createChatStreamState>, body)
-    : buildCompletionFromStreamState(streamState as ReturnType<typeof createTextStreamState>, body);
-
-  const updateState = (chunk: unknown) => {
-    if (type === "chat") {
-      updateChatStreamState(streamState as ReturnType<typeof createChatStreamState>, chunk);
-    } else {
-      updateTextStreamState(streamState as ReturnType<typeof createTextStreamState>, chunk);
-    }
-  };
-
-  const emitFinalSpan = (error?: unknown) => {
-    if (error) {
-      emitErrorOnce(state, type, body, startTime, error);
-      return;
-    }
-    emitSuccessOnce(state, type, body, startTime, buildResponse());
-  };
-
-  streamResult[Symbol.asyncIterator] = function () {
-    const iterator = originalAsyncIterator();
-
-    return {
-      async next(...args: any[]) {
+  const state =
+    op.type === "chat" ? createChatStreamState() : createTextStreamState();
+  const final = () =>
+    op.type === "chat"
+      ? buildChatCompletionFromStreamState(state as any)
+      : buildCompletionFromStreamState(state as any);
+  stream[key] = function (this: any, ...args: any[]) {
+    const iterator = factory.apply(this, args);
+    // Keep the native iterator, iterator result, chunk and controller identities.
+    for (const key of ["next", "return", "throw"] as const) {
+      const original = iterator[key];
+      if (typeof original !== "function") continue;
+      iterator[key] = function (this: any, ...callArgs: any[]) {
+        let result: any;
         try {
-          const result = await iterator.next(...args);
-          if (result.done) {
-            emitFinalSpan();
-          } else {
-            updateState(result.value);
-          }
-          return result;
-        } catch (err) {
-          emitFinalSpan(err);
-          throw err;
+          result = original.apply(this, callArgs);
+        } catch (error) {
+          finishOperation(op, undefined, error);
+          throw error;
         }
-      },
-
-      async return(value?: any) {
-        try {
-          const result = typeof iterator.return === "function"
-            ? await iterator.return(value)
-            : { done: true, value };
-          emitFinalSpan();
-          return result;
-        } catch (err) {
-          emitFinalSpan(err);
-          throw err;
-        }
-      },
-
-      async throw(err?: any) {
-        emitFinalSpan(err);
-        if (typeof iterator.throw === "function") {
-          return iterator.throw(err);
-        }
-        throw err;
-      },
-
-      [Symbol.asyncIterator]() {
-        return this;
-      },
-    };
-  };
-
-  return streamResult;
-}
-
-function handleSuccessValue(
-  state: InstrumentationState,
-  type: WriterOperationType,
-  body: Record<string, any>,
-  startTime: [number, number],
-  value: any,
-): any {
-  if (body.stream === true) {
-    return instrumentAsyncIterableStream(value, type, body, startTime, state);
-  }
-
-  emitSuccessOnce(state, type, body, startTime, value);
-  return value;
-}
-
-export function instrumentApiPromise(
-  result: any,
-  type: WriterOperationType,
-  body: Record<string, any>,
-  startTime: [number, number] = hrTime(),
-  state: InstrumentationState = { handled: false },
-): any {
-  if (!result || typeof result !== "object") {
-    return result;
-  }
-  if (result[PROMISE_PROXY]) {
-    return result[PROMISE_PROXY];
-  }
-
-  const originalThen = typeof result.then === "function" ? result.then.bind(result) : null;
-  const wrappedThen = originalThen
-    ? function (onfulfilled?: any, onrejected?: any) {
-        return originalThen(
-          (value: any) => {
-            const instrumentedValue = handleSuccessValue(state, type, body, startTime, value);
-            return onfulfilled ? onfulfilled(instrumentedValue) : instrumentedValue;
-          },
-          (reason: any) => {
-            emitErrorOnce(state, type, body, startTime, reason);
-            if (onrejected) {
-              return onrejected(reason);
+        result.then(
+          (item: any) => {
+            try {
+              refresh(op.policy);
+              if (key !== "next" || item.done) finishOperation(op, final());
+              else if (op.policy.outputs) {
+                const chunk = snapshot(item.value);
+                if (op.type === "chat")
+                  updateChatStreamState(state as any, chunk);
+                else updateTextStreamState(state as any, chunk);
+              } else {
+                // Usage/model fields remain useful without retaining chunk content.
+                const chunk = {
+                  model: data(item.value, "model"),
+                  usage: snapshot(data(item.value, "usage")),
+                };
+                if (op.type === "chat")
+                  updateChatStreamState(state as any, chunk);
+                else updateTextStreamState(state as any, chunk);
+              }
+            } catch {
+              /* isolated observation */
             }
-            throw reason;
           },
+          (error: unknown) => finishOperation(op, undefined, error),
         );
-      }
-    : undefined;
+        return result;
+      };
+    }
+    return iterator;
+  };
+}
 
-  const originalCatch = typeof result.catch === "function" ? result.catch.bind(result) : null;
-  const wrappedCatch = originalCatch
-    ? function (onrejected?: any) {
-        return originalCatch((reason: any) => {
-          emitErrorOnce(state, type, body, startTime, reason);
-          if (onrejected) {
-            return onrejected(reason);
-          }
-          throw reason;
-        });
-      }
-    : undefined;
-
-  const originalWithResponse =
-    typeof result.withResponse === "function" ? result.withResponse.bind(result) : null;
-  const wrappedWithResponse = originalWithResponse
-    ? async function () {
-        try {
-          const response = await originalWithResponse();
-          return {
-            ...response,
-            data: handleSuccessValue(state, type, body, startTime, response.data),
-          };
-        } catch (err) {
-          emitErrorOnce(state, type, body, startTime, err);
-          throw err;
-        }
-      }
-    : undefined;
-
-  const originalThenUnwrap =
-    typeof result._thenUnwrap === "function" ? result._thenUnwrap.bind(result) : null;
-  const wrappedThenUnwrap = originalThenUnwrap
-    ? function (...args: any[]) {
-        return instrumentApiPromise(originalThenUnwrap(...args), type, body, startTime, state);
-      }
-    : undefined;
-
-  const proxy = new Proxy(result, {
-    get(target, prop, receiver) {
-      if (prop === "then" && wrappedThen) return wrappedThen;
-      if (prop === "catch" && wrappedCatch) return wrappedCatch;
-      if (prop === "withResponse" && wrappedWithResponse) return wrappedWithResponse;
-      if (prop === "_thenUnwrap" && wrappedThenUnwrap) return wrappedThenUnwrap;
-      const value = Reflect.get(target, prop, receiver);
-      return typeof value === "function" ? value.bind(target) : value;
+/** Observe Stainless' native lazy parse boundary without a Proxy or eager parse. */
+export function instrumentApiPromise(result: any, op: Operation): any {
+  if (!result || typeof result !== "object") return result;
+  const parseResponse = result.parseResponse;
+  if (typeof parseResponse !== "function" || !result.responsePromise?.then)
+    return result;
+  result.responsePromise.then(
+    (props: any) => {
+      op.status = props.response.status;
     },
-  });
-
-  Object.defineProperty(result, PROMISE_PROXY, {
-    value: proxy,
-    configurable: true,
-    enumerable: false,
-  });
-
-  return proxy;
+    (error: unknown) => finishOperation(op, undefined, error),
+  );
+  result.parseResponse = function (this: any, ...args: any[]) {
+    let parsed: any;
+    try {
+      parsed = parseResponse.apply(this, args);
+    } catch (error) {
+      finishOperation(op, undefined, error);
+      throw error;
+    }
+    parsed.then(
+      (value: any) => {
+        try {
+          if (data(op.body, "stream") === true) observeStream(value, op);
+          else finishOperation(op, value);
+        } catch {
+          /* isolated observation */
+        }
+      },
+      (error: unknown) => finishOperation(op, undefined, error),
+    );
+    return parsed;
+  };
+  const asResponse = result.asResponse;
+  if (typeof asResponse === "function")
+    result.asResponse = function (this: any, ...args: any[]) {
+      const promise = asResponse.apply(this, args);
+      promise.then(
+        () => {
+          if (!this.parsedPromise) finishOperation(op);
+        },
+        (error: unknown) => finishOperation(op, undefined, error),
+      );
+      return promise;
+    };
+  return result;
 }
 export interface PatchedMethodTarget {
   target: any;
   methodName: string;
   originalMethod: any;
+  wrappedMethod: any;
+  owners: Set<CaptureOptions>;
 }
-
 export function patchWriterMethod(
   target: any,
   methodName: string,
   type: WriterOperationType,
+  owners = new Set<CaptureOptions>([{}]),
 ): PatchedMethodTarget | null {
-  if (!target || typeof target[methodName] !== "function") {
-    return null;
-  }
-
-  const patchedTarget: PatchedMethodTarget = {
+  const originalMethod = target?.[methodName];
+  if (typeof originalMethod !== "function") return null;
+  const patch: PatchedMethodTarget = {
     target,
     methodName,
-    originalMethod: target[methodName],
+    originalMethod,
+    wrappedMethod: undefined,
+    owners,
   };
-
-  target[methodName] = function (this: any, body: any, options?: any) {
-    const startTime = hrTime();
-    const normalizedBody = body && typeof body === "object" ? body : {};
-    try {
-      if (type === "chat") {
-        emitToolSpansFromMessages(normalizedBody.messages);
-      }
-      return instrumentApiPromise(
-        patchedTarget.originalMethod.call(this, body, options),
-        type,
-        normalizedBody,
-        startTime,
-      );
-    } catch (err) {
-      emitOperationError({ type, body: normalizedBody, startTime, error: err });
-      throw err;
+  patch.wrappedMethod = function (this: any, ...args: any[]) {
+    if (
+      owners.size === 0 ||
+      context.active().getValue(internalWriterCall) === true
+    )
+      return originalMethod.apply(this, args);
+    const options: CaptureOptions = {
+      traceContent: true,
+      recordInputs: true,
+      recordOutputs: true,
+    };
+    for (const owner of owners) {
+      options.traceContent &&= owner.traceContent !== false;
+      options.recordInputs &&= owner.recordInputs !== false;
+      options.recordOutputs &&= owner.recordOutputs !== false;
     }
+    let op: Operation | undefined;
+    try {
+      op = startOperation(type, args[0], options);
+    } catch {
+      /* fail open for native behavior */
+    }
+    let result: any;
+    try {
+      result = context.with(
+        context.active().setValue(internalWriterCall, true),
+        () => originalMethod.apply(this, args),
+      );
+    } catch (error) {
+      if (op) finishOperation(op, undefined, error);
+      throw error;
+    }
+    if (op)
+      try {
+        instrumentApiPromise(result, op);
+      } catch {
+        /* keep native result */
+      }
+    return result;
   };
-
-  return patchedTarget;
+  target[methodName] = patch.wrappedMethod;
+  return patch;
 }
