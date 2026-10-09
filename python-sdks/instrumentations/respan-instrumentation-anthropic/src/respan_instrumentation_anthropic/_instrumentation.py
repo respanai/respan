@@ -1,401 +1,444 @@
-"""Anthropic SDK instrumentation plugin for Respan."""
+"""Observe native Anthropic calls while preserving SDK return objects."""
 
 from __future__ import annotations
 
 import importlib
+import inspect
 import logging
-import time
+from contextvars import ContextVar
+from functools import wraps
+from threading import RLock
 from typing import Any
 
-from respan_instrumentation_anthropic._constants import (
-    ANTHROPIC_BETA_SESSIONS_MODULE,
-    ANTHROPIC_CHAT_SPAN_NAME,
-    ANTHROPIC_INSTRUMENTATION_NAME,
-    ANTHROPIC_RESOURCES_MODULE,
-    ASYNC_EVENTS_CLASS_NAME,
-    ASYNC_MESSAGES_CLASS_NAME,
-    CREATE_METHOD_NAME,
-    EVENTS_CLASS_NAME,
-    GET_FINAL_MESSAGE_METHOD_NAME,
-    MESSAGES_CLASS_NAME,
-    SESSION_ERROR_EVENT,
-    STREAM_METHOD_NAME,
-)
-from respan_instrumentation_anthropic._managed_agents import (
-    _wrap_async_events_stream,
-    _wrap_sync_events_stream,
-)
-from respan_instrumentation_anthropic._messages import (
-    _build_error_attrs,
-    _emit_message_spans,
-    _emit_span,
+from opentelemetry import context as context_api
+from opentelemetry import trace
+
+from respan_instrumentation_anthropic._messages import CallState
+from respan_instrumentation_anthropic._privacy import (
+    PrivacyObserver,
+    explicit_capture,
+    suppressed,
 )
 
 logger = logging.getLogger(__name__)
-
-_original_sync_create = None
-_original_async_create = None
-_original_sync_stream = None
-_original_async_stream = None
-_original_sync_events_stream = None
-_original_async_events_stream = None
+_LOCK = RLock()
+_OWNERS: set[Any] = set()
+_PATCHES: list[tuple[Any, str, Any, Any]] = []
+_CONFIG = None
+_ACTIVE = ContextVar("respan_anthropic_native_call", default=False)
 
 
-def _get_module_attr(module_path: str, attr_name: str) -> Any:
-    module = importlib.import_module(module_path)
-    attr_value = getattr(module, attr_name, None)
-    if attr_value is None:
-        raise AttributeError(f"{module_path}.{attr_name}")
-    return attr_value
+def _detach_wrapper(original: Any, instrumentor: Any) -> Any:
+    @wraps(original)
+    def detach(*args: Any, **kwargs: Any) -> Any:
+        # Export processors temporarily suppress themselves. That scope must
+        # not revoke a pending sibling request's capture policy.
+        if instrumentor._patches_active and not explicit_capture():
+            try:
+                instrumentor._observer.notice()
+            except Exception:  # noqa: BLE001, S110
+                pass
+        return original(*args, **kwargs)
+
+    return detach
 
 
-def _load_messages_classes() -> tuple[type[Any], type[Any]]:
-    return (
-        _get_module_attr(
-            module_path=ANTHROPIC_RESOURCES_MODULE,
-            attr_name=MESSAGES_CLASS_NAME,
-        ),
-        _get_module_attr(
-            module_path=ANTHROPIC_RESOURCES_MODULE,
-            attr_name=ASYNC_MESSAGES_CLASS_NAME,
-        ),
-    )
+def _manager_entry(original: Any, asynchronous: bool) -> Any:
+    def observe(manager: Any, stream: Any) -> Any:
+        state = getattr(manager, "__respan_state__", None)
+        # SDK 0.x helpers rebuild a MessageStream from the response; SDK 1.x
+        # helpers consume the returned raw stream. Observe only the consumed one.
+        raw_stream = getattr(stream, "_raw_stream", None)
+        if (
+            state is not None
+            and getattr(raw_stream, "__respan_state__", None) is not state
+        ):
+            try:
+                _observe_stream(raw_stream if raw_stream is not None else stream, state)
+                close = stream.close
+                if asynchronous:
+
+                    async def aclose(*args: Any, **kwargs: Any):
+                        try:
+                            return await close(*args, **kwargs)
+                        finally:
+                            state.safe("finish")
+
+                    stream.close = aclose
+                else:
+
+                    def sync_close(*args: Any, **kwargs: Any):
+                        try:
+                            return close(*args, **kwargs)
+                        finally:
+                            state.safe("finish")
+
+                    stream.close = sync_close
+            except Exception:  # noqa: BLE001
+                state.safe("finish")
+        return stream
+
+    if asynchronous:
+
+        @wraps(original)
+        async def enter(manager: Any) -> Any:
+            return observe(manager, await original(manager))
+    else:
+
+        @wraps(original)
+        def enter(manager: Any) -> Any:
+            return observe(manager, original(manager))
+
+    return enter
 
 
-def _load_events_classes() -> tuple[type[Any], type[Any]]:
-    return (
-        _get_module_attr(
-            module_path=ANTHROPIC_BETA_SESSIONS_MODULE,
-            attr_name=EVENTS_CLASS_NAME,
-        ),
-        _get_module_attr(
-            module_path=ANTHROPIC_BETA_SESSIONS_MODULE,
-            attr_name=ASYNC_EVENTS_CLASS_NAME,
-        ),
-    )
+def _observe_stream(stream: Any, state: CallState) -> Any:
+    """Keep the actual Stream/AsyncStream and observe its native iterator."""
+    iterator = stream._iterator
+    close = stream.close
+    stream.__respan_state__ = state
+    if inspect.isasyncgen(iterator) or hasattr(iterator, "__anext__"):
+
+        async def iterate():
+            try:
+                async for event in iterator:
+                    state.safe("event", event)
+                    yield event
+            except BaseException as exc:
+                if not isinstance(exc, GeneratorExit):
+                    state.safe("failure", exc)
+                raise
+            finally:
+                state.safe("finish")
+
+        @wraps(close)
+        async def aclose(*args: Any, **kwargs: Any):
+            try:
+                return await close(*args, **kwargs)
+            finally:
+                state.safe("finish")
+
+        stream._iterator = iterate()
+        stream.close = aclose
+    else:
+
+        def iterate():
+            try:
+                for event in iterator:
+                    state.safe("event", event)
+                    yield event
+            except BaseException as exc:
+                if not isinstance(exc, GeneratorExit):
+                    state.safe("failure", exc)
+                raise
+            finally:
+                state.safe("finish")
+
+        @wraps(close)
+        def sync_close(*args: Any, **kwargs: Any):
+            try:
+                return close(*args, **kwargs)
+            finally:
+                state.safe("finish")
+
+        stream._iterator = iterate()
+        stream.close = sync_close
+    return stream
 
 
-def _emit_message_span_safely(
-    *, kwargs: dict[str, Any], message: Any, start_ns: int
-) -> None:
-    try:
-        _emit_message_spans(kwargs=kwargs, message=message, start_ns=start_ns)
-    except Exception:
-        logger.debug("Failed to build Anthropic span attrs", exc_info=True)
-
-
-def _provider_status_code(exc: Exception) -> int:
-    response = getattr(exc, "response", None)
-    candidates = (
-        getattr(exc, "status_code", None),
-        getattr(exc, "status", None),
-        getattr(response, "status_code", None),
-        getattr(response, "status", None),
-    )
-    for candidate in candidates:
-        value = getattr(candidate, "value", candidate)
+def _wrapper(
+    original: Any,
+    instrumentor: Any,
+    *,
+    helper: bool = False,
+    managed: bool = False,
+    asynchronous: bool = False,
+) -> Any:
+    def start(args: Any, kwargs: Any) -> CallState | None:
+        if (
+            not instrumentor._patches_active
+            or _ACTIVE.get()
+            or suppressed()
+            or (instrumentor.context is not None and suppressed(instrumentor.context))
+        ):
+            return None
         try:
-            status_code = int(value)
-        except (TypeError, ValueError):
-            continue
-        if 400 <= status_code <= 599:
-            return status_code
-    return 500
+            instrumentor._ensure_provider()
+            session = (
+                kwargs.get("session_id", args[0] if args else None) if managed else None
+            )
+            state = CallState.__new__(CallState)
+            try:
+                state.__init__(instrumentor, kwargs, session_id=session)
+            except Exception:
+                span = getattr(state, "span", None)
+                if span is not None:
+                    try:
+                        span.end()
+                    except Exception:  # noqa: BLE001, S110
+                        pass
+                raise
+            return state
+        except Exception:  # noqa: BLE001
+            return None
 
-
-def _emit_error_span(*, kwargs: dict[str, Any], start_ns: int, exc: Exception) -> None:
-    _emit_span(
-        attrs=_build_error_attrs(kwargs=kwargs),
-        start_ns=start_ns,
-        error_message=str(exc),
-        status_code=_provider_status_code(exc),
-    )
-
-
-def _wrap_sync_create(original: Any) -> Any:
-    """Wrap ``Messages.create()`` for the sync Anthropic client."""
-
-    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        start_ns = time.time_ns()
+    def observe(result: Any, state: CallState | None) -> Any:
+        if state is None:
+            return result
         try:
-            message = original(self, *args, **kwargs)
-        except Exception as exc:
-            _emit_error_span(kwargs=kwargs, start_ns=start_ns, exc=exc)
+            if helper:
+                result.__respan_state__ = state
+                class_name = type(result).__name__
+                request_key = f"_{class_name}__api_request"
+                if class_name in ("MessageStreamManager", "BetaMessageStreamManager"):
+                    request = getattr(result, request_key)
+
+                    def send():
+                        token = _ACTIVE.set(True)
+                        try:
+                            result = request()
+                        except BaseException as exc:
+                            state.safe("failure", exc)
+                            state.safe("finish")
+                            raise
+                        finally:
+                            _ACTIVE.reset(token)
+
+                        try:
+                            return _observe_stream(result, state)
+                        except Exception:  # noqa: BLE001
+                            state.safe("finish")
+                            return result
+
+                    setattr(result, request_key, send)
+                elif class_name in (
+                    "AsyncMessageStreamManager",
+                    "BetaAsyncMessageStreamManager",
+                    "AsyncBetaMessageStreamManager",
+                ):
+                    request = getattr(result, request_key)
+
+                    async def send_async():
+                        token = _ACTIVE.set(True)
+                        try:
+                            result = await request
+                        except BaseException as exc:
+                            state.safe("failure", exc)
+                            state.safe("finish")
+                            raise
+                        finally:
+                            _ACTIVE.reset(token)
+
+                        try:
+                            return _observe_stream(result, state)
+                        except Exception:  # noqa: BLE001
+                            state.safe("finish")
+                            return result
+
+                    setattr(result, request_key, send_async())
+                else:
+                    state.safe("finish")
+            else:
+                from anthropic import AsyncStream, Stream
+
+                if isinstance(result, (Stream, AsyncStream)):
+                    _observe_stream(result, state)
+                else:
+                    state.safe("finish", result)
+        except Exception:  # noqa: BLE001
+            state.safe("finish")
+        return result
+
+    if asynchronous:
+
+        @wraps(original)
+        async def async_call(self: Any, *args: Any, **kwargs: Any) -> Any:
+            state = start(args, kwargs)
+            try:
+                result = await original(self, *args, **kwargs)
+            except BaseException as exc:
+                if state:
+                    state.safe("failure", exc)
+                    state.safe("finish")
+                raise
+            return observe(result, state)
+
+        return async_call
+
+    @wraps(original)
+    def call(self: Any, *args: Any, **kwargs: Any) -> Any:
+        state = start(args, kwargs)
+        try:
+            result = original(self, *args, **kwargs)
+        except BaseException as exc:
+            if state:
+                state.safe("failure", exc)
+                state.safe("finish")
             raise
+        return observe(result, state)
 
-        _emit_message_span_safely(kwargs=kwargs, message=message, start_ns=start_ns)
-        return message
-
-    return wrapper
-
-
-def _wrap_async_create(original: Any) -> Any:
-    """Wrap ``AsyncMessages.create()`` for the async Anthropic client."""
-
-    async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        start_ns = time.time_ns()
-        try:
-            message = await original(self, *args, **kwargs)
-        except Exception as exc:
-            _emit_error_span(kwargs=kwargs, start_ns=start_ns, exc=exc)
-            raise
-
-        _emit_message_span_safely(kwargs=kwargs, message=message, start_ns=start_ns)
-        return message
-
-    return wrapper
-
-
-def _wrap_sync_stream(original: Any) -> Any:
-    """Wrap ``Messages.stream()`` for the sync Anthropic client."""
-
-    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        start_ns = time.time_ns()
-        stream_cm = original(self, *args, **kwargs)
-
-        class _InstrumentedStream:
-            """Proxy that delegates to the real MessageStream context manager."""
-
-            def __init__(self, cm: Any) -> None:
-                self._cm = cm
-                self._stream = None
-
-            def __enter__(self) -> Any:
-                self._stream = self._cm.__enter__()
-                return self._stream
-
-            def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> Any:
-                result = self._cm.__exit__(exc_type, exc_val, exc_tb)
-                try:
-                    final_message_getter = getattr(
-                        self._stream, GET_FINAL_MESSAGE_METHOD_NAME, None
-                    )
-                    if callable(final_message_getter):
-                        _emit_message_span_safely(
-                            kwargs=kwargs,
-                            message=final_message_getter(),
-                            start_ns=start_ns,
-                        )
-                    elif exc_val is not None:
-                        _emit_error_span(
-                            kwargs=kwargs,
-                            start_ns=start_ns,
-                            exc=exc_val,
-                        )
-                except Exception:
-                    logger.debug("Failed to emit stream span", exc_info=True)
-                return result
-
-            def __iter__(self) -> Any:
-                return iter(self._cm)
-
-        return _InstrumentedStream(cm=stream_cm)
-
-    return wrapper
-
-
-def _wrap_async_stream(original: Any) -> Any:
-    """Wrap ``AsyncMessages.stream()`` for the async Anthropic client."""
-
-    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        start_ns = time.time_ns()
-        stream_cm = original(self, *args, **kwargs)
-
-        class _InstrumentedAsyncStream:
-            """Proxy that delegates to the real AsyncMessageStream."""
-
-            def __init__(self, cm: Any) -> None:
-                self._cm = cm
-                self._stream = None
-
-            async def __aenter__(self) -> Any:
-                self._stream = await self._cm.__aenter__()
-                return self._stream
-
-            async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> Any:
-                result = await self._cm.__aexit__(exc_type, exc_val, exc_tb)
-                try:
-                    final_message_getter = getattr(
-                        self._stream, GET_FINAL_MESSAGE_METHOD_NAME, None
-                    )
-                    if callable(final_message_getter):
-                        _emit_message_span_safely(
-                            kwargs=kwargs,
-                            message=final_message_getter(),
-                            start_ns=start_ns,
-                        )
-                    elif exc_val is not None:
-                        _emit_error_span(
-                            kwargs=kwargs,
-                            start_ns=start_ns,
-                            exc=exc_val,
-                        )
-                except Exception:
-                    logger.debug("Failed to emit async stream span", exc_info=True)
-                return result
-
-            def __aiter__(self) -> Any:
-                return self._cm.__aiter__()
-
-        return _InstrumentedAsyncStream(cm=stream_cm)
-
-    return wrapper
+    return call
 
 
 class AnthropicInstrumentor:
-    """Respan instrumentor for the Anthropic SDK."""
+    """Instrument stable/beta Messages and available managed-session streams.
 
-    name = ANTHROPIC_INSTRUMENTATION_NAME
+    Capture policy is intersected with OTel context and observed local parents.
+    Optional SDK surfaces are discovered without deploying agent resources.
+    """
 
-    def __init__(self) -> None:
+    name = "anthropic"
+
+    def __init__(
+        self,
+        *,
+        capture_content: bool = True,
+        tracer_provider: Any = None,
+        context: Any = None,
+    ) -> None:
+        self.capture_content = capture_content
+        self.tracer_provider = tracer_provider
+        self.context = context
+        self._observer = PrivacyObserver()
+        self._providers: list[Any] = []
+        self._tracer = None
         self._is_instrumented = False
+        self._patches_active = False
 
-    def activate(self) -> None:
-        """Monkey-patch the Anthropic SDK."""
-        global _original_sync_create, _original_async_create
-        global _original_sync_stream, _original_async_stream
-        global _original_sync_events_stream, _original_async_events_stream
+    def _ensure_provider(self) -> None:
+        provider = self.tracer_provider or trace.get_tracer_provider()
+        self._tracer = provider.get_tracer(__name__)
+        if provider not in self._providers and hasattr(provider, "add_span_processor"):
+            provider.add_span_processor(self._observer)
+            self._providers.append(provider)
 
-        try:
-            Messages, AsyncMessages = _load_messages_classes()
-        except ImportError as exc:
-            # SDK genuinely absent — expected when the app doesn't use Anthropic
-            # (the anthropic SDK is an optional extra).
-            logger.debug(
-                "Anthropic instrumentation inactive — missing dependency: %s",
-                exc,
-            )
-            return
-        except AttributeError as exc:
-            # SDK installed but incompatible (a class moved/renamed) — surface it
-            # so a broken install isn't silently left untraced.
-            logger.warning(
-                "anthropic is installed but incompatible — instrumentation inactive: %s",
-                exc,
-            )
-            return
-        except Exception as exc:
-            logger.warning("Failed to activate Anthropic instrumentation: %s", exc)
-            return
+    def activate(self, *, tracer_provider: Any = None) -> None:
+        global _CONFIG
+        with _LOCK:
+            if self._is_instrumented:
+                return
+            if tracer_provider is not None:
+                self.tracer_provider = tracer_provider
+            config = (self.capture_content, self.tracer_provider, self.context)
+            if _OWNERS:
+                if config != _CONFIG:
+                    logger.warning(
+                        "Anthropic instrumentation is active with a different configuration"
+                    )
+                    return
+                _OWNERS.add(self)
+                self._is_instrumented = True
+                return
+            try:
+                resources = importlib.import_module("anthropic.resources.messages")
+            except ImportError:
+                return
+            staged = []
+            try:
+                self._ensure_provider()
+                runtime = context_api._RUNTIME_CONTEXT
+                original = runtime.detach
+                replacement = _detach_wrapper(original, self)
+                replacement.__respan_owner__ = self
+                staged.append((runtime, "detach", original, replacement))
+                runtime.detach = replacement
+                modules = [(resources, False)]
+                for path, managed in (
+                    ("anthropic.resources.beta.messages.messages", False),
+                    ("anthropic.resources.beta.sessions.events", True),
+                ):
+                    try:
+                        modules.append((importlib.import_module(path), managed))
+                    except ImportError:
+                        pass
+                for module, managed in modules:
+                    for name in (
+                        ("Events", "AsyncEvents")
+                        if managed
+                        else ("Messages", "AsyncMessages")
+                    ):
+                        cls = getattr(module, name, None)
+                        if cls is None:
+                            continue
+                        for method in (
+                            ("stream",) if managed else ("create", "parse", "stream")
+                        ):
+                            original = getattr(cls, method, None)
+                            if original is None:
+                                continue
+                            helper = method == "stream" and not managed
+                            replacement = _wrapper(
+                                original,
+                                self,
+                                helper=helper,
+                                managed=managed,
+                                asynchronous=name.startswith("Async") and not helper,
+                            )
+                            replacement.__respan_owner__ = self
+                            staged.append((cls, method, original, replacement))
+                            setattr(cls, method, replacement)
+                streaming = importlib.import_module("anthropic.lib.streaming")
+                for name in (
+                    "MessageStreamManager",
+                    "AsyncMessageStreamManager",
+                    "BetaMessageStreamManager",
+                    "BetaAsyncMessageStreamManager",
+                    "AsyncBetaMessageStreamManager",
+                ):
+                    cls = getattr(streaming, name, None)
+                    if cls is None:
+                        continue
+                    asynchronous = "Async" in name
+                    method = "__aenter__" if asynchronous else "__enter__"
+                    original = getattr(cls, method)
+                    replacement = _manager_entry(original, asynchronous)
+                    replacement.__respan_owner__ = self
+                    staged.append((cls, method, original, replacement))
+                    setattr(cls, method, replacement)
+            except Exception:  # noqa: BLE001
+                for cls, method, original, replacement in reversed(staged):
+                    if getattr(cls, method, None) is replacement:
+                        setattr(cls, method, original)
+                self._remove_processors()
+                return
+            _PATCHES.extend(staged)
+            self._patches_active = True
+            _CONFIG = config
+            _OWNERS.add(self)
+            self._is_instrumented = True
 
-        self._is_instrumented = True
-
-        try:
-            if _original_sync_create is None:
-                _original_sync_create = getattr(Messages, CREATE_METHOD_NAME)
-            setattr(
-                Messages,
-                CREATE_METHOD_NAME,
-                _wrap_sync_create(original=_original_sync_create),
-            )
-
-            if _original_async_create is None:
-                _original_async_create = getattr(AsyncMessages, CREATE_METHOD_NAME)
-            setattr(
-                AsyncMessages,
-                CREATE_METHOD_NAME,
-                _wrap_async_create(original=_original_async_create),
-            )
-
-            if hasattr(Messages, STREAM_METHOD_NAME):
-                if _original_sync_stream is None:
-                    _original_sync_stream = getattr(Messages, STREAM_METHOD_NAME)
-                setattr(
-                    Messages,
-                    STREAM_METHOD_NAME,
-                    _wrap_sync_stream(original=_original_sync_stream),
-                )
-
-            if hasattr(AsyncMessages, STREAM_METHOD_NAME):
-                if _original_async_stream is None:
-                    _original_async_stream = getattr(AsyncMessages, STREAM_METHOD_NAME)
-                setattr(
-                    AsyncMessages,
-                    STREAM_METHOD_NAME,
-                    _wrap_async_stream(original=_original_async_stream),
-                )
-        except Exception as exc:
-            logger.warning("Failed to activate Anthropic instrumentation: %s", exc)
-            self.deactivate()
-            return
-
-        try:
-            Events, AsyncEvents = _load_events_classes()
-
-            if _original_sync_events_stream is None:
-                _original_sync_events_stream = getattr(Events, STREAM_METHOD_NAME)
-            setattr(
-                Events,
-                STREAM_METHOD_NAME,
-                _wrap_sync_events_stream(original=_original_sync_events_stream),
-            )
-
-            if _original_async_events_stream is None:
-                _original_async_events_stream = getattr(AsyncEvents, STREAM_METHOD_NAME)
-            setattr(
-                AsyncEvents,
-                STREAM_METHOD_NAME,
-                _wrap_async_events_stream(original=_original_async_events_stream),
-            )
-
-            logger.info("Anthropic Managed Agents instrumentation activated")
-        except (AttributeError, ImportError):
-            logger.debug(
-                "Managed Agents beta not available in installed anthropic SDK; skipping"
-            )
-        except Exception as exc:
-            logger.warning(
-                "Failed to activate Managed Agents instrumentation: %s", exc
-            )
-
-        logger.info("Anthropic SDK instrumentation activated")
+    def _remove_processors(self) -> None:
+        for provider in self._providers:
+            processor = getattr(provider, "_active_span_processor", None)
+            if processor is not None and hasattr(processor, "_span_processors"):
+                with processor._lock:
+                    processor._span_processors = tuple(
+                        item
+                        for item in processor._span_processors
+                        if item is not self._observer
+                    )
+        self._providers.clear()
 
     def deactivate(self) -> None:
-        """Restore original Anthropic SDK methods."""
-        global _original_sync_create, _original_async_create
-        global _original_sync_stream, _original_async_stream
-        global _original_sync_events_stream, _original_async_events_stream
-
-        if not self._is_instrumented:
-            return
-
-        try:
-            Messages, AsyncMessages = _load_messages_classes()
-
-            if _original_sync_create is not None:
-                setattr(Messages, CREATE_METHOD_NAME, _original_sync_create)
-                _original_sync_create = None
-
-            if _original_async_create is not None:
-                setattr(AsyncMessages, CREATE_METHOD_NAME, _original_async_create)
-                _original_async_create = None
-
-            if _original_sync_stream is not None:
-                setattr(Messages, STREAM_METHOD_NAME, _original_sync_stream)
-                _original_sync_stream = None
-
-            if _original_async_stream is not None:
-                setattr(AsyncMessages, STREAM_METHOD_NAME, _original_async_stream)
-                _original_async_stream = None
-        except Exception:
-            logger.debug("Failed to restore Anthropic message methods", exc_info=True)
-
-        try:
-            Events, AsyncEvents = _load_events_classes()
-
-            if _original_sync_events_stream is not None:
-                setattr(Events, STREAM_METHOD_NAME, _original_sync_events_stream)
-                _original_sync_events_stream = None
-
-            if _original_async_events_stream is not None:
-                setattr(
-                    AsyncEvents,
-                    STREAM_METHOD_NAME,
-                    _original_async_events_stream,
-                )
-                _original_async_events_stream = None
-        except Exception:
-            logger.debug("Failed to restore Anthropic managed-agent methods", exc_info=True)
-
-        self._is_instrumented = False
-        logger.info("Anthropic SDK instrumentation deactivated")
+        global _CONFIG
+        with _LOCK:
+            if self not in _OWNERS:
+                return
+            _OWNERS.remove(self)
+            self._is_instrumented = False
+            if _OWNERS:
+                return
+            owners = {
+                getattr(replacement, "__respan_owner__", None)
+                for _, _, _, replacement in _PATCHES
+            }
+            for cls, method, original, replacement in reversed(_PATCHES):
+                if getattr(cls, method, None) is replacement:
+                    setattr(cls, method, original)
+            for owner in owners:
+                if owner is not None:
+                    owner._patches_active = False
+                    owner._remove_processors()
+            self._remove_processors()
+            _PATCHES.clear()
+            _CONFIG = None

@@ -1,0 +1,9 @@
+{
+  "summary": "Support current Anthropic, AWS Bedrock, Vertex AI, and SageMaker native SDK APIs with complete content, source usage, streaming lifecycle, and privacy controls",
+  "packages": {
+    "respan-instrumentation-anthropic": "minor",
+    "respan-instrumentation-aws-bedrock": "minor",
+    "respan-instrumentation-vertexai": "minor",
+    "respan-instrumentation-sagemaker": "minor"
+  }
+}

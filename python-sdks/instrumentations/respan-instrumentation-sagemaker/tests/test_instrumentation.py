@@ -1,507 +1,633 @@
-from __future__ import annotations
+"""Native SDK transport/objects/data/ownership, no fake vendor modules."""
 
+import inspect
 import json
-import sys
-from types import ModuleType, SimpleNamespace
-from typing import Any
 
 import pytest
-from opentelemetry import context as context_api
-from opentelemetry.semconv._incubating.attributes import (
-    gen_ai_attributes as GenAIAttributes,
-)
-from opentelemetry.semconv_ai import LLMRequestTypeValues
-from opentelemetry.semconv_ai import SpanAttributes as TLSpanAttributes
-from respan_instrumentation_sagemaker import SageMakerInstrumentor, _instrumentation
-from respan_instrumentation_sagemaker._constants import (
-    INVOKE_ENDPOINT_ASYNC_OPERATION,
-    INVOKE_ENDPOINT_OPERATION,
-    INVOKE_ENDPOINT_STREAM_OPERATION,
-)
-from respan_instrumentation_sagemaker._otel_emitter import build_sagemaker_attrs
-from respan_instrumentation_sagemaker._translator import (
-    SageMakerStreamAccumulator,
-    parse_sagemaker_stream_response,
-)
-from respan_sdk.constants.llm_logging import LOG_TYPE_CHAT, LOG_TYPE_TASK
-from respan_sdk.constants.span_attributes import (
-    RESPAN_LOG_TYPE,
-    RESPAN_SPAN_HANDOFFS,
-    RESPAN_SPAN_TOOL_CALLS,
-    RESPAN_SPAN_TOOLS,
-)
-
-OFF_CONTRACT_ALIASES = {
-    "model",
-    "prompt_tokens",
-    "completion_tokens",
-    "total_request_tokens",
-    "tools",
-    "tool_calls",
-    "span_tools",
-    "has_tool_calls",
-    "parallel_tool_calls",
-    RESPAN_SPAN_TOOLS,
-    RESPAN_SPAN_TOOL_CALLS,
-    RESPAN_SPAN_HANDOFFS,
-}
+from _fixtures import client, frame
+from botocore.client import BaseClient
+from botocore.eventstream import EventStream
+from botocore.exceptions import ClientError, EventStreamError
+from botocore.response import StreamingBody
+from opentelemetry import context, trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.sdk.trace.sampling import ALWAYS_OFF
+from opentelemetry.semconv._incubating.attributes.error_attributes import ERROR_MESSAGE
+from opentelemetry.semconv.attributes.http_attributes import HTTP_RESPONSE_STATUS_CODE
+from opentelemetry.semconv_ai import SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY
+from opentelemetry.semconv_ai import SpanAttributes as AI
+from respan_instrumentation_sagemaker import SageMakerInstrumentor
+from respan_instrumentation_sagemaker import _instrumentation as module
+from respan_instrumentation_sagemaker._serialization import json_dumps, safe_text
+from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
+from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
 
 
-class _OneShotBody:
-    def __init__(self, payload: Any) -> None:
-        self._bytes = json.dumps(payload).encode("utf-8")
-        self._read = False
+@pytest.fixture
+def pipeline(monkeypatch):
+    for key in ("TRACELOOP_TRACE_CONTENT", "RESPAN_TRACE_CONTENT"):
+        monkeypatch.delenv(key, raising=False)
+    provider = TracerProvider()
+    memory = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(memory))
+    owners = []
 
-    def read(self) -> bytes:
-        if self._read:
-            return b""
-        self._read = True
-        return self._bytes
+    def owner(capture=True):
+        o = SageMakerInstrumentor(tracer_provider=provider, capture_content=capture)
+        o.activate()
+        owners.append(o)
+        return o
 
-
-@pytest.fixture(autouse=True)
-def reset_instrumentation_globals() -> None:
-    _instrumentation._original_make_api_call = None
-    _instrumentation._patched_make_api_call = None
-    _instrumentation._activation_count = 0
-
-
-@pytest.fixture()
-def captured_spans(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
-    spans: list[Any] = []
-    monkeypatch.setattr(
-        "respan_instrumentation_sagemaker._otel_emitter.inject_span",
-        lambda span: spans.append(span),
-    )
-    return spans
+    yield provider, memory, owner
+    for o in reversed(owners):
+        o.deactivate()
+    provider.shutdown()
 
 
-@pytest.fixture()
-def fake_botocore(monkeypatch: pytest.MonkeyPatch) -> type[Any]:
-    class BaseClient:
-        def __init__(self, service_name: str = "sagemaker-runtime") -> None:
-            self.meta = SimpleNamespace(
-                service_model=SimpleNamespace(service_name=service_name)
-            )
-
-        def _make_api_call(
-            self, operation_name: str, api_params: dict[str, Any]
-        ) -> Any:
-            if operation_name == INVOKE_ENDPOINT_OPERATION:
-                body = json.loads(api_params.get("Body", b"{}"))
-                if "messages" in body:
-                    return {
-                        "Body": _OneShotBody(
-                            {
-                                "choices": [
-                                    {
-                                        "message": {
-                                            "role": "assistant",
-                                            "content": "",
-                                            "tool_calls": [
-                                                {
-                                                    "id": "call_1",
-                                                    "type": "function",
-                                                    "function": {
-                                                        "name": "get_weather",
-                                                        "arguments": '{"city": "Tokyo"}',
-                                                    },
-                                                }
-                                            ],
-                                        }
-                                    }
-                                ],
-                                "usage": {
-                                    "prompt_tokens": 11,
-                                    "completion_tokens": 7,
-                                    "total_tokens": 18,
-                                },
-                            }
-                        ),
-                        "ContentType": "application/json",
-                        "ResponseMetadata": {"HTTPStatusCode": 200},
-                    }
-                return {
-                    "Body": _OneShotBody(
-                        [
-                            {
-                                "generated_text": "Hello from SageMaker",
-                                "details": {
-                                    "input_tokens": 5,
-                                    "generated_tokens": 4,
-                                },
-                            }
-                        ]
-                    ),
-                    "ContentType": "application/json",
-                    "ResponseMetadata": {"HTTPStatusCode": 200},
-                }
-            if operation_name == INVOKE_ENDPOINT_STREAM_OPERATION:
-                return {
-                    "Body": iter(
-                        [
-                            {
-                                "PayloadPart": {
-                                    "Bytes": json.dumps(
-                                        {"token": {"text": "Hello "}}
-                                    ).encode("utf-8")
-                                }
-                            },
-                            {
-                                "PayloadPart": {
-                                    "Bytes": json.dumps(
-                                        {
-                                            "token": {"text": "stream"},
-                                            "usage": {
-                                                "input_tokens": 2,
-                                                "generated_tokens": 3,
-                                            },
-                                        }
-                                    ).encode("utf-8")
-                                }
-                            },
-                        ]
-                    ),
-                    "ContentType": "application/json",
-                    "ResponseMetadata": {"HTTPStatusCode": 200},
-                }
-            if operation_name == INVOKE_ENDPOINT_ASYNC_OPERATION:
-                return {
-                    "InferenceId": "inference-123",
-                    "OutputLocation": "s3://bucket/output.json",
-                    "ResponseMetadata": {"HTTPStatusCode": 202},
-                }
-            return {"ok": True}
-
-    botocore_module = ModuleType("botocore")
-    client_module = ModuleType("botocore.client")
-    client_module.BaseClient = BaseClient
-    botocore_module.client = client_module
-    monkeypatch.setitem(sys.modules, "botocore", botocore_module)
-    monkeypatch.setitem(sys.modules, "botocore.client", client_module)
-    return BaseClient
-
-
-def test_invoke_endpoint_emits_text_span_and_preserves_response_body(
-    fake_botocore: type[Any],
-    captured_spans: list[Any],
-) -> None:
-    instrumentor = SageMakerInstrumentor()
-    instrumentor.activate()
-
-    response = fake_botocore()._make_api_call(
-        INVOKE_ENDPOINT_OPERATION,
-        {
-            "EndpointName": "jumpstart-text-endpoint",
-            "Body": json.dumps(
-                {
-                    "inputs": "Say hello from a SageMaker endpoint.",
-                    "parameters": {"max_new_tokens": 16},
-                }
-            ).encode("utf-8"),
-            "ContentType": "application/json",
-            "Accept": "application/json",
-            "CustomAttributes": "respan_model=gpt-4o-mini",
-        },
+def invoke(c, body=None, **extra):
+    return c.invoke_endpoint(
+        EndpointName="controlled-endpoint",
+        Body=json.dumps(
+            body
+            if body is not None
+            else {"messages": [{"role": "user", "content": "native prompt"}]}
+        ).encode(),
+        ContentType="application/json",
+        **extra,
     )
 
-    assert json.loads(response["Body"].read())[0]["generated_text"] == (
-        "Hello from SageMaker"
-    )
-    assert len(captured_spans) == 1
-    attrs = captured_spans[0]._attributes
-    assert attrs[RESPAN_LOG_TYPE] == LOG_TYPE_CHAT
-    assert attrs[TLSpanAttributes.LLM_SYSTEM] == "sagemaker"
-    assert attrs[GenAIAttributes.GEN_AI_PROVIDER_NAME] == "sagemaker"
-    assert attrs[TLSpanAttributes.LLM_REQUEST_MODEL] == "gpt-4o-mini"
-    assert attrs[TLSpanAttributes.LLM_REQUEST_TYPE] == LLMRequestTypeValues.CHAT.value
-    assert attrs[f"{TLSpanAttributes.LLM_PROMPTS}.0.role"] == "user"
-    assert (
-        attrs[f"{TLSpanAttributes.LLM_PROMPTS}.0.content"]
-        == "Say hello from a SageMaker endpoint."
-    )
-    assert attrs[f"{TLSpanAttributes.LLM_COMPLETIONS}.0.role"] == "assistant"
-    assert (
-        attrs[f"{TLSpanAttributes.LLM_COMPLETIONS}.0.content"] == "Hello from SageMaker"
-    )
-    assert attrs[GenAIAttributes.GEN_AI_USAGE_INPUT_TOKENS] == 5
-    assert attrs[GenAIAttributes.GEN_AI_USAGE_OUTPUT_TOKENS] == 4
-    assert attrs[GenAIAttributes.GEN_AI_USAGE_PROMPT_TOKENS] == 5
-    assert attrs[GenAIAttributes.GEN_AI_USAGE_COMPLETION_TOKENS] == 4
-    assert attrs[TLSpanAttributes.LLM_USAGE_PROMPT_TOKENS] == 5
-    assert attrs[TLSpanAttributes.LLM_USAGE_COMPLETION_TOKENS] == 4
-    assert attrs[TLSpanAttributes.LLM_USAGE_TOTAL_TOKENS] == 9
-    assert attrs[TLSpanAttributes.TRACELOOP_ENTITY_NAME] == "sagemaker.chat"
-    assert attrs[TLSpanAttributes.TRACELOOP_ENTITY_PATH] == "sagemaker.chat"
-    assert TLSpanAttributes.TRACELOOP_SPAN_KIND not in attrs
-    assert not OFF_CONTRACT_ALIASES.intersection(attrs)
 
-    instrumentor.deactivate()
-
-
-def test_chat_tools_and_tool_calls_use_canonical_fields_without_aliases(
-    fake_botocore: type[Any],
-    captured_spans: list[Any],
-) -> None:
-    instrumentor = SageMakerInstrumentor()
-    instrumentor.activate()
-
-    fake_botocore()._make_api_call(
-        INVOKE_ENDPOINT_OPERATION,
-        {
-            "EndpointName": "chat-endpoint",
-            "Body": json.dumps(
-                {
-                    "messages": [
+def test_native_body_identity_lazy_consumption_full_values_and_sourced_zero_usage(
+    pipeline,
+):
+    _, m, owner = pipeline
+    owner()
+    payload = {
+        "model": "controlled-model",
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": {
+                        "dense": list(range(5001)),
+                        "sparse": {"indices": [0, 5000], "values": [0, False]},
+                        "false": False,
+                        "zero": 0,
+                    },
+                    "tool_calls": [
                         {
-                            "role": "user",
-                            "content": "What is the weather in Tokyo?",
-                        }
-                    ],
-                    "tools": [
-                        {
+                            "id": "native-id",
                             "type": "function",
                             "function": {
-                                "name": "get_weather",
-                                "description": "Get weather for a city.",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {"city": {"type": "string"}},
-                                },
+                                "name": "native_tool",
+                                "arguments": json.dumps(
+                                    {
+                                        "history": list(range(75)),
+                                        "zero": 0,
+                                        "false": False,
+                                    }
+                                ),
                             },
                         }
                     ],
                 }
-            ).encode("utf-8"),
-            "ContentType": "application/json",
-            "Accept": "application/json",
-        },
-    )
-
-    attrs = captured_spans[0]._attributes
-    tools = json.loads(attrs[TLSpanAttributes.LLM_REQUEST_FUNCTIONS])
-    tool_calls = json.loads(attrs[f"{TLSpanAttributes.LLM_COMPLETIONS}.0.tool_calls"])
-    assert attrs[RESPAN_LOG_TYPE] == LOG_TYPE_CHAT
-    assert attrs[TLSpanAttributes.LLM_REQUEST_TYPE] == LLMRequestTypeValues.CHAT.value
-    assert tools[0]["function"]["name"] == "get_weather"
-    assert tool_calls[0]["function"]["name"] == "get_weather"
-    assert tool_calls[0]["function"]["arguments"] == '{"city": "Tokyo"}'
-    assert not OFF_CONTRACT_ALIASES.intersection(attrs)
-
-    instrumentor.deactivate()
-
-
-def test_stream_emits_span_after_stream_is_consumed(
-    fake_botocore: type[Any],
-    captured_spans: list[Any],
-) -> None:
-    instrumentor = SageMakerInstrumentor()
-    instrumentor.activate()
-
-    response = fake_botocore()._make_api_call(
-        INVOKE_ENDPOINT_STREAM_OPERATION,
-        {
-            "EndpointName": "stream-endpoint",
-            "Body": json.dumps({"inputs": "Stream a greeting."}).encode("utf-8"),
-            "ContentType": "application/json",
-            "Accept": "application/json",
-        },
-    )
-
-    assert len(captured_spans) == 0
-    assert len(list(response["Body"])) == 2
-    assert len(captured_spans) == 1
-    attrs = captured_spans[0]._attributes
-    assert attrs[f"{TLSpanAttributes.LLM_COMPLETIONS}.0.content"] == "Hello stream"
-    assert attrs[GenAIAttributes.GEN_AI_USAGE_INPUT_TOKENS] == 2
-    assert attrs[GenAIAttributes.GEN_AI_USAGE_OUTPUT_TOKENS] == 3
-    assert attrs[TLSpanAttributes.LLM_USAGE_TOTAL_TOKENS] == 5
-    assert attrs[TLSpanAttributes.LLM_IS_STREAMING] is True
-    assert not OFF_CONTRACT_ALIASES.intersection(attrs)
-
-    instrumentor.deactivate()
-
-
-def test_async_endpoint_emits_lifecycle_task_without_llm_semantics(
-    fake_botocore: type[Any],
-    captured_spans: list[Any],
-) -> None:
-    instrumentor = SageMakerInstrumentor()
-    instrumentor.activate()
-
-    fake_botocore()._make_api_call(
-        INVOKE_ENDPOINT_ASYNC_OPERATION,
-        {
-            "EndpointName": "async-endpoint",
-            "InputLocation": "s3://bucket/input.json",
-            "ContentType": "application/json",
-            "Accept": "application/json",
-            "CustomAttributes": "respan_model=gpt-4o-mini",
-        },
-    )
-
-    attrs = captured_spans[0]._attributes
-    assert attrs[RESPAN_LOG_TYPE] == LOG_TYPE_TASK
-    assert attrs[TLSpanAttributes.TRACELOOP_ENTITY_NAME] == (
-        "sagemaker.invoke_endpoint_async"
-    )
-    assert json.loads(attrs[TLSpanAttributes.TRACELOOP_ENTITY_INPUT]) == {
-        "endpoint_name": "async-endpoint",
-        "input_location": "s3://bucket/input.json",
+            }
+        ],
+        "usage": {"input_tokens": 0, "output_tokens": 2, "total_tokens": 0},
     }
-    assert json.loads(attrs[TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT]) == {
-        "inference_id": "inference-123",
-        "output_location": "s3://bucket/output.json",
-        "state": "submitted",
-    }
-    assert TLSpanAttributes.LLM_REQUEST_MODEL not in attrs
-    assert TLSpanAttributes.LLM_REQUEST_TYPE not in attrs
-    assert not any(key.startswith(f"{TLSpanAttributes.LLM_PROMPTS}.") for key in attrs)
-    assert not any(
-        key.startswith(f"{TLSpanAttributes.LLM_COMPLETIONS}.") for key in attrs
-    )
-    assert not OFF_CONTRACT_ALIASES.intersection(attrs)
-
-    instrumentor.deactivate()
-
-
-def test_non_sagemaker_client_is_ignored(
-    fake_botocore: type[Any],
-    captured_spans: list[Any],
-) -> None:
-    instrumentor = SageMakerInstrumentor()
-    instrumentor.activate()
-
-    response = fake_botocore(service_name="s3")._make_api_call("ListBuckets", {})
-
-    assert response == {"ok": True}
-    assert captured_spans == []
-
-    instrumentor.deactivate()
-
-
-def test_active_workflow_name_is_attached_to_span() -> None:
-    token = context_api.attach(
-        context_api.set_value(
-            TLSpanAttributes.TRACELOOP_ENTITY_NAME,
-            "sagemaker_invoke_endpoint",
-        )
-    )
-    try:
-        attrs = build_sagemaker_attrs(
-            operation_name=INVOKE_ENDPOINT_OPERATION,
-            api_params={
-                "EndpointName": "jumpstart-text-endpoint",
-                "Body": json.dumps({"inputs": "Say hello"}).encode("utf-8"),
-            },
-            response_payload=[
+    c, _, _ = client(payload)
+    response = invoke(
+        c,
+        {
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": f"item-{i}"} for i in range(75)],
+            "tools": [
                 {
-                    "generated_text": "Hello",
-                    "details": {"input_tokens": 1, "generated_tokens": 2},
+                    "type": "function",
+                    "function": {
+                        "name": "native_tool",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "api_key": {
+                                    "type": "string",
+                                    "default": "controlled secret",
+                                }
+                            },
+                        },
+                    },
                 }
             ],
-        )
+        },
+    )
+    body = response["Body"]
+    assert (
+        type(body) is StreamingBody
+        and body._amount_read == 0
+        and len(m.get_finished_spans()) == 0
+    )
+    native_bytes = body.read()
+    assert json.loads(native_bytes) == payload
+    assert "read" not in body.__dict__
+    span = m.get_finished_spans()[0]
+    attrs = span.attributes
+    assert json.loads(attrs[AI.TRACELOOP_ENTITY_OUTPUT]) == payload
+    assert len(json.loads(attrs[AI.TRACELOOP_ENTITY_INPUT])["messages"]) == 75
+    assert attrs[AI.LLM_REQUEST_MODEL] == "controlled-model"
+    assert (
+        attrs[AI.LLM_USAGE_PROMPT_TOKENS] == 0 and attrs[AI.LLM_USAGE_TOTAL_TOKENS] == 0
+    )
+    assert attrs[HTTP_RESPONSE_STATUS_CODE] == 200
+    assert (
+        json.loads(attrs[AI.LLM_REQUEST_FUNCTIONS])[0]["function"]["parameters"][
+            "properties"
+        ]["api_key"]["default"]
+        == "[REDACTED]"
+    )
+    body.close()
+    c.close()
+
+
+def test_usage_absent_and_total_not_invented(pipeline):
+    _, m, owner = pipeline
+    owner()
+    for payload in (
+        {"generated_text": "native", "usage": {"input_tokens": 0, "output_tokens": 2}},
+        {"generated_text": "native"},
+    ):
+        c, _, _ = client(payload)
+        r = invoke(c, {"inputs": "native prompt"})
+        r["Body"].read()
+        r["Body"].close()
+        c.close()
+    assert all(
+        AI.LLM_USAGE_TOTAL_TOKENS not in s.attributes for s in m.get_finished_spans()
+    )
+    assert AI.LLM_USAGE_PROMPT_TOKENS not in m.get_finished_spans()[1].attributes
+
+
+def test_endpoint_is_not_fabricated_model_and_native_ml_is_task(pipeline):
+    _, m, owner = pipeline
+    owner()
+    c, _, _ = client({"predictions": [False, 0]})
+    r = invoke(c, {"instances": [[0, False]]})
+    r["Body"].read()
+    r["Body"].close()
+    c.close()
+    attrs = m.get_finished_spans()[0].attributes
+    assert attrs[RESPAN_LOG_TYPE] == "task"
+    assert AI.LLM_REQUEST_MODEL not in attrs
+    assert json.loads(attrs[AI.TRACELOOP_ENTITY_OUTPUT]) == {"predictions": [False, 0]}
+
+
+def test_native_embedding_vectors_complete(pipeline):
+    _, m, owner = pipeline
+    owner()
+    payload = {
+        "object": "list",
+        "data": [{"object": "embedding", "index": 0, "embedding": list(range(5001))}],
+        "usage": {"input_tokens": 0},
+    }
+    c, _, _ = client(payload)
+    r = invoke(c, {"model": "native-embedding", "input": ["native"]})
+    r["Body"].read()
+    r["Body"].close()
+    c.close()
+    attrs = m.get_finished_spans()[0].attributes
+    assert attrs[RESPAN_LOG_TYPE] == "embedding"
+    assert json.loads(attrs[AI.TRACELOOP_ENTITY_OUTPUT]) == [list(range(5001))]
+
+
+def test_async_submission_retains_actual_sdk_fields_without_result_guess(pipeline):
+    _, m, owner = pipeline
+    owner()
+    c, _, _ = client(
+        {},
+        status=202,
+        headers={
+            "x-amzn-sagemaker-inference-id": "native-inference",
+            "x-amzn-sagemaker-outputlocation": "s3://controlled/output",
+            "x-amzn-sagemaker-failurelocation": "s3://controlled/failure",
+        },
+    )
+    result = c.invoke_endpoint_async(
+        EndpointName="controlled-endpoint",
+        InputLocation="s3://controlled/input",
+        ContentType="application/json",
+    )
+    c.close()
+    attrs = m.get_finished_spans()[0].attributes
+    payload = json.loads(attrs[AI.TRACELOOP_ENTITY_OUTPUT])
+    assert {k: v for k, v in payload.items() if k != "ResponseMetadata"} == {
+        k: v for k, v in result.items() if k != "ResponseMetadata"
+    }
+    assert "state" not in payload
+    assert attrs[HTTP_RESPONSE_STATUS_CODE] == 202
+
+
+def test_native_error_no_output_and_error_identity(pipeline):
+    _, m, owner = pipeline
+    owner()
+    c, _, _ = client(
+        {"Message": "controlled native error"},
+        status=429,
+        headers={"x-amzn-errortype": "ThrottlingException"},
+    )
+    with pytest.raises(ClientError) as error:
+        invoke(c)
+    assert error.value.response["ResponseMetadata"]["HTTPStatusCode"] == 429
+    span = m.get_finished_spans()[0]
+    assert span.status.status_code is trace.StatusCode.ERROR
+    assert AI.TRACELOOP_ENTITY_OUTPUT not in span.attributes
+    assert span.attributes[HTTP_RESPONSE_STATUS_CODE] == 429
+    assert span.attributes[ERROR_MESSAGE] == "controlled native error"
+    c.close()
+
+
+@pytest.mark.parametrize("mode", ["constructor", "env", "context"])
+def test_private_native_body_untouched_no_content_or_diagnostics(
+    pipeline, monkeypatch, mode
+):
+    _, m, owner = pipeline
+    token = None
+    if mode == "env":
+        monkeypatch.setenv("TRACELOOP_TRACE_CONTENT", "false")
+    if mode == "context":
+        token = context.attach(context.set_value(ENABLE_CONTENT_TRACING_KEY, False))
+    try:
+        owner(mode != "constructor")
+        c, _, _ = client({"generated_text": "PRIVATE result"})
+        r = invoke(c, {"inputs": "PRIVATE prompt"})
+        body = r["Body"]
+        assert type(body) is StreamingBody and "read" not in body.__dict__
+        body.read()
+        body.close()
+        c.close()
     finally:
-        context_api.detach(token)
-
+        if token:
+            context.detach(token)
+    assert len(m.get_finished_spans()) == 1
+    assert "PRIVATE" not in str(m.get_finished_spans()[0].attributes)
     assert (
-        attrs[TLSpanAttributes.TRACELOOP_WORKFLOW_NAME] == "sagemaker_invoke_endpoint"
+        AI.TRACELOOP_ENTITY_INPUT not in m.get_finished_spans()[0].attributes
+        and AI.TRACELOOP_ENTITY_OUTPUT not in m.get_finished_spans()[0].attributes
     )
 
 
-def test_historical_tool_call_and_result_linkage_is_preserved() -> None:
-    attrs = build_sagemaker_attrs(
-        operation_name=INVOKE_ENDPOINT_OPERATION,
-        api_params={
-            "EndpointName": "chat-endpoint",
-            "Body": json.dumps(
+@pytest.mark.parametrize(
+    "key",
+    [
+        context._SUPPRESS_INSTRUMENTATION_KEY,
+        SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY,
+    ],
+)
+def test_suppression_zero_extra_body_activity(pipeline, key):
+    _, m, owner = pipeline
+    owner()
+    t = context.attach(context.set_value(key, True))
+    try:
+        c, _, _ = client({"generated_text": "native"})
+        r = invoke(c)
+        assert "read" not in r["Body"].__dict__
+        r["Body"].read()
+        r["Body"].close()
+        c.close()
+    finally:
+        context.detach(t)
+    assert not m.get_finished_spans()
+
+
+def test_sampling_no_extraction(monkeypatch):
+    p = TracerProvider(sampler=ALWAYS_OFF)
+    m = InMemorySpanExporter()
+    p.add_span_processor(SimpleSpanProcessor(m))
+    o = SageMakerInstrumentor(tracer_provider=p)
+    o.activate()
+    monkeypatch.setattr(
+        module,
+        "request_body",
+        lambda p: (_ for _ in ()).throw(AssertionError("should not extract")),
+    )
+    try:
+        c, _, _ = client({"generated_text": "native"})
+        r = invoke(c)
+        assert "read" not in r["Body"].__dict__
+        r["Body"].read()
+        r["Body"].close()
+        c.close()
+    finally:
+        o.deactivate()
+        p.shutdown()
+    assert not m.get_finished_spans()
+
+
+@pytest.mark.parametrize("parent", ["unobserved", "initial", "finished"])
+def test_native_parent_bounds_cannot_widen(pipeline, parent):
+    p, m, owner = pipeline
+    if parent == "unobserved":
+        span = p.get_tracer("native").start_span("parent")
+        owner()
+    else:
+        owner()
+        t = context.attach(context.set_value(ENABLE_CONTENT_TRACING_KEY, False))
+        span = p.get_tracer("native").start_span("parent")
+        context.detach(t)
+        if parent == "finished":
+            span.end()
+    t = context.attach(trace.set_span_in_context(span))
+    try:
+        c, _, _ = client({"generated_text": "PRIVATE native"})
+        r = invoke(c, {"inputs": "PRIVATE prompt"})
+        r["Body"].read()
+        r["Body"].close()
+        c.close()
+    finally:
+        context.detach(t)
+        span.end()
+    sage = next(s for s in m.get_finished_spans() if s.name.startswith("sagemaker"))
+    assert (
+        AI.TRACELOOP_ENTITY_INPUT not in sage.attributes
+        and AI.TRACELOOP_ENTITY_OUTPUT not in sage.attributes
+    )
+
+
+def test_pre_detach_and_late_body_veto_clear_retained_content(pipeline):
+    _, m, owner = pipeline
+    owner()
+    c, _, _ = client({"generated_text": "PRIVATE output"})
+    r = invoke(c, {"inputs": "PRIVATE input"})
+    b = r["Body"]
+    b.read(5)
+    state = next(iter(module._MANAGER.states))
+    assert state.chunks
+    t = context.attach(context.set_value(ENABLE_CONTENT_TRACING_KEY, False))
+    b.read()
+    context.detach(t)
+    assert not state.chunks and not state.params
+    span = m.get_finished_spans()[0]
+    assert (
+        AI.TRACELOOP_ENTITY_INPUT not in span.attributes
+        and AI.TRACELOOP_ENTITY_OUTPUT not in span.attributes
+    )
+    b.close()
+    c.close()
+
+
+def test_native_partial_read_and_readinto_preserve_full_bytes(pipeline):
+    _, m, owner = pipeline
+    owner()
+    payload = {"generated_text": "native string"}
+    c, _, _ = client(payload)
+    r = invoke(c, {"inputs": "native"})
+    b = r["Body"]
+    prefix = b.read(2)
+    if not hasattr(b, "readinto"):
+        b.close()
+        c.close()
+        pytest.skip("native SDK floor has no StreamingBody.readinto")
+    chunks = [prefix]
+    buffer = bytearray(7)
+    while count := b.readinto(buffer):
+        chunks.append(bytes(buffer[:count]))
+    assert json.loads(b"".join(chunks)) == payload
+    assert (
+        json.loads(m.get_finished_spans()[0].attributes[AI.TRACELOOP_ENTITY_OUTPUT])
+        == payload
+    )
+    b.close()
+    c.close()
+
+
+def test_native_context_manager_return_unchanged(pipeline):
+    _, m, owner = pipeline
+    owner()
+    c, _, raws = client({"generated_text": "native"})
+    r = invoke(c, {"inputs": "native"})
+    with r["Body"] as raw:
+        assert raw is raws[0]
+        data = raw.read()
+    assert json.loads(data) == {"generated_text": "native"}
+    assert len(m.get_finished_spans()) == 1
+    c.close()
+
+
+def test_native_event_stream_identity_fragmented_json_tool_args_usage(pipeline):
+    _, m, owner = pipeline
+    owner()
+    frames = [
+        {
+            "choices": [
                 {
-                    "messages": [
-                        {"role": "user", "content": "weather"},
-                        {
-                            "role": "assistant",
-                            "content": "",
-                            "tool_calls": [
-                                {
-                                    "id": "call_weather",
-                                    "type": "function",
-                                    "function": {
-                                        "name": "get_weather",
-                                        "arguments": '{"city":"Tokyo"}',
-                                    },
-                                }
-                            ],
-                        },
-                        {
-                            "role": "tool",
-                            "tool_call_id": "call_weather",
-                            "content": "sunny",
-                        },
-                    ]
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "native-call",
+                                "type": "function",
+                                "function": {
+                                    "name": "native_tool",
+                                    "arguments": '{"value":',
+                                },
+                            }
+                        ],
+                    },
                 }
-            ).encode(),
+            ]
         },
-        response_payload={
-            "choices": [{"message": {"role": "assistant", "content": "done"}}]
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {"index": 0, "function": {"arguments": 'false,"zero":0}'}}
+                        ]
+                    },
+                }
+            ],
+            "usage": {"input_tokens": 0, "output_tokens": 2},
         },
+    ]
+    encoded = b"".join((json.dumps(x) + "\n").encode() for x in frames)
+    data = frame(encoded[:13]) + frame(encoded[13:40]) + frame(encoded[40:])
+    c, _, _ = client(events=data)
+    r = c.invoke_endpoint_with_response_stream(
+        EndpointName="controlled-endpoint",
+        Body=b'{"messages":[{"role":"user","content":"native"}]}',
+        ContentType="application/json",
     )
+    body = r["Body"]
+    assert type(body) is EventStream and not m.get_finished_spans()
+    events = list(body)
+    assert b"".join(e["PayloadPart"]["Bytes"] for e in events) == encoded
+    attrs = m.get_finished_spans()[0].attributes
+    tool = json.loads(attrs[AI.LLM_COMPLETIONS + ".0.tool_calls"])[0]
+    assert tool["id"] == "native-call"
+    assert json.loads(tool["function"]["arguments"]) == {"value": False, "zero": 0}
+    assert attrs[AI.LLM_USAGE_PROMPT_TOKENS] == 0
+    assert AI.LLM_USAGE_TOTAL_TOKENS not in attrs
+    body.close()
+    c.close()
 
+
+def test_native_event_stream_error_partial_result_not_fabricated(pipeline):
+    _, m, owner = pipeline
+    owner()
+    data = frame(b'{"token":{"text":"native part"}}\n') + frame(
+        b'{"Message":"controlled stream error"}',
+        kind="ModelStreamError",
+        message_type="exception",
+    )
+    c, _, _ = client(events=data)
+    r = c.invoke_endpoint_with_response_stream(
+        EndpointName="controlled-endpoint",
+        Body=b'{"inputs":"native"}',
+        ContentType="application/json",
+    )
+    with pytest.raises(EventStreamError):
+        list(r["Body"])
+    span = m.get_finished_spans()[0]
+    assert span.status.status_code is trace.StatusCode.ERROR
+    assert "error" not in json.loads(span.attributes[AI.TRACELOOP_ENTITY_OUTPUT])
     assert (
-        json.loads(attrs[f"{TLSpanAttributes.LLM_PROMPTS}.1.tool_calls"])[0]["id"]
-        == "call_weather"
+        json.loads(span.attributes[AI.TRACELOOP_ENTITY_OUTPUT])["token"]["text"]
+        == "native part"
     )
-    assert json.loads(attrs[f"{TLSpanAttributes.LLM_PROMPTS}.2.content"]) == {
-        "content": "sunny",
-        "tool_call_id": "call_weather",
-    }
+    r["Body"].close()
+    c.close()
 
 
-def test_multiple_instrumentors_share_patch_until_final_deactivation(
-    fake_botocore: type[Any],
-) -> None:
-    original = fake_botocore._make_api_call
-    first = SageMakerInstrumentor()
-    second = SageMakerInstrumentor()
+@pytest.mark.parametrize("fault", ["start", "extract", "attributes", "end"])
+def test_observer_faults_preserve_native_response_and_cleanup(
+    pipeline, monkeypatch, fault
+):
+    _, _, owner = pipeline
+    owner()
 
+    def fail(*a, **k):
+        raise RuntimeError("controlled observer fault")
+
+    if fault == "start":
+        monkeypatch.setattr(module._Call, "__init__", fail)
+    elif fault == "extract":
+        monkeypatch.setattr(module, "request_body", fail)
+    elif fault == "attributes":
+        monkeypatch.setattr(module, "build_sagemaker_attrs", fail)
+    c, _, _ = client({"generated_text": "native"})
+    r = invoke(c)
+    if fault == "end" and module._MANAGER.states:
+        state = next(iter(module._MANAGER.states))
+        monkeypatch.setattr(state.span, "end", fail)
+    assert json.loads(r["Body"].read()) == {"generated_text": "native"}
+    r["Body"].close()
+    assert "read" not in r["Body"].__dict__
+    assert not module._MANAGER.states
+    c.close()
+
+
+def test_shared_idempotent_conflict_and_foreign_wrapper_ownership(pipeline):
+    p, _, owner = pipeline
+    original = inspect.getattr_static(BaseClient, "_make_api_call")
+    first = owner()
     first.activate()
-    patched = fake_botocore._make_api_call
-    second.activate()
-    assert fake_botocore._make_api_call is patched
-
+    second = owner()
     first.deactivate()
-    assert fake_botocore._make_api_call is patched
+    assert inspect.getattr_static(BaseClient, "_make_api_call") is not original
+    with pytest.raises(RuntimeError):
+        SageMakerInstrumentor(tracer_provider=p, capture_content=False).activate()
+    owned = inspect.getattr_static(BaseClient, "_make_api_call")
+
+    def foreign(*a, **k):
+        return owned(*a, **k)
+
+    BaseClient._make_api_call = foreign
     second.deactivate()
-    assert fake_botocore._make_api_call is original
+    assert BaseClient._make_api_call is foreign
+    BaseClient._make_api_call = original
 
 
-def test_stream_accumulator_is_bounded_and_redacts_direct_content() -> None:
-    accumulator = SageMakerStreamAccumulator()
-    for index in range(1_000):
-        text = "😀" * 40
-        if index == 700:
-            text += ' api_key="plain-stream-secret"'
-        accumulator.add_event(
-            {
-                "PayloadPart": {
-                    "Bytes": json.dumps(
-                        {
-                            "token": {"text": text},
-                            "usage": {
-                                "input_tokens": 8,
-                                "generated_tokens": index + 1,
-                            },
-                        }
-                    ).encode()
-                }
-            }
-        )
+def test_serializer_no_unknown_hooks_valid_idempotent_encoded_schema():
+    class Unknown:
+        def model_dump(self):
+            raise AssertionError("unknown hook")
 
-    response = parse_sagemaker_stream_response(events=accumulator)
-    assert len(response.content.encode("utf-8")) <= 16_000
-    assert "plain-stream-secret" not in response.content
-    assert response.usage == {
-        "input_tokens": 8,
-        "output_tokens": 1_000,
-        "total_tokens": 1_008,
+        def __str__(self):
+            raise AssertionError("unknown str")
+
+    data = {
+        "unknown": Unknown(),
+        "schema": {
+            "type": "object",
+            "properties": {"api_key": {"type": "string", "default": "secret value"}},
+            "required": ["api_key"],
+        },
+        "text": "x" * 20000,
     }
-    assert not hasattr(accumulator, "_events")
+    parsed = json.loads(json_dumps(data))
+    assert len(parsed["text"]) == 20000
+    assert parsed["unknown"] == {"type": "Unknown"}
+    encoded = safe_text(json_dumps(data))
+    assert safe_text(encoded) == encoded
+    assert (
+        json.loads(encoded)["schema"]["properties"]["api_key"]["default"]
+        == "[REDACTED]"
+    )
+    assert json.loads(safe_text('{"api_key":"secret words","ok":false}')) == {
+        "api_key": "[REDACTED]",
+        "ok": False,
+    }
+
+
+def test_preimported_detach_alias_and_active_parent_attribute_latch(pipeline):
+    from opentelemetry.context import detach as alias
+
+    p, m, owner = pipeline
+    owner()
+    with p.get_tracer("native").start_as_current_span("parent") as parent:
+        c, _, _ = client({"generated_text": "PRIVATE output"})
+        r = invoke(c, {"inputs": "PRIVATE input"})
+        t = context.attach(context.set_value(ENABLE_CONTENT_TRACING_KEY, False))
+        alias(t)
+        r["Body"].read()
+        r["Body"].close()
+        c.close()
+    assert (
+        AI.TRACELOOP_ENTITY_OUTPUT
+        not in next(
+            s for s in m.get_finished_spans() if s.name.startswith("sagemaker")
+        ).attributes
+    )
+    with p.get_tracer("native").start_as_current_span("second") as parent:
+        c, _, _ = client({"generated_text": "PRIVATE output"})
+        r = invoke(c, {"inputs": "PRIVATE input"})
+        parent.set_attribute("trace_content", False)
+        r["Body"].read()
+        r["Body"].close()
+        c.close()
+    assert all(
+        AI.TRACELOOP_ENTITY_OUTPUT not in s.attributes
+        for s in m.get_finished_spans()
+        if s.name.startswith("sagemaker")
+    )
+
+
+def test_no_implicit_native_depth_limit_or_stream_role_default():
+    from respan_instrumentation_sagemaker._translator import StreamData
+
+    data = {"leaf": False}
+    for _ in range(80):
+        data = {"next": data}
+    assert json.loads(json_dumps(data)) == data
+    stream = StreamData()
+    stream.add(
+        {
+            "PayloadPart": {
+                "Bytes": b'{"choices":[{"index":0,"delta":{"content":"native"}}]}\n{"choices":[{"index":0,"delta":{"content":" part"}}]}\n'
+            }
+        }
+    )
+    assert "role" not in stream.payload()["choices"][0]["message"]

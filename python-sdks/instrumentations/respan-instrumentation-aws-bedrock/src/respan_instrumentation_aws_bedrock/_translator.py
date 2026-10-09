@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import io
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -37,7 +36,13 @@ from respan_instrumentation_aws_bedrock._constants import (
     USAGE_KEY,
     USER_ROLE,
 )
-from respan_sdk.utils.serialization import serialize_value
+from respan_instrumentation_aws_bedrock._privacy import json_text
+
+
+def serialize_value(*, value):
+    from respan_instrumentation_aws_bedrock._privacy import value as builtin_value
+
+    return builtin_value(value)
 
 
 @dataclass(frozen=True)
@@ -58,56 +63,8 @@ class BedrockResponse:
     raw_payload: Any = None
 
 
-class ReplayableBody:
-    """Small file-like wrapper that lets callers read a captured response body."""
-
-    def __init__(self, body: bytes, original_body: Any = None) -> None:
-        self._body = body
-        self._stream = io.BytesIO(body)
-        self._original_body = original_body
-
-    def read(self, amt: int | None = None) -> bytes:
-        if amt is None:
-            return self._stream.read()
-        return self._stream.read(amt)
-
-    def iter_chunks(self, chunk_size: int = 1024) -> Iterable[bytes]:
-        while True:
-            chunk = self.read(chunk_size)
-            if not chunk:
-                break
-            yield chunk
-
-    def iter_lines(self, chunk_size: int = 1024) -> Iterable[bytes]:
-        pending = b""
-        for chunk in self.iter_chunks(chunk_size=chunk_size):
-            pending += chunk
-            while b"\n" in pending:
-                line, pending = pending.split(b"\n", 1)
-                yield line
-        if pending:
-            yield pending
-
-    def close(self) -> None:
-        close = getattr(self._original_body, "close", None)
-        if callable(close):
-            close()
-        self._stream.close()
-
-    def __iter__(self) -> Iterable[bytes]:
-        return self.iter_chunks()
-
-    def __getattr__(self, name: str) -> Any:
-        if self._original_body is None:
-            raise AttributeError(name)
-        return getattr(self._original_body, name)
-
-
-def safe_json(value: Any) -> str:
-    try:
-        return json.dumps(serialize_value(value=value), default=str)
-    except Exception:
-        return str(value)
+def safe_json(value):
+    return json_text(value)
 
 
 def to_json_attr(value: Any) -> str:
@@ -119,7 +76,7 @@ def to_json_attr(value: Any) -> str:
 def _field(value: Any, name: str, default: Any = None) -> Any:
     if isinstance(value, Mapping):
         return value.get(name, default)
-    return getattr(value, name, default)
+    return default
 
 
 def _coerce_int(value: Any) -> int | None:
@@ -127,13 +84,6 @@ def _coerce_int(value: Any) -> int | None:
         return None
     if isinstance(value, int):
         return value
-    if isinstance(value, float):
-        return int(value)
-    if isinstance(value, str):
-        try:
-            return int(value)
-        except ValueError:
-            return None
     return None
 
 
@@ -153,40 +103,6 @@ def _load_json(value: Any) -> Any:
     if isinstance(value, Mapping | list):
         return value
     return serialize_value(value=value)
-
-
-def _read_body_bytes(body: Any) -> bytes | None:
-    if body is None:
-        return None
-    if isinstance(body, bytes | bytearray):
-        return bytes(body)
-    if isinstance(body, str):
-        return body.encode("utf-8")
-
-    read = getattr(body, "read", None)
-    if not callable(read):
-        return None
-
-    data = read()
-    if isinstance(data, str):
-        return data.encode("utf-8")
-    if isinstance(data, bytes | bytearray):
-        return bytes(data)
-    return None
-
-
-def capture_invoke_response_payload(response: Any) -> tuple[Any, Any]:
-    """Read and restore `invoke_model` response bodies for translation."""
-    if not isinstance(response, dict):
-        return response, None
-
-    body = response.get(BODY_KEY)
-    body_bytes = _read_body_bytes(body)
-    if body_bytes is None:
-        return response, None
-
-    response[BODY_KEY] = ReplayableBody(body=body_bytes, original_body=body)
-    return response, _load_json(body_bytes)
 
 
 def _normalize_text_content(content: Any) -> Any:
@@ -281,7 +197,7 @@ def _normalize_prompt_from_body(body: Any) -> list[dict[str, Any]]:
 
     for key in ("prompt", "inputText", "input_text", INPUT_KEY):
         value = body.get(key)
-        if value:
+        if value is not None:
             messages.append(
                 {ROLE_KEY: USER_ROLE, CONTENT_KEY: _normalize_text_content(value)}
             )
@@ -448,40 +364,37 @@ def parse_bedrock_request(
     )
 
 
-def _usage_from_mapping(value: Any) -> dict[str, int]:
-    if not isinstance(value, Mapping):
+def _usage_from_mapping(value):
+    if type(value) is not dict:
         return {}
-
-    prompt_tokens = (
-        _coerce_int(value.get("input_tokens"))
-        or _coerce_int(value.get("inputTokens"))
-        or _coerce_int(value.get("prompt_tokens"))
-        or _coerce_int(value.get("promptTokens"))
-        or _coerce_int(value.get("inputTextTokenCount"))
-    )
-    completion_tokens = (
-        _coerce_int(value.get("output_tokens"))
-        or _coerce_int(value.get("outputTokens"))
-        or _coerce_int(value.get("completion_tokens"))
-        or _coerce_int(value.get("completionTokens"))
-    )
-    total_tokens = (
-        _coerce_int(value.get("total_tokens"))
-        or _coerce_int(value.get("totalTokens"))
-        or _coerce_int(value.get("total_token_count"))
-    )
-
-    result: dict[str, int] = {}
-    if prompt_tokens is not None:
-        result["input_tokens"] = prompt_tokens
-    if completion_tokens is not None:
-        result["output_tokens"] = completion_tokens
-    if total_tokens is None and (
-        prompt_tokens is not None or completion_tokens is not None
-    ):
-        total_tokens = (prompt_tokens or 0) + (completion_tokens or 0)
-    if total_tokens is not None:
-        result["total_tokens"] = total_tokens
+    names = {
+        "input_tokens": (
+            "input_tokens",
+            "inputTokens",
+            "prompt_tokens",
+            "promptTokens",
+            "inputTextTokenCount",
+        ),
+        "output_tokens": (
+            "output_tokens",
+            "outputTokens",
+            "completion_tokens",
+            "completionTokens",
+        ),
+        "total_tokens": ("total_tokens", "totalTokens", "total_token_count"),
+        "cache_read_input_tokens": ("cacheReadInputTokens", "cache_read_input_tokens"),
+        "cache_creation_input_tokens": (
+            "cacheWriteInputTokens",
+            "cache_creation_input_tokens",
+        ),
+    }
+    result = {}
+    for target, sources in names.items():
+        for source in sources:
+            count = _coerce_int(value.get(source))
+            if count is not None:
+                result[target] = count
+                break
     return result
 
 
@@ -534,10 +447,6 @@ def _response_from_titan_payload(payload: Mapping[str, Any]) -> BedrockResponse:
             output_tokens = _coerce_int(first_result.get("tokenCount"))
             if output_tokens is not None:
                 usage["output_tokens"] = output_tokens
-    if usage and "total_tokens" not in usage:
-        usage["total_tokens"] = usage.get("input_tokens", 0) + usage.get(
-            "output_tokens", 0
-        )
     return BedrockResponse(content=text, usage=usage, raw_payload=payload)
 
 
@@ -619,70 +528,85 @@ def _parse_chunk_payload(event: Mapping[str, Any]) -> Any:
     return None
 
 
-def parse_bedrock_stream_response(
-    *,
-    operation_name: str,
-    events: list[Any],
-) -> BedrockResponse:
-    text_parts: list[str] = []
-    tool_calls: list[dict[str, Any]] = []
-    usage: dict[str, int] = {}
-    raw_payloads: list[Any] = []
-
+def parse_bedrock_stream_response(*, operation_name, events):
+    text_parts = []
+    tools = {}
+    usage = {}
     for event in events:
-        if not isinstance(event, Mapping):
-            raw_payloads.append(serialize_value(value=event))
+        if type(event) is not dict:
             continue
-        raw_payloads.append(serialize_value(value=event))
-
         if operation_name == CONVERSE_STREAM_OPERATION:
-            delta = _field(
-                _field(event.get("contentBlockDelta"), "delta", {}), TEXT_KEY
-            )
-            if isinstance(delta, str):
-                text_parts.append(delta)
-
-            start_block = _field(event.get("contentBlockStart"), "start", {})
-            if isinstance(start_block, Mapping) and "toolUse" in start_block:
-                tool_call = _normalize_tool_call(start_block["toolUse"])
-                if tool_call.get(FUNCTION_KEY, {}).get(NAME_KEY):
-                    tool_calls.append(tool_call)
-
-            metadata = event.get("metadata")
-            if isinstance(metadata, Mapping):
-                _merge_usage(usage, _usage_from_mapping(metadata.get(USAGE_KEY)))
-            continue
-
-        payload = _parse_chunk_payload(event)
-        if not isinstance(payload, Mapping):
-            continue
-        raw_payloads.append(payload)
-
-        payload_type = payload.get(TYPE_KEY)
-        if payload_type == "content_block_delta":
-            delta = payload.get("delta")
-            text = delta.get(TEXT_KEY) if isinstance(delta, Mapping) else None
-            if isinstance(text, str):
-                text_parts.append(text)
-        elif payload_type == "content_block_start":
-            content_block = payload.get("content_block")
+            start = event.get("contentBlockStart", {})
+            delta = event.get("contentBlockDelta", {})
             if (
-                isinstance(content_block, Mapping)
-                and content_block.get(TYPE_KEY) == "tool_use"
+                type(start) is dict
+                and type(start.get("start")) is dict
+                and "toolUse" in start["start"]
             ):
-                tool_call = _normalize_anthropic_tool_use(content_block)
-                if tool_call.get(FUNCTION_KEY, {}).get(NAME_KEY):
-                    tool_calls.append(tool_call)
-        elif payload_type == "message_start":
-            message = payload.get(MESSAGE_KEY)
-            if isinstance(message, Mapping):
-                _merge_usage(usage, _usage_from_mapping(message.get(USAGE_KEY)))
-        elif payload_type == "message_delta":
-            _merge_usage(usage, _usage_from_mapping(payload.get(USAGE_KEY)))
-
+                tools[start.get("contentBlockIndex", 0)] = _normalize_tool_call(
+                    start["start"]["toolUse"]
+                )
+            block = delta.get("delta", {}) if type(delta) is dict else {}
+            if type(block) is dict:
+                if type(block.get("text")) is str:
+                    text_parts.append(block["text"])
+                fragment = (
+                    block.get("toolUse", {}).get("input")
+                    if type(block.get("toolUse")) is dict
+                    else None
+                )
+                tool = tools.get(delta.get("contentBlockIndex", 0))
+                if tool is not None and type(fragment) is str:
+                    function = tool["function"]
+                    previous = function.get("_fragments", "")
+                    function["_fragments"] = previous + fragment
+            metadata = event.get("metadata", {})
+            if type(metadata) is dict:
+                _merge_usage(usage, _usage_from_mapping(metadata.get("usage")))
+        else:
+            payload = _parse_chunk_payload(event)
+            if type(payload) is not dict:
+                continue
+            kind = payload.get("type")
+            index = payload.get("index", 0)
+            if (
+                kind == "content_block_start"
+                and type(payload.get("content_block")) is dict
+                and payload["content_block"].get("type") == "tool_use"
+            ):
+                tools[index] = _normalize_anthropic_tool_use(payload["content_block"])
+            if kind == "content_block_delta" and type(payload.get("delta")) is dict:
+                delta = payload["delta"]
+                if type(delta.get("text")) is str:
+                    text_parts.append(delta["text"])
+                if type(delta.get("partial_json")) is str and index in tools:
+                    function = tools[index]["function"]
+                    function["_fragments"] = (
+                        function.get("_fragments", "") + delta["partial_json"]
+                    )
+            for key in ("outputText", "generation", "completion"):
+                if type(payload.get(key)) is str:
+                    text_parts.append(payload[key])
+                    break
+            message = payload.get("message", {})
+            if type(message) is dict:
+                _merge_usage(usage, _usage_from_mapping(message.get("usage")))
+            _merge_usage(usage, _usage_from_mapping(payload.get("usage")))
+            _merge_usage(
+                usage,
+                _usage_from_mapping(payload.get("amazon-bedrock-invocationMetrics")),
+            )
+    for tool in tools.values():
+        function = tool["function"]
+        fragments = function.pop("_fragments", None)
+        if fragments is not None:
+            try:
+                function["arguments"] = safe_json(json.loads(fragments))
+            except ValueError:
+                function["arguments"] = fragments
     return BedrockResponse(
         content="".join(text_parts),
-        tool_calls=tool_calls,
+        tool_calls=list(tools.values()),
         usage=usage,
-        raw_payload=raw_payloads,
+        raw_payload=events,
     )

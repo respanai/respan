@@ -12,9 +12,9 @@ packages = [
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
 respan-tracing = "^2.17.0"
-respan-sdk = ">=2.6.1"
+respan-sdk = ">=2.6.26"
 boto3 = ">=1.34.0"
-opentelemetry-semantic-conventions-ai = ">=0.4.1"
+opentelemetry-semantic-conventions-ai = ">=0.5.1,<0.6"
 
 [tool.poetry.plugins."respan.instrumentations"]
 sagemaker = "respan_instrumentation_sagemaker:SageMakerInstrumentor"

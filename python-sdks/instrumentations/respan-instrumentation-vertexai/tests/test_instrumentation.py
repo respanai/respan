@@ -1,480 +1,794 @@
-from __future__ import annotations
+"""Real SDK clients, protobuf responses and local gRPC transport frames."""
 
 import asyncio
+import inspect
 import json
-import sys
-from types import ModuleType
-from typing import Any
+import types
 
 import pytest
-from opentelemetry import context as context_api
-from opentelemetry.semconv._incubating.attributes import (
-    gen_ai_attributes as GenAIAttributes,
+from google.api_core.exceptions import ServiceUnavailable
+from opentelemetry import context, trace
+from opentelemetry.sdk.trace import Span, TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.sdk.trace.sampling import ALWAYS_OFF
+from opentelemetry.semconv._incubating.attributes.error_attributes import ERROR_MESSAGE
+from opentelemetry.semconv.attributes.error_attributes import ERROR_TYPE
+from opentelemetry.semconv_ai import (
+    SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY,
+    SpanAttributes,
 )
-from opentelemetry.semconv_ai import SpanAttributes
-from respan_instrumentation_vertexai import VertexAIInstrumentor, _instrumentation
-from respan_instrumentation_vertexai._constants import (
-    CANDIDATES_TOKEN_COUNT_KEY,
-    CHAT_SESSION_CLASS_NAME,
-    GENERATE_CONTENT_ASYNC_METHOD_NAME,
-    GENERATE_CONTENT_METHOD_NAME,
-    GENERATIVE_MODEL_CLASS_NAME,
-    PROMPT_TOKEN_COUNT_KEY,
-    SEND_MESSAGE_ASYNC_METHOD_NAME,
-    SEND_MESSAGE_METHOD_NAME,
-    TOTAL_TOKEN_COUNT_KEY,
-    VERTEXAI_GENERATIVE_MODELS_MODULE,
-)
-from respan_instrumentation_vertexai._otel_emitter import build_generate_content_attrs
-from respan_instrumentation_vertexai._translator import extract_usage
-from respan_instrumentation_vertexai._translator import request_payload_from_call
-from respan_sdk.constants.llm_logging import LOG_TYPE_CHAT
-from respan_sdk.constants.span_attributes import (
-    RESPAN_LOG_TYPE,
-    RESPAN_SPAN_TOOL_CALLS,
-    RESPAN_SPAN_TOOLS,
-)
+from respan_instrumentation_vertexai import VertexAIInstrumentor
+from respan_instrumentation_vertexai import _instrumentation as adapter
+from respan_instrumentation_vertexai._serialization import json_dumps, safe_text
+from respan_instrumentation_vertexai._translator import native_value
+from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+from vertexai.generative_models import FunctionDeclaration, Part, Tool
+
+from tests._native import NativeRuntime
+
+INPUT = SpanAttributes.TRACELOOP_ENTITY_INPUT
+OUTPUT = SpanAttributes.TRACELOOP_ENTITY_OUTPUT
 
 
-class Obj:
-    def __init__(self, **kwargs: Any) -> None:
-        for key, value in kwargs.items():
-            setattr(self, key, value)
+@pytest.fixture
+def runtime():
+    r = NativeRuntime()
+    p = TracerProvider()
+    e = InMemorySpanExporter()
+    p.add_span_processor(SimpleSpanProcessor(e))
+    inst = VertexAIInstrumentor(tracer_provider=p)
+    inst.activate()
+    yield r, p, e, inst
+    inst.deactivate()
+    r.close()
+    p.shutdown()
 
 
-def make_response(
-    text: str = "Hello",
-    *,
-    usage: Obj | None = None,
-    parts: list[Any] | None = None,
-) -> Obj:
-    content = Obj(role="model", parts=parts if parts is not None else [Obj(text=text)])
-    candidate = Obj(content=content)
-    return Obj(text=text, candidates=[candidate], usage_metadata=usage)
-
-
-def make_usage(prompt_tokens: int = 3, completion_tokens: int = 4) -> Obj:
-    return Obj(
-        prompt_token_count=prompt_tokens,
-        candidates_token_count=completion_tokens,
-        total_token_count=prompt_tokens + completion_tokens,
-    )
-
-
-@pytest.fixture(autouse=True)
-def reset_instrumentation_globals() -> Any:
-    _instrumentation._reset_runtime_for_tests()
-    yield
-    _instrumentation._reset_runtime_for_tests()
-
-
-@pytest.fixture()
-def captured_spans(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
-    spans: list[Any] = []
-    monkeypatch.setattr(
-        "respan_instrumentation_vertexai._otel_emitter.inject_span",
-        lambda span: spans.append(span),
-    )
-    return spans
-
-
-@pytest.fixture()
-def fake_vertexai(monkeypatch: pytest.MonkeyPatch) -> tuple[type[Any], type[Any]]:
-    class GenerativeModel:
-        def __init__(
-            self,
-            model_name: str = "gemini-2.0-flash",
-            *,
-            system_instruction: str | None = None,
-            tools: list[Any] | None = None,
-        ) -> None:
-            self._model_name = model_name
-            self._system_instruction = system_instruction
-            self._tools = tools
-
-        def generate_content(self, contents: Any, **kwargs: Any) -> Any:
-            if kwargs.get("stream"):
-                return iter(
-                    [
-                        make_response(text="Hello "),
-                        make_response(text="world", usage=make_usage(5, 6)),
-                    ]
-                )
-            return make_response(
-                text=f"{self._model_name}: {contents}", usage=make_usage()
-            )
-
-        async def generate_content_async(self, contents: Any, **kwargs: Any) -> Any:
-            if kwargs.get("stream"):
-
-                async def chunks():
-                    yield make_response(text="async ")
-                    yield make_response(text="stream", usage=make_usage(7, 8))
-
-                return chunks()
-            return make_response(text=f"async {contents}", usage=make_usage(9, 10))
-
-    class ChatSession:
-        def __init__(self, model: GenerativeModel) -> None:
-            self.model = model
-
-        def send_message(self, content: Any, **kwargs: Any) -> Any:
-            return make_response(text=f"chat: {content}", usage=make_usage(11, 12))
-
-        async def send_message_async(self, content: Any, **kwargs: Any) -> Any:
-            return make_response(
-                text=f"async chat: {content}", usage=make_usage(13, 14)
-            )
-
-    vertexai_module = ModuleType("vertexai")
-    generative_models_module = ModuleType(VERTEXAI_GENERATIVE_MODELS_MODULE)
-    setattr(generative_models_module, GENERATIVE_MODEL_CLASS_NAME, GenerativeModel)
-    setattr(generative_models_module, CHAT_SESSION_CLASS_NAME, ChatSession)
-    vertexai_module.generative_models = generative_models_module
-
-    monkeypatch.setitem(sys.modules, "vertexai", vertexai_module)
-    monkeypatch.setitem(
-        sys.modules,
-        VERTEXAI_GENERATIVE_MODELS_MODULE,
-        generative_models_module,
-    )
-    return GenerativeModel, ChatSession
-
-
-def test_activate_patches_generate_content_and_emits_chat_span(
-    fake_vertexai: tuple[type[Any], type[Any]],
-    captured_spans: list[Any],
-) -> None:
-    GenerativeModel, _ = fake_vertexai
-    tool = Obj(
-        function_declarations=[
-            Obj(
-                name="get_weather",
-                description="Get weather",
-                parameters={
-                    "type": "object",
-                    "properties": {"city": {"type": "string"}},
-                },
-            )
+def test_native_generation_response_parent_and_sourced_usage(runtime):
+    r, p, e, _ = runtime
+    model = r.model()
+    with p.get_tracer("parent").start_as_current_span("outer") as parent:
+        response = model.generate_content("hello")
+    assert response.text == "native response" and len(r.requests) == 1
+    span = e.get_finished_spans()[0]
+    assert span.parent.span_id == parent.context.span_id
+    assert (
+        json.loads(span.attributes[OUTPUT])[0]["candidates"][0]["content"]["parts"][0][
+            "text"
         ]
+        == "native response"
     )
-    model = GenerativeModel(
-        "gemini-2.0-flash",
-        system_instruction="Be brief",
-        tools=[tool],
+    assert span.attributes["gen_ai.usage.input_tokens"] == 7
+    assert span.attributes["gen_ai.usage.output_tokens"] == 3
+    assert span.attributes["llm.usage.total_tokens"] == 10
+    assert "status_code" not in span.attributes
+    assert "traceloop.span.kind" not in span.attributes
+
+
+def test_native_stream_preserves_generator_and_all_seventy_chunks(runtime):
+    r, _, e, _ = runtime
+    source = r.model().generate_content("stream", stream=True)
+    assert iter(source) is source and type(source.source) is types.GeneratorType
+    chunks = list(source)
+    assert len(chunks) == 70 and len(r.requests) == 1
+    span = e.get_finished_spans()[0]
+    assert span.attributes["gen_ai.completion.0.content"] == "".join(
+        c.text for c in chunks
     )
-    instrumentor = VertexAIInstrumentor()
+    assert len(json.loads(span.attributes[OUTPUT])) == 70
+    assert span.attributes["gen_ai.usage.input_tokens"] == 7
 
-    instrumentor.activate()
-    response = model.generate_content("Say hello")
 
-    assert response.text == "gemini-2.0-flash: Say hello"
-    assert len(captured_spans) == 1
-    attrs = captured_spans[0]._attributes
-    assert attrs[RESPAN_LOG_TYPE] == LOG_TYPE_CHAT
-    assert attrs[SpanAttributes.LLM_REQUEST_MODEL] == "gemini-2.0-flash"
-    assert attrs[f"{SpanAttributes.LLM_PROMPTS}.0.role"] == "system"
-    assert attrs[f"{SpanAttributes.LLM_PROMPTS}.0.content"] == "Be brief"
-    assert attrs[f"{SpanAttributes.LLM_PROMPTS}.1.content"] == "Say hello"
-    assert (
-        attrs[f"{SpanAttributes.LLM_COMPLETIONS}.0.content"]
-        == "gemini-2.0-flash: Say hello"
+def test_native_early_close_finishes_span_and_native_generator(runtime):
+    r, _, e, _ = runtime
+    source = r.model().generate_content("stream", stream=True)
+    assert next(source).text == "0,"
+    source.close()
+    assert inspect.getgeneratorstate(source) == "GEN_CLOSED"
+    assert len(e.get_finished_spans()) == 1
+    assert e.get_finished_spans()[0].attributes["gen_ai.completion.0.content"] == "0,"
+
+
+def test_native_function_calls_and_full_tool_schema_history(runtime):
+    r, _, e, _ = runtime
+    declaration = FunctionDeclaration(
+        name="get_weather",
+        description="lookup",
+        parameters={
+            "type": "object",
+            "properties": {
+                "city": {"type": "string"},
+                "api_key": {"type": "string", "description": "credential parameter"},
+            },
+            "required": ["city"],
+        },
     )
-    assert attrs[SpanAttributes.LLM_USAGE_PROMPT_TOKENS] == 3
-    assert attrs[SpanAttributes.LLM_USAGE_COMPLETION_TOKENS] == 4
-    assert attrs[GenAIAttributes.GEN_AI_USAGE_INPUT_TOKENS] == 3
-    assert attrs[GenAIAttributes.GEN_AI_USAGE_OUTPUT_TOKENS] == 4
-    assert attrs[SpanAttributes.LLM_USAGE_TOTAL_TOKENS] == 7
-    assert (
-        json.loads(attrs[SpanAttributes.LLM_REQUEST_FUNCTIONS])[0]["function"]["name"]
-        == "get_weather"
+    model = r.model()
+    chat = model.start_chat()
+    first = chat.send_message(
+        "weather", tools=[Tool(function_declarations=[declaration])]
     )
-
-    instrumentor.deactivate()
-
-
-def test_thinking_tokens_are_included_in_output_usage() -> None:
-    usage = Obj(
-        prompt_token_count=100,
-        candidates_token_count=50,
-        thoughts_token_count=800,
-        total_token_count=950,
+    assert first.candidates[0].content.parts[0].function_call.name == "get_weather"
+    second = chat.send_message(
+        Part.from_function_response(name="get_weather", response={"weather": "sunny"})
     )
-
-    attrs = build_generate_content_attrs(
-        request_payload={"model": "gemini-2.5-flash", "contents": "Explain"},
-        response_or_chunks=make_response(text="Reasoned answer", usage=usage),
-    )
-
-    assert attrs[GenAIAttributes.GEN_AI_USAGE_INPUT_TOKENS] == 100
-    assert attrs[GenAIAttributes.GEN_AI_USAGE_OUTPUT_TOKENS] == 850
-    assert attrs[SpanAttributes.LLM_USAGE_COMPLETION_TOKENS] == 850
-    assert attrs[SpanAttributes.LLM_USAGE_TOTAL_TOKENS] == 950
-
-
-def test_stream_emits_one_span_after_iterator_is_consumed(
-    fake_vertexai: tuple[type[Any], type[Any]],
-    captured_spans: list[Any],
-) -> None:
-    GenerativeModel, _ = fake_vertexai
-    model = GenerativeModel()
-    instrumentor = VertexAIInstrumentor()
-    instrumentor.activate()
-
-    chunks = list(model.generate_content("Stream this", stream=True))
-
-    assert [chunk.text for chunk in chunks] == ["Hello ", "world"]
-    assert len(captured_spans) == 1
-    attrs = captured_spans[0]._attributes
-    assert attrs[f"{SpanAttributes.LLM_COMPLETIONS}.0.content"] == "Hello world"
-    assert attrs[SpanAttributes.LLM_USAGE_PROMPT_TOKENS] == 5
-    assert attrs[SpanAttributes.LLM_USAGE_COMPLETION_TOKENS] == 6
-
-    instrumentor.deactivate()
+    assert second.text == "native response" and len(r.requests) == 2
+    spans = e.get_finished_spans()
+    first_attrs = spans[0].attributes
+    calls = json.loads(first_attrs["gen_ai.completion.0.tool_calls"])
+    assert json.loads(calls[0]["function"]["arguments"]) == {"city": "Tokyo"}
+    schema = json.loads(first_attrs["llm.request.functions"])[0]["function"][
+        "parameters"
+    ]
+    assert schema["properties"]["api_key"]["type"] == "string"
+    history = json.loads(spans[1].attributes[INPUT])["messages"]
+    assert history[0]["content"] == "weather"
+    assert history[1]["tool_calls"][0]["function"]["name"] == "get_weather"
+    assert history[2]["role"] == "tool"
+    assert "gen_ai.completion.0.tool_calls" not in spans[1].attributes
 
 
-def test_async_methods_emit_spans(
-    fake_vertexai: tuple[type[Any], type[Any]],
-    captured_spans: list[Any],
-) -> None:
-    async def run() -> None:
-        GenerativeModel, ChatSession = fake_vertexai
-        model = GenerativeModel()
-        chat = ChatSession(model)
-        instrumentor = VertexAIInstrumentor()
-        instrumentor.activate()
+def test_native_embeddings_preserve_full_5001_vectors_and_only_source_usage(runtime):
+    r, _, e, _ = runtime
+    response = r.embedding().get_embeddings(["first", "second"])
+    assert len(response) == 2 and all(len(v.values) == 5001 for v in response)
+    span = e.get_finished_spans()[0]
+    assert json.loads(span.attributes[OUTPUT]) == [v.values for v in response]
+    assert span.attributes["gen_ai.usage.input_tokens"] == 10
+    assert "gen_ai.usage.output_tokens" not in span.attributes
+    assert "llm.usage.total_tokens" not in span.attributes
 
-        response = await model.generate_content_async("Async hello")
-        async_stream = await model.generate_content_async("Async stream", stream=True)
-        chunks = [chunk async for chunk in async_stream]
-        chat_response = await chat.send_message_async("Async chat")
 
-        assert response.text == "async Async hello"
-        assert [chunk.text for chunk in chunks] == ["async ", "stream"]
-        assert chat_response.text == "async chat: Async chat"
-        assert len(captured_spans) == 3
-        assert (
-            captured_spans[0]._attributes[SpanAttributes.LLM_USAGE_PROMPT_TOKENS] == 9
-        )
-        assert (
-            captured_spans[1]._attributes[f"{SpanAttributes.LLM_COMPLETIONS}.0.content"]
-            == "async stream"
-        )
-        assert (
-            captured_spans[2]._attributes[SpanAttributes.LLM_USAGE_COMPLETION_TOKENS]
-            == 14
-        )
+def test_native_async_generation_stream_and_close(runtime):
+    r, _, e, _ = runtime
 
-        instrumentor.deactivate()
+    async def run():
+        model, channel = await r.async_model()
+        try:
+            response = await model.generate_content_async("hello")
+            assert response.text == "native response"
+            source = await model.generate_content_async("stream", stream=True)
+            assert (
+                source.__aiter__() is source
+                and type(source.source) is types.AsyncGeneratorType
+            )
+            chunks = [c async for c in source]
+            assert len(chunks) == 70
+            early = await model.generate_content_async("stream", stream=True)
+            assert (await early.__anext__()).text == "0,"
+            await early.aclose()
+        finally:
+            await channel.close()
 
     asyncio.run(run())
+    spans = e.get_finished_spans()
+    assert len(spans) == 3
+    assert "69," in spans[1].attributes["gen_ai.completion.0.content"]
 
 
-def test_chat_session_send_message_uses_nested_model_name(
-    fake_vertexai: tuple[type[Any], type[Any]],
-    captured_spans: list[Any],
-) -> None:
-    GenerativeModel, ChatSession = fake_vertexai
-    model = GenerativeModel("gemini-2.0-flash")
-    chat = ChatSession(model)
-    instrumentor = VertexAIInstrumentor()
-    instrumentor.activate()
-
-    response = chat.send_message("Continue")
-
-    assert response.text == "chat: Continue"
-    assert len(captured_spans) == 1
-    attrs = captured_spans[0]._attributes
-    assert attrs[SpanAttributes.LLM_REQUEST_MODEL] == "gemini-2.0-flash"
-    assert attrs[f"{SpanAttributes.LLM_PROMPTS}.0.content"] == "Continue"
-
-    instrumentor.deactivate()
+def test_native_provider_error_identity_and_no_invented_result(runtime):
+    r, _, e, _ = runtime
+    with pytest.raises(ServiceUnavailable) as caught:
+        r.model().generate_content("failure")
+    span = e.get_finished_spans()[0]
+    assert span.status.status_code is trace.StatusCode.ERROR
+    assert span.attributes[ERROR_TYPE] == type(caught.value).__name__
+    assert span.attributes["http.response.status_code"] == 503
+    assert OUTPUT not in span.attributes
 
 
-def test_active_workflow_name_is_attached_to_injected_chat_span() -> None:
-    token = context_api.attach(
-        context_api.set_value(
-            SpanAttributes.TRACELOOP_ENTITY_NAME,
-            "vertexai_generate_content_example",
-        )
+@pytest.mark.parametrize(
+    "key",
+    [
+        context._SUPPRESS_INSTRUMENTATION_KEY,
+        SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY,
+    ],
+)
+def test_suppression_precedes_native_payload_inspection(runtime, monkeypatch, key):
+    r, _, e, _ = runtime
+    monkeypatch.setattr(
+        adapter, "request_payload_from_call", lambda **kw: pytest.fail("inspected")
+    )
+    token = context.attach(context.set_value(key, True))
+    try:
+        assert r.model().generate_content("hello").text == "native response"
+    finally:
+        context.detach(token)
+    assert not e.get_finished_spans()
+
+
+def test_sampling_precedes_native_payload_inspection(runtime, monkeypatch):
+    r, p, e, _ = runtime
+    p.sampler = ALWAYS_OFF
+    monkeypatch.setattr(
+        adapter, "request_payload_from_call", lambda **kw: pytest.fail("inspected")
+    )
+    source = r.model().generate_content("stream", stream=True)
+    assert type(source) is types.GeneratorType and len(list(source)) == 70
+    assert not e.get_finished_spans()
+
+
+@pytest.mark.parametrize("veto", ["context", "environment", "capture"])
+def test_initial_privacy_skips_body_and_native_diagnostics(runtime, monkeypatch, veto):
+    r, _p, e, inst = runtime
+    if veto == "capture":
+        inst.deactivate()
+        inst._capture_content = False
+        inst.activate()
+    if veto == "environment":
+        monkeypatch.setenv("TRACELOOP_TRACE_CONTENT", "false")
+    token = (
+        context.attach(context.set_value(ENABLE_CONTENT_TRACING_KEY, False))
+        if veto == "context"
+        else None
+    )
+    monkeypatch.setattr(
+        adapter, "request_payload_from_call", lambda **kw: pytest.fail("inspected")
     )
     try:
-        attrs = build_generate_content_attrs(
-            request_payload={
-                "model": "gemini-2.0-flash",
-                "contents": "Hello",
-                "system_instruction": None,
-                "tools": None,
-                "generation_config": None,
-            },
-            response_or_chunks=make_response(text="Hi"),
+        with pytest.raises(ServiceUnavailable):
+            r.model().generate_content("failure")
+    finally:
+        if token is not None:
+            context.detach(token)
+    span = e.get_finished_spans()[0]
+    assert (
+        INPUT not in span.attributes
+        and OUTPUT not in span.attributes
+        and ERROR_MESSAGE not in span.attributes
+    )
+    assert span.status.description is None and not span.events
+
+
+def test_stream_late_privacy_clears_previous_content_and_retention(runtime):
+    r, _, e, _ = runtime
+    source = r.model().generate_content("stream", stream=True)
+    assert next(source).text == "0,"
+    token = context.attach(context.set_value(ENABLE_CONTENT_TRACING_KEY, False))
+    try:
+        assert next(source).text == "1,"
+    finally:
+        context.detach(token)
+    list(source)
+    span = e.get_finished_spans()[0]
+    assert INPUT not in span.attributes and OUTPUT not in span.attributes
+    assert not span.events and span.status.description is None
+
+
+@pytest.mark.parametrize("finished", [False, True])
+def test_observed_parent_initial_veto_survives_context_restore(runtime, finished):
+    r, p, e, _ = runtime
+    token = context.attach(context.set_value(ENABLE_CONTENT_TRACING_KEY, False))
+    parent = p.get_tracer("test").start_span("outer")
+    context.detach(token)
+    if finished:
+        parent.end()
+    with trace.use_span(parent):
+        r.model().generate_content("hello")
+    if not finished:
+        parent.end()
+    child = next(
+        s for s in e.get_finished_spans() if s.name == "vertexai.generate_content"
+    )
+    assert INPUT not in child.attributes and OUTPUT not in child.attributes
+
+
+def test_active_child_veto_is_irreversible_for_parent_stream_and_sibling(runtime):
+    r, p, e, _ = runtime
+    with p.get_tracer("test").start_as_current_span("parent"):
+        source = r.model().generate_content("stream", stream=True)
+        next(source)
+        token = context.attach(context.set_value(ENABLE_CONTENT_TRACING_KEY, False))
+        try:
+            r.model().generate_content("hello")
+        finally:
+            context.detach(token)
+        list(source)
+        r.model().generate_content("hello")
+    for s in e.get_finished_spans()[:-1]:
+        assert INPUT not in s.attributes and OUTPUT not in s.attributes
+
+
+def test_late_provider_unknown_recording_and_finished_carrier_closed(runtime):
+    r, _, _, inst = runtime
+    inst.deactivate()
+    p = TracerProvider()
+    e = InMemorySpanExporter()
+    p.add_span_processor(SimpleSpanProcessor(e))
+    recording = p.get_tracer("test").start_span("unknown")
+    finished = p.get_tracer("test").start_span("finished")
+    finished.end()
+    other = VertexAIInstrumentor(tracer_provider=p)
+    other.activate()
+    try:
+        for parent in [recording, trace.NonRecordingSpan(finished.context)]:
+            with trace.use_span(parent):
+                r.model().generate_content("hello")
+    finally:
+        other.deactivate()
+        recording.end()
+        p.shutdown()
+    assert all(
+        INPUT not in s.attributes
+        for s in e.get_finished_spans()
+        if s.name == "vertexai.generate_content"
+    )
+
+
+@pytest.mark.parametrize(
+    "fault", ["start", "request", "attribute", "output", "end", "detach"]
+)
+def test_telemetry_faults_preserve_actual_native_result_and_stream_cleanup(
+    runtime, monkeypatch, fault
+):
+    r, p, _e, _ = runtime
+
+    def fail(*a, **k):
+        raise RuntimeError("telemetry fault")
+
+    if fault == "start":
+        monkeypatch.setattr(p.get_tracer("vertexai"), "start_span", fail)
+    elif fault == "request":
+        monkeypatch.setattr(adapter, "request_payload_from_call", fail)
+    elif fault == "output":
+        monkeypatch.setattr(adapter, "response_attributes", fail)
+    elif fault == "detach":
+        monkeypatch.setattr(adapter.context, "detach", fail)
+    else:
+        monkeypatch.setattr(
+            Span, "set_attribute" if fault == "attribute" else "end", fail
+        )
+    model = r.model()
+    response = model.generate_content("hello")
+    assert response.text == "native response"
+    source = model.generate_content("stream", stream=True)
+    assert next(source).text == "0,"
+    source.close()
+    assert inspect.getgeneratorstate(source) == "GEN_CLOSED"
+
+
+def test_shared_lifecycle_foreign_wrapper_and_configuration(runtime):
+    _, p, _, first = runtime
+    second = VertexAIInstrumentor(tracer_provider=p)
+    second.activate()
+    with pytest.raises(ValueError):
+        VertexAIInstrumentor(capture_content=False, tracer_provider=p).activate()
+    patch = adapter._PATCHES[0]
+    wrapped = patch.wrapper
+
+    @__import__("functools").wraps(wrapped)
+    def foreign(*args, **kwargs):
+        return wrapped(*args, **kwargs)
+
+    setattr(patch.cls, patch.method_name, foreign)
+    try:
+        first.deactivate()
+        assert adapter._ENABLED
+        second.deactivate()
+        assert inspect.getattr_static(patch.cls, patch.method_name) is foreign
+    finally:
+        setattr(patch.cls, patch.method_name, patch.original)
+
+
+def test_partial_install_rollback_preserves_native_descriptors(runtime, monkeypatch):
+    _, p, _, first = runtime
+    first.deactivate()
+    targets = adapter._load_targets()
+    originals = [inspect.getattr_static(t[0], t[1]) for t in targets]
+    monkeypatch.setattr(
+        adapter,
+        "_load_targets",
+        lambda: [
+            targets[0],
+            (targets[0][0], "does_not_exist", "invalid", False, False),
+        ],
+    )
+    with pytest.raises(AttributeError):
+        VertexAIInstrumentor(tracer_provider=p).activate()
+    assert all(
+        inspect.getattr_static(t[0], t[1]) is orig
+        for t, orig in zip(targets, originals)
+    )
+    assert not adapter._PATCHES
+
+
+def test_complete_json_schema_history_vectors_and_unknown_hooks():
+    class Unknown:
+        def model_dump(self, *args, **kwargs):
+            pytest.fail("customer hook")
+
+        def __getattribute__(self, key):
+            if key in {"to_dict", "model_dump", "__dict__"}:
+                pytest.fail("customer hook")
+            return object.__getattribute__(self, key)
+
+    assert native_value(Unknown()) == {"type": "Unknown"}
+    value = {
+        "vector": list(range(5001)),
+        "history": [{"role": "user", "content": "x" * 6000}] * 80,
+        "arguments": '{"api_key":"two word secret","enabled":false,"count":0}',
+        "schema": {"properties": {"api_key": {"type": "string", "default": "private"}}},
+    }
+    parsed = json.loads(json_dumps(value))
+    assert len(parsed["vector"]) == 5001 and len(parsed["history"]) == 80
+    args = json.loads(parsed["arguments"])
+    assert args == {"api_key": "[REDACTED]", "enabled": False, "count": 0}
+    assert parsed["schema"]["properties"]["api_key"] == {
+        "type": "string",
+        "default": "[REDACTED]",
+    }
+    cleaned = safe_text(
+        'secret="two word secret" Bearer private Basic cHJpdmF0ZQ== https://user:pass@example.com/?token=private'
+    )
+    assert (
+        "private" not in cleaned
+        and "two word" not in cleaned
+        and "user:pass" not in cleaned
+    )
+
+
+def test_native_stream_close_before_first_read_finishes_without_rpc(runtime):
+    r, _, e, _ = runtime
+    source = r.model().generate_content("stream", stream=True)
+    source.close()
+    assert not r.requests and source.gi_frame is None
+    assert (
+        len(e.get_finished_spans()) == 1
+        and OUTPUT not in e.get_finished_spans()[0].attributes
+    )
+
+
+def test_native_async_stream_aclose_before_first_read_finishes_without_consumption(
+    runtime,
+):
+    r, _, e, _ = runtime
+
+    async def run():
+        model, channel = await r.async_model()
+        try:
+            source = await model.generate_content_async("stream", stream=True)
+            await source.aclose()
+            assert source.ag_frame is None
+        finally:
+            await channel.close()
+
+    asyncio.run(run())
+    assert len(r.requests) <= 1 and len(e.get_finished_spans()) == 1
+    assert OUTPUT not in e.get_finished_spans()[0].attributes
+
+
+@pytest.mark.parametrize(
+    "flag", ["override_enable_content_tracing", "enable_content_tracing"]
+)
+def test_traceloop_and_respan_context_vetoes_apply(runtime, flag):
+    r, _, e, _ = runtime
+    key = ENABLE_CONTENT_TRACING_KEY if flag == "enable_content_tracing" else flag
+    token = context.attach(context.set_value(key, False))
+    try:
+        r.model().generate_content("hello")
+    finally:
+        context.detach(token)
+    assert INPUT not in e.get_finished_spans()[0].attributes
+
+
+def test_respan_environment_veto_applies(runtime, monkeypatch):
+    r, _, e, _ = runtime
+    monkeypatch.setenv("RESPAN_TRACE_CONTENT", "false")
+    r.model().generate_content("hello")
+    assert INPUT not in e.get_finished_spans()[0].attributes
+
+
+@pytest.mark.parametrize("finished", [False, True])
+def test_active_and_finished_ancestor_attribute_veto_is_irreversible(runtime, finished):
+    r, p, e, _ = runtime
+    with p.get_tracer("test").start_as_current_span("parent") as parent:
+        parent.set_attribute("traceloop.enable_content_tracing", False)
+        if finished:
+            parent.end()
+        r.model().generate_content("hello")
+        parent.set_attribute("traceloop.enable_content_tracing", True)
+        r.model().generate_content("hello")
+    assert all(
+        INPUT not in s.attributes
+        for s in e.get_finished_spans()
+        if s.name == "vertexai.generate_content"
+    )
+
+
+def test_detach_and_runtime_fault_restore_exact_native_context(runtime, monkeypatch):
+    r, _p, _e, _ = runtime
+    ambient = context.get_current()
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("telemetry context fault")
+
+    monkeypatch.setattr(context, "detach", fail)
+    monkeypatch.setattr(context._RUNTIME_CONTEXT, "detach", fail)
+    assert r.model().generate_content("hello").text == "native response"
+    assert context.get_current() is ambient
+
+
+def test_owned_observer_removal_preserves_foreign_processors(runtime):
+    _r, p, _, inst = runtime
+    foreign = SimpleSpanProcessor(InMemorySpanExporter())
+    p.add_span_processor(foreign)
+    owned = adapter._POLICIES[p]
+    inst.deactivate()
+    assert any(x is foreign for x in p._active_span_processor._span_processors)
+    assert all(x is not owned for x in p._active_span_processor._span_processors)
+
+
+def test_unknown_exception_descriptor_hooks_are_omitted():
+    from respan_instrumentation_vertexai._serialization import (
+        provider_status_code,
+        safe_exception_message,
+    )
+
+    class Unknown(RuntimeError):
+        @property
+        def code(self):
+            pytest.fail("code hook")
+
+        def __getattribute__(self, key):
+            if key in {"args", "response", "status_code"}:
+                pytest.fail("error hook")
+            return object.__getattribute__(self, key)
+
+    Unknown.__module__ = "google.api_core.exceptions"
+    error = Unknown("actual builtin argument")
+    assert safe_exception_message(error) == "actual builtin argument"
+    assert provider_status_code(error) is None
+
+
+def test_native_async_embeddings_complete_vectors_and_statistics(runtime):
+    r, _, e, _ = runtime
+
+    async def run():
+        model, channel = await r.async_embedding()
+        try:
+            result = await model.get_embeddings_async(["first"])
+            assert len(result[0].values) == 5001
+            return result
+        finally:
+            await channel.close()
+
+    result = asyncio.run(run())
+    span = e.get_finished_spans()[0]
+    assert json.loads(span.attributes[OUTPUT]) == [result[0].values]
+    assert span.attributes["gen_ai.usage.input_tokens"] == 5
+
+
+def test_native_cached_usage_and_full_response_fields(runtime):
+    from google.cloud.aiplatform_v1.types import GenerateContentResponse
+
+    if (
+        "cached_content_token_count"
+        not in GenerateContentResponse.UsageMetadata.meta.fields
+    ):
+        pytest.skip("installed native SDK has no cache token field")
+    r, _, e, _ = runtime
+    response = r.model().generate_content("hello")
+    span = e.get_finished_spans()[0]
+    assert (
+        span.attributes[SpanAttributes.LLM_USAGE_CACHE_READ_INPUT_TOKENS]
+        == response.usage_metadata.cached_content_token_count
+        == 2
+    )
+    raw = json.loads(span.attributes[OUTPUT])[0]
+    assert raw["candidates"][0]["finish_reason"] == "STOP"
+    assert raw["usage_metadata"]["total_token_count"] == 10
+
+
+def test_supplied_parent_context_suppression_and_content_are_both_vetoes(runtime):
+    _, _p, _, _ = runtime
+    from respan_instrumentation_vertexai._policy import content_allowed
+
+    supplied = context.set_value(ENABLE_CONTENT_TRACING_KEY, False)
+    assert not content_allowed(True, supplied)
+    token = context.attach(supplied)
+    try:
+        assert not content_allowed(
+            True, context.set_value(ENABLE_CONTENT_TRACING_KEY, True)
         )
     finally:
-        context_api.detach(token)
+        context.detach(token)
+    assert not content_allowed(
+        True, context.set_value(SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY, True)
+    )
 
+
+def test_native_known_reasoning_signature_fields_preserved(runtime):
+    from google.cloud.aiplatform_v1.types import GenerateContentResponse
+    from google.cloud.aiplatform_v1.types import Part as NativePart
+
+    if "thought_signature" not in NativePart._meta.fields:
+        pytest.skip("Native SDK does not expose thought_signature")
+    r, _, e, _ = runtime
+    original = r.response
+
+    def response(*args, **kwargs):
+        return GenerateContentResponse(
+            {
+                "candidates": [
+                    {
+                        "content": {
+                            "role": "model",
+                            "parts": [
+                                {
+                                    "text": "thought",
+                                    "thought": True,
+                                    "thought_signature": b"complete-signature",
+                                }
+                            ],
+                        },
+                        "finish_reason": "STOP",
+                    }
+                ]
+            }
+        )
+
+    r.response = response
+    native = r.model().generate_content("hello")
     assert (
-        attrs[SpanAttributes.TRACELOOP_WORKFLOW_NAME]
-        == "vertexai_generate_content_example"
+        native.candidates[0].content.parts[0]._raw_part.thought_signature
+        == b"complete-signature"
     )
-
-
-def test_function_calls_use_canonical_completion_field_only() -> None:
-    function_call = Obj(id="call_1", name="get_weather", args={"city": "Tokyo"})
-    response = make_response(
-        text="",
-        parts=[Obj(function_call=function_call)],
+    raw = json.loads(e.get_finished_spans()[0].attributes[OUTPUT])[0]
+    part = raw["candidates"][0]["content"]["parts"][0]
+    assert (
+        part["thought"] is True
+        and part["thought_signature"] == "Y29tcGxldGUtc2lnbmF0dXJl"
     )
+    r.response = original
 
-    attrs = build_generate_content_attrs(
-        request_payload={
-            "model": "gemini-2.0-flash",
-            "contents": "Weather in Tokyo?",
-            "system_instruction": None,
-            "tools": None,
-            "generation_config": None,
-        },
-        response_or_chunks=response,
+
+def test_native_startup_fault_restores_exact_ambient_context(runtime, monkeypatch):
+    r, _p, _, _ = runtime
+    ambient = context.get_current()
+    original = adapter.request_attributes
+
+    def fault(payload):
+        context.attach(context.set_value("poisoned", True))
+        raise RuntimeError("telemetry")
+
+    monkeypatch.setattr(adapter, "request_attributes", fault)
+    response = r.model().generate_content("hello")
+    assert response.text == "native response" and len(r.requests) == 1
+    assert context.get_current() is ambient
+    monkeypatch.setattr(adapter, "request_attributes", original)
+
+
+def test_owned_policy_activation_rollback_removes_only_own_processor(
+    runtime, monkeypatch
+):
+    _, p, _, inst = runtime
+    inst.deactivate()
+    foreign = p._active_span_processor._span_processors
+    original = adapter._policy
+
+    def fault():
+        original()
+        raise RuntimeError("telemetry startup")
+
+    monkeypatch.setattr(adapter, "_policy", fault)
+    with pytest.raises(RuntimeError):
+        VertexAIInstrumentor(tracer_provider=p).activate()
+    assert p._active_span_processor._span_processors == foreign
+    assert not adapter._POLICIES and not adapter._PATCHES
+
+
+def test_propagated_unknown_hooks_and_credentials_are_safe(runtime):
+    from respan_tracing.utils.span_factory import _PROPAGATED_ATTRIBUTES
+
+    class Unknown:
+        def __str__(self):
+            raise AssertionError("customer formatting called")
+
+    r, _, e, _ = runtime
+    token = _PROPAGATED_ATTRIBUTES.set(
+        {"metadata": {"opaque": Unknown(), "api_key": "private-value", "zero": 0}}
     )
+    try:
+        assert r.model().generate_content("hello").text == "native response"
+    finally:
+        _PROPAGATED_ATTRIBUTES.reset(token)
+    attrs = e.get_finished_spans()[0].attributes
+    assert attrs["respan.metadata.api_key"] == "[REDACTED]"
+    assert attrs["respan.metadata.zero"] == "0"
+    assert "Unknown" in attrs["respan.metadata.opaque"]
 
-    tool_calls = json.loads(attrs[f"{SpanAttributes.LLM_COMPLETIONS}.0.tool_calls"])
-    assert tool_calls == [
-        {
-            "id": "call_1",
-            "type": "function",
-            "function": {
-                "name": "get_weather",
-                "arguments": '{"city":"Tokyo"}',
-            },
-        }
+
+def test_two_pending_native_streams_under_parent_keep_content_after_export(runtime):
+    r, p, e, _ = runtime
+    with p.get_tracer("parent").start_as_current_span("outer"):
+        first = r.model().generate_content("first", stream=True)
+        second = r.model().generate_content("second", stream=True)
+        assert next(first).text == next(second).text == "0,"
+        first.close()
+        assert next(second).text == "1,"
+        second.close()
+    spans = [
+        span for span in e.get_finished_spans() if span.name.startswith("vertexai.")
     ]
-    assert RESPAN_SPAN_TOOLS not in attrs
-    assert RESPAN_SPAN_TOOL_CALLS not in attrs
-    assert "tools" not in attrs
-    assert "tool_calls" not in attrs
+    assert len(spans) == 2
+    assert all(INPUT in span.attributes and OUTPUT in span.attributes for span in spans)
+    assert spans[1].attributes["gen_ai.completion.0.content"] == "0,1,"
 
 
-def test_error_path_emits_failed_span(
-    monkeypatch: pytest.MonkeyPatch,
-    fake_vertexai: tuple[type[Any], type[Any]],
-    captured_spans: list[Any],
-) -> None:
-    GenerativeModel, _ = fake_vertexai
+def test_native_processor_start_fault_preserves_native_ambient(runtime):
+    from opentelemetry.sdk.trace import SpanProcessor
 
-    def raise_error(self: Any, contents: Any, **kwargs: Any) -> Any:
-        raise RuntimeError("boom")
+    r, p, _, _ = runtime
+    ambient = context.get_current()
 
-    monkeypatch.setattr(GenerativeModel, GENERATE_CONTENT_METHOD_NAME, raise_error)
-    instrumentor = VertexAIInstrumentor()
-    instrumentor.activate()
+    class FaultProcessor(SpanProcessor):
+        def on_start(self, span, parent_context=None):
+            context.attach(context.set_value("processor-poison", True))
+            raise RuntimeError("processor startup")
 
-    with pytest.raises(RuntimeError, match="boom"):
-        GenerativeModel("gemini-2.0-flash").generate_content("fail")
-
-    assert len(captured_spans) == 1
-    span = captured_spans[0]
-    assert span.status.status_code.name == "ERROR"
-    assert span._attributes["error.message"] == "RuntimeError: boom"
-    assert span._attributes[SpanAttributes.LLM_REQUEST_MODEL] == "gemini-2.0-flash"
-
-    instrumentor.deactivate()
+    p.add_span_processor(FaultProcessor())
+    assert r.model().generate_content("hello").text == "native response"
+    assert len(r.requests) == 1 and context.get_current() is ambient
 
 
-def test_deactivate_restores_original_methods(
-    fake_vertexai: tuple[type[Any], type[Any]],
-) -> None:
-    GenerativeModel, ChatSession = fake_vertexai
-    original_generate = getattr(GenerativeModel, GENERATE_CONTENT_METHOD_NAME)
-    original_generate_async = getattr(
-        GenerativeModel, GENERATE_CONTENT_ASYNC_METHOD_NAME
+def test_full_native_request_config_safety_tools_and_labels(runtime):
+    from vertexai.generative_models import (
+        GenerationConfig,
+        HarmBlockThreshold,
+        HarmCategory,
+        SafetySetting,
+        ToolConfig,
     )
-    original_send = getattr(ChatSession, SEND_MESSAGE_METHOD_NAME)
-    original_send_async = getattr(ChatSession, SEND_MESSAGE_ASYNC_METHOD_NAME)
 
-    instrumentor = VertexAIInstrumentor()
-    instrumentor.activate()
+    r, _, e, _ = runtime
+    config = GenerationConfig(
+        temperature=0,
+        top_p=0.25,
+        stop_sequences=["done"],
+        candidate_count=1,
+        max_output_tokens=32,
+    )
+    tools = ToolConfig(
+        function_calling_config=ToolConfig.FunctionCallingConfig(
+            mode=ToolConfig.FunctionCallingConfig.Mode.AUTO
+        )
+    )
+    safety = SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+        threshold=HarmBlockThreshold.BLOCK_NONE,
+    )
     assert (
-        getattr(GenerativeModel, GENERATE_CONTENT_METHOD_NAME) is not original_generate
+        r.model()
+        .generate_content(
+            "hello",
+            generation_config=config,
+            tool_config=tools,
+            safety_settings=[safety],
+            labels={"controlled": "value"},
+        )
+        .text
+        == "native response"
     )
-    assert getattr(ChatSession, SEND_MESSAGE_METHOD_NAME) is not original_send
+    value = json.loads(e.get_finished_spans()[0].attributes[INPUT])["request"]
+    assert value["generation_config"]["top_p"] == 0.25
+    assert value["generation_config"]["stop_sequences"] == ["done"]
+    assert value["tool_config"]["function_calling_config"]["mode"] == "AUTO"
+    assert value["safety_settings"][0]["threshold"] == "BLOCK_NONE"
+    assert value["labels"] == {"controlled": "value"}
+    assert len(r.requests) == 1 and r.requests[0].generation_config.top_p == 0.25
 
-    instrumentor.deactivate()
-    assert getattr(GenerativeModel, GENERATE_CONTENT_METHOD_NAME) is original_generate
+
+def test_native_blocked_prompt_feedback_is_preserved_without_invented_completion(
+    runtime,
+):
+    r, _, e, _ = runtime
+    response = r.model().generate_content("blocked")
+    assert not response.candidates and len(r.requests) == 1
+    span = e.get_finished_spans()[0]
     assert (
-        getattr(GenerativeModel, GENERATE_CONTENT_ASYNC_METHOD_NAME)
-        is original_generate_async
+        json.loads(span.attributes[OUTPUT])[0]["prompt_feedback"]["block_reason"]
+        == "SAFETY"
     )
-    assert getattr(ChatSession, SEND_MESSAGE_METHOD_NAME) is original_send
-    assert getattr(ChatSession, SEND_MESSAGE_ASYNC_METHOD_NAME) is original_send_async
-
-
-def test_request_payload_reads_model_defaults(
-    fake_vertexai: tuple[type[Any], type[Any]],
-) -> None:
-    GenerativeModel, _ = fake_vertexai
-    tool = Obj(function_declarations=[Obj(name="lookup")])
-    model = GenerativeModel(
-        "gemini-2.0-flash",
-        system_instruction="Use short answers",
-        tools=[tool],
-    )
-
-    payload = request_payload_from_call(
-        instance=model,
-        args=("Hello",),
-        kwargs={"generation_config": {"temperature": 0.1}},
-    )
-
-    assert payload["model"] == "gemini-2.0-flash"
-    assert payload["contents"] == "Hello"
-    assert payload["system_instruction"] == "Use short answers"
-    assert payload["tools"] == [tool]
-
-
-def test_thinking_tokens_reconcile_against_the_reported_total() -> None:
-    """Prompt plus completion must equal the total the API returned.
-
-    The merged change pins the individual values. This pins the invariant they have
-    to satisfy, which is what anything costing off the span actually depends on.
-    """
-    usage = Obj(
-        prompt_token_count=100,
-        candidates_token_count=50,
-        thoughts_token_count=800,
-        total_token_count=950,
-    )
-
-    result = extract_usage(make_response(usage=usage))
-
-    assert result[PROMPT_TOKEN_COUNT_KEY] == 100
-    assert result[CANDIDATES_TOKEN_COUNT_KEY] == 850
-    assert (
-        result[PROMPT_TOKEN_COUNT_KEY] + result[CANDIDATES_TOKEN_COUNT_KEY]
-        == result[TOTAL_TOKEN_COUNT_KEY]
-    )
-
-
-def test_usage_is_unchanged_when_the_model_does_not_think() -> None:
-    """Control: no thoughts field at all, which is every non-thinking model.
-
-    This is the shape of every pre-existing fixture, which is why the defect went
-    unnoticed. It pins that the fold stays inert on the common path.
-    """
-    result = extract_usage(make_response(usage=make_usage(100, 50)))
-
-    assert result[CANDIDATES_TOKEN_COUNT_KEY] == 50
-    assert result[TOTAL_TOKEN_COUNT_KEY] == 150
-
-
-def test_zero_thinking_tokens_leave_the_output_count_alone() -> None:
-    """A thinking budget of zero still emits the field, and must be a no-op."""
-    usage = Obj(
-        prompt_token_count=100,
-        candidates_token_count=50,
-        thoughts_token_count=0,
-        total_token_count=150,
-    )
-
-    result = extract_usage(make_response(usage=usage))
-
-    assert result[CANDIDATES_TOKEN_COUNT_KEY] == 50
-    assert result[TOTAL_TOKEN_COUNT_KEY] == 150
+    assert "gen_ai.completion.0.content" not in span.attributes
+    assert "gen_ai.usage.input_tokens" not in span.attributes

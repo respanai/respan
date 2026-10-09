@@ -1,39 +1,20 @@
 # respan-instrumentation-sagemaker
 
-Respan instrumentation plugin for AWS SageMaker Runtime calls made through
-`boto3`.
-
-## Installation
-
-```bash
-pip install respan-ai respan-instrumentation-sagemaker boto3
-```
-
-## Usage
+Observe the three native SageMaker Runtime boto3 operations: InvokeEndpoint, InvokeEndpointWithResponseStream and InvokeEndpointAsync. Current boto3/botocore 1.43.108 and the declared 1.34.0 floor are verified against released companions. Install and activate with an existing Respan or OTel provider:
 
 ```python
-import json
-
-import boto3
-from respan import Respan
 from respan_instrumentation_sagemaker import SageMakerInstrumentor
 
-respan = Respan(instrumentations=[SageMakerInstrumentor()])
-client = boto3.client("sagemaker-runtime", region_name="us-east-1")
-
-response = client.invoke_endpoint(
-    EndpointName="my-llm-endpoint",
-    Body=json.dumps({"inputs": "Reply with one short sentence."}).encode("utf-8"),
-    ContentType="application/json",
-    Accept="application/json",
-)
-
-body = json.loads(response["Body"].read())
-print(body[0]["generated_text"])
-respan.flush()
+instrumentor = SageMakerInstrumentor()
+instrumentor.activate()
+# Call the normal boto3 SageMaker Runtime client and read/close its returned body.
+instrumentor.deactivate()
 ```
 
-The instrumentor patches `botocore.client.BaseClient._make_api_call` and only
-emits spans for SageMaker Runtime operations. It currently normalizes
-`InvokeEndpoint`, `InvokeEndpointWithResponseStream`, and `InvokeEndpointAsync`
-into canonical Respan LLM spans.
+Native StreamingBody and EventStream instances, response dictionaries, bytes, iteration, context-manager return values, close behavior and exceptions are preserved. The adapter reads no response body in advance; it observes caller consumption through owned instance hooks. Normal bodies finish at EOF/full read or close; streams retain consumed fragments and native partial data when an error follows. Unconsumed bodies do not claim a completed result.
+
+Known native JSON retains complete histories, schemas, tool IDs/arguments, false/zero and dense/sparse vectors. Fragmented JSON/NDJSON/SSE application data is assembled from actual consumed PayloadPart bytes. Native embedding records map to embedding spans; unknown ML payloads remain tasks. Async submission preserves its actual response fields without inventing an inference result or submission state. Current session/routing response fields and native request selectors are retained in scoped metadata. Endpoint names are not fabricated model names; source model, usage, cache/reasoning and explicit totals are mapped only when present. Native configured OTel attribute limits can bound convenience indexed attributes; complete canonical bodies are written last.
+
+`capture_content=False`, canonical content-disabled context, supported legacy flags, `TRACELOOP_TRACE_CONTENT=false` or `RESPAN_TRACE_CONTENT=false` omit owned content and error messages. Ambient/supplied, initial, active/finished ancestor, unknown local parent and runtime context exits are bounded irreversibly. Sampling and instrumentation suppression precede content inspection. Unknown conversion hooks/iterators and opaque request streams are not read solely for tracing. Credential values are redacted while schemas and valid encoded JSON retain their structure.
+
+Observer faults preserve native outcomes and release owned hooks/contexts. Shared activation/configuration and foreign wrappers/processors retain their ownership. The released SDK/constants and AI semantic-convention floors are verified by installed native tests and a wheel built from the sdist. The companion examples default to controlled local SDK transports; hosted permissions and arbitrary custom model protocols are separate checks. Stored backend projections require exact same-run inspection and are not repaired with ingestion aliases.

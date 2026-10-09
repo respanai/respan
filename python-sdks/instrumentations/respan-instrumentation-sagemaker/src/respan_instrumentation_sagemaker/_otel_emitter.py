@@ -1,243 +1,142 @@
-"""Emit AWS SageMaker Runtime calls as OTEL ReadableSpan objects."""
+"""Canonical attributes from actual request, body and SDK response fields."""
 
 from __future__ import annotations
 
-import logging
-import time
-from collections.abc import Mapping
-from typing import Any
+from opentelemetry.semconv._incubating.attributes import gen_ai_attributes as GenAI
+from opentelemetry.semconv_ai import SpanAttributes as AI
+from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE, RESPAN_METADATA
 
-from opentelemetry import context as context_api
-from opentelemetry import trace
-from opentelemetry.semconv._incubating.attributes import (
-    gen_ai_attributes as GenAIAttributes,
-)
-from opentelemetry.semconv_ai import LLMRequestTypeValues
-from opentelemetry.semconv_ai import SpanAttributes as TLSpanAttributes
-from respan_sdk.constants.llm_logging import LOG_TYPE_CHAT, LOG_TYPE_TASK, LOG_TYPE_TEXT
-from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
-from respan_sdk.utils.data_processing.id_processing import (
-    format_span_id,
-    format_trace_id,
-)
-from respan_tracing.utils.span_factory import build_readable_span, inject_span
-
-from respan_instrumentation_sagemaker._constants import (
-    SAGEMAKER_ASYNC_SPAN_NAME,
-    SAGEMAKER_CHAT_SPAN_NAME,
-    SAGEMAKER_COMPLETION_SPAN_NAME,
-    SAGEMAKER_SYSTEM_NAME,
-)
-from respan_instrumentation_sagemaker._translator import (
-    SageMakerResponse,
-    SageMakerStreamAccumulator,
-    parse_sagemaker_request,
-    parse_sagemaker_response,
-    parse_sagemaker_stream_response,
-    redact_text,
-    safe_json,
-    to_json_attr,
-)
-
-logger = logging.getLogger(__name__)
-
-
-def _current_trace_parent_ids() -> tuple[str | None, str | None]:
-    current_span = trace.get_current_span()
-    span_context = current_span.get_span_context()
-
-    trace_id = getattr(span_context, "trace_id", 0) or 0
-    span_id = getattr(span_context, "span_id", 0) or 0
-    if trace_id == 0 or span_id == 0:
-        return None, None
-    return format_trace_id(trace_id=trace_id), format_span_id(span_id=span_id)
-
-
-def _span_name_for_request_type(request_type: str) -> str:
-    if request_type == LLMRequestTypeValues.CHAT.value:
-        return SAGEMAKER_CHAT_SPAN_NAME
-    return SAGEMAKER_COMPLETION_SPAN_NAME
-
-
-def _log_type_for_request_type(request_type: str) -> str:
-    if request_type == LLMRequestTypeValues.CHAT.value:
-        return LOG_TYPE_CHAT
-    return LOG_TYPE_TEXT
-
-
-def _base_attrs(request_type: str) -> dict[str, Any]:
-    span_name = _span_name_for_request_type(request_type)
-    attrs = {
-        TLSpanAttributes.LLM_SYSTEM: SAGEMAKER_SYSTEM_NAME,
-        GenAIAttributes.GEN_AI_PROVIDER_NAME: SAGEMAKER_SYSTEM_NAME,
-        TLSpanAttributes.LLM_REQUEST_TYPE: request_type,
-        TLSpanAttributes.TRACELOOP_ENTITY_NAME: span_name,
-        TLSpanAttributes.TRACELOOP_ENTITY_PATH: span_name,
-        RESPAN_LOG_TYPE: _log_type_for_request_type(request_type),
-    }
-    workflow_name = context_api.get_value(TLSpanAttributes.TRACELOOP_ENTITY_NAME)
-    if workflow_name:
-        attrs[TLSpanAttributes.TRACELOOP_WORKFLOW_NAME] = workflow_name
-    return attrs
-
-
-def _set_prompt_attrs(attrs: dict[str, Any], messages: list[dict[str, Any]]) -> None:
-    for index, message in enumerate(messages):
-        role = message.get("role")
-        content = message.get("content")
-        if role is not None:
-            attrs[f"{TLSpanAttributes.LLM_PROMPTS}.{index}.role"] = str(role)
-        if content is not None:
-            attrs[f"{TLSpanAttributes.LLM_PROMPTS}.{index}.content"] = to_json_attr(
-                content
-            )
-        tool_calls = message.get("tool_calls")
-        if tool_calls:
-            attrs[f"{TLSpanAttributes.LLM_PROMPTS}.{index}.tool_calls"] = safe_json(
-                tool_calls
-            )
-
-
-def _set_usage_attrs(attrs: dict[str, Any], usage: Mapping[str, int]) -> None:
-    input_tokens = usage.get("input_tokens")
-    output_tokens = usage.get("output_tokens")
-    total_tokens = usage.get("total_tokens")
-
-    if input_tokens is not None:
-        attrs[GenAIAttributes.GEN_AI_USAGE_INPUT_TOKENS] = input_tokens
-        attrs[GenAIAttributes.GEN_AI_USAGE_PROMPT_TOKENS] = input_tokens
-        attrs[TLSpanAttributes.LLM_USAGE_PROMPT_TOKENS] = input_tokens
-    if output_tokens is not None:
-        attrs[GenAIAttributes.GEN_AI_USAGE_OUTPUT_TOKENS] = output_tokens
-        attrs[GenAIAttributes.GEN_AI_USAGE_COMPLETION_TOKENS] = output_tokens
-        attrs[TLSpanAttributes.LLM_USAGE_COMPLETION_TOKENS] = output_tokens
-    if total_tokens is not None:
-        attrs[TLSpanAttributes.LLM_USAGE_TOTAL_TOKENS] = total_tokens
-
-
-def _set_response_attrs(attrs: dict[str, Any], response: SageMakerResponse) -> None:
-    content = redact_text(response.content)
-    attrs[f"{TLSpanAttributes.LLM_COMPLETIONS}.0.role"] = response.role
-    attrs[f"{TLSpanAttributes.LLM_COMPLETIONS}.0.content"] = content
-    attrs[TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT] = content
-    if response.tool_calls:
-        attrs[f"{TLSpanAttributes.LLM_COMPLETIONS}.0.tool_calls"] = safe_json(
-            response.tool_calls
-        )
-    _set_usage_attrs(attrs=attrs, usage=response.usage)
+from ._serialization import json_dumps
+from ._translator import embedding, usage
 
 
 def build_sagemaker_attrs(
     *,
-    operation_name: str,
-    api_params: Mapping[str, Any] | None,
-    response_payload: Any = None,
-    stream_events: list[Any] | SageMakerStreamAccumulator | None = None,
-) -> dict[str, Any]:
-    request = parse_sagemaker_request(
-        operation_name=operation_name,
-        api_params=api_params,
+    operation_name,
+    params,
+    body=None,
+    payload=None,
+    response_fields=None,
+    streaming=False,
+):
+    attrs = {
+        RESPAN_LOG_TYPE: "task",
+        AI.TRACELOOP_ENTITY_NAME: "sagemaker." + operation_name,
+        AI.TRACELOOP_ENTITY_PATH: "",
+    }
+    metadata = {
+        "operation": operation_name,
+        "request": {k: v for k, v in params.items() if k != "Body"},
+        "response": response_fields or {},
+    }
+    attrs[RESPAN_METADATA + ".sagemaker"] = json_dumps(metadata)
+    attrs[AI.TRACELOOP_ENTITY_INPUT] = json_dumps(
+        params if operation_name == "InvokeEndpointAsync" else body
     )
+    kind = "task"
+    model = None
+    if type(body) is dict:
+        if type(body.get("model")) is str:
+            model = body["model"]
+        messages = body.get("messages")
+        if type(messages) is list:
+            kind = "chat"
+            for index, message in enumerate(messages):
+                if type(message) is not dict:
+                    continue
+                role = message.get("role")
+                content = message.get("content")
+                if type(role) is str:
+                    attrs[f"{AI.LLM_PROMPTS}.{index}.role"] = role
+                if "content" in message:
+                    attrs[f"{AI.LLM_PROMPTS}.{index}.content"] = (
+                        content if type(content) is str else json_dumps(content)
+                    )
+                if "tool_calls" in message:
+                    attrs[f"{AI.LLM_PROMPTS}.{index}.tool_calls"] = json_dumps(
+                        message["tool_calls"]
+                    )
+                if "tool_call_id" in message:
+                    attrs[f"{AI.LLM_PROMPTS}.{index}.content"] = json_dumps(message)
+        elif any(type(body.get(k)) is str for k in ("inputs", "prompt", "text")):
+            kind = "text"
+        tools = body.get("tools", body.get("functions"))
+        if type(tools) is list:
+            attrs[AI.LLM_REQUEST_FUNCTIONS] = json_dumps(tools)
+    if type(payload) is dict and type(payload.get("model")) is str:
+        model = payload["model"]
+    vectors = embedding(payload)
+    if vectors is not None:
+        kind = "embedding"
     if operation_name == "InvokeEndpointAsync":
-        attrs = {
-            RESPAN_LOG_TYPE: LOG_TYPE_TASK,
-            TLSpanAttributes.TRACELOOP_ENTITY_NAME: SAGEMAKER_ASYNC_SPAN_NAME,
-            TLSpanAttributes.TRACELOOP_ENTITY_PATH: SAGEMAKER_ASYNC_SPAN_NAME,
-            TLSpanAttributes.TRACELOOP_ENTITY_INPUT: safe_json(
-                {
-                    "endpoint_name": request.endpoint_name,
-                    "input_location": (request.raw_payload or {}).get("InputLocation")
-                    if isinstance(request.raw_payload, Mapping)
-                    else None,
-                }
-            ),
-        }
-        if isinstance(response_payload, Mapping):
-            attrs[TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safe_json(
-                {
-                    "inference_id": response_payload.get("InferenceId"),
-                    "output_location": response_payload.get("OutputLocation"),
-                    "state": "submitted",
-                }
-            )
-        return attrs
-
-    attrs = _base_attrs(request.request_type)
-    if stream_events is not None:
-        attrs[TLSpanAttributes.LLM_IS_STREAMING] = True
-
-    model_id = request.model_id or request.endpoint_name
-    if model_id:
-        attrs[TLSpanAttributes.LLM_REQUEST_MODEL] = model_id
-
-    if request.messages:
-        attrs[TLSpanAttributes.TRACELOOP_ENTITY_INPUT] = safe_json(request.messages)
-        _set_prompt_attrs(attrs=attrs, messages=request.messages)
-    elif request.raw_payload is not None:
-        attrs[TLSpanAttributes.TRACELOOP_ENTITY_INPUT] = safe_json(request.raw_payload)
-
-    if request.tools:
-        attrs[TLSpanAttributes.LLM_REQUEST_FUNCTIONS] = safe_json(request.tools)
-
-    response: SageMakerResponse | None = None
-    if stream_events is not None:
-        response = parse_sagemaker_stream_response(events=stream_events)
-    elif response_payload is not None:
-        response = parse_sagemaker_response(
-            operation_name=operation_name,
-            response_payload=response_payload,
+        kind = "task"
+    attrs[RESPAN_LOG_TYPE] = kind
+    if kind != "task":
+        attrs[AI.LLM_SYSTEM] = "sagemaker"
+        attrs[GenAI.GEN_AI_PROVIDER_NAME] = "sagemaker"
+        attrs[AI.LLM_REQUEST_TYPE] = (
+            "chat"
+            if kind == "chat"
+            else ("embedding" if kind == "embedding" else "completion")
         )
-
-    if response is not None:
-        _set_response_attrs(attrs=attrs, response=response)
-
+        if model:
+            attrs[AI.LLM_REQUEST_MODEL] = model
+    if streaming:
+        attrs[AI.LLM_IS_STREAMING] = True
+    if payload is not None:
+        attrs[AI.TRACELOOP_ENTITY_OUTPUT] = json_dumps(
+            vectors if vectors is not None else payload
+        )
+        if type(payload) is dict:
+            for index, choice in enumerate(
+                payload.get("choices", [])
+                if type(payload.get("choices")) is list
+                else []
+            ):
+                if type(choice) is not dict:
+                    continue
+                message = choice.get("message")
+                if type(message) is dict:
+                    if type(message.get("role")) is str:
+                        attrs[f"{AI.LLM_COMPLETIONS}.{index}.role"] = message["role"]
+                    if "content" in message:
+                        attrs[f"{AI.LLM_COMPLETIONS}.{index}.content"] = (
+                            message["content"]
+                            if type(message["content"]) is str
+                            else json_dumps(message["content"])
+                        )
+                    if "tool_calls" in message:
+                        attrs[f"{AI.LLM_COMPLETIONS}.{index}.tool_calls"] = json_dumps(
+                            message["tool_calls"]
+                        )
+            counts = usage(payload)
+            for field, keys in [
+                (
+                    "input_tokens",
+                    (GenAI.GEN_AI_USAGE_INPUT_TOKENS, AI.LLM_USAGE_PROMPT_TOKENS),
+                ),
+                (
+                    "output_tokens",
+                    (GenAI.GEN_AI_USAGE_OUTPUT_TOKENS, AI.LLM_USAGE_COMPLETION_TOKENS),
+                ),
+                ("total_tokens", (AI.LLM_USAGE_TOTAL_TOKENS,)),
+                ("cache_read", (AI.LLM_USAGE_CACHE_READ_INPUT_TOKENS,)),
+                ("cache_creation", (AI.LLM_USAGE_CACHE_CREATION_INPUT_TOKENS,)),
+                ("reasoning", (AI.LLM_USAGE_REASONING_TOKENS,)),
+            ]:
+                if field in counts:
+                    for key in keys:
+                        attrs[key] = counts[field]
+    # Native OTel limits can bound convenience indexed attributes. Write the
+    # complete canonical bodies last so they survive those configured limits.
+    priority = (
+        RESPAN_LOG_TYPE,
+        AI.TRACELOOP_ENTITY_INPUT,
+        AI.TRACELOOP_ENTITY_OUTPUT,
+        AI.LLM_REQUEST_FUNCTIONS,
+        RESPAN_METADATA + ".sagemaker",
+    )
+    for name in priority:
+        if name in attrs:
+            attrs[name] = attrs.pop(name)
     return attrs
-
-
-def emit_sagemaker_span(
-    *,
-    operation_name: str,
-    api_params: Mapping[str, Any] | None,
-    start_ns: int,
-    response_payload: Any = None,
-    stream_events: list[Any] | SageMakerStreamAccumulator | None = None,
-    error_message: str | None = None,
-    status_code: int = 200,
-    trace_id: str | None = None,
-    parent_id: str | None = None,
-) -> None:
-    """Build a ReadableSpan for a SageMaker Runtime call and inject it."""
-    try:
-        attrs = build_sagemaker_attrs(
-            operation_name=operation_name,
-            api_params=api_params,
-            response_payload=response_payload,
-            stream_events=stream_events,
-        )
-        if error_message:
-            attrs["error.message"] = error_message
-            status_code = status_code if status_code >= 400 else 500
-
-        request_type = attrs.get(TLSpanAttributes.LLM_REQUEST_TYPE)
-        span_name = (
-            SAGEMAKER_ASYNC_SPAN_NAME
-            if operation_name == "InvokeEndpointAsync"
-            else _span_name_for_request_type(
-                str(request_type or LLMRequestTypeValues.COMPLETION.value)
-            )
-        )
-        if trace_id is None or parent_id is None:
-            trace_id, parent_id = _current_trace_parent_ids()
-        span = build_readable_span(
-            name=span_name,
-            trace_id=trace_id,
-            parent_id=parent_id,
-            start_time_ns=start_ns,
-            end_time_ns=time.time_ns(),
-            attributes=attrs,
-            error_message=error_message,
-            status_code=status_code,
-        )
-        inject_span(span=span)
-    except Exception:
-        logger.debug("Failed to emit SageMaker span", exc_info=True)

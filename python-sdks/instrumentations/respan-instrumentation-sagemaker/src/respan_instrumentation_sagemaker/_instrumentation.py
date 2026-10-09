@@ -1,319 +1,584 @@
-"""AWS SageMaker Runtime instrumentation plugin for Respan."""
+"""Observe native SageMaker client calls and consumption without replacing objects."""
 
 from __future__ import annotations
 
-import importlib
+import functools
+import inspect
 import logging
 import threading
-import time
-from collections.abc import Iterable, Iterator, Mapping
-from types import TracebackType
-from typing import Any, Self
+import weakref
+from contextlib import contextmanager
 
-from respan_tracing.core.tracer import RespanTracer
+from botocore.client import BaseClient
+from botocore.eventstream import EventStream
+from botocore.exceptions import ClientError, EventStreamError
+from botocore.response import StreamingBody
+from opentelemetry import context, trace
+from opentelemetry.sdk.util import BoundedList
+from opentelemetry.semconv._incubating.attributes.error_attributes import ERROR_MESSAGE
+from opentelemetry.semconv.attributes.error_attributes import ERROR_TYPE
+from opentelemetry.semconv.attributes.http_attributes import HTTP_RESPONSE_STATUS_CODE
+from opentelemetry.semconv_ai import SpanAttributes as AI
+from opentelemetry.trace import SpanKind, Status, StatusCode
+from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE, RESPAN_METADATA
+from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
 
-from respan_instrumentation_sagemaker._constants import (
-    BODY_KEY,
-    SAGEMAKER_INSTRUMENTATION_NAME,
-    SAGEMAKER_RUNTIME_SERVICE_NAME,
-    STREAMING_OPERATIONS,
-    SUPPORTED_OPERATIONS,
-)
-from respan_instrumentation_sagemaker._otel_emitter import emit_sagemaker_span
-from respan_instrumentation_sagemaker._translator import (
-    SageMakerStreamAccumulator,
-    capture_invoke_response_payload,
-)
+from ._constants import SUPPORTED_OPERATIONS
+from ._otel_emitter import build_sagemaker_attrs
+from ._policy import Policy, key, permitted, suppressed
+from ._serialization import safe_text, to_jsonable
+from ._translator import StreamData, decode, request_body
 
 logger = logging.getLogger(__name__)
+_LOCK = threading.RLock()
+_OWNERS = set()
+_PATCH = None
+_MANAGER = None
 
-_original_make_api_call = None
-_patched_make_api_call = None
-_activation_count = 0
-_activation_lock = threading.RLock()
+
+def _safe(method):
+    @functools.wraps(method)
+    def call(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except Exception:  # noqa: BLE001 - observer faults must preserve native results/errors.
+            self.allowed = False
+            try:
+                self.scrub()
+            finally:
+                self.finish()
+            logger.debug("SageMaker telemetry observation failed")
+            return None
+
+    return call
 
 
-def _error_details(exc: BaseException) -> tuple[str, int]:
-    try:
-        response = getattr(exc, "response", None)
-    except Exception:  # noqa: BLE001 - provider exception properties are untrusted
-        response = None
-    status_code = _status_code_from_response(response)
-    if status_code < 400:
-        status_code = 500
-    error = response.get("Error") if isinstance(response, Mapping) else None
-    if isinstance(error, Mapping):
-        error_type = error.get("Code")
-        message = error.get("Message")
-        return (
-            f"{error_type or type(exc).__name__}: {message or 'request failed'}",
-            status_code,
+def _http_code(response):
+    if type(response) is dict and type(response.get("ResponseMetadata")) is dict:
+        code = response["ResponseMetadata"].get("HTTPStatusCode")
+        return code if type(code) is int else None
+    return None
+
+
+class _Manager:
+    def __init__(self, capture, provider):
+        self.capture = capture
+        self.provider = provider
+        self.policies = []
+        self.states = weakref.WeakSet()
+        self.enabled = True
+        self.observe()
+
+    def observe(self):
+        provider = self.provider or trace.get_tracer_provider()
+        for existing, policy in self.policies:
+            if existing is provider:
+                return provider, policy
+        policy = (
+            Policy(provider, self.scrub)
+            if hasattr(provider, "add_span_processor")
+            else None
         )
-    return type(exc).__name__, status_code
+        if policy:
+            self.policies.append((provider, policy))
+        return provider, policy
+
+    def scrub(self):
+        for state in list(self.states):
+            if not state.done and not state.check():
+                state.scrub()
+
+    def close(self):
+        self.enabled = False
+        for state in list(self.states):
+            state.allowed = False
+            state.finish()
+        for _, policy in self.policies:
+            policy.close()
+        self.policies.clear()
 
 
-def _load_base_client_class() -> type[Any]:
-    module = importlib.import_module("botocore.client")
-    base_client = getattr(module, "BaseClient", None)
-    if base_client is None:
-        raise AttributeError("botocore.client.BaseClient")
-    return base_client
-
-
-def _is_sagemaker_runtime_client(client: Any) -> bool:
-    service_model = getattr(getattr(client, "meta", None), "service_model", None)
-    return (
-        getattr(service_model, "service_name", None) == SAGEMAKER_RUNTIME_SERVICE_NAME
-    )
-
-
-def _status_code_from_response(response: Any) -> int:
-    if not isinstance(response, Mapping):
-        return 200
-    response_metadata = response.get("ResponseMetadata")
-    if not isinstance(response_metadata, Mapping):
-        return 200
-    value = response_metadata.get("HTTPStatusCode")
-    return value if isinstance(value, int) else 200
-
-
-class _InstrumentedEventStream:
-    def __init__(
-        self,
-        *,
-        stream: Iterable[Any],
-        operation_name: str,
-        api_params: Mapping[str, Any] | None,
-        start_ns: int,
-        trace_id: str | None,
-        parent_id: str | None,
-    ) -> None:
-        self._stream = stream
-        self._operation_name = operation_name
-        self._api_params = api_params
-        self._start_ns = start_ns
-        self._trace_id = trace_id
-        self._parent_id = parent_id
-        self._accumulator = SageMakerStreamAccumulator()
-        self._emitted = False
-
-    def __iter__(self) -> Iterator[Any]:
-        stream_iterable = (
-            [self._stream] if isinstance(self._stream, Mapping) else self._stream
+class _Call:
+    def __init__(self, manager, operation, params):
+        self.manager = manager
+        self.operation = operation
+        self.ctx = context.get_current()
+        self.span = None
+        self.done = False
+        self.allowed = False
+        self.undo = []
+        self.chunks = bytearray()
+        self.stream = StreamData()
+        self.params = {}
+        self.body = None
+        self.fields = {}
+        self.streaming = False
+        self.native_reads = 0
+        self.http = None
+        provider, self.policy = manager.observe()
+        self.allowed = bool(
+            manager.capture
+            and permitted(self.ctx)
+            and self.policy
+            and self.policy.enroll(trace.get_current_span(self.ctx))
+        )
+        private = (
+            context.attach(context.set_value(ENABLE_CONTENT_TRACING_KEY, False))
+            if not self.allowed
+            else None
         )
         try:
-            for event in stream_iterable:
-                self._accumulator.add_event(event)
-                yield event
-        except BaseException as exc:
-            error_message, status_code = _error_details(exc)
-            self._emit(error_message=error_message, status_code=status_code)
+            self.span = provider.get_tracer(__name__).start_span(
+                "sagemaker." + operation, kind=SpanKind.CLIENT
+            )
+            self.span.set_attribute(RESPAN_LOG_TYPE, "task")
+            self.span.set_attribute(AI.TRACELOOP_ENTITY_NAME, "sagemaker." + operation)
+            self.span.set_attribute(AI.TRACELOOP_ENTITY_PATH, "")
+            self.allowed = self.allowed and self.span.is_recording()
+            self.structural = {
+                k: v
+                for k, v in (getattr(self.span, "attributes", None) or {}).items()
+                if k == RESPAN_METADATA or k.startswith(RESPAN_METADATA + ".")
+            }
+            manager.states.add(self)
+            if self.check():
+                self.params = to_jsonable(params)
+                self.body = request_body(params)
+        except Exception:
+            if self.span:
+                self.scrub()
+                try:
+                    self.span.end()
+                except Exception:  # noqa: BLE001 - telemetry faults must preserve native SDK behavior.
+                    logger.debug("SageMaker partial span cleanup failed")
             raise
-        else:
-            self._emit()
-
-    def close(self) -> None:
-        try:
-            close = getattr(self._stream, "close", None)
-            if callable(close):
-                close()
         finally:
-            self._emit()
+            if private:
+                context.detach(private)
 
-    def __enter__(self) -> Self:
-        enter = getattr(self._stream, "__enter__", None)
-        if callable(enter):
-            enter()
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> bool:
-        if exc is not None:
-            message, status = _error_details(exc)
-            self._emit(error_message=message, status_code=status)
-        else:
-            self._emit()
-        exit_method = getattr(self._stream, "__exit__", None)
-        if callable(exit_method):
-            return bool(exit_method(exc_type, exc, traceback))
-        self.close()
-        return False
-
-    def _emit(
-        self, *, error_message: str | None = None, status_code: int = 200
-    ) -> None:
-        if self._emitted:
-            return
-        self._emitted = True
-        emit_sagemaker_span(
-            operation_name=self._operation_name,
-            api_params=self._api_params,
-            start_ns=self._start_ns,
-            stream_events=self._accumulator,
-            error_message=error_message,
-            status_code=status_code,
-            trace_id=self._trace_id,
-            parent_id=self._parent_id,
+    def check(self):
+        self.allowed = bool(
+            self.allowed
+            and not self.done
+            and self.manager.enabled
+            and permitted(self.ctx)
+            and self.policy
+            and self.policy.enabled
+            and self.policy.bound(key(self.span))
         )
+        if not self.allowed:
+            if self.policy and not self.policy.scrubbing:
+                self.policy.deny(key(self.span))
+            self.scrub()
+        return self.allowed and self.span.is_recording()
 
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._stream, name)
-
-
-def _wrap_streaming_response(
-    *,
-    response: Any,
-    operation_name: str,
-    api_params: Mapping[str, Any] | None,
-    start_ns: int,
-    trace_id: str | None,
-    parent_id: str | None,
-) -> Any:
-    if not isinstance(response, dict):
-        return response
-
-    stream = response.get(BODY_KEY)
-    if stream is None:
-        emit_sagemaker_span(
-            operation_name=operation_name,
-            api_params=api_params,
-            start_ns=start_ns,
-            response_payload=response,
-            status_code=_status_code_from_response(response),
-            trace_id=trace_id,
-            parent_id=parent_id,
-        )
-        return response
-
-    response[BODY_KEY] = _InstrumentedEventStream(
-        stream=stream,
-        operation_name=operation_name,
-        api_params=api_params,
-        start_ns=start_ns,
-        trace_id=trace_id,
-        parent_id=parent_id,
-    )
-    return response
-
-
-def _wrap_make_api_call(original: Any) -> Any:
-    def wrapper(
-        self: Any, operation_name: str, api_params: Mapping[str, Any] | None = None
-    ) -> Any:
+    def scrub(self):
+        self.params = {}
+        self.body = None
+        self.fields = {}
+        self.chunks.clear()
+        self.stream.clear()
+        attrs = getattr(self.span, "_attributes", None)
+        if attrs is not None:
+            for name in list(attrs):
+                if name in (
+                    AI.TRACELOOP_ENTITY_INPUT,
+                    AI.TRACELOOP_ENTITY_OUTPUT,
+                    AI.LLM_REQUEST_FUNCTIONS,
+                    ERROR_MESSAGE,
+                    RESPAN_METADATA + ".sagemaker",
+                ) or name.startswith((AI.LLM_PROMPTS + ".", AI.LLM_COMPLETIONS + ".")):
+                    attrs.pop(name, None)
+        if hasattr(self.span, "_events"):
+            self.span._events = BoundedList(0)
         if (
-            operation_name not in SUPPORTED_OPERATIONS
-            or not _is_sagemaker_runtime_client(self)
+            getattr(getattr(self.span, "status", None), "status_code", None)
+            is StatusCode.ERROR
         ):
-            return original(self, operation_name, api_params)
+            self.span._status = Status(StatusCode.ERROR)
 
-        start_ns = time.time_ns()
-        from respan_instrumentation_sagemaker._otel_emitter import (
-            _current_trace_parent_ids,
+    def tap(self, obj, name, factory):
+        original = getattr(obj, name)
+        stored = obj.__dict__.get(name)
+        present = name in obj.__dict__
+        owned = factory(original)
+        setattr(obj, name, owned)
+        self.undo.append((weakref.ref(obj), name, stored, present, owned))
+
+    @_safe
+    def response(self, response):
+        self.http = _http_code(response)
+        if self.http is not None:
+            self.span.set_attribute(HTTP_RESPONSE_STATUS_CODE, self.http)
+        if not self.check():
+            self.finish()
+            return
+        if type(response) is not dict:
+            self.finish()
+            return
+        self.fields = to_jsonable(
+            {k: v for k, v in response.items() if k not in ("Body", "ResponseMetadata")}
         )
+        native_meta = response.get("ResponseMetadata")
+        if type(native_meta) is dict:
+            self.fields["ResponseMetadata"] = {
+                k: native_meta[k]
+                for k in ("RequestId", "HTTPStatusCode", "RetryAttempts")
+                if k in native_meta
+            }
+        body = response.get("Body")
+        if isinstance(body, EventStream):
+            self.streaming = True
+            self.tap_events(body)
+        elif isinstance(body, StreamingBody):
+            self.tap_body(body)
+        else:
+            self.finish(
+                payload=self.fields if self.operation == "InvokeEndpointAsync" else None
+            )
 
-        trace_id, parent_id = _current_trace_parent_ids()
+    def tap_body(self, body):
+        def reader(original, raw=False):
+            @functools.wraps(original)
+            def read(*args, **kwargs):
+                if raw and self.native_reads:
+                    return original(*args, **kwargs)
+                try:
+                    if not raw:
+                        self.native_reads += 1
+                    try:
+                        result = original(*args, **kwargs)
+                    finally:
+                        if not raw:
+                            self.native_reads -= 1
+                except BaseException as error:
+                    self.finish(error=error)
+                    raise
+                self.read_result(result, args, kwargs)
+                return result
+
+            return read
+
+        self.tap(body, "read", reader)
+        if hasattr(body, "readinto"):
+
+            def into(original):
+                def readinto(buffer):
+                    try:
+                        self.native_reads += 1
+                        try:
+                            count = original(buffer)
+                        finally:
+                            self.native_reads -= 1
+                    except BaseException as error:
+                        self.finish(error=error)
+                        raise
+                    self.into_result(buffer, count)
+                    return count
+
+                return readinto
+
+            self.tap(body, "readinto", into)
+        self.tap_close(body)
+        from urllib3.response import HTTPResponse
+
+        raw = body._raw_stream
+        if isinstance(raw, HTTPResponse):
+            self.tap(raw, "read", lambda original: reader(original, True))
+            self.tap_close(raw)
+
+    @_safe
+    def read_result(self, result, args, kwargs):
+        if self.check() and type(result) is bytes:
+            self.chunks.extend(result)
+        amt = args[0] if args else kwargs.get("amt")
+        if amt is None or (amt != 0 and result == b""):
+            self.finish(payload=decode(bytes(self.chunks)))
+
+    @_safe
+    def into_result(self, buffer, count):
+        if (
+            self.check()
+            and type(count) is int
+            and count > 0
+            and type(buffer) in (bytearray, memoryview)
+        ):
+            self.chunks.extend(buffer[:count])
+        if count == 0 and len(buffer) > 0:
+            self.finish(payload=decode(bytes(self.chunks)))
+
+    def tap_events(self, body):
+        def parser(original):
+            def parse(event):
+                try:
+                    result = original(event)
+                except BaseException as error:
+                    self.finish(error=error)
+                    raise
+                self.event_result(result)
+                return result
+
+            return parse
+
+        self.tap(body, "_parse_event", parser)
+        original = body._event_generator
+
+        def frames():
+            try:
+                yield from original
+            except Exception as error:
+                self.finish(error=error)
+                raise
+            finally:
+                self.finish_observed()
+
+        body._event_generator = frames()
+        self.tap_close(body)
+
+    @_safe
+    def event_result(self, event):
+        if self.check():
+            self.stream.add(event)
+
+    def finish_observed(self):
         try:
-            response = original(self, operation_name, api_params)
-        except Exception as exc:
-            error_message, status_code = _error_details(exc)
-            emit_sagemaker_span(
-                operation_name=operation_name,
-                api_params=api_params,
-                start_ns=start_ns,
-                error_message=error_message,
-                status_code=status_code,
-                trace_id=trace_id,
-                parent_id=parent_id,
+            payload = (
+                (
+                    self.stream.payload()
+                    if self.streaming
+                    else (decode(bytes(self.chunks)) if self.chunks else None)
+                )
+                if not self.done and self.check()
+                else None
             )
-            raise
+            self.finish(payload=payload)
+        except Exception:  # noqa: BLE001 - native generator cleanup must not expose observer faults.
+            self.allowed = False
+            self.finish()
 
-        if operation_name in STREAMING_OPERATIONS:
-            return _wrap_streaming_response(
-                response=response,
-                operation_name=operation_name,
-                api_params=api_params,
-                start_ns=start_ns,
-                trace_id=trace_id,
-                parent_id=parent_id,
-            )
+    def tap_close(self, body):
+        def closer(original):
+            def close(*args, **kwargs):
+                try:
+                    return original(*args, **kwargs)
+                except BaseException as error:
+                    self.finish(error=error)
+                    raise
+                finally:
+                    self.finish_observed()
 
-        response, response_payload = capture_invoke_response_payload(response)
-        if response_payload is None:
-            response_payload = response
-        emit_sagemaker_span(
-            operation_name=operation_name,
-            api_params=api_params,
-            start_ns=start_ns,
-            response_payload=response_payload,
-            status_code=_status_code_from_response(response),
-            trace_id=trace_id,
-            parent_id=parent_id,
-        )
-        return response
+            return close
 
-    return wrapper
+        self.tap(body, "close", closer)
+
+    def finish(self, payload=None, error=None):
+        if self.done:
+            return
+        try:
+            allowed = self.check()
+            if self.span.is_recording():
+                if allowed:
+                    attrs = build_sagemaker_attrs(
+                        operation_name=self.operation,
+                        params=self.params,
+                        body=self.body,
+                        payload=payload,
+                        response_fields=self.fields,
+                        streaming=self.streaming,
+                    )
+                    if error is not None and payload is None:
+                        payload = (
+                            self.stream.payload()
+                            if self.streaming and self.stream.data
+                            else (decode(bytes(self.chunks)) if self.chunks else None)
+                        )
+                        attrs = build_sagemaker_attrs(
+                            operation_name=self.operation,
+                            params=self.params,
+                            body=self.body,
+                            payload=payload,
+                            response_fields=self.fields,
+                            streaming=self.streaming,
+                        )
+                    self.span.set_attributes(attrs)
+                    self.span.set_attributes(self.structural)
+                if self.http is not None:
+                    self.span.set_attribute(HTTP_RESPONSE_STATUS_CODE, self.http)
+                if error is not None:
+                    self.span.set_status(Status(StatusCode.ERROR))
+                    self.span.set_attribute(
+                        ERROR_TYPE, type.__getattribute__(type(error), "__name__")
+                    )
+                    if isinstance(error, (ClientError, EventStreamError)):
+                        code = _http_code(error.response)
+                        if self.http is None and code is not None:
+                            self.span.set_attribute(HTTP_RESPONSE_STATUS_CODE, code)
+                        source = error.response.get("Error", {})
+                        message = (
+                            source.get("Message") if type(source) is dict else None
+                        )
+                    else:
+                        message = next(
+                            (
+                                v
+                                for v in BaseException.args.__get__(error)
+                                if type(v) is str
+                            ),
+                            None,
+                        )
+                    if allowed and type(message) is str:
+                        self.span.set_attribute(ERROR_MESSAGE, safe_text(message))
+                self.check()
+        except Exception:  # noqa: BLE001 - telemetry errors never replace native outcomes.
+            self.allowed = False
+            self.scrub()
+            logger.debug("SageMaker telemetry finalization failed")
+        finally:
+            self.done = True
+            try:
+                self.span.end()
+            except Exception:  # noqa: BLE001 - telemetry faults must preserve native SDK behavior.
+                logger.debug("SageMaker telemetry span end failed")
+            if self.policy:
+                self.policy.on_end(self.span)
+            for ref, name, stored, present, owned in self.undo:
+                obj = ref()
+                if obj is not None and getattr(obj, name, None) is owned:
+                    try:
+                        if present:
+                            setattr(obj, name, stored)
+                        else:
+                            delattr(obj, name)
+                    except Exception:  # noqa: BLE001 - telemetry faults must preserve native SDK behavior.
+                        logger.debug("SageMaker telemetry tap cleanup failed")
+            self.undo.clear()
+            self.params = {}
+            self.body = None
+            self.chunks.clear()
+            self.stream.clear()
+            self.fields = {}
+            self.manager.states.discard(self)
+
+
+@contextmanager
+def _scope(state):
+    token = None
+    private = None
+    try:
+        try:
+            if state:
+                if not state.check():
+                    private = context.attach(
+                        context.set_value(ENABLE_CONTENT_TRACING_KEY, False)
+                    )
+                token = context.attach(trace.set_span_in_context(state.span))
+        except Exception:  # noqa: BLE001 - telemetry context faults cannot prevent native calls.
+            if state:
+                state.allowed = False
+                state.scrub()
+            logger.debug("SageMaker telemetry context startup failed")
+        yield
+    finally:
+        try:
+            if state and not state.done:
+                state.check()
+        except Exception:  # noqa: BLE001 - telemetry context faults cannot mask native outcomes.
+            if state:
+                state.allowed = False
+                state.scrub()
+            logger.debug("SageMaker telemetry policy check failed")
+        if token:
+            try:
+                context.detach(token)
+            except Exception:  # noqa: BLE001 - telemetry faults must preserve native SDK behavior.
+                logger.debug("SageMaker telemetry context cleanup failed")
+        if private:
+            try:
+                context.detach(private)
+            except Exception:  # noqa: BLE001 - telemetry faults must preserve native SDK behavior.
+                logger.debug("SageMaker telemetry privacy cleanup failed")
+
+
+def _wrap(original):
+    @functools.wraps(original)
+    def call(client, operation_name, api_params=None):
+        if (
+            _MANAGER is None
+            or operation_name not in SUPPORTED_OPERATIONS
+            or client.meta.service_model.service_name != "sagemaker-runtime"
+            or suppressed()
+        ):
+            return original(client, operation_name, api_params)
+        state = None
+        try:
+            state = _Call(_MANAGER, operation_name, api_params)
+        except Exception:  # noqa: BLE001 - telemetry faults must preserve native SDK behavior.
+            logger.debug("SageMaker telemetry startup failed")
+        with _scope(state):
+            try:
+                result = original(client, operation_name, api_params)
+            except BaseException as error:
+                if state:
+                    state.finish(error=error)
+                raise
+            if state:
+                state.response(result)
+            return result
+
+    return call
 
 
 class SageMakerInstrumentor:
-    """Respan instrumentor for the AWS SageMaker Runtime boto3 client."""
+    name = "sagemaker"
 
-    name = SAGEMAKER_INSTRUMENTATION_NAME
+    def __init__(self, *, capture_content=True, tracer_provider=None):
+        self.capture_content = capture_content
+        self.provider = tracer_provider
+        self.active = False
 
-    def __init__(self) -> None:
-        self._is_instrumented = False
-
-    def activate(self) -> None:
-        """Monkey-patch botocore's SageMaker Runtime call path."""
-        global _activation_count, _original_make_api_call, _patched_make_api_call
-
-        try:
-            base_client = _load_base_client_class()
-        except (AttributeError, ImportError) as exc:
-            logger.warning(
-                "Failed to activate SageMaker instrumentation - missing dependency: %s",
-                exc,
-            )
-            return
-        with _activation_lock:
-            if self._is_instrumented:
+    def activate(self):
+        global _PATCH, _MANAGER
+        with _LOCK:
+            if self.active:
                 return
-            if _activation_count == 0:
-                _original_make_api_call = base_client._make_api_call
-                _patched_make_api_call = _wrap_make_api_call(_original_make_api_call)
-                base_client._make_api_call = _patched_make_api_call
-            _activation_count += 1
-            RespanTracer().get_tracer()
-            self._is_instrumented = True
-        logger.info("SageMaker instrumentation activated")
-
-    def deactivate(self) -> None:
-        """Restore botocore's original call path."""
-        global _activation_count, _original_make_api_call, _patched_make_api_call
-
-        if not self._is_instrumented:
-            return
-
-        with _activation_lock:
-            self._is_instrumented = False
-            _activation_count = max(_activation_count - 1, 0)
-            if _activation_count:
-                return
-            try:
-                base_client = _load_base_client_class()
-                if (
-                    _original_make_api_call is not None
-                    and base_client._make_api_call is _patched_make_api_call
-                ):
-                    base_client._make_api_call = _original_make_api_call
-            except Exception:
-                logger.debug(
-                    "Failed to deactivate SageMaker instrumentation", exc_info=True
+            if _MANAGER is not None and (
+                _MANAGER.capture != self.capture_content
+                or _MANAGER.provider is not self.provider
+            ):
+                raise RuntimeError(
+                    "SageMaker instrumentation already active with different configuration"
                 )
-            finally:
-                _original_make_api_call = None
-                _patched_make_api_call = None
-                logger.info("SageMaker instrumentation deactivated")
+            if not _OWNERS:
+                manager = None
+                try:
+                    manager = _Manager(self.capture_content, self.provider)
+                    original = inspect.getattr_static(BaseClient, "_make_api_call")
+                    owned = _wrap(original)
+                    BaseClient._make_api_call = owned
+                    _PATCH = (original, owned)
+                    _MANAGER = manager
+                except Exception:
+                    if manager:
+                        manager.close()
+                    raise
+            _OWNERS.add(self)
+            self.active = True
+
+    def deactivate(self):
+        global _PATCH, _MANAGER
+        with _LOCK:
+            if not self.active:
+                return
+            self.active = False
+            _OWNERS.discard(self)
+            if _OWNERS:
+                return
+            if _MANAGER:
+                _MANAGER.close()
+            if (
+                _PATCH
+                and inspect.getattr_static(BaseClient, "_make_api_call") is _PATCH[1]
+            ):
+                BaseClient._make_api_call = _PATCH[0]
+            _PATCH = None
+            _MANAGER = None
