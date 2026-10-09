@@ -1,4 +1,5 @@
 import type { ReadableSpan } from "@opentelemetry/sdk-trace-base";
+import { types } from "node:util";
 import {
   ATTR_GEN_AI_OPERATION_NAME,
   ATTR_GEN_AI_TOOL_CALL_ARGUMENTS,
@@ -94,19 +95,70 @@ export function setMetadata(
   }
 }
 
-export function setDefault(attrs: SpanAttributes, key: string, value: any): void {
+export function setDefault(
+  attrs: SpanAttributes,
+  key: string,
+  value: any,
+): void {
   if (attrs[key] === undefined && value !== undefined && value !== null) {
     attrs[key] = value;
   }
 }
 
 export function safeJsonStr(value: unknown): string {
-  if (value === undefined || value === null) return "";
+  if (value === undefined) return "";
   if (typeof value === "string") return value;
   try {
-    return JSON.stringify(value);
+    return JSON.stringify(dataSnapshot(value));
   } catch {
-    return String(value);
+    return "[unavailable]";
+  }
+}
+
+/** Copy data without invoking caller getters, toJSON, or custom iterators. */
+function dataSnapshot(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (typeof value === "function" || typeof value === "symbol")
+    return undefined;
+  if (value === null || typeof value !== "object")
+    return typeof value === "bigint" ? value.toString() : value;
+  if (types.isProxy(value)) return "[unavailable]";
+  if (seen.has(value)) return "[circular]";
+  seen.add(value);
+  try {
+    if (types.isDate(value)) return Date.prototype.toISOString.call(value);
+    if (Buffer.isBuffer(value))
+      return {
+        type: "Buffer",
+        data: Array.from(Uint8Array.prototype.values.call(value)),
+      };
+    if (types.isTypedArray(value))
+      return Array.from(Uint8Array.prototype.values.call(value));
+    if (types.isMap(value))
+      return Array.from(Map.prototype.entries.call(value), ([key, item]) => [
+        dataSnapshot(key, seen),
+        dataSnapshot(item, seen),
+      ]);
+    if (types.isSet(value))
+      return Array.from(Set.prototype.values.call(value), (item) =>
+        dataSnapshot(item, seen),
+      );
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const result: Record<string, unknown> | unknown[] = Array.isArray(value)
+      ? []
+      : {};
+    for (const [key, descriptor] of Object.entries(descriptors)) {
+      if (descriptor.enumerable && "value" in descriptor) {
+        Object.defineProperty(result, key, {
+          value: dataSnapshot(descriptor.value, seen),
+          enumerable: true,
+          configurable: true,
+          writable: true,
+        });
+      }
+    }
+    return result;
+  } finally {
+    seen.delete(value);
   }
 }
 
@@ -117,20 +169,24 @@ export function safeJsonStr(value: unknown): string {
  * drift, degenerate-vector detection); size is handled by storage tiering at
  * ingest, not by dropping data here.
  */
-export function formatEmbeddingInput(attrs: SpanAttributes): string | undefined {
+export function formatEmbeddingInput(
+  attrs: SpanAttributes,
+): string | undefined {
   const value = attrs[AI_VALUE] ?? attrs[AI_VALUES];
   if (value === undefined || value === null) return undefined;
   return safeJsonStr(normalizeEmbeddingValue(value));
 }
 
-export function formatEmbeddingOutput(attrs: SpanAttributes): string | undefined {
+export function formatEmbeddingOutput(
+  attrs: SpanAttributes,
+): string | undefined {
   const raw = attrs[AI_EMBEDDING] ?? attrs[AI_EMBEDDINGS];
   if (raw === undefined || raw === null) return undefined;
   return safeJsonStr(normalizeEmbeddingValue(raw));
 }
 
 export function safeJsonParse(value: unknown): unknown {
-  if (typeof value !== "string") return value;
+  if (typeof value !== "string") return dataSnapshot(value);
   try {
     return JSON.parse(value);
   } catch {
@@ -157,10 +213,17 @@ function normalizeEmbeddingValue(value: unknown): unknown {
 }
 
 export function isRecord(value: unknown): value is Record<string, any> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !types.isProxy(value) &&
+    !Array.isArray(value)
+  );
 }
 
-export function instrumentationScopeName(span: Partial<ReadableSpan> | any): string | undefined {
+export function instrumentationScopeName(
+  span: Partial<ReadableSpan> | any,
+): string | undefined {
   return span.instrumentationScope?.name;
 }
 
@@ -171,7 +234,10 @@ export function isVercelAIScope(scopeName: unknown): boolean {
   return VERCEL_AI_SCOPE_NAMES.has(scopeName) || scopeName.includes("ai-sdk");
 }
 
-export function modernOperationName(name: string, attrs: SpanAttributes = {}): string | undefined {
+export function modernOperationName(
+  name: string,
+  attrs: SpanAttributes = {},
+): string | undefined {
   const fromAttrs = attrs[ATTR_GEN_AI_OPERATION_NAME];
   if (fromAttrs !== undefined && fromAttrs !== null) {
     return String(fromAttrs);
@@ -232,47 +298,58 @@ export function resolveLogType(name: string, attrs: SpanAttributes): string {
   }
 
   if (
-    attrs[AI_EMBEDDING] || attrs[AI_EMBEDDINGS] ||
-    name.includes("embed") || operationId?.includes("embed")
+    attrs[AI_EMBEDDING] ||
+    attrs[AI_EMBEDDINGS] ||
+    name.includes("embed") ||
+    operationId?.includes("embed")
   ) {
     return RespanLogType.EMBEDDING;
   }
 
   if (
-    attrs[AI_TOOL_CALL_ID] || attrs[AI_TOOL_CALL_NAME] ||
-    attrs[AI_TOOL_CALL_ARGS] || attrs[AI_TOOL_CALL_RESULT] ||
-    attrs[ATTR_GEN_AI_TOOL_CALL_ID] || attrs[ATTR_GEN_AI_TOOL_NAME] ||
-    attrs[ATTR_GEN_AI_TOOL_CALL_ARGUMENTS] || attrs[ATTR_GEN_AI_TOOL_CALL_RESULT] ||
+    attrs[AI_TOOL_CALL_ID] ||
+    attrs[AI_TOOL_CALL_NAME] ||
+    attrs[AI_TOOL_CALL_ARGS] ||
+    attrs[AI_TOOL_CALL_RESULT] ||
+    attrs[ATTR_GEN_AI_TOOL_CALL_ID] ||
+    attrs[ATTR_GEN_AI_TOOL_NAME] ||
+    attrs[ATTR_GEN_AI_TOOL_CALL_ARGUMENTS] ||
+    attrs[ATTR_GEN_AI_TOOL_CALL_RESULT] ||
     attrs[AI_RESPONSE_TOOL_CALLS] ||
-    name.includes("tool") || operationId?.includes("tool")
+    name.includes("tool") ||
+    operationId?.includes("tool")
   ) {
     return RespanLogType.TOOL;
   }
 
   if (
     attrs[AI_AGENT_ID] ||
-    name.includes("agent") || operationId?.includes("agent")
+    name.includes("agent") ||
+    operationId?.includes("agent")
   ) {
     return RespanLogType.AGENT;
   }
 
   if (
     attrs[AI_WORKFLOW_ID] ||
-    name.includes("workflow") || operationId?.includes("workflow")
+    name.includes("workflow") ||
+    operationId?.includes("workflow")
   ) {
     return RespanLogType.WORKFLOW;
   }
 
   if (
     attrs[AI_TRANSCRIPT] ||
-    name.includes("transcript") || operationId?.includes("transcript")
+    name.includes("transcript") ||
+    operationId?.includes("transcript")
   ) {
     return RespanLogType.TEXT;
   }
 
   if (
     attrs[AI_SPEECH] ||
-    name.includes("speech") || operationId?.includes("speech")
+    name.includes("speech") ||
+    operationId?.includes("speech")
   ) {
     return RespanLogType.TEXT;
   }
@@ -285,13 +362,5 @@ export function resolveLogType(name: string, attrs: SpanAttributes): string {
 }
 
 export function normalizeModel(modelId: string): string {
-  const model = modelId.toLowerCase();
-
-  if (model.includes("gemini-2.0-flash-001")) return "gemini/gemini-2.0-flash";
-  if (model.includes("gemini-2.0-pro")) return "gemini/gemini-2.0-pro-exp-02-05";
-  if (model.includes("claude-3-5-sonnet")) return "claude-3-5-sonnet-20241022";
-  if (model.includes("deepseek")) return `deepseek/${model}`;
-  if (model.includes("o3-mini")) return "o3-mini";
-
-  return model;
+  return modelId;
 }

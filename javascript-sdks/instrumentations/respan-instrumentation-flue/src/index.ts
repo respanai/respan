@@ -1,1137 +1,842 @@
-import { context, trace } from "@opentelemetry/api";
-import type { ReadableSpan } from "@opentelemetry/sdk-trace-base";
+import { types } from "node:util";
 import {
-  ATTR_ERROR_MESSAGE,
-  ATTR_GEN_AI_COMPLETION,
-  ATTR_GEN_AI_PROMPT,
-  ATTR_GEN_AI_REQUEST_MODEL,
-  ATTR_GEN_AI_SYSTEM,
-  ATTR_GEN_AI_USAGE_COMPLETION_TOKENS,
+  context,
+  createContextKey,
+  trace,
+  type Context,
+  type Span,
+  type SpanOptions,
+  type Tracer,
+} from "@opentelemetry/api";
+import { isTracingSuppressed } from "@opentelemetry/core";
+import {
+  ATTR_GEN_AI_TOOL_CALL_ID,
   ATTR_GEN_AI_USAGE_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_OUTPUT_TOKENS,
-  ATTR_GEN_AI_USAGE_PROMPT_TOKENS,
+  ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
+  ATTR_GEN_AI_RESPONSE_ID,
 } from "@opentelemetry/semantic-conventions/incubating";
+import { RespanLogType, RespanSpanAttributes } from "@respan/respan-sdk";
 import {
-  RespanLogType,
-  RespanSpanAttributes,
-} from "@respan/respan-sdk";
-import {
-  buildReadableSpan,
-  ensureTraceId,
-  injectSpan,
-} from "@respan/tracing";
-import { SpanAttributes } from "@traceloop/ai-semantic-conventions";
-import type {
-  FlueContext,
-  FlueEvent,
-  FlueEventSubscriber,
-  LlmAssistantMessage,
-  LlmMessage,
-  LlmTool,
-  LlmToolCall,
-  PromptUsage,
-} from "@flue/runtime";
+  CONTEXT_KEY_ALLOW_TRACE_CONTENT,
+  SpanAttributes,
+} from "@traceloop/ai-semantic-conventions";
 
-const PACKAGE_VERSION = "0.1.0";
-const INSTRUMENTATION_NAME = "@respan/instrumentation-flue";
-const FLUE_INSTRUMENTATION_NAME = "flue";
-const RESPAN_LOG_METHOD_TS_TRACING = "ts_tracing";
-const STATUS_CODE_ATTR = "status_code";
-
-const GEN_AI_COMPLETION_PREFIX = `${ATTR_GEN_AI_COMPLETION}.0`;
-const GEN_AI_COMPLETION_ROLE = `${GEN_AI_COMPLETION_PREFIX}.role`;
-const GEN_AI_COMPLETION_CONTENT = `${GEN_AI_COMPLETION_PREFIX}.content`;
-const GEN_AI_COMPLETION_TOOL_CALLS = `${GEN_AI_COMPLETION_PREFIX}.tool_calls`;
-
-type FlueObserve = (subscriber: FlueEventSubscriber) => () => void;
+type Event = Record<string, any>;
+type Subscriber = (event: Event, ctx?: unknown) => void;
+type Disposer = () => void | Promise<void>;
 
 export interface FlueRuntimeModule {
-  observe?: FlueObserve;
+  observe?: (subscriber: Subscriber) => Disposer;
+  instrument?: (instrumentation: any) => Disposer;
 }
 
 export interface FlueInstrumentorOptions {
   runtimeModule?: FlueRuntimeModule;
   workflowName?: string;
+  traceContent?: boolean;
 }
 
-interface StartedEvent {
-  timestamp: string;
-  event: FlueEvent;
+interface RecordState {
+  span: Span;
+  native: Span;
+  event: Event;
+  denied: boolean;
+  parent?: RecordState;
+  parentSpan?: Span;
+  ended: boolean;
+  readable?: { attributes: Event; events: any[]; status: Event };
 }
 
-interface PendingCompaction {
-  event: Extract<FlueEvent, { type: "compaction" }>;
-  start?: StartedEvent;
-}
-
-interface TurnState {
-  start?: StartedEvent;
-  request?: Extract<FlueEvent, { type: "turn_request" }>;
-}
-
-interface ToolState {
-  start?: StartedEvent;
-}
-
-interface SpanInput {
-  name: string;
-  logType: RespanLogType;
-  entityName: string;
-  event: FlueEvent;
-  attributes?: Record<string, unknown>;
-  input?: unknown;
-  output?: unknown;
-  start?: StartedEvent;
-  durationMs?: number;
-  error?: unknown;
-  parentId?: string;
-  spanId?: string;
-  statusCode?: number;
+interface Registration {
+  runtime: FlueRuntimeModule;
+  owner: FlueInstrumentor;
+  owners: Set<FlueInstrumentor>;
+  traceContent?: boolean;
   workflowName?: string;
 }
+const registrations = new WeakMap<FlueRuntimeModule, Registration>();
 
+// These are accepted privacy signals, not exported telemetry aliases.
+const CONTENT_FLAGS = [
+  "allow_trace_content",
+  "trace_content",
+  "traceloop.trace_content",
+  "respan.trace_content",
+];
+const LM_SUPPRESSION = createContextKey(
+  "suppress_language_model_instrumentation",
+);
+const recordsBySpan = new WeakMap<object, RecordState>();
+const recordsById = new Map<string, RecordState>();
+const VERSION = "0.1.0";
+
+/** Reuses Flue's official lifecycle and interceptor with canonical, complete content. */
 export class FlueInstrumentor {
-  public readonly name = FLUE_INSTRUMENTATION_NAME;
+  readonly name = "flue";
+  private active = false;
+  private activating?: Promise<void>;
+  private dispose?: Disposer;
+  private delegate?: {
+    observe: Subscriber;
+    interceptor?: any;
+    dispose?: Disposer;
+  };
+  private readonly records = new Set<RecordState>();
+  private currentEvent?: Event;
+  private registration?: Registration;
 
-  private readonly _runtimeModule?: FlueRuntimeModule;
-  private readonly _fallbackWorkflowName?: string;
-  private _unsubscribe?: () => void;
-  private _isActive = false;
+  constructor(private readonly options: FlueInstrumentorOptions = {}) {}
 
-  private readonly _traceIds = new Map<string, string>();
-  private readonly _workflowNames = new Map<string, string>();
-  private readonly _runStarts = new Map<string, StartedEvent>();
-  private readonly _agentStarts = new Map<string, StartedEvent>();
-  private readonly _operationStarts = new Map<string, Map<string, StartedEvent>>();
-  private readonly _exportedOperationSpanIds = new Map<string, Set<string>>();
-  private readonly _pendingCompactions = new Map<string, PendingCompaction[]>();
-  private readonly _taskStarts = new Map<string, StartedEvent>();
-  private readonly _toolStarts = new Map<string, ToolState>();
-  private readonly _turns = new Map<string, TurnState>();
-  private readonly _compactionStarts = new Map<string, StartedEvent>();
-
-  constructor(options: FlueInstrumentorOptions = {}) {
-    this._runtimeModule = options.runtimeModule;
-    this._fallbackWorkflowName = options.workflowName;
+  activate(): Promise<void> {
+    if (this.activating) return this.activating;
+    if (this.active) return Promise.resolve();
+    this.active = true;
+    this.activating = this.install()
+      .catch((error) => {
+        this.active = false;
+        throw error;
+      })
+      .finally(() => {
+        this.activating = undefined;
+      });
+    return this.activating;
   }
 
-  async activate(): Promise<void> {
-    if (this._isActive) {
+  private async install(): Promise<void> {
+    const runtime: FlueRuntimeModule =
+      this.options.runtimeModule ??
+      ((await import("@flue/runtime")) as unknown as FlueRuntimeModule);
+    const upstream: any = await import("@flue/opentelemetry");
+    if (!this.active) return;
+    const existing = registrations.get(runtime);
+    if (existing) {
+      if (
+        existing.traceContent !== (this.options.traceContent !== false) ||
+        existing.workflowName !== this.options.workflowName
+      )
+        throw new Error(
+          "Flue instrumentors sharing a runtime must use the same content and workflow options.",
+        );
+      existing.owners.add(this);
+      this.registration = existing;
       return;
     }
-
-    const runtime = this._runtimeModule ?? await this._resolveRuntimeModule();
-    if (!runtime?.observe) {
-      return;
+    const registration: Registration = {
+      runtime,
+      owner: this,
+      owners: new Set([this]),
+      traceContent: this.options.traceContent !== false,
+      workflowName: this.options.workflowName,
+    };
+    const tracer: Tracer = {
+      startSpan: (name, options, parent) =>
+        this.startSpan(name, options, parent),
+      startActiveSpan: (..._args: any[]): any => {
+        throw new Error("Flue adapter must use startSpan");
+      },
+    };
+    if (runtime.instrument && upstream.createOpenTelemetryInstrumentation) {
+      const native = upstream.createOpenTelemetryInstrumentation({
+        tracer,
+        content: false,
+      });
+      this.delegate = native;
+      this.dispose = runtime.instrument({
+        ...native,
+        observe: (event: Event, ctx: unknown) => this.handleEvent(event, ctx),
+      });
+    } else if (runtime.observe && upstream.createOpenTelemetryObserver) {
+      this.delegate = {
+        observe: upstream.createOpenTelemetryObserver({
+          tracer,
+          exportContent: () => undefined,
+          resolveRootContext: () => context.active(),
+        }),
+      };
+      this.dispose = runtime.observe((event: Event, ctx: unknown) =>
+        this.handleEvent(event, ctx),
+      );
+    } else {
+      this.active = false;
+      throw new Error(
+        "Install matching released @flue/runtime and @flue/opentelemetry versions (beta.1 or 2.2.2).",
+      );
     }
-
-    this._unsubscribe = runtime.observe((event, ctx) => {
-      this.handleEvent(event, ctx);
-    });
-    this._isActive = true;
+    this.registration = registration;
+    registrations.set(runtime, registration);
   }
 
-  deactivate(): void {
-    this._unsubscribe?.();
-    this._unsubscribe = undefined;
-    this._isActive = false;
-    this._flushAllPendingCompactions();
-    this._traceIds.clear();
-    this._workflowNames.clear();
-    this._runStarts.clear();
-    this._agentStarts.clear();
-    this._operationStarts.clear();
-    this._exportedOperationSpanIds.clear();
-    this._pendingCompactions.clear();
-    this._taskStarts.clear();
-    this._toolStarts.clear();
-    this._turns.clear();
-    this._compactionStarts.clear();
+  async deactivate(): Promise<void> {
+    this.active = false;
+    await this.activating;
+    const registration = this.registration;
+    if (registration) {
+      registration.owners.delete(this);
+      if (registration.owner !== this) this.registration = undefined;
+      if (registration.owners.size) return;
+      registrations.delete(registration.runtime);
+      await registration.owner.stopRegistration();
+      registration.owner.registration = undefined;
+      return;
+    }
+    await this.stopRegistration();
+  }
+
+  private async stopRegistration(): Promise<void> {
+    const dispose = this.dispose;
+    this.dispose = undefined;
+    await dispose?.();
+    for (const record of this.records) {
+      if (!record.ended) record.span.end();
+      recordsById.delete(spanKey(record.native));
+    }
+    this.records.clear();
+    this.delegate = undefined;
   }
 
   isActive(): boolean {
-    return this._isActive;
+    return this.active;
   }
 
-  handleEvent(event: FlueEvent, _ctx?: FlueContext): void {
-    switch (event.type) {
-      case "run_start":
-        this._runStarts.set(event.runId, { event, timestamp: event.startedAt ?? event.timestamp });
-        this._workflowNames.set(this._traceKey(event), event.workflowName);
-        break;
-      case "run_resume":
-        this._runStarts.set(event.runId, { event, timestamp: event.startedAt ?? event.timestamp });
-        this._workflowNames.set(this._traceKey(event), event.workflowName);
-        break;
-      case "run_end":
-        this._emitRunEnd(event);
-        break;
-      case "agent_start":
-        this._agentStarts.set(this._agentKey(event), { event, timestamp: event.timestamp });
-        break;
-      case "agent_end":
-        this._emitAgentEnd(event);
-        break;
-      case "operation_start":
-        this._rememberOperationStart(event);
-        break;
-      case "operation":
-        this._emitOperation(event);
-        break;
-      case "task_start":
-        this._taskStarts.set(event.taskId, { event, timestamp: event.timestamp });
-        break;
-      case "task":
-        this._emitTask(event);
-        break;
-      case "tool_start":
-        this._toolStarts.set(this._toolKey(event), {
-          start: { event, timestamp: event.timestamp },
-        });
-        break;
-      case "tool":
-        this._emitTool(event);
-        break;
-      case "turn_start":
-        this._upsertTurn(event.turnId).start = { event, timestamp: event.timestamp };
-        break;
-      case "turn_request":
-        this._upsertTurn(event.turnId).request = event;
-        break;
-      case "turn":
-        this._emitTurn(event);
-        break;
-      case "compaction_start":
-        this._compactionStarts.set(this._compactionKey(event), { event, timestamp: event.timestamp });
-        break;
-      case "compaction":
-        this._handleCompaction(event);
-        break;
-      case "log":
-        this._emitLog(event);
-        break;
-      case "submission_settled":
-        this._emitSubmissionSettled(event);
-        break;
-      case "idle":
-      case "message_start":
-      case "message_end":
-      case "turn_messages":
-      case "text_delta":
-      case "thinking_start":
-      case "thinking_delta":
-      case "thinking_end":
-        break;
-    }
-  }
-
-  private async _resolveRuntimeModule(): Promise<FlueRuntimeModule | undefined> {
-    try {
-      return (await import("@flue/runtime")) as unknown as FlueRuntimeModule;
-    } catch {
-      return undefined;
-    }
-  }
-
-  private _emitRunEnd(event: Extract<FlueEvent, { type: "run_end" }>): void {
-    const start = this._runStarts.get(event.runId);
-    const workflowName =
-      this._workflowNames.get(this._traceKey(event)) ??
-      startEventValue(start, "workflowName") ??
-      this._fallbackWorkflowName ??
-      "flue.workflow";
-
-    this._emitSpan({
-      name: `flue.workflow.${workflowName}`,
-      logType: RespanLogType.WORKFLOW,
-      entityName: String(workflowName),
-      event,
-      input: startEventValue(start, "payload"),
-      output: event.isError ? errorOutput(event.error) : event.result,
-      start,
-      durationMs: event.durationMs,
-      error: event.error,
-      spanId: this._workflowSpanId(event),
-      workflowName: String(workflowName),
-    });
-    this._runStarts.delete(event.runId);
-    this._flushPendingCompactionsForTrace(event);
-    this._clearOperationState(this._traceKey(event));
-  }
-
-  private _emitAgentEnd(event: Extract<FlueEvent, { type: "agent_end" }>): void {
-    const start = this._agentStarts.get(this._agentKey(event));
-    const entityName = this._agentName(event);
-    this._emitSpan({
-      name: `flue.agent.${entityName}`,
-      logType: RespanLogType.AGENT,
-      entityName,
-      event,
-      input: this._identityInput(event),
-      output: { messages: event.messages },
-      start,
-      spanId: this._agentSpanId(event),
-      parentId: this._rootParentId(event),
-    });
-    this._agentStarts.delete(this._agentKey(event));
-    if (!event.runId) {
-      this._settleDirectAgentOperationState(event);
-    }
-  }
-
-  private _emitOperation(event: Extract<FlueEvent, { type: "operation" }>): void {
-    const traceKey = this._traceKey(event);
-    const start = this._operationStarts.get(traceKey)?.get(event.operationId);
-    const logType = event.operationKind === "shell" ? RespanLogType.TOOL : RespanLogType.TASK;
-    this._emitSpan({
-      name: `flue.operation.${event.operationKind}`,
-      logType,
-      entityName: `flue.${event.operationKind}`,
-      event,
-      input: {
-        operationId: event.operationId,
-        operationKind: event.operationKind,
-      },
-      output: event.isError ? errorOutput(event.error) : event.result,
-      start,
-      durationMs: event.durationMs,
-      error: event.error,
-      spanId: this._operationSpanId(event),
-      parentId: this._rootOrAgentParentId(event),
-      attributes: {
-        [metadataKey("flue_operation_kind")]: event.operationKind,
-      },
-    });
-    this._rememberExportedOperationSpan(event);
-    this._flushPendingCompactionsForOperation(event);
-    const traceStarts = this._operationStarts.get(traceKey);
-    traceStarts?.delete(event.operationId);
-    if (traceStarts?.size === 0) {
-      this._operationStarts.delete(traceKey);
-    }
-    if (!event.runId && !this._agentStarts.has(this._agentKey(event))) {
-      this._forgetExportedOperationSpan(event);
-      if (
-        !this._operationStarts.has(traceKey) &&
-        !this._pendingCompactions.has(traceKey)
-      ) {
-        this._clearOperationState(traceKey);
-      }
-    }
-  }
-
-  private _emitTask(event: Extract<FlueEvent, { type: "task" }>): void {
-    const start = this._taskStarts.get(event.taskId);
-    const taskStart = start?.event as Extract<FlueEvent, { type: "task_start" }> | undefined;
-    const entityName = taskStart?.agent ? `flue.task.${taskStart.agent}` : "flue.task";
-    this._emitSpan({
-      name: entityName,
-      logType: RespanLogType.TASK,
-      entityName,
-      event,
-      input: {
-        prompt: taskStart?.prompt,
-        agent: taskStart?.agent ?? event.agent,
-        cwd: taskStart?.cwd,
-      },
-      output: event.isError ? errorOutput(event.result) : event.result,
-      start,
-      durationMs: event.durationMs,
-      error: event.isError ? event.result : undefined,
-      spanId: this._taskSpanId(event),
-      parentId: this._operationOrRootParentId(event),
-      attributes: {
-        [metadataKey("flue_task_agent")]: taskStart?.agent ?? event.agent,
-      },
-    });
-    this._taskStarts.delete(event.taskId);
-  }
-
-  private _emitTool(event: Extract<FlueEvent, { type: "tool" }>): void {
-    const state = this._toolStarts.get(this._toolKey(event));
-    const startEvent = state?.start?.event as Extract<FlueEvent, { type: "tool_start" }> | undefined;
-    this._emitSpan({
-      name: `flue.tool.${event.toolName}`,
-      logType: RespanLogType.TOOL,
-      entityName: event.toolName,
-      event,
-      input: {
-        name: event.toolName,
-        arguments: startEvent?.args,
-      },
-      output: event.isError ? errorOutput(event.result) : event.result,
-      start: state?.start,
-      durationMs: event.durationMs,
-      error: event.isError ? event.result : undefined,
-      spanId: this._toolSpanId(event),
-      parentId: this._operationOrRootParentId(event),
-    });
-    this._toolStarts.delete(this._toolKey(event));
-  }
-
-  private _emitTurn(event: Extract<FlueEvent, { type: "turn" }>): void {
-    const state = this._turns.get(event.turnId);
-    const request = state?.request;
-    const attributes: Record<string, unknown> = {
-      [SpanAttributes.LLM_REQUEST_TYPE]: RespanLogType.CHAT,
-      [metadataKey("flue_turn_purpose")]: event.purpose,
-    };
-
-    const provider = request?.provider ?? event.provider;
-    const model = request?.model ?? event.model;
-    if (provider) {
-      attributes[ATTR_GEN_AI_SYSTEM] = normalizeProvider(provider);
-    }
-    if (model) {
-      attributes[ATTR_GEN_AI_REQUEST_MODEL] = normalizeModel(model, provider);
-    }
-    if (request?.api) {
-      attributes[metadataKey("flue_model_api")] = request.api;
-    } else if (event.api) {
-      attributes[metadataKey("flue_model_api")] = event.api;
-    }
-    if (request?.reasoning) {
-      attributes[metadataKey("flue_reasoning")] = request.reasoning;
-    }
-
-    if (request?.input) {
-      addPromptAttributes(attributes, request.input.systemPrompt, request.input.messages);
-      if (request.input.tools && request.input.tools.length > 0) {
-        attributes[SpanAttributes.LLM_REQUEST_FUNCTIONS] = safeJson(
-          request.input.tools.map(toToolDefinition),
-        );
-      }
-    }
-    if (event.output) {
-      addCompletionAttributes(attributes, event.output);
-    }
-    addUsageAttributes(attributes, event.usage);
-
-    this._emitSpan({
-      name: `flue.turn.${event.purpose}`,
-      logType: RespanLogType.CHAT,
-      entityName: `flue.${event.purpose}.turn`,
-      event,
-      input: request?.input,
-      output: event.isError ? errorOutput(event.error) : event.output,
-      start: state?.start,
-      durationMs: event.durationMs,
-      error: event.error,
-      spanId: this._turnSpanId(event),
-      parentId: this._operationOrRootParentId(event),
-      attributes,
-    });
-    this._turns.delete(event.turnId);
-  }
-
-  private _handleCompaction(event: Extract<FlueEvent, { type: "compaction" }>): void {
-    const start = this._compactionStarts.get(this._compactionKey(event));
-    this._compactionStarts.delete(this._compactionKey(event));
-    const pending = { event, start };
-
-    if (event.operationId) {
-      const operationSpanId = this._operationSpanId(event as FlueEvent & { operationId: string });
-      if (this._hasExportedOperationSpan(event, operationSpanId)) {
-        this._emitCompaction(pending, operationSpanId);
-        return;
-      }
-      this._queuePendingCompaction(pending);
+  handleEvent(event: Event, ctx?: unknown): void {
+    if ((!this.active && !this.registration?.owners.size) || !this.delegate)
       return;
+    try {
+      // Policy is evaluated before copying/converting caller-owned content.
+      const skeleton = eventSkeleton(event);
+      const ambient = context.active();
+      const terminal = [
+        "turn",
+        "tool",
+        "task",
+        "operation",
+        "compaction",
+        "run_end",
+      ].includes(skeleton.type);
+      const lateSuppression = suppressed(ambient);
+      if (lateSuppression && !terminal) return;
+      this.currentEvent = skeleton;
+      const matching = [...this.records].filter(
+        (record) => !record.ended && matches(record.event, skeleton),
+      );
+      if (lateSuppression) for (const record of matching) record.denied = true;
+      for (const record of this.records) {
+        if (
+          !record.ended &&
+          record.event.instanceId === skeleton.instanceId &&
+          record.event.runId === skeleton.runId &&
+          (record.event.operationId === undefined ||
+            record.event.operationId === skeleton.operationId)
+        )
+          this.updatePolicy(record, ambient);
+      }
+      // Start upstream spans before content capture so the SDK sampler decides first.
+      if (!terminal) this.delegate.observe(adapterEvent(skeleton), ctx);
+      const targets = terminal
+        ? matching
+        : [...this.records].filter(
+            (record) => !record.ended && record.event === skeleton,
+          );
+      const allowed =
+        contentAllowed(this.options.traceContent, ambient) &&
+        targets.some((record) => record.native.isRecording()) &&
+        targets.every((record) => !record.denied);
+      const snapshot = allowed ? (safeCopy(event) as Event) : skeleton;
+      for (const record of targets) this.mapEvent(record, snapshot ?? skeleton);
+      // The adapter receives structural fields only; its content budget never
+      // shortens canonical payloads or performs caller-content conversion.
+      if (terminal) this.delegate.observe(adapterEvent(skeleton), ctx);
+    } catch {
+      // Telemetry must not affect native results, callback errors, or cancellation.
+    } finally {
+      this.currentEvent = undefined;
     }
-
-    this._emitCompaction(pending, this._rootOrAgentParentId(event));
   }
 
-  private _emitCompaction(
-    pending: PendingCompaction,
-    parentId: string | undefined,
-  ): void {
-    const { event, start } = pending;
-    const startEvent = start?.event as Extract<FlueEvent, { type: "compaction_start" }> | undefined;
-    const attributes: Record<string, unknown> = {
-      [metadataKey("flue_compaction_messages_before")]: event.messagesBefore,
-      [metadataKey("flue_compaction_messages_after")]: event.messagesAfter,
+  private startSpan(
+    name: string,
+    options: SpanOptions = {},
+    supplied: Context = context.active(),
+  ): Span {
+    const initial = this.currentEvent ?? {};
+    const ambient = context.active();
+    const native = trace
+      .getTracer("@respan/instrumentation-flue", VERSION)
+      .startSpan(name, options, supplied);
+    const parentSpan = trace.getSpan(supplied);
+    const parent = parentSpan && recordsBySpan.get(parentSpan);
+    const record: RecordState = {
+      native,
+      span: native,
+      event: initial,
+      ended: false,
+      parent,
+      parentSpan,
+      denied:
+        !contentAllowed(this.options.traceContent, ambient) ||
+        !contentAllowed(this.options.traceContent, supplied) ||
+        !ancestorAllows(parentSpan) ||
+        flagsDeny(options.attributes),
     };
-    if (startEvent?.reason) {
-      attributes[metadataKey("flue_compaction_reason")] = startEvent.reason;
-    }
-    if (startEvent?.estimatedTokens !== undefined) {
-      attributes[metadataKey("flue_compaction_estimated_tokens")] = startEvent.estimatedTokens;
-    }
-    addUsageMetadata(attributes, event.usage);
-
-    this._emitSpan({
-      name: "flue.compaction",
-      logType: RespanLogType.TASK,
-      entityName: "flue.compaction",
-      event,
-      input: {
-        reason: startEvent?.reason,
-        estimatedTokens: startEvent?.estimatedTokens,
-      },
-      output: {
-        messagesBefore: event.messagesBefore,
-        messagesAfter: event.messagesAfter,
-      },
-      start,
-      durationMs: event.durationMs,
-      error: event.error,
-      parentId,
-      spanId: this._compactionSpanId(event),
-      attributes,
-    });
-  }
-
-  private _emitLog(event: Extract<FlueEvent, { type: "log" }>): void {
-    this._emitSpan({
-      name: `flue.log.${event.level}`,
-      logType: RespanLogType.TASK,
-      entityName: `flue.log.${event.level}`,
-      event,
-      input: event.attributes ?? {},
-      output: { level: event.level, message: event.message },
-      parentId: this._operationOrRootParentId(event),
-      spanId: this._eventSpanId(event, `log:${event.eventIndex}`),
-      attributes: {
-        [metadataKey("flue_log_level")]: event.level,
-        [metadataKey("flue_log_message")]: event.message,
+    const proxy = new Proxy(native, {
+      get: (target, key) => {
+        if (key === "end")
+          return (time?: any) => {
+            if (record.ended) return;
+            this.updatePolicy(record, context.active());
+            if (record.denied) scrub(target);
+            stripVendorAttributes(target);
+            record.ended = true;
+            this.guardReadable(record);
+            target.end(time);
+            this.records.delete(record);
+            recordsById.delete(spanKey(target));
+          };
+        if (key === "setAttribute" || key === "setAttributes")
+          return (...args: any[]) => {
+            const attrs =
+              key === "setAttribute" ? { [args[0]]: args[1] } : args[0];
+            if (flagsDeny(attrs)) record.denied = true;
+            this.updatePolicy(record, context.active());
+            (target as any)[key](...args);
+            if (record.denied) scrub(target);
+            return proxy;
+          };
+        if (
+          key === "addEvent" ||
+          key === "recordException" ||
+          key === "setStatus"
+        )
+          return (...args: any[]) => {
+            this.updatePolicy(record, context.active());
+            if (record.denied) {
+              if (key === "setStatus") target.setStatus({ code: args[0].code });
+              return proxy;
+            }
+            (target as any)[key](...args);
+            return proxy;
+          };
+        const value = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
       },
     });
-  }
-
-  private _emitSubmissionSettled(event: Extract<FlueEvent, { type: "submission_settled" }>): void {
-    this._emitSpan({
-      name: `flue.submission.${event.outcome}`,
-      logType: RespanLogType.TASK,
-      entityName: `flue.submission.${event.outcome}`,
-      event,
-      input: { submissionId: event.submissionId },
-      output: {
-        outcome: event.outcome,
-        error: event.error,
-      },
-      error: event.outcome === "failed" ? event.error : undefined,
-      parentId: this._rootParentId(event),
-      spanId: this._eventSpanId(event, `submission:${event.submissionId}`),
-      attributes: {
-        [metadataKey("flue_submission_id")]: event.submissionId,
-        [metadataKey("flue_submission_outcome")]: event.outcome,
-      },
-    });
-  }
-
-  private _emitSpan(input: SpanInput): void {
-    const event = input.event;
-    const errorMessage = input.error === undefined ? undefined : errorMessageFrom(input.error);
-    const statusCode = input.statusCode ?? (errorMessage ? 500 : 200);
-    const attrs: Record<string, unknown> = {
-      [RespanSpanAttributes.RESPAN_LOG_METHOD]: RESPAN_LOG_METHOD_TS_TRACING,
-      [RespanSpanAttributes.RESPAN_LOG_TYPE]: input.logType,
-      [SpanAttributes.TRACELOOP_ENTITY_NAME]: input.entityName,
-      [SpanAttributes.TRACELOOP_ENTITY_PATH]: input.entityName,
-      ...(errorMessage
+    record.span = proxy;
+    recordsBySpan.set(proxy, record);
+    recordsBySpan.set(native, record);
+    recordsById.set(spanKey(native), record);
+    this.records.add(record);
+    const logType = classify(initial, name);
+    const entity =
+      initial.toolName ??
+      initial.agentName ??
+      initial.agent ??
+      (logType === RespanLogType.CHAT ? "llm" : logType);
+    native.setAttributes({
+      [RespanSpanAttributes.RESPAN_LOG_TYPE]: logType,
+      [SpanAttributes.TRACELOOP_ENTITY_NAME]: entity,
+      [SpanAttributes.TRACELOOP_ENTITY_PATH]: "",
+      ...(this.options.workflowName
         ? {
-            [ATTR_ERROR_MESSAGE]: errorMessage,
-            [STATUS_CODE_ATTR]: statusCode,
+            [SpanAttributes.TRACELOOP_WORKFLOW_NAME]: this.options.workflowName,
           }
         : {}),
-      [metadataKey("flue_event_type")]: event.type,
-      [metadataKey("flue_event_index")]: event.eventIndex,
-      ...identityMetadata(event),
-      ...input.attributes,
+      ...identityAttributes(initial),
+    });
+    return proxy;
+  }
+
+  private updatePolicy(record: RecordState, ambient: Context): void {
+    if (
+      !contentAllowed(this.options.traceContent, ambient) ||
+      !ancestorAllows(trace.getSpan(ambient)) ||
+      flagsDeny(readSpanAttributes(record.native)) ||
+      record.parent?.denied ||
+      !ancestorAllows(record.parentSpan)
+    )
+      record.denied = true;
+    for (let parent = record.parent; parent; parent = parent.parent) {
+      if (parent.denied || flagsDeny(readSpanAttributes(parent.native)))
+        record.denied = true;
+    }
+    if (record.denied) scrub(record.native);
+  }
+
+  private guardReadable(record: RecordState): void {
+    // ReadableSpan buffers stay protected through processor mutation, batching,
+    // shutdown and reactivation. The closure lives with the span, not registration.
+    const native = record.native;
+    const state = (record.readable = {
+      attributes: own(native, "attributes") ?? {},
+      events: own(native, "events") ?? [],
+      status: own(native, "status") ?? {},
+    });
+    const refresh = () => {
+      if (flagsDeny(state.attributes) || !ancestorAllows(record.parentSpan))
+        record.denied = true;
+      if (record.denied) {
+        for (const key of Object.keys(state.attributes))
+          if (contentKey(key)) delete state.attributes[key];
+        state.events.length = 0;
+        delete state.status.message;
+      }
     };
-
-    const workflowName =
-      input.workflowName ??
-      this._workflowNames.get(this._traceKey(event)) ??
-      this._fallbackWorkflowName;
-    if (workflowName) {
-      attrs[SpanAttributes.TRACELOOP_WORKFLOW_NAME] = workflowName;
-    }
-
-    if (input.input !== undefined) {
-      attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safeJson(input.input);
-    }
-    if (input.output !== undefined) {
-      attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safeJson(input.output);
-    }
-
-    const traceId = this._resolveTraceId(event);
-    const activeContext = trace.getSpan(context.active())?.spanContext();
-    const parentId = input.parentId ?? (
-      activeContext?.traceId === traceId ? activeContext.spanId : undefined
-    );
-    const endTimeIso = event.timestamp;
-    const startTimeIso =
-      input.start?.timestamp ??
-      startTimeFromDuration(event.timestamp, input.durationMs) ??
-      event.timestamp;
-    const readableSpan = buildReadableSpan({
-      name: input.name,
-      traceId,
-      spanId: input.spanId,
-      parentId,
-      startTimeIso,
-      endTimeIso,
-      attributes: sanitizeAttributes(attrs),
-      statusCode,
-      errorMessage,
-    }) as ReadableSpan & {
-      instrumentationScope?: { name: string; version?: string };
-    };
-
-    readableSpan.instrumentationScope = {
-      name: INSTRUMENTATION_NAME,
-      version: PACKAGE_VERSION,
-    };
-    injectSpan(readableSpan);
-  }
-
-  private _resolveTraceId(event: FlueEvent): string {
-    const key = this._traceKey(event);
-    const existing = this._traceIds.get(key);
-    if (existing) {
-      return existing;
-    }
-
-    const activeTraceId = trace.getSpan(context.active())?.spanContext().traceId;
-    const resolved = isUsableTraceId(activeTraceId)
-      ? activeTraceId
-      : ensureTraceId(key);
-    this._traceIds.set(key, resolved);
-    return resolved;
-  }
-
-  private _upsertTurn(turnId: string): TurnState {
-    const existing = this._turns.get(turnId);
-    if (existing) {
-      return existing;
-    }
-    const state: TurnState = {};
-    this._turns.set(turnId, state);
-    return state;
-  }
-
-  private _traceKey(event: FlueEvent): string {
-    return event.runId ??
-      event.instanceId ??
-      event.dispatchId ??
-      event.submissionId ??
-      `${event.harness ?? "harness"}:${event.session ?? "session"}`;
-  }
-
-  private _agentKey(event: FlueEvent): string {
-    return `${this._traceKey(event)}:${event.instanceId ?? event.harness ?? event.session ?? "agent"}`;
-  }
-
-  private _toolKey(event: Extract<FlueEvent, { type: "tool_start" | "tool" }>): string {
-    return `${this._traceKey(event)}:${event.toolCallId}`;
-  }
-
-  private _compactionKey(event: FlueEvent): string {
-    return `${this._traceKey(event)}:${event.operationId ?? "compaction"}`;
-  }
-
-  private _agentName(event: FlueEvent): string {
-    return event.instanceId ??
-      event.harness ??
-      event.session ??
-      event.runId ??
-      "agent";
-  }
-
-  private _identityInput(event: FlueEvent): Record<string, unknown> {
-    return {
-      runId: event.runId,
-      instanceId: event.instanceId,
-      dispatchId: event.dispatchId,
-      harness: event.harness,
-      session: event.session,
-    };
-  }
-
-  private _workflowSpanId(event: FlueEvent): string {
-    return this._eventSpanId(event, "workflow");
-  }
-
-  private _agentSpanId(event: FlueEvent): string {
-    return this._eventSpanId(event, `agent:${this._agentName(event)}`);
-  }
-
-  private _operationSpanId(event: FlueEvent & { operationId: string }): string {
-    return this._eventSpanId(event, `operation:${event.operationId}`);
-  }
-
-  private _taskSpanId(event: Extract<FlueEvent, { taskId: string }>): string {
-    return this._eventSpanId(event, `task:${event.taskId}`);
-  }
-
-  private _toolSpanId(event: Extract<FlueEvent, { toolCallId: string }>): string {
-    return this._eventSpanId(event, `tool:${event.toolCallId}`);
-  }
-
-  private _turnSpanId(event: Extract<FlueEvent, { turnId: string }>): string {
-    return this._eventSpanId(event, `turn:${event.turnId}`);
-  }
-
-  private _compactionSpanId(event: FlueEvent): string {
-    return this._eventSpanId(event, `compaction:${event.operationId ?? event.eventIndex}`);
-  }
-
-  private _eventSpanId(event: FlueEvent, suffix: string): string {
-    return `flue:${this._traceKey(event)}:${suffix}`;
-  }
-
-  private _rootParentId(event: FlueEvent): string | undefined {
-    if (event.runId) {
-      return this._workflowSpanId(event);
-    }
-    return undefined;
-  }
-
-  private _operationOrRootParentId(event: FlueEvent): string | undefined {
-    if (event.operationId) {
-      return this._operationSpanId(event as FlueEvent & { operationId: string });
-    }
-    return this._rootOrAgentParentId(event);
-  }
-
-  private _rootOrAgentParentId(event: FlueEvent): string | undefined {
-    return this._rootParentId(event) ?? (
-      event.instanceId ? this._agentSpanId(event) : undefined
-    );
-  }
-
-  private _rememberOperationStart(
-    event: Extract<FlueEvent, { type: "operation_start" }>,
-  ): void {
-    const traceKey = this._traceKey(event);
-    const starts = this._operationStarts.get(traceKey) ?? new Map<string, StartedEvent>();
-    starts.set(event.operationId, { event, timestamp: event.timestamp });
-    this._operationStarts.set(traceKey, starts);
-  }
-
-  private _rememberExportedOperationSpan(
-    event: Extract<FlueEvent, { type: "operation" }>,
-  ): void {
-    const traceKey = this._traceKey(event);
-    const spanIds = this._exportedOperationSpanIds.get(traceKey) ?? new Set<string>();
-    spanIds.add(this._operationSpanId(event));
-    this._exportedOperationSpanIds.set(traceKey, spanIds);
-  }
-
-  private _hasExportedOperationSpan(event: FlueEvent, spanId: string): boolean {
-    return Boolean(
-      this._exportedOperationSpanIds.get(this._traceKey(event))?.has(spanId),
-    );
-  }
-
-  private _forgetExportedOperationSpan(
-    event: Extract<FlueEvent, { type: "operation" }>,
-  ): void {
-    const traceKey = this._traceKey(event);
-    const spanIds = this._exportedOperationSpanIds.get(traceKey);
-    spanIds?.delete(this._operationSpanId(event));
-    if (spanIds?.size === 0) {
-      this._exportedOperationSpanIds.delete(traceKey);
+    for (const field of ["attributes", "events", "status"] as const) {
+      Object.defineProperty(native, field, {
+        enumerable: true,
+        configurable: false,
+        get() {
+          refresh();
+          if (!record.denied) return state[field];
+          if (field === "events") return [];
+          return { ...state[field] };
+        },
+        set(value) {
+          // Later processors may replace buffers, but never the original veto.
+          const copied = safeCopy(value);
+          (state as any)[field] = copied ?? (field === "events" ? [] : {});
+          refresh();
+        },
+      });
     }
   }
 
-  private _queuePendingCompaction(pending: PendingCompaction): void {
-    const traceKey = this._traceKey(pending.event);
-    const pendingCompactions = this._pendingCompactions.get(traceKey) ?? [];
-    pendingCompactions.push(pending);
-    this._pendingCompactions.set(traceKey, pendingCompactions);
-  }
-
-  private _flushPendingCompactionsForOperation(
-    event: Extract<FlueEvent, { type: "operation" }>,
-  ): void {
-    const traceKey = this._traceKey(event);
-    const pendingCompactions = this._pendingCompactions.get(traceKey);
-    if (!pendingCompactions) {
-      return;
+  private mapEvent(record: RecordState, event: Event): void {
+    const span = record.span;
+    this.updatePolicy(record, context.active());
+    if (!record.native.isRecording()) return;
+    if (event.type === "turn_request") {
+      const request = event.request ?? event;
+      if (typeof (request.requestedModel ?? request.model) === "string")
+        span.setAttribute(
+          SpanAttributes.LLM_REQUEST_MODEL,
+          request.requestedModel ?? request.model,
+        );
+      if (typeof (request.providerName ?? request.provider) === "string")
+        span.setAttribute(
+          SpanAttributes.LLM_SYSTEM,
+          request.providerName ?? request.provider,
+        );
+      span.setAttribute(SpanAttributes.LLM_REQUEST_TYPE, "chat");
+      if (!record.denied && request.input) {
+        span.setAttribute(
+          SpanAttributes.TRACELOOP_ENTITY_INPUT,
+          json(request.input),
+        );
+        promptAttributes(span, request.input);
+      }
+    } else if (event.type === "turn") {
+      const response = event.response ?? event;
+      usageAttributes(span, response.usage);
+      if (typeof response.responseId === "string")
+        span.setAttribute(ATTR_GEN_AI_RESPONSE_ID, response.responseId);
+      if (!record.denied && response.output !== undefined) {
+        span.setAttribute(
+          SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+          json(response.output),
+        );
+        completionAttributes(span, response.output);
+      }
+    } else if (event.type === "tool_start") {
+      if (typeof event.toolCallId === "string")
+        span.setAttribute(ATTR_GEN_AI_TOOL_CALL_ID, event.toolCallId);
+      if (!record.denied)
+        span.setAttribute(
+          SpanAttributes.TRACELOOP_ENTITY_INPUT,
+          json({ name: event.toolName, arguments: event.args }),
+        );
+    } else if (event.type === "tool") {
+      if (!record.denied) {
+        const result = Object.hasOwn(event, "effectiveResult")
+          ? event.effectiveResult
+          : event.result;
+        if (result !== undefined)
+          span.setAttribute(
+            SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+            json(result),
+          );
+      }
+    } else if (!record.denied) {
+      const input = event.agentInput ?? event.prompt ?? event.payload;
+      const output = event.agentOutput ?? event.result;
+      if (input !== undefined)
+        span.setAttribute(SpanAttributes.TRACELOOP_ENTITY_INPUT, json(input));
+      if (output !== undefined)
+        span.setAttribute(SpanAttributes.TRACELOOP_ENTITY_OUTPUT, json(output));
     }
-
-    const remaining: PendingCompaction[] = [];
-    const operationSpanId = this._operationSpanId(event);
-    for (const pending of pendingCompactions) {
-      if (pending.event.operationId === event.operationId) {
-        this._emitCompaction(pending, operationSpanId);
-      } else {
-        remaining.push(pending);
+    if (event.isError && !record.denied) {
+      const error = (event.response ?? event).error ?? event.errorInfo;
+      if (error !== undefined) {
+        const value = safeCopy(error) as Event;
+        if (value?.message !== undefined)
+          span.setStatus({ code: 2, message: value.message });
+        if (typeof value?.message === "string")
+          span.recordException({
+            message: value.message,
+            ...(typeof value.name === "string" ? { name: value.name } : {}),
+            ...(typeof value.stack === "string" ? { stack: value.stack } : {}),
+          });
       }
     }
-
-    if (remaining.length > 0) {
-      this._pendingCompactions.set(traceKey, remaining);
-    } else {
-      this._pendingCompactions.delete(traceKey);
-    }
-  }
-
-  private _flushPendingCompactionsForTrace(event: FlueEvent): void {
-    const traceKey = this._traceKey(event);
-    const pendingCompactions = this._pendingCompactions.get(traceKey);
-    this._pendingCompactions.delete(traceKey);
-    if (!pendingCompactions) {
-      return;
-    }
-
-    for (const pending of pendingCompactions) {
-      this._emitCompaction(pending, this._rootOrAgentParentId(pending.event));
-    }
-  }
-
-  private _settleDirectAgentOperationState(event: FlueEvent): void {
-    const traceKey = this._traceKey(event);
-    const starts = this._operationStarts.get(traceKey);
-    const pendingCompactions = this._pendingCompactions.get(traceKey) ?? [];
-    const remaining: PendingCompaction[] = [];
-
-    for (const pending of pendingCompactions) {
-      if (pending.event.operationId && starts?.has(pending.event.operationId)) {
-        remaining.push(pending);
-      } else {
-        this._emitCompaction(pending, this._rootOrAgentParentId(pending.event));
-      }
-    }
-
-    if (remaining.length > 0) {
-      this._pendingCompactions.set(traceKey, remaining);
-    } else {
-      this._pendingCompactions.delete(traceKey);
-    }
-
-    if (starts) {
-      const retainedOperationIds = new Set(
-        remaining.flatMap((pending) =>
-          pending.event.operationId ? [pending.event.operationId] : [],
-        ),
-      );
-      for (const operationId of starts.keys()) {
-        if (!retainedOperationIds.has(operationId)) {
-          starts.delete(operationId);
-        }
-      }
-      if (starts.size === 0) {
-        this._operationStarts.delete(traceKey);
-      }
-    }
-
-    this._exportedOperationSpanIds.delete(traceKey);
-  }
-
-  private _flushAllPendingCompactions(): void {
-    const pendingCompactions = Array.from(this._pendingCompactions.values()).flat();
-    this._pendingCompactions.clear();
-    for (const pending of pendingCompactions) {
-      this._emitCompaction(pending, undefined);
-    }
-  }
-
-  private _clearOperationState(traceKey: string): void {
-    this._operationStarts.delete(traceKey);
-    this._exportedOperationSpanIds.delete(traceKey);
-    this._pendingCompactions.delete(traceKey);
   }
 }
 
 export { FlueInstrumentor as RespanFlueObserver };
 
-function addPromptAttributes(
-  attrs: Record<string, unknown>,
-  systemPrompt: string | undefined,
-  messages: LlmMessage[],
-): void {
-  let index = 0;
-  if (systemPrompt) {
-    attrs[promptRoleKey(index)] = "system";
-    attrs[promptContentKey(index)] = systemPrompt;
-    index += 1;
-  }
-
-  for (const message of messages) {
-    attrs[promptRoleKey(index)] = normalizePromptRole(message.role);
-    attrs[promptContentKey(index)] = messageToContent(message);
-    const toolCalls = messageToToolCalls(message);
-    if (toolCalls.length > 0) {
-      attrs[promptToolCallsKey(index)] = safeJson(toolCalls);
-    }
-    index += 1;
+function own(value: any, key: string): any {
+  if (
+    value &&
+    (typeof value === "object" || typeof value === "function") &&
+    types.isProxy(value)
+  )
+    return undefined;
+  if (!value || (typeof value !== "object" && typeof value !== "function"))
+    return undefined;
+  try {
+    return Object.getOwnPropertyDescriptor(value, key)?.value;
+  } catch {
+    return undefined;
   }
 }
-
-function addCompletionAttributes(
-  attrs: Record<string, unknown>,
-  message: LlmAssistantMessage,
-): void {
-  attrs[GEN_AI_COMPLETION_ROLE] = "assistant";
-  attrs[GEN_AI_COMPLETION_CONTENT] = assistantContent(message);
-  const toolCalls = assistantToolCalls(message);
-  if (toolCalls.length > 0) {
-    attrs[GEN_AI_COMPLETION_TOOL_CALLS] = safeJson(toolCalls);
-  }
+function flagsDeny(value: any): boolean {
+  return CONTENT_FLAGS.some((key) => own(value, key) === false);
 }
-
-function addUsageAttributes(
-  attrs: Record<string, unknown>,
-  usage: PromptUsage | undefined,
-): void {
-  if (!usage) {
-    return;
-  }
-  attrs[ATTR_GEN_AI_USAGE_INPUT_TOKENS] = usage.input;
-  attrs[ATTR_GEN_AI_USAGE_PROMPT_TOKENS] = usage.input;
-  attrs[ATTR_GEN_AI_USAGE_OUTPUT_TOKENS] = usage.output;
-  attrs[ATTR_GEN_AI_USAGE_COMPLETION_TOKENS] = usage.output;
-  attrs[SpanAttributes.LLM_USAGE_TOTAL_TOKENS] = usage.totalTokens;
-  addUsageMetadata(attrs, usage);
+function suppressed(ctx: Context): boolean {
+  return isTracingSuppressed(ctx) || ctx.getValue(LM_SUPPRESSION) === true;
 }
-
-function addUsageMetadata(
-  attrs: Record<string, unknown>,
-  usage: PromptUsage | undefined,
-): void {
-  if (!usage) {
-    return;
-  }
-  attrs[metadataKey("flue_usage_cache_read_tokens")] = usage.cacheRead;
-  attrs[metadataKey("flue_usage_cache_write_tokens")] = usage.cacheWrite;
-  attrs[metadataKey("flue_usage_cost_total")] = usage.cost.total;
-}
-
-function promptRoleKey(index: number): string {
-  return `${ATTR_GEN_AI_PROMPT}.${index}.role`;
-}
-
-function promptContentKey(index: number): string {
-  return `${ATTR_GEN_AI_PROMPT}.${index}.content`;
-}
-
-function promptToolCallsKey(index: number): string {
-  return `${ATTR_GEN_AI_PROMPT}.${index}.tool_calls`;
-}
-
-function normalizePromptRole(role: string): string {
-  if (role === "toolResult") {
-    return "tool";
-  }
-  return role;
-}
-
-function messageToContent(message: LlmMessage): string {
-  if (message.role === "toolResult") {
-    return contentBlocksToText(message.content);
-  }
-  if (typeof message.content === "string") {
-    return message.content;
-  }
-  return contentBlocksToText(message.content);
-}
-
-function messageToToolCalls(message: LlmMessage): unknown[] {
-  if (message.role !== "assistant") {
-    return [];
-  }
-  return assistantToolCalls(message);
-}
-
-function assistantContent(message: LlmAssistantMessage): string {
-  return contentBlocksToText(
-    message.content.filter((block) => block.type !== "toolCall"),
+function contentAllowed(option: boolean | undefined, ctx: Context): boolean {
+  return (
+    option !== false &&
+    process.env.RESPAN_TRACE_CONTENT !== "false" &&
+    process.env.TRACELOOP_TRACE_CONTENT !== "false" &&
+    ctx.getValue(CONTEXT_KEY_ALLOW_TRACE_CONTENT) !== false
   );
 }
-
-function assistantToolCalls(message: LlmAssistantMessage): unknown[] {
-  return message.content
-    .filter((block): block is LlmToolCall => block.type === "toolCall")
-    .map(toOpenAIToolCall);
+function readSpanAttributes(span: Span): Event | undefined {
+  return (
+    recordsBySpan.get(span)?.readable?.attributes ?? own(span, "attributes")
+  );
 }
-
-function contentBlocksToText(blocks: Array<Record<string, any>>): string {
-  return blocks
-    .map((block) => {
-      if (block.type === "text") {
-        return block.text ?? "";
-      }
-      if (block.type === "thinking") {
-        return block.thinking ?? "";
-      }
-      if (block.type === "image") {
-        return `[image:${block.mimeType ?? "unknown"}]`;
-      }
-      if (block.type === "toolCall") {
-        return "";
-      }
-      return safeJson(block);
-    })
-    .filter(Boolean)
-    .join("\n");
+function spanKey(span: Span): string {
+  const id = span.spanContext();
+  return `${id.traceId}:${id.spanId}`;
 }
-
-function toOpenAIToolCall(call: LlmToolCall): unknown {
-  return {
-    id: call.id,
-    type: "function",
-    function: {
-      name: call.name,
-      arguments: safeJson(call.arguments ?? {}),
-    },
-  };
-}
-
-function toToolDefinition(tool: LlmTool): unknown {
-  return {
-    name: tool.name,
-    description: tool.description,
-    parameters: toSerializableValue(tool.parameters),
-  };
-}
-
-function normalizeProvider(provider: string): string {
-  return provider.toLowerCase();
-}
-
-function normalizeModel(model: string, provider?: string): string {
-  const prefix = provider ? `${provider}/` : undefined;
-  if (prefix && model.startsWith(prefix)) {
-    return model.slice(prefix.length);
-  }
-  return model;
-}
-
-function startEventValue<T extends string>(start: StartedEvent | undefined, key: T): unknown {
-  return start?.event && key in start.event
-    ? (start.event as Record<string, unknown>)[key]
-    : undefined;
-}
-
-function startTimeFromDuration(endTimeIso: string, durationMs: number | undefined): string | undefined {
-  if (durationMs === undefined) {
-    return undefined;
-  }
-  const endMs = new Date(endTimeIso).getTime();
-  if (!Number.isFinite(endMs)) {
-    return undefined;
-  }
-  return new Date(endMs - durationMs).toISOString();
-}
-
-function errorMessageFrom(error: unknown): string {
-  if (error instanceof Error) {
-    return error.message;
-  }
-  if (typeof error === "string") {
-    return error;
-  }
-  if (error && typeof error === "object" && "message" in error) {
-    return String((error as { message?: unknown }).message);
-  }
-  return safeJson(error);
-}
-
-function errorOutput(error: unknown): unknown {
-  if (error instanceof Error) {
-    return {
-      error: error.name,
-      message: error.message,
-      stack: error.stack,
-    };
-  }
-  if (error && typeof error === "object") {
-    return toSerializableValue(error);
-  }
-  return {
-    error: String(error),
-  };
-}
-
-function identityMetadata(event: FlueEvent): Record<string, unknown> {
-  return {
-    [metadataKey("flue_run_id")]: event.runId,
-    [metadataKey("flue_instance_id")]: event.instanceId,
-    [metadataKey("flue_dispatch_id")]: event.dispatchId,
-    [metadataKey("flue_submission_id")]: event.submissionId,
-    [metadataKey("flue_harness")]: event.harness,
-    [metadataKey("flue_session")]: event.session,
-    [metadataKey("flue_parent_session")]: event.parentSession,
-    [metadataKey("flue_operation_id")]: event.operationId,
-    [metadataKey("flue_turn_id")]: event.turnId,
-    [metadataKey("flue_task_id")]: event.taskId,
-  };
-}
-
-function metadataKey(key: string): string {
-  return `${RespanSpanAttributes.RESPAN_METADATA}.${key}`;
-}
-
-function sanitizeAttributes(attrs: Record<string, unknown>): Record<string, string | number | boolean | string[] | number[] | boolean[]> {
-  const sanitized: Record<string, string | number | boolean | string[] | number[] | boolean[]> = {};
-  for (const [key, value] of Object.entries(attrs)) {
-    if (value === undefined || value === null) {
-      continue;
-    }
-    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-      sanitized[key] = value;
-      continue;
-    }
-    if (Array.isArray(value) && value.every((item) => typeof item === "string")) {
-      sanitized[key] = value;
-      continue;
-    }
-    if (Array.isArray(value) && value.every((item) => typeof item === "number")) {
-      sanitized[key] = value;
-      continue;
-    }
-    if (Array.isArray(value) && value.every((item) => typeof item === "boolean")) {
-      sanitized[key] = value;
-      continue;
-    }
-    sanitized[key] = safeJson(value);
-  }
-  return sanitized;
-}
-
-function safeJson(value: unknown): string {
-  try {
-    return JSON.stringify(toSerializableValue(value), (_key, innerValue) =>
-      typeof innerValue === "bigint" ? innerValue.toString() : innerValue,
+function ancestorAllows(span: Span | undefined): boolean {
+  if (!span) return true;
+  const record = recordsBySpan.get(span) ?? recordsById.get(spanKey(span));
+  if (record)
+    return (
+      !record.denied &&
+      !flagsDeny(readSpanAttributes(record.native)) &&
+      (!record.parentSpan || ancestorAllows(record.parentSpan))
     );
-  } catch {
-    return JSON.stringify(String(value));
-  }
+  const attrs = own(span, "attributes");
+  if (attrs) return !flagsDeny(attrs);
+  return span.spanContext().isRemote === true;
 }
-
-function toSerializableValue(value: unknown): unknown {
-  if (value === undefined) {
-    return null;
-  }
-  if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+function safeCopy(value: any, seen = new WeakSet<object>()): any {
+  if (value === null || ["string", "boolean"].includes(typeof value))
     return value;
+  if (typeof value === "number")
+    return Number.isFinite(value) ? value : undefined;
+  if (typeof value === "bigint") return `${value}`;
+  if (typeof value !== "object" || !value || seen.has(value)) return undefined;
+  if (types.isProxy(value)) return undefined;
+  const proto = Object.getPrototypeOf(value);
+  if (
+    !Array.isArray(value) &&
+    proto !== Object.prototype &&
+    proto !== null &&
+    !(value instanceof Error)
+  )
+    return undefined;
+  seen.add(value);
+  const output: any = Array.isArray(value) ? [] : {};
+  for (const [key, descriptor] of Object.entries(
+    Object.getOwnPropertyDescriptors(value),
+  )) {
+    if (
+      !descriptor.enumerable &&
+      !(value instanceof Error && ["name", "message", "stack"].includes(key))
+    )
+      continue;
+    if (!Object.hasOwn(descriptor, "value") || key === "toJSON") continue;
+    const item = safeCopy(descriptor.value, seen);
+    if (item !== undefined)
+      Object.defineProperty(output, key, {
+        value: item,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
   }
-  if (typeof value === "bigint") {
-    return value.toString();
-  }
-  if (value instanceof Error) {
-    return errorOutput(value);
-  }
-  if (Array.isArray(value)) {
-    return value.map(toSerializableValue);
-  }
-  if (typeof value === "object") {
-    const output: Record<string, unknown> = {};
-    for (const [key, innerValue] of Object.entries(value as Record<string, unknown>)) {
-      if (typeof innerValue === "function" || typeof innerValue === "symbol") {
-        continue;
-      }
-      output[key] = toSerializableValue(innerValue);
-    }
-    return output;
-  }
-  return String(value);
+  seen.delete(value);
+  return output;
 }
-
-function isUsableTraceId(value: string | undefined): value is string {
-  return Boolean(value && /^[0-9a-f]{32}$/i.test(value));
+function json(value: unknown): string {
+  return JSON.stringify(value) ?? "null";
+}
+function eventSkeleton(event: Event): Event {
+  const output: Event = {};
+  for (const key of [
+    "type",
+    "v",
+    "timestamp",
+    "eventIndex",
+    "runId",
+    "instanceId",
+    "dispatchId",
+    "submissionId",
+    "harness",
+    "session",
+    "parentSession",
+    "conversationId",
+    "operationId",
+    "operationKind",
+    "turnId",
+    "taskId",
+    "toolCallId",
+    "toolName",
+    "agentName",
+    "agent",
+    "purpose",
+    "origin",
+    "durationMs",
+    "isError",
+    "startedAt",
+    "workflowName",
+    "outcome",
+  ]) {
+    const value = own(event, key);
+    if (["string", "number", "boolean"].includes(typeof value))
+      output[key] = value;
+  }
+  for (const key of ["request", "response"]) {
+    const input = own(event, key);
+    if (input) {
+      output[key] = {};
+      for (const field of [
+        "providerId",
+        "providerName",
+        "requestedModel",
+        "api",
+        "responseId",
+        "responseModel",
+        "finishReason",
+        "providerFinishReason",
+        "maxTokens",
+        "temperature",
+        "reasoningLevel",
+        "serverAddress",
+        "serverPort",
+      ]) {
+        const value = own(input, field);
+        if (["string", "number", "boolean"].includes(typeof value))
+          output[key][field] = value;
+      }
+      if (key === "request") output[key].input = { messages: [] };
+      if (key === "response") output[key].usage = safeCopy(own(input, "usage"));
+    }
+  }
+  for (const key of ["provider", "model", "api", "reasoning", "stopReason"]) {
+    const value = own(event, key);
+    if (typeof value === "string") output[key] = value;
+  }
+  output.usage = safeCopy(own(event, "usage"));
+  return output;
+}
+function adapterEvent(event: Event): Event {
+  const result = eventSkeleton(event);
+  if (event.type === "turn_request" && !result.request)
+    result.input = { messages: [] };
+  if (result.response) result.response.output = undefined;
+  // Error type is structural; messages, stacks, and arbitrary details stay behind our gate.
+  for (const key of ["errorInfo", "error"]) {
+    const type = own(own(event, key), "type");
+    if (typeof type === "string") result[key] = { type };
+  }
+  if (result.response) {
+    const type = own(own(event.response, "error"), "type");
+    if (typeof type === "string") result.response.error = { type };
+  }
+  return result;
+}
+function matches(start: Event, event: Event): boolean {
+  for (const key of [
+    "runId",
+    "instanceId",
+    "harness",
+    "session",
+    "operationId",
+    "taskId",
+    "turnId",
+    "toolCallId",
+  ]) {
+    if (start[key] !== undefined && event[key] !== start[key]) return false;
+  }
+  if (["turn_request", "turn"].includes(event.type))
+    return start.type === "turn_request";
+  if (["tool_start", "tool"].includes(event.type))
+    return start.type === "tool_start";
+  if (["operation_start", "operation"].includes(event.type))
+    return start.type === "operation_start";
+  if (["task_start", "task"].includes(event.type))
+    return start.type === "task_start";
+  if (["compaction_start", "compaction"].includes(event.type))
+    return start.type === "compaction_start";
+  return (
+    event.type === "run_end" && ["run_start", "run_resume"].includes(start.type)
+  );
+}
+function classify(event: Event, name: string): RespanLogType {
+  if (event.type === "turn_request") return RespanLogType.CHAT;
+  if (event.type === "tool_start") return RespanLogType.TOOL;
+  if (["run_start", "run_resume"].includes(event.type))
+    return RespanLogType.WORKFLOW;
+  if (
+    ["prompt", "skill"].includes(event.operationKind) ||
+    event.type === "task_start" ||
+    name.startsWith("invoke_agent")
+  )
+    return RespanLogType.AGENT;
+  return RespanLogType.TASK;
+}
+function identityAttributes(event: Event): Record<string, string | number> {
+  const result: Record<string, string | number> = {};
+  for (const key of [
+    "runId",
+    "instanceId",
+    "dispatchId",
+    "submissionId",
+    "harness",
+    "session",
+    "parentSession",
+    "conversationId",
+    "operationId",
+    "turnId",
+    "taskId",
+    "toolCallId",
+    "eventIndex",
+  ]) {
+    if (event[key] !== undefined)
+      result[`${RespanSpanAttributes.RESPAN_METADATA}.flue_${key}`] =
+        event[key];
+  }
+  return result;
+}
+function promptAttributes(span: Span, input: Event): void {
+  let index = 0;
+  if (input.systemPrompt !== undefined) {
+    span.setAttribute(`${SpanAttributes.LLM_PROMPTS}.${index}.role`, "system");
+    span.setAttribute(
+      `${SpanAttributes.LLM_PROMPTS}.${index++}.content`,
+      content(input.systemPrompt),
+    );
+  }
+  for (const message of input.messages ?? []) {
+    const prefix = `${SpanAttributes.LLM_PROMPTS}.${index++}`;
+    span.setAttribute(
+      `${prefix}.role`,
+      message.role === "toolResult" ? "tool" : message.role,
+    );
+    span.setAttribute(
+      `${prefix}.content`,
+      content(
+        message.role === "assistant" && Array.isArray(message.content)
+          ? message.content.filter((block: Event) => block.type !== "toolCall")
+          : message.content,
+      ),
+    );
+    const calls = toolCalls(message);
+    if (calls.length) span.setAttribute(`${prefix}.tool_calls`, json(calls));
+    if (typeof message.toolCallId === "string")
+      span.setAttribute(`${prefix}.tool_call_id`, message.toolCallId);
+  }
+  if (input.tools !== undefined)
+    span.setAttribute(SpanAttributes.LLM_REQUEST_FUNCTIONS, json(input.tools));
+}
+function completionAttributes(span: Span, message: Event): void {
+  const prefix = `${SpanAttributes.LLM_COMPLETIONS}.0`;
+  span.setAttribute(`${prefix}.role`, message.role ?? "assistant");
+  const blocks = Array.isArray(message.content)
+    ? message.content.filter((block: Event) => block.type !== "toolCall")
+    : message.content;
+  span.setAttribute(`${prefix}.content`, content(blocks));
+  const calls = toolCalls(message);
+  if (calls.length) span.setAttribute(`${prefix}.tool_calls`, json(calls));
+}
+function content(value: any): string {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value) && value.every((block) => block?.type === "text"))
+    return value.map((block) => block.text ?? "").join("");
+  return json(value);
+}
+function toolCalls(message: Event): any[] {
+  return Array.isArray(message.content)
+    ? message.content
+        .filter((block: Event) => block?.type === "toolCall")
+        .map((block: Event) => ({
+          id: block.id,
+          type: "function",
+          function: {
+            name: block.name,
+            arguments:
+              typeof block.arguments === "string"
+                ? block.arguments
+                : json(block.arguments),
+          },
+        }))
+    : [];
+}
+function usageAttributes(span: Span, usage: Event | undefined): void {
+  if (!usage) return;
+  for (const [source, keys] of [
+    [
+      "input",
+      [ATTR_GEN_AI_USAGE_INPUT_TOKENS, SpanAttributes.LLM_USAGE_PROMPT_TOKENS],
+    ],
+    [
+      "output",
+      [
+        ATTR_GEN_AI_USAGE_OUTPUT_TOKENS,
+        SpanAttributes.LLM_USAGE_COMPLETION_TOKENS,
+      ],
+    ],
+    ["totalTokens", [SpanAttributes.LLM_USAGE_TOTAL_TOKENS]],
+    ["cacheRead", [ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS]],
+  ] as const)
+    if (typeof usage[source] === "number" && Number.isFinite(usage[source]))
+      for (const key of keys) span.setAttribute(key, usage[source]);
+}
+function contentKey(key: string): boolean {
+  return (
+    key === SpanAttributes.LLM_REQUEST_FUNCTIONS ||
+    key === RespanSpanAttributes.RESPAN_METADATA ||
+    (key.startsWith(`${RespanSpanAttributes.RESPAN_METADATA}.`) &&
+      !key.startsWith(`${RespanSpanAttributes.RESPAN_METADATA}.flue_`)) ||
+    /(?:^gen_ai\.(?:prompt|completion|input|output|system_instructions|tool\.(?:call\.(?:arguments|result)|definitions|description))|^traceloop\.entity\.(?:input|output)$|exception|error\.message|(?:^|[._])(?:prompt|input|output|arguments|result|description|message|stack)(?:[._]|$))/.test(
+      key,
+    )
+  );
+}
+function scrub(span: Span): void {
+  const attributes = own(span, "attributes");
+  if (attributes)
+    for (const key of Object.keys(attributes))
+      if (contentKey(key)) delete attributes[key];
+  const events = own(span, "events");
+  if (Array.isArray(events)) events.length = 0;
+  const status = own(span, "status");
+  if (status && typeof status === "object") delete status.message;
+}
+function stripVendorAttributes(span: Span): void {
+  const attributes = own(span, "attributes");
+  if (attributes)
+    for (const key of Object.keys(attributes))
+      if (
+        key.startsWith("flue.") ||
+        key === "gen_ai.tool.call.arguments" ||
+        key === "gen_ai.tool.call.result"
+      )
+        delete attributes[key];
 }

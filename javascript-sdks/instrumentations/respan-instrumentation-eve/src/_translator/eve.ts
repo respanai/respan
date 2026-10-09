@@ -1,5 +1,6 @@
 import {
   ATTR_GEN_AI_AGENT_NAME,
+  ATTR_GEN_AI_CONVERSATION_ID,
   ATTR_GEN_AI_OPERATION_NAME,
   ATTR_GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
@@ -19,6 +20,14 @@ import {
   EVE_TURN_ID,
   EVE_TURN_SEQUENCE,
   EVE_VERSION,
+  EVE_AGENT_RUN_ID,
+  EVE_AGENT_FRAMEWORK_VERSION,
+  EVE_AGENT_TURN_ID,
+  EVE_AGENT_TURN_SEQUENCE,
+  EVE_AGENT_STEP_INDEX,
+  EVE_AGENT_CHANNEL_KIND,
+  EVE_AGENT_PARENT_RUN_ID,
+  EVE_AGENT_PARENT_CALL_ID,
 } from "../constants/eve.js";
 import {
   EVE_RESPAN_BRIDGE_RUNTIME_CONTEXT_KEY,
@@ -35,6 +44,8 @@ import {
   AI_TELEMETRY_FUNCTION_ID,
   setDefault,
   setMetadata,
+  safeJsonParse,
+  safeJsonStr,
   type SpanAttributes,
 } from "./shared.js";
 
@@ -54,11 +65,13 @@ export function enrichEveAttributes(
   attrs: SpanAttributes,
   span: { readonly name: string; readonly scopeName?: string },
 ): void {
-  const sessionId = readEveAttribute(attrs, EVE_SESSION_ID);
-  const rootSessionId = readNonEmptyAttribute(
-    attrs,
-    EVE_RESPAN_LINEAGE_ROOT_SESSION_ID_ATTRIBUTE,
-  );
+  const sessionId =
+    readEveAttribute(attrs, EVE_SESSION_ID) ?? attrs[EVE_AGENT_RUN_ID];
+  const rootSessionId =
+    readNonEmptyAttribute(
+      attrs,
+      EVE_RESPAN_LINEAGE_ROOT_SESSION_ID_ATTRIBUTE,
+    ) ?? readNonEmptyAttribute(attrs, ATTR_GEN_AI_CONVERSATION_ID);
   if (sessionId !== undefined && sessionId !== null && sessionId !== "") {
     const normalizedSessionId = String(sessionId);
     setDefault(
@@ -91,28 +104,29 @@ export function enrichEveAttributes(
   addMetadataValue(
     eveMetadata,
     "version",
-    readEveAttribute(attrs, EVE_VERSION),
+    readEveAttribute(attrs, EVE_VERSION) ?? attrs[EVE_AGENT_FRAMEWORK_VERSION],
   );
   addMetadataValue(eveMetadata, "environment", environment);
   addMetadataValue(
     eveMetadata,
     "turn_id",
-    readEveAttribute(attrs, EVE_TURN_ID),
+    readEveAttribute(attrs, EVE_TURN_ID) ?? attrs[EVE_AGENT_TURN_ID],
   );
   addNumericMetadataValue(
     eveMetadata,
     "turn_sequence",
-    readEveAttribute(attrs, EVE_TURN_SEQUENCE),
+    readEveAttribute(attrs, EVE_TURN_SEQUENCE) ??
+      attrs[EVE_AGENT_TURN_SEQUENCE],
   );
   addNumericMetadataValue(
     eveMetadata,
     "step_index",
-    readEveAttribute(attrs, EVE_STEP_INDEX),
+    readEveAttribute(attrs, EVE_STEP_INDEX) ?? attrs[EVE_AGENT_STEP_INDEX],
   );
   addMetadataValue(
     eveMetadata,
     "channel_kind",
-    readEveAttribute(attrs, EVE_CHANNEL_KIND),
+    readEveAttribute(attrs, EVE_CHANNEL_KIND) ?? attrs[EVE_AGENT_CHANNEL_KIND],
   );
   addMetadataValue(
     eveMetadata,
@@ -173,10 +187,7 @@ export function enrichEveAttributes(
   }
 }
 
-function readEveAttribute(
-  attrs: SpanAttributes,
-  key: string,
-): unknown {
+function readEveAttribute(attrs: SpanAttributes, key: string): unknown {
   return attrs[key] ?? attrs[AI_SETTINGS_CONTEXT_PREFIX + key];
 }
 
@@ -228,12 +239,13 @@ function buildParentMetadata(
     readNonEmptyAttribute(
       attrs,
       EVE_RESPAN_LINEAGE_PARENT_SESSION_ID_ATTRIBUTE,
-    ),
+    ) ?? attrs[EVE_AGENT_PARENT_RUN_ID],
   );
   addMetadataValue(
     parent,
     "call_id",
-    readNonEmptyAttribute(attrs, EVE_RESPAN_LINEAGE_PARENT_CALL_ID_ATTRIBUTE),
+    readNonEmptyAttribute(attrs, EVE_RESPAN_LINEAGE_PARENT_CALL_ID_ATTRIBUTE) ??
+      attrs[EVE_AGENT_PARENT_CALL_ID],
   );
 
   const turn: Record<string, unknown> = {};
@@ -282,8 +294,7 @@ function toJsonSafeValue(value: unknown): unknown | undefined {
   }
 
   try {
-    const serialized = JSON.stringify(value);
-    return serialized === undefined ? undefined : JSON.parse(serialized);
+    return safeJsonParse(safeJsonStr(value));
   } catch {
     // Authored instrumentation must never be able to break span export.
     return undefined;

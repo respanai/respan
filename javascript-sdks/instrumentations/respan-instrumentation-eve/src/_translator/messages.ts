@@ -1,6 +1,7 @@
 import {
   ATTR_GEN_AI_INPUT_MESSAGES,
   ATTR_GEN_AI_OUTPUT_MESSAGES,
+  ATTR_GEN_AI_SYSTEM_INSTRUCTIONS,
   ATTR_GEN_AI_TOOL_CALL_ARGUMENTS,
   ATTR_GEN_AI_TOOL_CALL_ID,
   ATTR_GEN_AI_TOOL_CALL_RESULT,
@@ -32,17 +33,16 @@ import {
 
 type MessagePayload = Record<string, any>;
 
-function normalizeToolCallShape(call: unknown): Record<string, any> | undefined {
+function normalizeToolCallShape(
+  call: unknown,
+): Record<string, any> | undefined {
   if (!isRecord(call)) {
     return undefined;
   }
 
   const callFunction = isRecord(call.function) ? call.function : undefined;
   const rawName =
-    callFunction?.name ??
-    call.name ??
-    call.toolName ??
-    call.tool_name;
+    callFunction?.name ?? call.name ?? call.toolName ?? call.tool_name;
   const rawArguments =
     callFunction?.arguments ??
     callFunction?.args ??
@@ -93,16 +93,24 @@ function normalizeSemConvToolResult(block: MessagePayload): MessagePayload {
   return message;
 }
 
-function normalizeToolCallList(value: unknown): Record<string, any>[] | undefined {
+function normalizeToolCallList(
+  value: unknown,
+): Record<string, any>[] | undefined {
   const parsed = safeJsonParse(value);
-  const rawCalls = Array.isArray(parsed) ? parsed : parsed !== undefined ? [parsed] : [];
+  const rawCalls = Array.isArray(parsed)
+    ? parsed
+    : parsed !== undefined
+      ? [parsed]
+      : [];
   const normalized = rawCalls
     .map((call) => normalizeToolCallShape(call))
     .filter((call): call is Record<string, any> => Boolean(call));
   return normalized.length > 0 ? normalized : undefined;
 }
 
-export function parseToolCalls(attrs: SpanAttributes): Record<string, any>[] | undefined {
+export function parseToolCalls(
+  attrs: SpanAttributes,
+): Record<string, any>[] | undefined {
   for (const key of [AI_RESPONSE_TOOL_CALLS, AI_TOOL_CALL, AI_TOOL_CALLS]) {
     if (!attrs[key]) {
       continue;
@@ -114,7 +122,11 @@ export function parseToolCalls(attrs: SpanAttributes): Record<string, any>[] | u
     }
   }
 
-  if (attrs[AI_TOOL_CALL_ID] || attrs[AI_TOOL_CALL_NAME] || attrs[AI_TOOL_CALL_ARGS]) {
+  if (
+    attrs[AI_TOOL_CALL_ID] ||
+    attrs[AI_TOOL_CALL_NAME] ||
+    attrs[AI_TOOL_CALL_ARGS]
+  ) {
     const toolCall: Record<string, any> = { type: "function" };
     for (const [key, value] of Object.entries(attrs)) {
       if (key.startsWith(AI_TOOL_CALL_PREFIX)) {
@@ -124,7 +136,11 @@ export function parseToolCalls(attrs: SpanAttributes): Record<string, any>[] | u
     return normalizeToolCallList(toolCall);
   }
 
-  if (attrs[ATTR_GEN_AI_TOOL_CALL_ID] || attrs[ATTR_GEN_AI_TOOL_NAME] || attrs[ATTR_GEN_AI_TOOL_CALL_ARGUMENTS]) {
+  if (
+    attrs[ATTR_GEN_AI_TOOL_CALL_ID] ||
+    attrs[ATTR_GEN_AI_TOOL_NAME] ||
+    attrs[ATTR_GEN_AI_TOOL_CALL_ARGUMENTS]
+  ) {
     return normalizeToolCallList({
       id: attrs[ATTR_GEN_AI_TOOL_CALL_ID],
       name: attrs[ATTR_GEN_AI_TOOL_NAME],
@@ -137,7 +153,10 @@ export function parseToolCalls(attrs: SpanAttributes): Record<string, any>[] | u
 
 function parseToolDefinition(tool: unknown): unknown {
   const parsedTool = typeof tool === "string" ? safeJsonParse(tool) : tool;
-  if (!isRecord(parsedTool) || parsedTool.type !== "function") {
+  if (
+    !isRecord(parsedTool) ||
+    (parsedTool.type !== "function" && typeof parsedTool.name !== "string")
+  ) {
     return parsedTool;
   }
 
@@ -174,7 +193,9 @@ export function parseToolsValue(attrs: SpanAttributes): unknown[] | undefined {
     }
 
     const parsedToolsValue = safeJsonParse(tools);
-    const rawTools = Array.isArray(parsedToolsValue) ? parsedToolsValue : [parsedToolsValue];
+    const rawTools = Array.isArray(parsedToolsValue)
+      ? parsedToolsValue
+      : [parsedToolsValue];
     const parsedTools = rawTools
       .map((tool) => parseToolDefinition(tool))
       .filter(Boolean);
@@ -185,7 +206,6 @@ export function parseToolsValue(attrs: SpanAttributes): unknown[] | undefined {
   }
 }
 
-
 export function parseToolChoice(attrs: SpanAttributes): string | undefined {
   try {
     const toolChoice = attrs[AI_PROMPT_TOOL_CHOICE];
@@ -193,7 +213,8 @@ export function parseToolChoice(attrs: SpanAttributes): string | undefined {
       return undefined;
     }
 
-    const parsed = typeof toolChoice === "string" ? JSON.parse(toolChoice) : toolChoice;
+    const parsed =
+      typeof toolChoice === "string" ? JSON.parse(toolChoice) : toolChoice;
     if (parsed.function?.name) {
       return safeJsonStr({
         type: String(parsed.type),
@@ -228,7 +249,11 @@ function isMessageLike(value: unknown): value is MessagePayload {
 }
 
 function isMessageArray(value: unknown): value is MessagePayload[] {
-  return Array.isArray(value) && value.length > 0 && value.every((item) => isMessageLike(item));
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every((item) => isMessageLike(item))
+  );
 }
 
 function unwrapKnownResponseWrapper(value: unknown): unknown {
@@ -236,7 +261,9 @@ function unwrapKnownResponseWrapper(value: unknown): unknown {
     return value;
   }
 
-  return value.response ?? value.object ?? value.output ?? value.result ?? value;
+  return (
+    value.response ?? value.object ?? value.output ?? value.result ?? value
+  );
 }
 
 function extractMessagePayload(value: unknown): unknown {
@@ -306,7 +333,10 @@ function collapseNestedMessageWrapper(value: unknown): unknown {
   return nested ?? value;
 }
 
-function isContentBlockType(block: unknown, type: string): block is MessagePayload {
+function isContentBlockType(
+  block: unknown,
+  type: string,
+): block is MessagePayload {
   return isRecord(block) && block.type === type;
 }
 
@@ -383,8 +413,8 @@ function normalizeMessageForBackend(message: unknown): MessagePayload[] {
       role: typeof message.role === "string" ? message.role : "assistant",
       content: textParts.join("\n"),
     };
-    if (!normalized.content && unknownParts.length > 0) {
-      normalized.content = safeJsonStr(unknownParts);
+    if (unknownParts.length > 0) {
+      normalized.content = safeJsonStr(message.parts);
     }
     if (toolCalls.length > 0) {
       normalized.tool_calls = toolCalls;
@@ -409,11 +439,17 @@ function normalizeMessageForBackend(message: unknown): MessagePayload[] {
     delete normalized.toolCalls;
 
     if (normalized.role === "tool") {
-      if (normalized.toolCallId !== undefined && normalized.tool_call_id === undefined) {
+      if (
+        normalized.toolCallId !== undefined &&
+        normalized.tool_call_id === undefined
+      ) {
         normalized.tool_call_id = String(normalized.toolCallId);
       }
       delete normalized.toolCallId;
-      if (normalized.content !== undefined && typeof normalized.content !== "string") {
+      if (
+        normalized.content !== undefined &&
+        typeof normalized.content !== "string"
+      ) {
         normalized.content = safeJsonStr(normalized.content);
       }
     }
@@ -422,8 +458,12 @@ function normalizeMessageForBackend(message: unknown): MessagePayload[] {
   }
 
   const textParts: string[] = [];
-  const toolCallBlocks = message.content.filter((block) => isContentBlockType(block, "tool-call"));
-  const toolResultBlocks = message.content.filter((block) => isContentBlockType(block, "tool-result"));
+  const toolCallBlocks = message.content.filter((block) =>
+    isContentBlockType(block, "tool-call"),
+  );
+  const toolResultBlocks = message.content.filter((block) =>
+    isContentBlockType(block, "tool-result"),
+  );
   const unknownBlocks = message.content.filter((block) => {
     if (typeof block === "string") {
       return false;
@@ -431,7 +471,9 @@ function normalizeMessageForBackend(message: unknown): MessagePayload[] {
     if (!isRecord(block)) {
       return true;
     }
-    return !["text", "output_text", "tool-call", "tool-result"].includes(String(block.type ?? ""));
+    return !["text", "output_text", "tool-call", "tool-result"].includes(
+      String(block.type ?? ""),
+    );
   });
 
   for (const block of message.content) {
@@ -442,19 +484,26 @@ function normalizeMessageForBackend(message: unknown): MessagePayload[] {
     if (!isRecord(block)) {
       continue;
     }
-    if ((block.type === "text" || block.type === "output_text") && typeof block.text === "string") {
+    if (
+      (block.type === "text" || block.type === "output_text") &&
+      typeof block.text === "string"
+    ) {
       textParts.push(block.text);
     }
   }
 
   const textContent = textParts.join("\n");
 
-  if (message.role === "assistant" && (toolCallBlocks.length > 0 || normalizedToolCalls)) {
+  if (
+    message.role === "assistant" &&
+    (toolCallBlocks.length > 0 || normalizedToolCalls)
+  ) {
     const normalizedMessage: MessagePayload = {
       ...message,
       content: textContent,
     };
-    const toolCalls = normalizeToolCallList(toolCallBlocks) ?? normalizedToolCalls;
+    const toolCalls =
+      normalizeToolCallList(toolCallBlocks) ?? normalizedToolCalls;
     if (toolCalls) {
       normalizedMessage.tool_calls = toolCalls;
     }
@@ -473,14 +522,18 @@ function normalizeMessageForBackend(message: unknown): MessagePayload[] {
   return [{ ...message, content: message.content }];
 }
 
-function normalizeMessageCollection(value: unknown): MessagePayload[] | undefined {
+function normalizeMessageCollection(
+  value: unknown,
+): MessagePayload[] | undefined {
   const parsed = safeJsonParse(value);
   if (parsed === undefined || parsed === null) {
     return undefined;
   }
 
   if (Array.isArray(parsed)) {
-    const normalized = parsed.flatMap((message) => normalizeMessageForBackend(message));
+    const normalized = parsed.flatMap((message) =>
+      normalizeMessageForBackend(message),
+    );
     return normalized.length > 0 ? normalized : undefined;
   }
 
@@ -496,7 +549,9 @@ function collapseSingleMessagePayload(messages: MessagePayload[]): unknown {
   return messages.length === 1 ? messages[0] : messages;
 }
 
-function buildToolResultMessage(attrs: SpanAttributes): MessagePayload | undefined {
+function buildToolResultMessage(
+  attrs: SpanAttributes,
+): MessagePayload | undefined {
   if (!attrs[AI_TOOL_CALL_RESULT]) {
     return undefined;
   }
@@ -508,7 +563,10 @@ function buildToolResultMessage(attrs: SpanAttributes): MessagePayload | undefin
   };
 }
 
-function hasToolResultMessage(payload: unknown, toolResult: MessagePayload): boolean {
+function hasToolResultMessage(
+  payload: unknown,
+  toolResult: MessagePayload,
+): boolean {
   const messages = Array.isArray(payload) ? payload : [payload];
   return messages.some((message) => {
     if (!isRecord(message) || message.role !== "tool") {
@@ -516,23 +574,33 @@ function hasToolResultMessage(payload: unknown, toolResult: MessagePayload): boo
     }
 
     if (toolResult.tool_call_id) {
-      return message.tool_call_id === toolResult.tool_call_id || message.toolCallId === toolResult.tool_call_id;
+      return (
+        message.tool_call_id === toolResult.tool_call_id ||
+        message.toolCallId === toolResult.tool_call_id
+      );
     }
 
     return message.content === toolResult.content;
   });
 }
 
-function appendToolResultMessage(payload: unknown, attrs: SpanAttributes): unknown {
+function appendToolResultMessage(
+  payload: unknown,
+  attrs: SpanAttributes,
+): unknown {
   const toolResult = buildToolResultMessage(attrs);
   if (!toolResult || hasToolResultMessage(payload, toolResult)) {
     return payload;
   }
 
-  return Array.isArray(payload) ? [...payload, toolResult] : [payload, toolResult];
+  return Array.isArray(payload)
+    ? [...payload, toolResult]
+    : [payload, toolResult];
 }
 
-function selectPrimaryAssistantMessage(value: unknown): MessagePayload | undefined {
+function selectPrimaryAssistantMessage(
+  value: unknown,
+): MessagePayload | undefined {
   if (isMessageLike(value)) {
     return value.role === "assistant" ? value : undefined;
   }
@@ -567,17 +635,34 @@ function enrichCompletionAttrs(attrs: SpanAttributes, payload: unknown): void {
   }
 
   if (responseToolCalls && responseToolCalls.length > 0) {
-    attrs[`${TraceloopSpanAttributes.LLM_COMPLETIONS}.0.tool_calls`] = safeJsonStr(responseToolCalls);
+    attrs[`${TraceloopSpanAttributes.LLM_COMPLETIONS}.0.tool_calls`] =
+      safeJsonStr(responseToolCalls);
   }
 }
 
-function parsePromptInputValue(attrs: SpanAttributes): Record<string, any>[] | undefined {
-  const genAiMessages = normalizeMessageCollection(attrs[ATTR_GEN_AI_INPUT_MESSAGES]);
+function parsePromptInputValue(
+  attrs: SpanAttributes,
+): Record<string, any>[] | undefined {
+  const genAiMessages = normalizeMessageCollection(
+    attrs[ATTR_GEN_AI_INPUT_MESSAGES],
+  );
   if (genAiMessages && genAiMessages.length > 0) {
+    const instructions = safeJsonParse(attrs[ATTR_GEN_AI_SYSTEM_INSTRUCTIONS]);
+    if (Array.isArray(instructions)) {
+      return [
+        ...normalizeMessageForBackend({ role: "system", parts: instructions }),
+        ...genAiMessages,
+      ];
+    }
+    if (typeof instructions === "string") {
+      return [{ role: "system", content: instructions }, ...genAiMessages];
+    }
     return genAiMessages;
   }
 
-  const normalizedMessages = normalizeMessageCollection(attrs[AI_PROMPT_MESSAGES]);
+  const normalizedMessages = normalizeMessageCollection(
+    attrs[AI_PROMPT_MESSAGES],
+  );
   if (normalizedMessages && normalizedMessages.length > 0) {
     return normalizedMessages;
   }
@@ -590,7 +675,10 @@ function parsePromptInputValue(attrs: SpanAttributes): Record<string, any>[] | u
   return undefined;
 }
 
-function enrichPromptAttrs(attrs: SpanAttributes, messages: MessagePayload[]): void {
+function enrichPromptAttrs(
+  attrs: SpanAttributes,
+  messages: MessagePayload[],
+): void {
   messages.forEach((message, index) => {
     const prefix = `${TraceloopSpanAttributes.LLM_PROMPTS}.${index}`;
     if (message.role !== undefined) {
@@ -622,10 +710,17 @@ export function formatPromptInput(attrs: SpanAttributes): string | undefined {
   return safeJsonStr(messages);
 }
 
-export function formatCompletionOutput(attrs: SpanAttributes): string | undefined {
-  const genAiOutputMessages = normalizeMessageCollection(attrs[ATTR_GEN_AI_OUTPUT_MESSAGES]);
+export function formatCompletionOutput(
+  attrs: SpanAttributes,
+): string | undefined {
+  const genAiOutputMessages = normalizeMessageCollection(
+    attrs[ATTR_GEN_AI_OUTPUT_MESSAGES],
+  );
   if (genAiOutputMessages && genAiOutputMessages.length > 0) {
-    const outputPayload = appendToolResultMessage(collapseSingleMessagePayload(genAiOutputMessages), attrs);
+    const outputPayload = appendToolResultMessage(
+      collapseSingleMessagePayload(genAiOutputMessages),
+      attrs,
+    );
     enrichCompletionAttrs(attrs, outputPayload);
     return safeJsonStr(outputPayload);
   }
@@ -634,7 +729,9 @@ export function formatCompletionOutput(attrs: SpanAttributes): string | undefine
   // shape first so assistant messages and tool calls are preserved for the backend.
   const existingPayload = extractMessagePayload(attrs[AI_RESPONSE_TEXT]);
   if (existingPayload !== undefined) {
-    const normalizedMessages = normalizeMessageCollection(collapseNestedMessageWrapper(existingPayload));
+    const normalizedMessages = normalizeMessageCollection(
+      collapseNestedMessageWrapper(existingPayload),
+    );
     const normalizedPayload = normalizedMessages
       ? collapseSingleMessagePayload(normalizedMessages)
       : collapseNestedMessageWrapper(existingPayload);
@@ -646,7 +743,9 @@ export function formatCompletionOutput(attrs: SpanAttributes): string | undefine
   let content = "";
 
   if (attrs[AI_RESPONSE_OBJECT]) {
-    const parsed = unwrapKnownResponseWrapper(safeJsonParse(attrs[AI_RESPONSE_OBJECT]));
+    const parsed = unwrapKnownResponseWrapper(
+      safeJsonParse(attrs[AI_RESPONSE_OBJECT]),
+    );
     content = safeJsonStr(parsed);
   } else {
     content = String(attrs[AI_RESPONSE_TEXT] ?? "");
@@ -669,26 +768,31 @@ export function formatCompletionOutput(attrs: SpanAttributes): string | undefine
 
 export function formatToolInput(attrs: SpanAttributes): string | undefined {
   const name = attrs[ATTR_GEN_AI_TOOL_NAME] ?? attrs[AI_TOOL_CALL_NAME];
-  const args = attrs[ATTR_GEN_AI_TOOL_CALL_ARGUMENTS] ?? attrs[AI_TOOL_CALL_ARGS];
+  const args =
+    attrs[ATTR_GEN_AI_TOOL_CALL_ARGUMENTS] ?? attrs[AI_TOOL_CALL_ARGS];
   const id = attrs[ATTR_GEN_AI_TOOL_CALL_ID] ?? attrs[AI_TOOL_CALL_ID];
-  if (!name && !args && !id) {
+  if (name === undefined && args === undefined && id === undefined) {
     return undefined;
   }
 
   const input: Record<string, any> = {};
-  if (name) {
+  if (name !== undefined) {
     input.name = name;
   }
-  if (args) {
+  if (args !== undefined) {
     input.arguments = parseJsonish(args);
   }
   return safeJsonStr(input);
 }
 
 export function formatToolOutput(attrs: SpanAttributes): string | undefined {
-  const result = attrs[ATTR_GEN_AI_TOOL_CALL_RESULT] ?? attrs[AI_TOOL_CALL_RESULT];
+  const result =
+    attrs[ATTR_GEN_AI_TOOL_CALL_RESULT] ?? attrs[AI_TOOL_CALL_RESULT];
   if (result === undefined) {
     return undefined;
   }
-  return safeJsonStr(typeof result === "string" ? safeJsonParse(result) : result);
+  const parsed = typeof result === "string" ? safeJsonParse(result) : result;
+  return typeof parsed === "string"
+    ? JSON.stringify(parsed)
+    : safeJsonStr(parsed);
 }

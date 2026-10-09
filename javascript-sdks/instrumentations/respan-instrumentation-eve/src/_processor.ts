@@ -11,7 +11,14 @@
  */
 
 import type { Context, Span } from "@opentelemetry/api";
-import type { ReadableSpan, SpanProcessor } from "@opentelemetry/sdk-trace-base";
+import type {
+  ReadableSpan,
+  SpanProcessor,
+  SpanExporter,
+} from "@opentelemetry/sdk-trace-base";
+import { ExportResultCode } from "@opentelemetry/core";
+import { transformReadableSpanBatch } from "@respan/tracing";
+import { EveCapturePolicy } from "./_privacy.js";
 import {
   ATTR_GEN_AI_AGENT_ID,
   ATTR_GEN_AI_AGENT_NAME,
@@ -36,6 +43,12 @@ import {
   EVE_TURN_ID,
   EVE_TURN_SEQUENCE,
   EVE_TURN_SPAN_NAME,
+  isEveScope,
+  EVE_AGENT_NAME,
+  EVE_AGENT_DELIVERY_INPUT,
+  EVE_MEMORY_RECORDS,
+  EVE_MEMORY_RECORD_COUNT,
+  EVE_MEMORY_STORE_ID,
 } from "./constants/eve.js";
 import {
   EVE_RESPAN_LINEAGE_PARENT_SESSION_ID_ATTRIBUTE,
@@ -71,11 +84,15 @@ import {
   safeJsonStr,
   setDefault,
 } from "./_translator/shared.js";
+import { enrichEveAttributes, resolveEveAgentName } from "./_translator/eve.js";
 import {
-  enrichEveAttributes,
-  resolveEveAgentName,
-} from "./_translator/eve.js";
-import { enrichMetadata, enrichModel, enrichPerformanceMetrics, enrichSystem, enrichTokens, stripRedundantAttrs } from "./_translator/span-enrichment.js";
+  enrichMetadata,
+  enrichModel,
+  enrichPerformanceMetrics,
+  enrichSystem,
+  enrichTokens,
+  stripRedundantAttrs,
+} from "./_translator/span-enrichment.js";
 
 interface PendingDelegatedUsageLineage {
   readonly recordedAt: number;
@@ -125,19 +142,24 @@ const RETAINED_TRACE_CONTEXT_TTL_MS = 5 * 60 * 1000;
  */
 export class EveSpanProcessor implements SpanProcessor {
   private _ownerCount: number;
+  private readonly _capture: EveCapturePolicy;
   private readonly _inFlightSpans = new WeakSet<object>();
   /** Open structural wrapper spans: spanId → its own parentSpanId. */
   private readonly _openStructuralSpans = new Map<string, string | undefined>();
   /** Active Eve/AI SDK span IDs mapped to their inherited workflow name. */
   private readonly _openWorkflowNames = new Map<string, string>();
   /** Workflow names retained across Eve workflow-step context resumptions. */
-  private readonly _openTraceWorkflowNames =
-    new Map<string, RetainedWorkflowName>();
+  private readonly _openTraceWorkflowNames = new Map<
+    string,
+    RetainedWorkflowName
+  >();
   /** Completed Eve turns addressable by exact session + turn lineage. */
   private readonly _sessionTraceRoots = new Map<string, SessionTraceRoot>();
   /** Eve child OTel trace ID → caller trace root selected by authored lineage. */
-  private readonly _delegatedTraceCorrelations =
-    new Map<string, DelegatedTraceCorrelation>();
+  private readonly _delegatedTraceCorrelations = new Map<
+    string,
+    DelegatedTraceCorrelation
+  >();
   /**
    * Eve 0.26 emits caller-side subagent usage after a workflow boundary, with
    * no active trace or session attributes. Completed delegated model roots do
@@ -146,10 +168,20 @@ export class EveSpanProcessor implements SpanProcessor {
    * concurrent matches disagree about lineage, leave the usage span ungrouped
    * rather than guessing.
    */
-  private readonly _pendingDelegatedUsageLineages: PendingDelegatedUsageLineage[] = [];
+  private readonly _pendingDelegatedUsageLineages: PendingDelegatedUsageLineage[] =
+    [];
 
-  constructor({ initiallyActive = true }: { initiallyActive?: boolean } = {}) {
+  constructor({
+    initiallyActive = true,
+    ...capture
+  }: {
+    initiallyActive?: boolean;
+    traceContent?: boolean;
+    recordInputs?: boolean;
+    recordOutputs?: boolean;
+  } = {}) {
     this._ownerCount = initiallyActive ? 1 : 0;
+    this._capture = new EveCapturePolicy(capture);
   }
 
   acquire(): void {
@@ -170,13 +202,18 @@ export class EveSpanProcessor implements SpanProcessor {
     const scopeName = instrumentationScopeName(writableSpan);
     if (
       name !== EVE_TURN_SPAN_NAME &&
-      scopeName !== EVE_SCOPE_NAME &&
+      !isEveScope(scopeName) &&
       !name.startsWith(AI_PREFIX) &&
       !isModernVercelAISpanName(name) &&
       !isVercelAIScope(scopeName)
     ) {
       return;
     }
+
+    const capture = this._capture.capture(writableSpan, _parentContext);
+    if (writableSpan.attributes)
+      this._capture.stripAttributes(writableSpan.attributes, capture);
+    if (!capture.emit) return;
 
     this._applyPendingDelegatedUsageLineage(writableSpan, scopeName);
 
@@ -192,11 +229,7 @@ export class EveSpanProcessor implements SpanProcessor {
       writableSpan.parentSpanId ?? writableSpan.parentSpanContext?.spanId;
 
     if (name === EVE_TURN_SPAN_NAME) {
-      this._rememberSessionTraceRoot(
-        writableSpan.attributes,
-        traceId,
-        spanId,
-      );
+      this._rememberSessionTraceRoot(writableSpan.attributes, traceId, spanId);
     }
     this._applyDelegatedTraceCorrelation(
       writableSpan.attributes,
@@ -240,7 +273,7 @@ export class EveSpanProcessor implements SpanProcessor {
       }
       writableSpan.setAttribute(
         RespanSpanAttributes.RESPAN_INTERNAL_EXPORT_PARENT,
-        exportParent ?? ""
+        exportParent ?? "",
       );
     }
 
@@ -253,7 +286,10 @@ export class EveSpanProcessor implements SpanProcessor {
       // SDK transport wrapper around the real step + model spans, not another
       // framework agent. Semantic export drops these wrappers and reparents
       // their children; legacy export still preserves the emitted tree.
-      writableSpan.setAttribute(RespanSpanAttributes.RESPAN_INTERNAL_DROP_SPAN, true);
+      writableSpan.setAttribute(
+        RespanSpanAttributes.RESPAN_INTERNAL_DROP_SPAN,
+        true,
+      );
       if (spanId) {
         this._openStructuralSpans.set(spanId, parentSpanId);
       }
@@ -261,17 +297,26 @@ export class EveSpanProcessor implements SpanProcessor {
 
     const config = VERCEL_SPAN_CONFIG[name];
     if (config) {
-      writableSpan.setAttribute(RespanSpanAttributes.RESPAN_LOG_TYPE, config.logType);
+      writableSpan.setAttribute(
+        RespanSpanAttributes.RESPAN_LOG_TYPE,
+        config.logType,
+      );
       return;
     }
 
     const parentLogType = VERCEL_PARENT_SPANS[name];
     if (parentLogType !== undefined) {
-      writableSpan.setAttribute(RespanSpanAttributes.RESPAN_LOG_TYPE, parentLogType);
+      writableSpan.setAttribute(
+        RespanSpanAttributes.RESPAN_LOG_TYPE,
+        parentLogType,
+      );
       return;
     }
 
-    writableSpan.setAttribute(RespanSpanAttributes.RESPAN_LOG_TYPE, RespanLogType.TASK);
+    writableSpan.setAttribute(
+      RespanSpanAttributes.RESPAN_LOG_TYPE,
+      RespanLogType.TASK,
+    );
   }
 
   onEnd(span: ReadableSpan): void {
@@ -291,10 +336,15 @@ export class EveSpanProcessor implements SpanProcessor {
     const scopeName = instrumentationScopeName(span);
     if (
       !attrs ||
-      (!isEveTurn &&
-        scopeName !== EVE_SCOPE_NAME &&
-        !isVercelAISpan(span))
+      (!isEveTurn && !isEveScope(scopeName) && !isVercelAISpan(span))
     ) {
+      return;
+    }
+
+    const capture = this._capture.capture(span);
+    this._capture.stripAttributes(attrs, capture);
+    if (!capture.emit) {
+      this._capture.prepare(span);
       return;
     }
 
@@ -332,26 +382,63 @@ export class EveSpanProcessor implements SpanProcessor {
       parentLogType === RespanLogType.EMBEDDING
     ) {
       const embInput = formatEmbeddingInput(attrs);
-      if (embInput) setDefault(attrs, TraceloopSpanAttributes.TRACELOOP_ENTITY_INPUT, embInput);
+      if (embInput !== undefined)
+        setDefault(
+          attrs,
+          TraceloopSpanAttributes.TRACELOOP_ENTITY_INPUT,
+          embInput,
+        );
       const embOutput = formatEmbeddingOutput(attrs);
-      if (embOutput) setDefault(attrs, TraceloopSpanAttributes.TRACELOOP_ENTITY_OUTPUT, embOutput);
+      if (embOutput !== undefined)
+        setDefault(
+          attrs,
+          TraceloopSpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+          embOutput,
+        );
       enrichTokens(attrs);
     }
 
-    const entityName =
-      isEveTurn
-        ? resolveEveAgentName(attrs)
-        : logType === RespanLogType.AGENT
-        ? attrs[ATTR_GEN_AI_AGENT_NAME] ??
+    const entityName = isEveTurn
+      ? resolveEveAgentName(attrs)
+      : logType === RespanLogType.AGENT
+        ? (attrs[ATTR_GEN_AI_AGENT_NAME] ??
           attrs[ATTR_GEN_AI_AGENT_ID] ??
           attrs["ai.agent.name"] ??
           attrs[AI_AGENT_ID] ??
           attrs[AI_TELEMETRY_METADATA_PREFIX + "agent_name"] ??
-          name
+          name)
         : name;
 
     enrichEveAttributes(attrs, { name, scopeName });
     enrichMetadata(attrs);
+
+    if (isEveScope(scopeName)) {
+      if (
+        logType === RespanLogType.AGENT &&
+        attrs[EVE_AGENT_DELIVERY_INPUT] !== undefined
+      ) {
+        setDefault(
+          attrs,
+          TraceloopSpanAttributes.TRACELOOP_ENTITY_INPUT,
+          safeJsonStr(attrs[EVE_AGENT_DELIVERY_INPUT]),
+        );
+      }
+      if (attrs[EVE_MEMORY_RECORDS] !== undefined) {
+        setDefault(
+          attrs,
+          TraceloopSpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+          safeJsonStr(attrs[EVE_MEMORY_RECORDS]),
+        );
+      }
+      if (attrs[EVE_MEMORY_STORE_ID] !== undefined)
+        setMetadata(attrs, "memory_store_id", attrs[EVE_MEMORY_STORE_ID]);
+      if (attrs[EVE_MEMORY_RECORD_COUNT] !== undefined)
+        setMetadata(
+          attrs,
+          "memory_record_count",
+          attrs[EVE_MEMORY_RECORD_COUNT],
+        );
+    }
     delete attrs[TraceloopSpanAttributes.TRACELOOP_SPAN_KIND];
 
     attrs[RespanSpanAttributes.RESPAN_LOG_TYPE] = logType;
@@ -388,26 +475,39 @@ export class EveSpanProcessor implements SpanProcessor {
       // (see _otel_emitter.ts:398).
 
       if (config.isLLM) {
-        setDefault(attrs, TraceloopSpanAttributes.LLM_REQUEST_TYPE, RespanLogType.CHAT);
+        setDefault(
+          attrs,
+          TraceloopSpanAttributes.LLM_REQUEST_TYPE,
+          RespanLogType.CHAT,
+        );
 
         enrichSystem(attrs);
         enrichModel(attrs, attrs[AI_MODEL_ID]);
 
         const input = formatPromptInput(attrs);
         if (input) {
-          setDefault(attrs, TraceloopSpanAttributes.TRACELOOP_ENTITY_INPUT, input);
+          setDefault(
+            attrs,
+            TraceloopSpanAttributes.TRACELOOP_ENTITY_INPUT,
+            input,
+          );
         }
 
         const output = formatCompletionOutput(attrs);
         if (output) {
-          setDefault(attrs, TraceloopSpanAttributes.TRACELOOP_ENTITY_OUTPUT, output);
+          setDefault(
+            attrs,
+            TraceloopSpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+            output,
+          );
         }
 
         enrichTokens(attrs);
 
         const toolsValue = parseToolsValue(attrs);
         if (toolsValue) {
-          attrs[TraceloopSpanAttributes.LLM_REQUEST_FUNCTIONS] = safeJsonStr(toolsValue);
+          attrs[TraceloopSpanAttributes.LLM_REQUEST_FUNCTIONS] =
+            safeJsonStr(toolsValue);
         }
 
         const toolChoice = parseToolChoice(attrs);
@@ -418,27 +518,44 @@ export class EveSpanProcessor implements SpanProcessor {
         enrichPerformanceMetrics(attrs, name);
       }
 
-      if (config.logType === RespanLogType.EMBEDDING || logType === RespanLogType.EMBEDDING) {
+      if (
+        config.logType === RespanLogType.EMBEDDING ||
+        logType === RespanLogType.EMBEDDING
+      ) {
         // input/output/tokens are mapped in the up-front embedding block.
-        setDefault(attrs, TraceloopSpanAttributes.LLM_REQUEST_TYPE, RespanLogType.EMBEDDING);
+        setDefault(
+          attrs,
+          TraceloopSpanAttributes.LLM_REQUEST_TYPE,
+          RespanLogType.EMBEDDING,
+        );
         enrichSystem(attrs);
         enrichModel(attrs, attrs[AI_MODEL_ID]);
       }
 
-      if (config.logType === RespanLogType.TOOL || logType === RespanLogType.TOOL) {
+      if (
+        config.logType === RespanLogType.TOOL ||
+        logType === RespanLogType.TOOL
+      ) {
         setToolSpanNameHint(attrs, name);
 
         const toolInput = formatToolInput(attrs);
         if (toolInput) {
-          setDefault(attrs, TraceloopSpanAttributes.TRACELOOP_ENTITY_INPUT, toolInput);
+          setDefault(
+            attrs,
+            TraceloopSpanAttributes.TRACELOOP_ENTITY_INPUT,
+            toolInput,
+          );
         }
 
         const toolOutput = formatToolOutput(attrs);
-        if (toolOutput) {
-          setDefault(attrs, TraceloopSpanAttributes.TRACELOOP_ENTITY_OUTPUT, toolOutput);
+        if (toolOutput !== undefined) {
+          setDefault(
+            attrs,
+            TraceloopSpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+            toolOutput,
+          );
         }
       }
-
     } else {
       if (logType === RespanLogType.TEXT) {
         enrichSystem(attrs);
@@ -446,21 +563,34 @@ export class EveSpanProcessor implements SpanProcessor {
 
         enrichTokens(attrs);
 
-        setDefault(attrs, TraceloopSpanAttributes.LLM_REQUEST_TYPE, RespanLogType.CHAT);
+        setDefault(
+          attrs,
+          TraceloopSpanAttributes.LLM_REQUEST_TYPE,
+          RespanLogType.CHAT,
+        );
 
         const input = formatPromptInput(attrs);
         if (input) {
-          setDefault(attrs, TraceloopSpanAttributes.TRACELOOP_ENTITY_INPUT, input);
+          setDefault(
+            attrs,
+            TraceloopSpanAttributes.TRACELOOP_ENTITY_INPUT,
+            input,
+          );
         }
 
         const output = formatCompletionOutput(attrs);
         if (output) {
-          setDefault(attrs, TraceloopSpanAttributes.TRACELOOP_ENTITY_OUTPUT, output);
+          setDefault(
+            attrs,
+            TraceloopSpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+            output,
+          );
         }
 
         const toolsValue = parseToolsValue(attrs);
         if (toolsValue) {
-          attrs[TraceloopSpanAttributes.LLM_REQUEST_FUNCTIONS] = safeJsonStr(toolsValue);
+          attrs[TraceloopSpanAttributes.LLM_REQUEST_FUNCTIONS] =
+            safeJsonStr(toolsValue);
         }
 
         const toolChoice = parseToolChoice(attrs);
@@ -473,7 +603,11 @@ export class EveSpanProcessor implements SpanProcessor {
 
       if (logType === RespanLogType.EMBEDDING) {
         // input/output/tokens are mapped in the up-front embedding block.
-        setDefault(attrs, TraceloopSpanAttributes.LLM_REQUEST_TYPE, RespanLogType.EMBEDDING);
+        setDefault(
+          attrs,
+          TraceloopSpanAttributes.LLM_REQUEST_TYPE,
+          RespanLogType.EMBEDDING,
+        );
         enrichSystem(attrs);
         enrichModel(attrs, attrs[AI_MODEL_ID]);
       }
@@ -483,18 +617,26 @@ export class EveSpanProcessor implements SpanProcessor {
 
         const toolInput = formatToolInput(attrs);
         if (toolInput) {
-          setDefault(attrs, TraceloopSpanAttributes.TRACELOOP_ENTITY_INPUT, toolInput);
+          setDefault(
+            attrs,
+            TraceloopSpanAttributes.TRACELOOP_ENTITY_INPUT,
+            toolInput,
+          );
         }
 
         const toolOutput = formatToolOutput(attrs);
-        if (toolOutput) {
-          setDefault(attrs, TraceloopSpanAttributes.TRACELOOP_ENTITY_OUTPUT, toolOutput);
+        if (toolOutput !== undefined) {
+          setDefault(
+            attrs,
+            TraceloopSpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+            toolOutput,
+          );
         }
       }
     }
 
     stripRedundantAttrs(attrs, logType);
-
+    this._capture.stripAttributes(attrs, capture);
   }
 
   private _applyWorkflowName(
@@ -514,14 +656,16 @@ export class EveSpanProcessor implements SpanProcessor {
         ? undefined
         : this._openTraceWorkflowNames.get(traceId)?.workflowName;
     const workflowName =
-      nonEmptyString(
-        attrs[TraceloopSpanAttributes.TRACELOOP_WORKFLOW_NAME],
-      ) ??
+      nonEmptyString(attrs[TraceloopSpanAttributes.TRACELOOP_WORKFLOW_NAME]) ??
       nonEmptyString(attrs[AI_TELEMETRY_FUNCTION_ID]) ??
       (parentSpanId === undefined
         ? undefined
         : this._openWorkflowNames.get(parentSpanId)) ??
-      retainedWorkflow;
+      retainedWorkflow ??
+      (isEveScope(instrumentationScopeName(span))
+        ? (nonEmptyString(attrs[EVE_AGENT_NAME]) ??
+          nonEmptyString(attrs[ATTR_GEN_AI_AGENT_NAME]))
+        : undefined);
     if (workflowName === undefined) {
       return;
     }
@@ -594,7 +738,10 @@ export class EveSpanProcessor implements SpanProcessor {
     if (match === undefined) {
       return;
     }
-    const [lineage] = this._pendingDelegatedUsageLineages.splice(match.index, 1);
+    const [lineage] = this._pendingDelegatedUsageLineages.splice(
+      match.index,
+      1,
+    );
     if (lineage === undefined) {
       return;
     }
@@ -631,10 +778,7 @@ export class EveSpanProcessor implements SpanProcessor {
       // The real child Eve agent subtree carries the delegated model content
       // and tokens. This late Eve usage event duplicates that call and has no
       // content of its own, so suppress it only when exact correlation exists.
-      span.setAttribute(
-        RespanSpanAttributes.RESPAN_INTERNAL_DROP_SPAN,
-        true,
-      );
+      span.setAttribute(RespanSpanAttributes.RESPAN_INTERNAL_DROP_SPAN, true);
     }
   }
 
@@ -803,10 +947,7 @@ export class EveSpanProcessor implements SpanProcessor {
       };
       this._delegatedTraceCorrelations.delete(sourceTraceId);
       this._delegatedTraceCorrelations.set(sourceTraceId, correlation);
-      trimOldest(
-        this._delegatedTraceCorrelations,
-        MAX_RETAINED_TRACE_CONTEXTS,
-      );
+      trimOldest(this._delegatedTraceCorrelations, MAX_RETAINED_TRACE_CONTEXTS);
     }
 
     setAttribute(
@@ -821,9 +962,8 @@ export class EveSpanProcessor implements SpanProcessor {
     }
     if (
       correlation.workflowName !== undefined &&
-      nonEmptyString(
-        attrs[TraceloopSpanAttributes.TRACELOOP_WORKFLOW_NAME],
-      ) === undefined
+      nonEmptyString(attrs[TraceloopSpanAttributes.TRACELOOP_WORKFLOW_NAME]) ===
+        undefined
     ) {
       setAttribute(
         TraceloopSpanAttributes.TRACELOOP_WORKFLOW_NAME,
@@ -841,6 +981,20 @@ export class EveSpanProcessor implements SpanProcessor {
 
   /** Return an export-only clone for an exactly correlated delegated trace. */
   prepareForExport(span: ReadableSpan): ReadableSpan {
+    // Current Eve may finish memory recall before the first model step stamps
+    // functionId. At actual batch export the same native trace has that exact
+    // workflow identity; apply it to the earlier memory span as well.
+    const workflowName = this._openTraceWorkflowNames.get(
+      span.spanContext().traceId,
+    )?.workflowName;
+    if (workflowName && this._capture.shouldExport(span)) {
+      setDefault(
+        span.attributes as Record<string, unknown>,
+        TraceloopSpanAttributes.TRACELOOP_WORKFLOW_NAME,
+        workflowName,
+      );
+    }
+    span = this._capture.prepare(span);
     const attrs = span.attributes as Record<string, any>;
     const rawTraceId = attrs[EVE_RESPAN_INTERNAL_EXPORT_TRACE_ID_ATTRIBUTE];
     if (rawTraceId === undefined) {
@@ -866,7 +1020,33 @@ export class EveSpanProcessor implements SpanProcessor {
         value: () => ({ ...originalSpanContext, traceId }),
       });
     }
+    this._capture.associate(span, clone);
     return clone as ReadableSpan;
+  }
+
+  /** Compose with Eve's own OTel provider and apply policy at actual export. */
+  wrapExporter(
+    exporter: SpanExporter,
+    spanNameStyle = process.env.RESPAN_SPAN_NAME_STYLE,
+  ): SpanExporter {
+    return {
+      export: (spans, callback) => {
+        const prepared = spans
+          .filter((span) => this._capture.shouldExport(span))
+          .map((span) => this.prepareForExport(span));
+        const translated = transformReadableSpanBatch(prepared, spanNameStyle);
+        if (translated.length === 0) {
+          callback({ code: ExportResultCode.SUCCESS });
+          return;
+        }
+        exporter.export(translated, callback);
+      },
+      forceFlush: () => exporter.forceFlush?.() ?? Promise.resolve(),
+      shutdown: async () => {
+        await exporter.shutdown();
+        this._capture.clear();
+      },
+    };
   }
 
   forceFlush(): Promise<void> {
@@ -966,11 +1146,20 @@ function nonEmptyString(value: unknown): string | undefined {
  * from the log type, but the detail must be the tool's own name — the entity
  * name on AI SDK tool spans is the raw span name (e.g. "ai.toolCall").
  */
-function setToolSpanNameHint(attrs: Record<string, any>, spanName: string): void {
-  setDefault(attrs, RespanSpanAttributes.RESPAN_INTERNAL_SPAN_NAME_KIND, "tool");
+function setToolSpanNameHint(
+  attrs: Record<string, any>,
+  spanName: string,
+): void {
+  setDefault(
+    attrs,
+    RespanSpanAttributes.RESPAN_INTERNAL_SPAN_NAME_KIND,
+    "tool",
+  );
   setDefault(
     attrs,
     RespanSpanAttributes.RESPAN_INTERNAL_SPAN_NAME_DETAIL,
-    attrs[AI_TOOL_CALL_NAME] ?? attrs[ATTR_GEN_AI_TOOL_NAME] ?? spanName.split(".").at(-1)
+    attrs[AI_TOOL_CALL_NAME] ??
+      attrs[ATTR_GEN_AI_TOOL_NAME] ??
+      spanName.split(".").at(-1),
   );
 }

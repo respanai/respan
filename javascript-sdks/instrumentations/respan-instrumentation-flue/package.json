@@ -22,12 +22,13 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "yarn build && node --test tests/*.test.mjs",
+    "test": "tsc -p tsconfig.json && node --test tests/*.test.mjs",
     "publish:package": "yarn npm publish",
     "release": "yarn build && yarn version patch && yarn publish:package"
   },
   "dependencies": {
     "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/core": "^2.10.0",
     "@opentelemetry/sdk-trace-base": "^2.10.0",
     "@opentelemetry/semantic-conventions": "^1.43.0",
     "@respan/respan-sdk": "^1.1.7",
@@ -35,6 +36,7 @@
     "@traceloop/ai-semantic-conventions": "^0.13.0"
   },
   "peerDependencies": {
+    "@flue/opentelemetry": ">=1.0.0-beta.1",
     "@flue/runtime": ">=1.0.0-beta.1"
   },
   "peerDependenciesMeta": {
@@ -43,8 +45,11 @@
     }
   },
   "devDependencies": {
-    "@flue/runtime": "1.0.0-beta.2",
+    "@flue/opentelemetry": "2.2.2",
+    "@flue/runtime": "2.2.2",
+    "@opentelemetry/context-async-hooks": "^2.10.0",
     "@types/node": "^22.15.29",
-    "typescript": "^5.7.3"
+    "typescript": "^5.7.3",
+    "valibot": "^1.1.0"
   }
 }

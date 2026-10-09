@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { BasicTracerProvider } from "@opentelemetry/sdk-trace-base";
-import { RespanCompositeProcessor } from "../../../respan-tracing/dist/processor/composite.js";
+import { RespanCompositeProcessor } from "@respan/tracing/dist/processor/composite.js";
 import { EveInstrumentor } from "../dist/index.js";
 
 class RecordingManager {
@@ -35,10 +35,7 @@ function startTurn(tracer, sessionId) {
 function assertCanonicalTurn(span, sessionId) {
   assert.equal(span.attributes["respan.entity.log_type"], "agent");
   assert.equal(span.attributes["traceloop.entity.name"], "support-agent");
-  assert.equal(
-    span.attributes["respan.threads.thread_identifier"],
-    sessionId,
-  );
+  assert.equal(span.attributes["respan.threads.thread_identifier"], sessionId);
   assert.equal(span.attributes["traceloop.workflow.name"], "support-agent");
   assert.equal(span.attributes["eve.session.id"], undefined);
   assert.equal(span.attributes["traceloop.span.kind"], undefined);
@@ -80,7 +77,10 @@ test("OTel 2.10 transformers support cached tracers, shared ownership, and drain
       },
     });
     inactive.end();
-    assert.equal(manager.ended[3].attributes["respan.entity.log_type"], undefined);
+    assert.equal(
+      manager.ended[3].attributes["respan.entity.log_type"],
+      undefined,
+    );
     assert.equal(
       manager.ended[3].attributes["eve.session.id"],
       "session-after-deactivation",

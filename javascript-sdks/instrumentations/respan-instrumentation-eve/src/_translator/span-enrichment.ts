@@ -7,6 +7,8 @@ import {
   ATTR_GEN_AI_RESPONSE_FINISH_REASONS,
   ATTR_GEN_AI_RESPONSE_ID,
   ATTR_GEN_AI_SYSTEM,
+  ATTR_GEN_AI_SYSTEM_INSTRUCTIONS,
+  ATTR_GEN_AI_TOOL_CALL_ID,
   ATTR_GEN_AI_TOOL_DEFINITIONS,
   ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_INPUT_TOKENS,
@@ -60,22 +62,46 @@ export function enrichMetadata(attrs: SpanAttributes): void {
     const cleanKey = key.slice(AI_TELEMETRY_METADATA_PREFIX.length);
     switch (cleanKey) {
       case "customer_identifier":
-        setDefault(attrs, RespanSpanAttributes.RESPAN_CUSTOMER_PARAMS_ID, String(value));
+        setDefault(
+          attrs,
+          RespanSpanAttributes.RESPAN_CUSTOMER_PARAMS_ID,
+          String(value),
+        );
         break;
       case "customer_email":
-        setDefault(attrs, RespanSpanAttributes.RESPAN_CUSTOMER_PARAMS_EMAIL, String(value));
+        setDefault(
+          attrs,
+          RespanSpanAttributes.RESPAN_CUSTOMER_PARAMS_EMAIL,
+          String(value),
+        );
         break;
       case "customer_name":
-        setDefault(attrs, RespanSpanAttributes.RESPAN_CUSTOMER_PARAMS_NAME, String(value));
+        setDefault(
+          attrs,
+          RespanSpanAttributes.RESPAN_CUSTOMER_PARAMS_NAME,
+          String(value),
+        );
         break;
       case "session_identifier":
-        setDefault(attrs, RespanSpanAttributes.RESPAN_SESSION_ID, String(value));
+        setDefault(
+          attrs,
+          RespanSpanAttributes.RESPAN_SESSION_ID,
+          String(value),
+        );
         break;
       case "thread_identifier":
-        setDefault(attrs, RespanSpanAttributes.RESPAN_THREADS_ID, String(value));
+        setDefault(
+          attrs,
+          RespanSpanAttributes.RESPAN_THREADS_ID,
+          String(value),
+        );
         break;
       case "trace_group_identifier":
-        setDefault(attrs, RespanSpanAttributes.RESPAN_TRACE_GROUP_ID, String(value));
+        setDefault(
+          attrs,
+          RespanSpanAttributes.RESPAN_TRACE_GROUP_ID,
+          String(value),
+        );
         break;
       case "customer_params": {
         // customer_params is a JSON-stringified object (Vercel telemetry
@@ -85,11 +111,26 @@ export function enrichMetadata(attrs: SpanAttributes): void {
         // aliases too so older integrations keep working.
         try {
           const parsed = typeof value === "string" ? JSON.parse(value) : value;
-          if (parsed?.customer_identifier) setDefault(attrs, RespanSpanAttributes.RESPAN_CUSTOMER_PARAMS_ID, parsed.customer_identifier);
+          if (parsed?.customer_identifier)
+            setDefault(
+              attrs,
+              RespanSpanAttributes.RESPAN_CUSTOMER_PARAMS_ID,
+              parsed.customer_identifier,
+            );
           const email = parsed?.email ?? parsed?.customer_email;
-          if (email) setDefault(attrs, RespanSpanAttributes.RESPAN_CUSTOMER_PARAMS_EMAIL, email);
+          if (email)
+            setDefault(
+              attrs,
+              RespanSpanAttributes.RESPAN_CUSTOMER_PARAMS_EMAIL,
+              email,
+            );
           const name = parsed?.name ?? parsed?.customer_name;
-          if (name) setDefault(attrs, RespanSpanAttributes.RESPAN_CUSTOMER_PARAMS_NAME, name);
+          if (name)
+            setDefault(
+              attrs,
+              RespanSpanAttributes.RESPAN_CUSTOMER_PARAMS_NAME,
+              name,
+            );
         } catch {
           // Ignore malformed customer_params metadata.
         }
@@ -102,7 +143,11 @@ export function enrichMetadata(attrs: SpanAttributes): void {
         setMetadata(attrs, "completion_unit_price", String(value));
         break;
       case "userId":
-        setDefault(attrs, RespanSpanAttributes.RESPAN_CUSTOMER_PARAMS_ID, String(value));
+        setDefault(
+          attrs,
+          RespanSpanAttributes.RESPAN_CUSTOMER_PARAMS_ID,
+          String(value),
+        );
         setMetadata(attrs, cleanKey, String(value ?? ""));
         break;
       case "agent_name":
@@ -149,7 +194,11 @@ function normalizeSystem(system: unknown): string | undefined {
 }
 
 export function enrichSystem(attrs: SpanAttributes): void {
-  const system = normalizeSystem(attrs[ATTR_GEN_AI_SYSTEM] ?? attrs[ATTR_GEN_AI_PROVIDER_NAME] ?? attrs[AI_MODEL_PROVIDER]);
+  const system = normalizeSystem(
+    attrs[ATTR_GEN_AI_SYSTEM] ??
+      attrs[ATTR_GEN_AI_PROVIDER_NAME] ??
+      attrs[AI_MODEL_PROVIDER],
+  );
   if (system) {
     setDefault(attrs, ATTR_GEN_AI_SYSTEM, system);
   }
@@ -175,7 +224,9 @@ export function enrichTokens(attrs: SpanAttributes): void {
     attrs[TraceloopSpanAttributes.LLM_USAGE_COMPLETION_TOKENS] ??
     attrs[AI_USAGE_OUTPUT_TOKENS] ??
     attrs[AI_USAGE_COMPLETION_TOKENS];
-  const totalTokens = attrs[TraceloopSpanAttributes.LLM_USAGE_TOTAL_TOKENS] ?? attrs[AI_USAGE_TOTAL_TOKENS];
+  const totalTokens =
+    attrs[TraceloopSpanAttributes.LLM_USAGE_TOTAL_TOKENS] ??
+    attrs[AI_USAGE_TOTAL_TOKENS];
   const cacheReadInputTokens =
     attrs[ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS] ??
     attrs[LLM_USAGE_CACHE_READ_INPUT_TOKENS] ??
@@ -186,35 +237,58 @@ export function enrichTokens(attrs: SpanAttributes): void {
 
   if (promptTokens !== undefined) {
     setDefault(attrs, ATTR_GEN_AI_USAGE_INPUT_TOKENS, promptTokens);
-    setDefault(attrs, TraceloopSpanAttributes.LLM_USAGE_PROMPT_TOKENS, promptTokens);
+    setDefault(
+      attrs,
+      TraceloopSpanAttributes.LLM_USAGE_PROMPT_TOKENS,
+      promptTokens,
+    );
   }
   if (completionTokens !== undefined) {
     setDefault(attrs, ATTR_GEN_AI_USAGE_OUTPUT_TOKENS, completionTokens);
-    setDefault(attrs, TraceloopSpanAttributes.LLM_USAGE_COMPLETION_TOKENS, completionTokens);
+    setDefault(
+      attrs,
+      TraceloopSpanAttributes.LLM_USAGE_COMPLETION_TOKENS,
+      completionTokens,
+    );
   }
 
-  const resolvedTotalTokens = numberAttr(totalTokens) ?? (
-    promptTokens !== undefined && completionTokens !== undefined
-      ? promptTokens + completionTokens
-      : undefined
-  );
+  const resolvedTotalTokens = numberAttr(totalTokens);
   if (resolvedTotalTokens !== undefined) {
-    setDefault(attrs, TraceloopSpanAttributes.LLM_USAGE_TOTAL_TOKENS, resolvedTotalTokens);
+    setDefault(
+      attrs,
+      TraceloopSpanAttributes.LLM_USAGE_TOTAL_TOKENS,
+      resolvedTotalTokens,
+    );
   }
 
   const resolvedCacheReadInputTokens = numberAttr(cacheReadInputTokens);
   if (resolvedCacheReadInputTokens !== undefined) {
-    setDefault(attrs, LLM_USAGE_CACHE_READ_INPUT_TOKENS, resolvedCacheReadInputTokens);
+    setDefault(
+      attrs,
+      LLM_USAGE_CACHE_READ_INPUT_TOKENS,
+      resolvedCacheReadInputTokens,
+    );
   }
 }
 
-export function enrichPerformanceMetrics(attrs: SpanAttributes, spanName: string): void {
+export function enrichPerformanceMetrics(
+  attrs: SpanAttributes,
+  spanName: string,
+): void {
   // Streaming is a first-class promoted attribute (llm.is_streaming), not metadata.
-  setDefault(attrs, LLM_IS_STREAMING, spanName.toLowerCase().includes("stream"));
+  // Modern native `chat` spans do not say whether generation streamed. Keep
+  // that field absent rather than labeling a real streamed call as false.
+  if (/stream/i.test(spanName)) setDefault(attrs, LLM_IS_STREAMING, true);
+  else if (/generate/i.test(spanName))
+    setDefault(attrs, LLM_IS_STREAMING, false);
 
   const msToFinish = attrs[AI_RESPONSE_MS_TO_FINISH];
   if (msToFinish !== undefined) {
-    setMetadata(attrs, "time_to_first_token", String(Number(msToFinish) / 1000));
+    setMetadata(
+      attrs,
+      "time_to_first_token",
+      String(Number(msToFinish) / 1000),
+    );
   }
 
   const cost = attrs[GEN_AI_USAGE_COST];
@@ -248,6 +322,7 @@ const NON_CONTRACT_ATTRS_TO_STRIP = [
   ATTR_GEN_AI_INPUT_MESSAGES,
   ATTR_GEN_AI_OPERATION_NAME,
   ATTR_GEN_AI_OUTPUT_MESSAGES,
+  ATTR_GEN_AI_SYSTEM_INSTRUCTIONS,
   ATTR_GEN_AI_PROVIDER_NAME,
   ATTR_GEN_AI_RESPONSE_FINISH_REASONS,
   ATTR_GEN_AI_RESPONSE_ID,
@@ -311,15 +386,16 @@ export function stripRedundantAttrs(
   }
 
   const carriesLLMFields =
-    logType === RespanLogType.TEXT ||
-    logType === RespanLogType.EMBEDDING;
+    logType === RespanLogType.TEXT || logType === RespanLogType.EMBEDDING;
 
   for (const key of Object.keys(attrs)) {
     if (
       key.startsWith(AI_PREFIX) ||
       key.startsWith(EVE_ATTRIBUTE_PREFIX) ||
-      key.startsWith("gen_ai.tool.") ||
+      key.startsWith("agent.") ||
+      (key.startsWith("gen_ai.tool.") && key !== ATTR_GEN_AI_TOOL_CALL_ID) ||
       (!carriesLLMFields &&
+        key !== ATTR_GEN_AI_TOOL_CALL_ID &&
         (key.startsWith("gen_ai.") || key.startsWith("llm.")))
     ) {
       delete attrs[key];

@@ -1,5 +1,5 @@
 import { trace, type Attributes } from "@opentelemetry/api";
-import type { InstrumentationDefinition } from "eve/instrumentation";
+import { types } from "node:util";
 import {
   EVE_RESPAN_BRIDGE_RUNTIME_CONTEXT_KEY,
   EVE_RESPAN_LINEAGE_PARENT_CALL_ID_ATTRIBUTE,
@@ -50,13 +50,39 @@ interface EveLineage {
  * preserved. The private `__respan_eve` key is helper-owned and wins over an
  * authored value with the same name.
  */
-export function withEveLineage<T extends InstrumentationDefinition>(
-  definition: T,
-): T {
+export function withEveLineage<T extends object>(definition: T): T {
+  if (types.isProxy(definition)) return definition;
+  // Eve 0.62+ moved model runtime context from step.started to each OTel
+  // destination. Keep this helper independent of Eve's removed legacy types
+  // so the same package can serve both released API generations.
+  if (Object.hasOwn(definition, "runtimeContext")) {
+    const integration = definition as T & {
+      runtimeContext?: (input: EveStepStartedInputLike) => unknown;
+    };
+    const authoredRuntimeContext = ownData(
+      integration,
+      "runtimeContext",
+    ) as typeof integration.runtimeContext;
+    return extend(definition, {
+      runtimeContext(input: EveStepStartedInputLike): unknown {
+        const result = authoredRuntimeContext?.(input);
+        if (result !== undefined && !isRecord(result)) {
+          return result;
+        }
+        const lineage = buildLineage(input);
+        if (!lineage) return result;
+        stampActiveTurn(lineage);
+        return extend(result ?? {}, {
+          [EVE_RESPAN_BRIDGE_RUNTIME_CONTEXT_KEY]: { lineage },
+        });
+      },
+    });
+  }
   const typedDefinition = definition as T & EveInstrumentationDefinitionLike;
-  const authoredStepStarted = typedDefinition.events?.["step.started"] as
-    | ((input: EveStepStartedInputLike) => unknown)
-    | undefined;
+  const events = ownData(typedDefinition, "events");
+  const authoredStepStarted = (
+    isRecord(events) ? ownData(events, "step.started") : undefined
+  ) as ((input: EveStepStartedInputLike) => unknown) | undefined;
 
   const stepStarted = (input: EveStepStartedInputLike): unknown => {
     const authoredResult = authoredStepStarted?.(input);
@@ -65,49 +91,72 @@ export function withEveLineage<T extends InstrumentationDefinition>(
     // callback results instead of silently converting them into valid output.
     if (
       authoredResult !== undefined &&
-      (!isRecord(authoredResult) || !isRecord(authoredResult.runtimeContext))
+      (!isRecord(authoredResult) ||
+        !isRecord(ownData(authoredResult, "runtimeContext")))
     ) {
       return authoredResult;
     }
 
     const lineage = buildLineage(input);
+    if (!lineage) return authoredResult;
     const authoredRuntimeContext =
       authoredResult === undefined
         ? {}
-        : (authoredResult.runtimeContext as Record<string, unknown>);
+        : (ownData(authoredResult, "runtimeContext") as Record<
+            string,
+            unknown
+          >);
 
     stampActiveTurn(lineage);
 
     return {
-      runtimeContext: {
-        ...authoredRuntimeContext,
+      runtimeContext: extend(authoredRuntimeContext, {
         [EVE_RESPAN_BRIDGE_RUNTIME_CONTEXT_KEY]: { lineage },
-      },
+      }),
     };
   };
 
-  return {
-    ...definition,
-    events: {
-      ...typedDefinition.events,
+  return extend(definition, {
+    events: extend(isRecord(events) ? events : {}, {
       "step.started": stepStarted,
-    },
-  } as T;
+    }),
+  });
 }
 
-function buildLineage(input: EveStepStartedInputLike): EveLineage {
-  const parent = input.session.parent;
+function buildLineage(input: EveStepStartedInputLike): EveLineage | undefined {
+  if (types.isProxy(input)) return undefined;
+  const session = ownData(input, "session");
+  if (!isRecord(session) || typeof ownData(session, "id") !== "string")
+    return undefined;
+  const parent = ownData(session, "parent");
   if (parent === undefined) {
-    return { rootSessionId: input.session.id };
+    return { rootSessionId: ownData(session, "id") as string };
   }
 
+  if (!isRecord(parent)) return undefined;
+  const turn = ownData(parent, "turn");
+  if (!isRecord(turn)) return undefined;
+  const callId = ownData(parent, "callId"),
+    rootSessionId = ownData(parent, "rootSessionId"),
+    sessionId = ownData(parent, "sessionId");
+  const turnId = ownData(turn, "id"),
+    sequence = ownData(turn, "sequence");
+  if (
+    typeof callId !== "string" ||
+    typeof rootSessionId !== "string" ||
+    typeof sessionId !== "string" ||
+    typeof turnId !== "string" ||
+    typeof sequence !== "number"
+  )
+    return undefined;
+
   return {
-    callId: parent.callId,
-    rootSessionId: parent.rootSessionId,
-    sessionId: parent.sessionId,
+    callId,
+    rootSessionId,
+    sessionId,
     turn: {
-      id: parent.turn.id,
-      sequence: parent.turn.sequence,
+      id: turnId,
+      sequence,
     },
   };
 }
@@ -127,8 +176,7 @@ function stampActiveTurn(lineage: EveLineage): void {
     }
 
     const attributes: Attributes = {
-      [EVE_RESPAN_LINEAGE_ROOT_SESSION_ID_ATTRIBUTE]:
-        lineage.rootSessionId,
+      [EVE_RESPAN_LINEAGE_ROOT_SESSION_ID_ATTRIBUTE]: lineage.rootSessionId,
     };
     if (lineage.sessionId !== undefined) {
       attributes[EVE_RESPAN_LINEAGE_PARENT_SESSION_ID_ATTRIBUTE] =
@@ -149,5 +197,22 @@ function stampActiveTurn(lineage: EveLineage): void {
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
+  if (value === null || typeof value !== "object" || types.isProxy(value))
+    return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function ownData(value: object, key: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  return descriptor && "value" in descriptor ? descriptor.value : undefined;
+}
+
+function extend<T extends object>(value: T, additions: object): T {
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  for (const key of Object.keys(additions)) delete descriptors[key];
+  return Object.assign(
+    Object.create(Object.getPrototypeOf(value), descriptors),
+    additions,
+  );
 }

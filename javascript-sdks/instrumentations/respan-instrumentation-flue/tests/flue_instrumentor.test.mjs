@@ -1,677 +1,549 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-
-import { SpanStatusCode, trace } from "@opentelemetry/api";
-
+import { context, createContextKey, trace } from "@opentelemetry/api";
+import { suppressTracing } from "@opentelemetry/core";
+import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
+import {
+  AlwaysOffSampler,
+  BasicTracerProvider,
+  SimpleSpanProcessor,
+} from "@opentelemetry/sdk-trace-base";
+import { CONTEXT_KEY_ALLOW_TRACE_CONTENT } from "@traceloop/ai-semantic-conventions";
 import { FlueInstrumentor } from "../dist/index.js";
+import {
+  BODY,
+  VECTOR,
+  current,
+  nativeRuntime,
+  runtime,
+} from "./native_runtime.mjs";
 
-const captureState = { spans: [] };
-const originalGetTracerProvider = trace.getTracerProvider.bind(trace);
-
-test.before(() => {
-  Object.defineProperty(trace, "getTracerProvider", {
-    configurable: true,
-    writable: true,
-    value() {
-      return {
-        activeSpanProcessor: {
-          onEnd(span) {
-            captureState.spans.push(span);
-          },
-        },
-      };
+const exported = [];
+let dropped = false;
+const provider = new BasicTracerProvider({
+  sampler: {
+    shouldSample(...args) {
+      return dropped
+        ? new AlwaysOffSampler().shouldSample(...args)
+        : { decision: 2 };
     },
-  });
+  },
+  spanLimits: {
+    attributeValueLengthLimit: Infinity,
+    attributeCountLimit: 4096,
+  },
+  spanProcessors: [
+    {
+      onStart() {},
+      onEnd(span) {
+        exported.push(span);
+      },
+      async forceFlush() {},
+      async shutdown() {},
+    },
+  ],
 });
-
-test.after(() => {
-  Object.defineProperty(trace, "getTracerProvider", {
-    configurable: true,
-    writable: true,
-    value: originalGetTracerProvider,
-  });
+trace.setGlobalTracerProvider(provider);
+context.setGlobalContextManager(new AsyncLocalStorageContextManager().enable());
+test.after(async () => {
+  await provider.shutdown();
+  context.disable();
+  trace.disable();
 });
-
-function event(partial) {
-  return {
-    v: 1,
-    eventIndex: partial.eventIndex ?? 1,
-    timestamp: partial.timestamp ?? "2026-06-21T00:00:00.000Z",
-    ...partial,
-  };
-}
-
-function assertConnectedTree(spans) {
-  const spansById = new Map(spans.map((span) => [span.spanContext().spanId, span]));
-  const roots = spans.filter((span) => !span.parentSpanContext);
-
-  assert.equal(roots.length, 1);
-  for (const span of spans) {
-    const visited = new Set();
-    let current = span;
-    while (current.parentSpanContext) {
-      assert.ok(!visited.has(current.spanContext().spanId), `${span.name} has a parent cycle`);
-      visited.add(current.spanContext().spanId);
-      const parent = spansById.get(current.parentSpanContext.spanId);
-      assert.ok(
-        parent,
-        `${span.name} has an unexported parent`,
-      );
-      current = parent;
-    }
-    assert.equal(current.spanContext().spanId, roots[0].spanContext().spanId);
+const contentEntries = (span) =>
+  Object.entries(span.attributes).filter(
+    ([key]) =>
+      /(?:prompt|completion|entity\.(?:input|output)|functions|exception|error\.message|description|arguments|result)/.test(
+        key,
+      ) && !/usage|tokens/.test(key),
+  );
+const ownSpans = () =>
+  exported.filter(
+    (span) => span.instrumentationScope.name === "@respan/instrumentation-flue",
+  );
+async function scenario(options, run, instrumentorOptions = {}) {
+  exported.length = 0;
+  const instrumentor = new FlueInstrumentor({
+    runtimeModule: runtime,
+    ...instrumentorOptions,
+  });
+  await instrumentor.activate();
+  let native;
+  try {
+    native = await nativeRuntime(options);
+    await run(native, instrumentor);
+  } finally {
+    await native?.close();
+    await instrumentor.deactivate();
   }
+  return ownSpans();
 }
 
-test("exports Flue workflow, operation, model turn, and tool events as canonical spans", () => {
-  captureState.spans = [];
-  const instrumentor = new FlueInstrumentor();
-
-  instrumentor.handleEvent(event({
-    type: "run_start",
-    eventIndex: 1,
-    runId: "run-flue-1",
-    workflowName: "Flue Weather.workflow",
-    startedAt: "2026-06-21T00:00:00.000Z",
-    payload: { city: "Paris" },
-  }));
-  instrumentor.handleEvent(event({
-    type: "operation_start",
-    eventIndex: 2,
-    timestamp: "2026-06-21T00:00:00.050Z",
-    runId: "run-flue-1",
-    operationId: "op-1",
-    operationKind: "prompt",
-  }));
-  instrumentor.handleEvent(event({
-    type: "turn_start",
-    eventIndex: 3,
-    timestamp: "2026-06-21T00:00:00.100Z",
-    runId: "run-flue-1",
-    operationId: "op-1",
-    turnId: "turn-1",
-    purpose: "agent",
-  }));
-  instrumentor.handleEvent(event({
-    type: "turn_request",
-    eventIndex: 4,
-    timestamp: "2026-06-21T00:00:00.110Z",
-    runId: "run-flue-1",
-    operationId: "op-1",
-    turnId: "turn-1",
-    purpose: "agent",
-    model: "openai/gpt-4o-mini",
-    provider: "openai",
-    api: "responses",
-    input: {
-      systemPrompt: "Answer with weather facts.",
-      messages: [
-        { role: "user", content: "Weather in Paris?" },
-      ],
-      tools: [
-        {
-          name: "lookup_weather",
-          description: "Lookup weather.",
-          parameters: { type: "object" },
-        },
-      ],
-    },
-  }));
-  instrumentor.handleEvent(event({
-    type: "tool_start",
-    eventIndex: 5,
-    timestamp: "2026-06-21T00:00:00.200Z",
-    runId: "run-flue-1",
-    operationId: "op-1",
-    turnId: "turn-1",
-    toolCallId: "tool-1",
-    toolName: "lookup_weather",
-    args: { city: "Paris" },
-  }));
-  instrumentor.handleEvent(event({
-    type: "tool",
-    eventIndex: 6,
-    timestamp: "2026-06-21T00:00:00.260Z",
-    runId: "run-flue-1",
-    operationId: "op-1",
-    turnId: "turn-1",
-    toolCallId: "tool-1",
-    toolName: "lookup_weather",
-    isError: false,
-    result: { forecast: "sunny" },
-    durationMs: 60,
-  }));
-  instrumentor.handleEvent(event({
-    type: "turn",
-    eventIndex: 7,
-    timestamp: "2026-06-21T00:00:00.900Z",
-    runId: "run-flue-1",
-    operationId: "op-1",
-    turnId: "turn-1",
-    purpose: "agent",
-    durationMs: 800,
-    model: "openai/gpt-4o-mini",
-    provider: "openai",
-    api: "responses",
-    output: {
-      role: "assistant",
-      content: [
-        { type: "text", text: "Paris is sunny." },
-        { type: "toolCall", id: "tool-1", name: "lookup_weather", arguments: { city: "Paris" } },
-      ],
-    },
-    usage: {
-      input: 20,
-      output: 8,
-      cacheRead: 2,
-      cacheWrite: 0,
-      totalTokens: 28,
-      cost: { input: 0.01, output: 0.02, cacheRead: 0.001, cacheWrite: 0, total: 0.031 },
-    },
-    stopReason: "stop",
-    isError: false,
-  }));
-  instrumentor.handleEvent(event({
-    type: "operation",
-    eventIndex: 8,
-    timestamp: "2026-06-21T00:00:01.000Z",
-    runId: "run-flue-1",
-    operationId: "op-1",
-    operationKind: "prompt",
-    durationMs: 950,
-    isError: false,
-    result: { text: "Paris is sunny." },
-  }));
-  instrumentor.handleEvent(event({
-    type: "run_end",
-    eventIndex: 9,
-    timestamp: "2026-06-21T00:00:01.100Z",
-    runId: "run-flue-1",
-    result: { ok: true },
-    isError: false,
-    durationMs: 1100,
-  }));
-
-  assert.equal(captureState.spans.length, 4);
-
-  const workflowSpan = captureState.spans.find(
-    (span) => span.attributes["respan.entity.log_type"] === "workflow",
-  );
-  const operationSpan = captureState.spans.find(
-    (span) => span.name === "flue.operation.prompt",
-  );
-  const modelSpan = captureState.spans.find(
+test("real runtime preserves complete model history, schema, native tool IDs, vector5001 and zero usage", async () => {
+  const spans = await scenario({ tool: true, large: true }, async (native) => {
+    const handle = native.prompt();
+    assert.equal(typeof handle.abort, "function");
+    assert.ok(handle.signal instanceof AbortSignal);
+    assert.equal(typeof handle.catch, "function");
+    assert.equal(typeof handle.finally, "function");
+    const answer = await handle;
+    assert.equal(answer.text, BODY);
+    assert.equal(native.calls.length, 1);
+    assert.deepEqual(native.calls[0].data, {
+      flag: false,
+      count: 0,
+      empty: "",
+    });
+    assert.ok(native.calls[0].call.signal instanceof AbortSignal);
+    assert.equal(
+      (await native.prompt("continue the actual session")).text,
+      BODY,
+    );
+    assert.equal(native.requests.length, 3);
+    assert.ok(
+      native.requests[2].messages.some((message) => message.role === "tool"),
+    );
+  });
+  const chats = spans.filter(
     (span) => span.attributes["respan.entity.log_type"] === "chat",
   );
-  const toolSpan = captureState.spans.find(
+  const tools = spans.filter(
     (span) => span.attributes["respan.entity.log_type"] === "tool",
   );
+  assert.equal(chats.length, 3);
+  assert.equal(tools.length, 1);
+  assert.equal(chats.at(-1).attributes["gen_ai.completion.0.content"], BODY);
+  assert.ok(chats[0].attributes["llm.request.functions"].includes(BODY));
+  assert.equal(chats[0].attributes["gen_ai.usage.input_tokens"], 0);
+  assert.equal(chats[0].attributes["gen_ai.usage.output_tokens"], 0);
+  assert.equal(chats[0].attributes["llm.usage.total_tokens"], 0);
+  assert.equal(tools[0].attributes["gen_ai.tool.call.id"], "native-tool-call");
+  const output = JSON.parse(tools[0].attributes["traceloop.entity.output"]);
+  const parsed =
+    typeof output === "string"
+      ? JSON.parse(output)
+      : Array.isArray(output) && output[0]?.text
+        ? JSON.parse(output[0].text)
+        : output.content?.[0]?.text
+          ? JSON.parse(output.content[0].text)
+          : output;
+  assert.equal(parsed.vector?.length, 5001);
+  assert.ok(parsed.vector.every((value, index) => value === VECTOR[index]));
+  assert.deepEqual([parsed.flag, parsed.count, parsed.empty], [false, 0, ""]);
+  for (const span of spans) {
+    assert.equal(span.attributes["traceloop.span.kind"], undefined);
+    for (const key of [
+      "tools",
+      "tool_calls",
+      "model",
+      "prompt_tokens",
+      "respan.span.tools",
+    ])
+      assert.equal(span.attributes[key], undefined);
+    assert.ok(
+      !Object.keys(span.attributes).some((key) => key.startsWith("flue.")),
+    );
+    if (span.parentSpanContext)
+      assert.ok(
+        spans.some(
+          (parent) =>
+            parent.spanContext().spanId === span.parentSpanContext.spanId,
+        ),
+      );
+  }
+});
 
-  assert.ok(workflowSpan);
-  assert.ok(operationSpan);
-  assert.ok(modelSpan);
-  assert.ok(toolSpan);
-  assert.equal(modelSpan.instrumentationScope.name, "@respan/instrumentation-flue");
-  assert.equal(operationSpan.parentSpanContext?.spanId, workflowSpan.spanContext().spanId);
-  assert.equal(modelSpan.parentSpanContext?.spanId, operationSpan.spanContext().spanId);
-  assert.equal(toolSpan.parentSpanContext?.spanId, operationSpan.spanContext().spanId);
+test("content context, constructor, canonical environment and legacy environment veto before capture", async () => {
+  for (const gate of ["context", "option", "respan-env", "legacy-env"]) {
+    const key =
+      gate === "respan-env"
+        ? "RESPAN_TRACE_CONTENT"
+        : "TRACELOOP_TRACE_CONTENT";
+    const previous = process.env[key];
+    if (gate.endsWith("env")) process.env[key] = "false";
+    try {
+      const spans = await context.with(
+        gate === "context"
+          ? context.active().setValue(CONTEXT_KEY_ALLOW_TRACE_CONTENT, false)
+          : context.active(),
+        () =>
+          scenario(
+            { tool: true },
+            async (native) =>
+              assert.equal((await native.prompt()).text, "native answer"),
+            { traceContent: gate !== "option" },
+          ),
+      );
+      assert.ok(spans.length >= 4);
+      for (const span of spans)
+        assert.equal(
+          contentEntries(span).length,
+          0,
+          span.attributes["respan.entity.log_type"],
+        );
+    } finally {
+      if (previous === undefined) delete process.env[key];
+      else process.env[key] = previous;
+    }
+  }
+});
 
-  assert.equal(workflowSpan.attributes["traceloop.workflow.name"], "Flue Weather.workflow");
-  assert.equal(modelSpan.attributes["traceloop.workflow.name"], "Flue Weather.workflow");
-  assert.equal(modelSpan.attributes["gen_ai.system"], "openai");
-  assert.equal(modelSpan.attributes["gen_ai.request.model"], "gpt-4o-mini");
-  assert.equal(modelSpan.attributes["llm.request.type"], "chat");
-  assert.equal(modelSpan.attributes["gen_ai.prompt.0.role"], "system");
-  assert.equal(modelSpan.attributes["gen_ai.prompt.0.content"], "Answer with weather facts.");
-  assert.equal(modelSpan.attributes["gen_ai.prompt.1.role"], "user");
-  assert.equal(modelSpan.attributes["gen_ai.prompt.1.content"], "Weather in Paris?");
-  assert.deepEqual(JSON.parse(modelSpan.attributes["llm.request.functions"]), [
-    { name: "lookup_weather", description: "Lookup weather.", parameters: { type: "object" } },
-  ]);
-  assert.equal(modelSpan.attributes["gen_ai.completion.0.role"], "assistant");
-  assert.equal(modelSpan.attributes["gen_ai.completion.0.content"], "Paris is sunny.");
-  assert.deepEqual(JSON.parse(modelSpan.attributes["gen_ai.completion.0.tool_calls"]), [
+test("sampling and general/LM suppression preserve native execution", async () => {
+  for (const gate of ["sampling", "general", "lm"]) {
+    dropped = gate === "sampling";
+    const ctx =
+      gate === "general"
+        ? suppressTracing(context.active())
+        : gate === "lm"
+          ? context
+              .active()
+              .setValue(
+                createContextKey("suppress_language_model_instrumentation"),
+                true,
+              )
+          : context.active();
+    try {
+      const spans = await context.with(ctx, () =>
+        scenario({}, async (native) =>
+          assert.equal((await native.prompt()).text, "native answer"),
+        ),
+      );
+      assert.equal(spans.length, 0);
+    } finally {
+      dropped = false;
+    }
+  }
+});
+
+test("local unknown parent fails closed and a remote parent allows unless content context vetoes", async () => {
+  for (const remote of [false, true]) {
+    const parent = {
+      traceId: "1".repeat(32),
+      spanId: "2".repeat(16),
+      traceFlags: 1,
+      isRemote: remote,
+    };
+    const spans = await context.with(
+      trace.setSpanContext(context.active(), parent),
+      () =>
+        scenario({}, async (native) =>
+          assert.equal((await native.prompt()).text, "native answer"),
+        ),
+    );
+    assert.ok(spans.length >= 2);
+    assert.equal(
+      contentEntries(
+        spans.find(
+          (span) => span.attributes["respan.entity.log_type"] === "chat",
+        ),
+      ).length > 0,
+      remote,
+    );
+  }
+});
+
+test("ancestor false is immutable across later true, and late native attrs/events/status are scrubbed", async () => {
+  const root = trace.getTracer("test").startSpan("parent");
+  const spans = await context.with(trace.setSpan(context.active(), root), () =>
+    scenario(
+      {
+        tool: true,
+        onTool() {
+          root.setAttribute("allow_trace_content", false);
+        },
+        onEvent(event) {
+          if (event.type === "turn_messages")
+            root.setAttribute("allow_trace_content", true);
+        },
+      },
+      async (native) =>
+        assert.equal((await native.prompt()).text, "native answer"),
+    ),
+  );
+  root.end();
+  for (const span of spans.filter((span, index) => index > 0)) {
+    assert.equal(
+      contentEntries(span).length,
+      0,
+      span.attributes["respan.entity.log_type"],
+    );
+    assert.deepEqual(span.events, []);
+    assert.equal(span.status.message, undefined);
+  }
+});
+
+test("real provider errors remain SDK failures, without invented HTTP statuses", async () => {
+  let failure;
+  const spans = await scenario({ providerError: true }, async (native) => {
+    try {
+      await native.prompt();
+    } catch (error) {
+      failure = error;
+    }
+  });
+  assert.ok(failure instanceof runtime.OperationFailedError);
+  const chat = spans.find(
+    (span) => span.attributes["respan.entity.log_type"] === "chat",
+  );
+  assert.equal(chat.status.code, 2);
+  assert.equal(chat.attributes.status_code, undefined);
+  assert.equal(chat.attributes["http.response.status_code"], undefined);
+});
+
+test("deactivation and reactivation preserve native ownership without duplicate subtrees", async () => {
+  const instrumentor = new FlueInstrumentor({ runtimeModule: runtime });
+  for (let index = 0; index < 2; index++) {
+    exported.length = 0;
+    await Promise.all([instrumentor.activate(), instrumentor.activate()]);
+    const native = await nativeRuntime();
+    try {
+      await native.prompt();
+    } finally {
+      await native.close();
+      await instrumentor.deactivate();
+      await instrumentor.deactivate();
+    }
+    assert.equal(
+      ownSpans().filter(
+        (span) => span.attributes["respan.entity.log_type"] === "chat",
+      ).length,
+      1,
+    );
+    assert.equal(instrumentor.isActive(), false);
+  }
+});
+
+test("telemetry never adds caller getter or toJSON calls beyond bare runtime behavior", async () => {
+  async function run(instrumented) {
+    let getter = 0,
+      serialization = 0;
+    const output = {
+      toJSON() {
+        serialization++;
+        return { flag: false, count: 0, empty: "" };
+      },
+    };
+    Object.defineProperty(output, "lazy", {
+      enumerable: true,
+      get() {
+        getter++;
+        return "native getter";
+      },
+    });
+    const instrumentor = new FlueInstrumentor({ runtimeModule: runtime });
+    if (instrumented) await instrumentor.activate();
+    const native = await nativeRuntime({ tool: true, toolOutput: output });
+    try {
+      assert.equal((await native.prompt()).text, "native answer");
+    } finally {
+      await native.close();
+      await instrumentor.deactivate();
+    }
+    return { getter, serialization };
+  }
+  assert.deepEqual(await run(true), await run(false));
+});
+
+test("a native tool callback late veto removes prior and later attributes, exception events and status descriptions at readable export", async () => {
+  const spans = await scenario(
     {
-      id: "tool-1",
-      type: "function",
-      function: { name: "lookup_weather", arguments: JSON.stringify({ city: "Paris" }) },
-    },
-  ]);
-  assert.equal(modelSpan.attributes["gen_ai.usage.input_tokens"], 20);
-  assert.equal(modelSpan.attributes["gen_ai.usage.output_tokens"], 8);
-  assert.equal(modelSpan.attributes["gen_ai.usage.prompt_tokens"], 20);
-  assert.equal(modelSpan.attributes["gen_ai.usage.completion_tokens"], 8);
-  assert.equal(modelSpan.attributes["llm.usage.total_tokens"], 28);
-  assert.equal(modelSpan.attributes["respan.metadata.flue_usage_cache_read_tokens"], 2);
-
-  for (const span of captureState.spans) {
-    assert.equal(span.attributes["respan.span.tools"], undefined);
-    assert.equal(span.attributes["respan.span.tool_calls"], undefined);
-    assert.equal(span.attributes.tools, undefined);
-    assert.equal(span.attributes.tool_calls, undefined);
-    assert.equal(span.attributes.model, undefined);
-    assert.equal(span.attributes.prompt_tokens, undefined);
-    assert.equal(span.attributes.completion_tokens, undefined);
-  }
-});
-
-test("exports direct agent logs and compaction with fallback workflow name", () => {
-  captureState.spans = [];
-  const instrumentor = new FlueInstrumentor({
-    workflowName: "Flue Direct Agent.workflow",
-  });
-
-  instrumentor.handleEvent(event({
-    type: "agent_start",
-    eventIndex: 1,
-    instanceId: "agent-1",
-    harness: "default",
-    session: "main",
-  }));
-  instrumentor.handleEvent(event({
-    type: "log",
-    eventIndex: 2,
-    instanceId: "agent-1",
-    harness: "default",
-    session: "main",
-    level: "info",
-    message: "agent accepted input",
-    attributes: { channel: "test" },
-  }));
-  instrumentor.handleEvent(event({
-    type: "compaction_start",
-    eventIndex: 3,
-    timestamp: "2026-06-21T00:00:00.200Z",
-    instanceId: "agent-1",
-    operationId: "op-compact",
-    reason: "manual",
-    estimatedTokens: 1200,
-  }));
-  instrumentor.handleEvent(event({
-    type: "compaction",
-    eventIndex: 4,
-    timestamp: "2026-06-21T00:00:00.500Z",
-    instanceId: "agent-1",
-    operationId: "op-compact",
-    messagesBefore: 12,
-    messagesAfter: 3,
-    durationMs: 300,
-    isError: false,
-  }));
-  instrumentor.handleEvent(event({
-    type: "agent_end",
-    eventIndex: 5,
-    instanceId: "agent-1",
-    harness: "default",
-    session: "main",
-    messages: [{ role: "assistant", content: "done" }],
-  }));
-
-  assert.equal(captureState.spans.length, 3);
-  const logSpan = captureState.spans.find((span) => span.name === "flue.log.info");
-  const compactionSpan = captureState.spans.find((span) => span.name === "flue.compaction");
-  const agentSpan = captureState.spans.find(
-    (span) => span.attributes["respan.entity.log_type"] === "agent",
-  );
-
-  assert.ok(logSpan);
-  assert.ok(compactionSpan);
-  assert.ok(agentSpan);
-  assert.equal(logSpan.attributes["traceloop.workflow.name"], "Flue Direct Agent.workflow");
-  assert.equal(compactionSpan.attributes["respan.metadata.flue_compaction_reason"], "manual");
-  assert.equal(agentSpan.attributes["traceloop.entity.name"], "agent-1");
-  assert.equal(compactionSpan.parentSpanContext?.spanId, agentSpan.spanContext().spanId);
-  assertConnectedTree(captureState.spans);
-});
-
-test("parents compaction to the workflow when its started operation never finishes", () => {
-  captureState.spans = [];
-  const instrumentor = new FlueInstrumentor();
-
-  instrumentor.handleEvent(event({
-    type: "run_start",
-    eventIndex: 1,
-    runId: "run-compaction-fallback",
-    workflowName: "Flue Compaction Fallback.workflow",
-  }));
-  instrumentor.handleEvent(event({
-    type: "operation_start",
-    eventIndex: 2,
-    runId: "run-compaction-fallback",
-    operationId: "missing-operation",
-    operationKind: "compact",
-  }));
-  instrumentor.handleEvent(event({
-    type: "compaction_start",
-    eventIndex: 3,
-    runId: "run-compaction-fallback",
-    operationId: "missing-operation",
-    reason: "manual",
-  }));
-  instrumentor.handleEvent(event({
-    type: "compaction",
-    eventIndex: 4,
-    runId: "run-compaction-fallback",
-    operationId: "missing-operation",
-    messagesBefore: 12,
-    messagesAfter: 4,
-    isError: false,
-  }));
-  instrumentor.handleEvent(event({
-    type: "run_end",
-    eventIndex: 5,
-    runId: "run-compaction-fallback",
-    result: { ok: true },
-    isError: false,
-  }));
-
-  assert.equal(captureState.spans.length, 2);
-  const compactionSpan = captureState.spans.find((span) => span.name === "flue.compaction");
-  const workflowSpan = captureState.spans.find(
-    (span) => span.attributes["respan.entity.log_type"] === "workflow",
-  );
-
-  assert.ok(compactionSpan);
-  assert.ok(workflowSpan);
-  assert.equal(compactionSpan.parentSpanContext?.spanId, workflowSpan.spanContext().spanId);
-  assertConnectedTree(captureState.spans);
-});
-
-test("parents compaction to a matching observed operation", () => {
-  captureState.spans = [];
-  const instrumentor = new FlueInstrumentor();
-
-  instrumentor.handleEvent(event({
-    type: "run_start",
-    eventIndex: 1,
-    runId: "run-operation-compaction",
-    workflowName: "Flue Operation Compaction.workflow",
-  }));
-  instrumentor.handleEvent(event({
-    type: "operation_start",
-    eventIndex: 2,
-    runId: "run-operation-compaction",
-    operationId: "compact-operation",
-    operationKind: "prompt",
-  }));
-  instrumentor.handleEvent(event({
-    type: "compaction_start",
-    eventIndex: 3,
-    runId: "run-operation-compaction",
-    operationId: "compact-operation",
-    reason: "automatic",
-  }));
-  instrumentor.handleEvent(event({
-    type: "compaction",
-    eventIndex: 4,
-    runId: "run-operation-compaction",
-    operationId: "compact-operation",
-    messagesBefore: 20,
-    messagesAfter: 5,
-    isError: false,
-  }));
-  instrumentor.handleEvent(event({
-    type: "operation",
-    eventIndex: 5,
-    runId: "run-operation-compaction",
-    operationId: "compact-operation",
-    operationKind: "prompt",
-    isError: false,
-    result: { compacted: true },
-  }));
-  instrumentor.handleEvent(event({
-    type: "run_end",
-    eventIndex: 6,
-    runId: "run-operation-compaction",
-    result: { ok: true },
-    isError: false,
-  }));
-
-  assert.equal(captureState.spans.length, 3);
-  const compactionSpan = captureState.spans.find((span) => span.name === "flue.compaction");
-  const operationSpan = captureState.spans.find(
-    (span) => span.name === "flue.operation.prompt",
-  );
-
-  assert.ok(compactionSpan);
-  assert.ok(operationSpan);
-  assert.equal(compactionSpan.parentSpanContext?.spanId, operationSpan.spanContext().spanId);
-  assertConnectedTree(captureState.spans);
-});
-
-test("clears direct-agent operation state before an operation id is reused", () => {
-  captureState.spans = [];
-  const instrumentor = new FlueInstrumentor();
-
-  instrumentor.handleEvent(event({
-    type: "agent_start",
-    eventIndex: 1,
-    timestamp: "2026-06-21T00:00:00.000Z",
-    instanceId: "reused-agent",
-  }));
-  instrumentor.handleEvent(event({
-    type: "operation_start",
-    eventIndex: 2,
-    timestamp: "2026-06-21T00:00:01.000Z",
-    instanceId: "reused-agent",
-    operationId: "reused-operation",
-    operationKind: "compact",
-  }));
-  instrumentor.handleEvent(event({
-    type: "compaction_start",
-    eventIndex: 3,
-    timestamp: "2026-06-21T00:00:02.000Z",
-    instanceId: "reused-agent",
-    operationId: "reused-operation",
-    reason: "automatic",
-  }));
-  instrumentor.handleEvent(event({
-    type: "compaction",
-    eventIndex: 4,
-    timestamp: "2026-06-21T00:00:03.000Z",
-    instanceId: "reused-agent",
-    operationId: "reused-operation",
-    messagesBefore: 10,
-    messagesAfter: 3,
-    isError: false,
-  }));
-  instrumentor.handleEvent(event({
-    type: "operation_start",
-    eventIndex: 5,
-    timestamp: "2026-06-21T00:00:03.500Z",
-    instanceId: "reused-agent",
-    operationId: "abandoned-operation",
-    operationKind: "prompt",
-  }));
-  instrumentor.handleEvent(event({
-    type: "agent_end",
-    eventIndex: 6,
-    timestamp: "2026-06-21T00:00:04.000Z",
-    instanceId: "reused-agent",
-    messages: [],
-  }));
-  instrumentor.handleEvent(event({
-    type: "operation",
-    eventIndex: 7,
-    timestamp: "2026-06-21T00:00:05.000Z",
-    instanceId: "reused-agent",
-    operationId: "reused-operation",
-    operationKind: "compact",
-    isError: false,
-    result: { compacted: true },
-  }));
-
-  const firstCompactionSpan = captureState.spans.find(
-    (span) => span.name === "flue.compaction",
-  );
-  const firstOperationSpan = captureState.spans.find(
-    (span) => span.name === "flue.operation.compact",
-  );
-  assert.ok(firstCompactionSpan);
-  assert.ok(firstOperationSpan);
-  assert.equal(
-    firstCompactionSpan.parentSpanContext?.spanId,
-    firstOperationSpan.spanContext().spanId,
-  );
-  assertConnectedTree(captureState.spans);
-
-  captureState.spans = [];
-  instrumentor.handleEvent(event({
-    type: "agent_start",
-    eventIndex: 8,
-    timestamp: "2026-06-21T00:10:00.000Z",
-    instanceId: "reused-agent",
-  }));
-  instrumentor.handleEvent(event({
-    type: "compaction_start",
-    eventIndex: 9,
-    timestamp: "2026-06-21T00:10:01.000Z",
-    instanceId: "reused-agent",
-    operationId: "reused-operation",
-    reason: "manual",
-  }));
-  instrumentor.handleEvent(event({
-    type: "compaction",
-    eventIndex: 10,
-    timestamp: "2026-06-21T00:10:02.000Z",
-    instanceId: "reused-agent",
-    operationId: "reused-operation",
-    messagesBefore: 8,
-    messagesAfter: 2,
-    isError: false,
-  }));
-  instrumentor.handleEvent(event({
-    type: "operation",
-    eventIndex: 11,
-    timestamp: "2026-06-21T00:10:02.500Z",
-    instanceId: "reused-agent",
-    operationId: "abandoned-operation",
-    operationKind: "prompt",
-    isError: false,
-    result: { reused: true },
-  }));
-  instrumentor.handleEvent(event({
-    type: "agent_end",
-    eventIndex: 12,
-    timestamp: "2026-06-21T00:10:03.000Z",
-    instanceId: "reused-agent",
-    messages: [],
-  }));
-
-  assert.equal(captureState.spans.length, 3);
-  const compactionSpan = captureState.spans.find((span) => span.name === "flue.compaction");
-  const operationSpan = captureState.spans.find((span) => span.name === "flue.operation.prompt");
-  const agentSpan = captureState.spans.find(
-    (span) => span.attributes["respan.entity.log_type"] === "agent",
-  );
-
-  assert.ok(compactionSpan);
-  assert.ok(operationSpan);
-  assert.ok(agentSpan);
-  assert.equal(compactionSpan.parentSpanContext?.spanId, agentSpan.spanContext().spanId);
-  assert.equal(operationSpan.parentSpanContext?.spanId, agentSpan.spanContext().spanId);
-  assert.equal(
-    operationSpan.startTime[0],
-    Math.floor(Date.parse("2026-06-21T00:10:02.500Z") / 1000),
-  );
-  assert.equal(operationSpan.startTime[1], 500_000_000);
-  assertConnectedTree(captureState.spans);
-});
-
-test("marks failed Flue events with error status and backend status attributes", () => {
-  captureState.spans = [];
-  const instrumentor = new FlueInstrumentor({
-    workflowName: "Flue Error.workflow",
-  });
-
-  instrumentor.handleEvent(event({
-    type: "run_start",
-    eventIndex: 1,
-    runId: "run-error-1",
-    workflowName: "Flue Error.workflow",
-    payload: { command: "cat missing-file.txt" },
-  }));
-  instrumentor.handleEvent(event({
-    type: "operation_start",
-    eventIndex: 2,
-    runId: "run-error-1",
-    operationId: "op-shell",
-    operationKind: "shell",
-  }));
-  instrumentor.handleEvent(event({
-    type: "tool_start",
-    eventIndex: 3,
-    runId: "run-error-1",
-    operationId: "op-shell",
-    turnId: "turn-shell",
-    toolCallId: "tool-shell",
-    toolName: "shell",
-    args: { command: "cat missing-file.txt" },
-  }));
-  instrumentor.handleEvent(event({
-    type: "tool",
-    eventIndex: 4,
-    runId: "run-error-1",
-    operationId: "op-shell",
-    turnId: "turn-shell",
-    toolCallId: "tool-shell",
-    toolName: "shell",
-    isError: true,
-    result: { message: "missing-file.txt: No such file", exitCode: 1 },
-  }));
-  instrumentor.handleEvent(event({
-    type: "operation",
-    eventIndex: 5,
-    runId: "run-error-1",
-    operationId: "op-shell",
-    operationKind: "shell",
-    isError: true,
-    error: { name: "ShellError", message: "Command failed" },
-  }));
-  instrumentor.handleEvent(event({
-    type: "run_end",
-    eventIndex: 6,
-    runId: "run-error-1",
-    isError: true,
-    error: { name: "WorkflowError", message: "Unable to read required file" },
-  }));
-
-  assert.equal(captureState.spans.length, 3);
-  const toolSpan = captureState.spans.find((span) => span.name === "flue.tool.shell");
-  const operationSpan = captureState.spans.find((span) => span.name === "flue.operation.shell");
-  const workflowSpan = captureState.spans.find(
-    (span) => span.attributes["respan.entity.log_type"] === "workflow",
-  );
-
-  for (const span of [toolSpan, operationSpan, workflowSpan]) {
-    assert.ok(span);
-    assert.equal(span.status.code, SpanStatusCode.ERROR);
-    assert.equal(span.attributes.status_code, 500);
-    assert.equal(typeof span.attributes["error.message"], "string");
-  }
-  assert.equal(operationSpan.parentSpanContext?.spanId, workflowSpan.spanContext().spanId);
-  assert.equal(toolSpan.parentSpanContext?.spanId, operationSpan.spanContext().spanId);
-});
-
-test("activate and deactivate wire the Flue observe subscriber", async () => {
-  let subscriber;
-  let unsubscribeCalls = 0;
-  const instrumentor = new FlueInstrumentor({
-    runtimeModule: {
-      observe(nextSubscriber) {
-        subscriber = nextSubscriber;
-        return () => {
-          unsubscribeCalls += 1;
-        };
+      tool: true,
+      onTool() {
+        const active = trace.getActiveSpan();
+        if (!active) return; // Minimum observer has no execution interceptor.
+        active.setAttribute("allow_trace_content", false);
+        active.setAttribute("allow_trace_content", true);
+        active.setAttribute(
+          "gen_ai.prompt.99.content",
+          "late controlled content",
+        );
+        active.setAttribute("llm.request.functions", "late controlled schema");
+        active.addEvent("late controlled event", {
+          content: "late controlled event data",
+        });
+        active.recordException(new Error("late controlled exception"));
+        active.setStatus({
+          code: 2,
+          message: "late controlled status description",
+        });
       },
     },
+    async (native) =>
+      assert.equal((await native.prompt()).text, "native answer"),
+  );
+  const tool = spans.find(
+    (span) => span.attributes["respan.entity.log_type"] === "tool",
+  );
+  if (current) {
+    assert.equal(contentEntries(tool).length, 0);
+    assert.equal(tool.events.length, 0);
+    assert.equal(tool.status.message, undefined);
+  } else assert.ok(contentEntries(tool).length > 0);
+});
+
+test("a foreign observation subscriber survives activation, disposal and reactivation", async () => {
+  let calls = 0;
+  const stop = runtime.observe(() => calls++);
+  const instrumentor = new FlueInstrumentor({ runtimeModule: runtime });
+  try {
+    for (let index = 0; index < 2; index++) {
+      await instrumentor.activate();
+      await instrumentor.deactivate();
+      const native = await nativeRuntime();
+      try {
+        await native.prompt();
+      } finally {
+        await native.close();
+      }
+    }
+    assert.ok(calls > 0);
+  } finally {
+    stop();
+    await instrumentor.deactivate();
+  }
+});
+
+test("native delegated tasks and explicit compaction retain connected SDK parentage", async () => {
+  const delegated = await scenario({ delegate: true }, async (native) => {
+    assert.equal((await native.prompt()).text, "native answer");
+    assert.equal(native.requests.length, 3);
+    assert.ok(native.events.some((event) => event.type === "task_start"));
   });
+  assert.ok(
+    delegated.filter(
+      (span) => span.attributes["respan.entity.log_type"] === "agent",
+    ).length >= 2,
+  );
+  for (const span of delegated)
+    if (span.parentSpanContext)
+      assert.ok(
+        delegated.some(
+          (parent) =>
+            parent.spanContext().spanId === span.parentSpanContext.spanId,
+        ),
+      );
+  const compacted = await scenario({ compaction: true }, async (native) => {
+    await native.prompt("Create actual native session history.");
+    await native.prompt("Continue actual native session history.");
+    await native.session.compact();
+    assert.ok(native.events.some((event) => event.type === "compaction_start"));
+  });
+  assert.ok(compacted.some((span) => span.name === "flue.compaction"));
+});
 
+test("original content veto survives onEnd injection and actual queued exporter reads after deactivate/reactivate", async () => {
+  const spans = await scenario(
+    { tool: true },
+    async (native) => await native.prompt(),
+    { traceContent: false },
+  );
+  const source = spans.find(
+    (span) => span.attributes["respan.entity.log_type"] === "tool",
+  );
+  const oldAttributes = source.attributes;
+  const oldEvents = source.events;
+  const oldStatus = source.status;
+  source.attributes["traceloop.entity.output"] = "controlled-after-end-private";
+  source.attributes["respan.metadata"] = "controlled-after-end-private";
+  source.attributes["respan.metadata.private"] = "controlled-after-end-private";
+  source.events.push({
+    name: "exception",
+    attributes: { "exception.message": "controlled-after-end-private" },
+  });
+  source.status.message = "controlled-after-end-private";
+  source.attributes = {
+    ...source.attributes,
+    "gen_ai.completion.0.content": "controlled-after-end-private",
+  };
+  source.events = [
+    {
+      name: "exception",
+      attributes: { "exception.message": "controlled-after-end-private" },
+    },
+  ];
+  source.status = { code: 2, message: "controlled-after-end-private" };
+  const next = new FlueInstrumentor({ runtimeModule: runtime });
+  await next.activate();
+  await next.deactivate();
+  let serialized;
+  const processor = new SimpleSpanProcessor({
+    export(batch, done) {
+      serialized = JSON.stringify(
+        batch.map((span) => ({
+          attributes: span.attributes,
+          events: span.events,
+          status: span.status,
+        })),
+      );
+      done({ code: 0 });
+    },
+    async shutdown() {},
+  });
+  processor.onEnd(source);
+  await processor.forceFlush();
+  await processor.shutdown();
+  assert.ok(serialized && !serialized.includes("controlled-after-end-private"));
+  assert.equal(contentEntries(source).length, 0);
+  assert.equal(source.events.length, 0);
+  assert.equal(source.status.message, undefined);
+  assert.equal(contentEntries({ attributes: oldAttributes }).length, 0);
+  assert.equal(oldEvents.length, 0);
+  assert.equal(oldStatus.message, undefined);
+});
+
+test("a late suppressed real terminal event closes upstream lifecycle and emits no captured content", async () => {
+  exported.length = 0;
+  const instrumentor = new FlueInstrumentor({ runtimeModule: runtime });
+  const stop = runtime.observe((event) => {
+    if (["turn", "operation"].includes(event.type))
+      context.with(suppressTracing(context.active()), () =>
+        instrumentor.handleEvent(event),
+      );
+  });
   await instrumentor.activate();
-  assert.equal(instrumentor.isActive(), true);
-  assert.equal(typeof subscriber, "function");
+  const native = await nativeRuntime();
+  try {
+    await native.prompt();
+    assert.ok(ownSpans().length >= 2);
+    for (const span of ownSpans()) assert.equal(contentEntries(span).length, 0);
+  } finally {
+    await native.close();
+    await instrumentor.deactivate();
+    stop();
+  }
+});
 
-  instrumentor.deactivate();
-  assert.equal(instrumentor.isActive(), false);
-  assert.equal(unsubscribeCalls, 1);
+test("compatible owners share one official registration across original-owner deactivation and reactivation", async () => {
+  exported.length = 0;
+  const first = new FlueInstrumentor({ runtimeModule: runtime });
+  const second = new FlueInstrumentor({
+    runtimeModule: runtime,
+    traceContent: true,
+  });
+  await Promise.all([first.activate(), second.activate()]);
+  await first.deactivate();
+  assert.equal(first.isActive(), false);
+  assert.equal(second.isActive(), true);
+  await first.activate();
+  await first.deactivate();
+  const parent = trace.getTracer("owner-parent").startSpan("owner-parent");
+  const native = await nativeRuntime();
+  try {
+    await context.with(trace.setSpan(context.active(), parent), () =>
+      native.prompt(),
+    );
+    for (const span of ownSpans())
+      assert.equal(span.spanContext().traceId, parent.spanContext().traceId);
+  } finally {
+    parent.end();
+    await native.close();
+    await second.deactivate();
+    await first.deactivate();
+  }
+  assert.equal(
+    ownSpans().filter(
+      (span) => span.attributes["respan.entity.log_type"] === "chat",
+    ).length,
+    1,
+  );
 });

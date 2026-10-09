@@ -13,6 +13,7 @@ import {
   type SpanTransformerRegistration,
 } from "@respan/tracing";
 import { EveSpanProcessor } from "./_processor.js";
+import type { SpanExporter } from "@opentelemetry/sdk-trace-base";
 
 export { withEveLineage } from "./lineage.js";
 
@@ -69,6 +70,11 @@ export class EveInstrumentor {
 
   isActive(): boolean {
     return this._active;
+  }
+
+  /** Use for an export-time privacy ceiling when Respan owns the provider. */
+  wrapExporter(exporter: SpanExporter, spanNameStyle?: string): SpanExporter {
+    return EveInstrumentor._processor.wrapExporter(exporter, spanNameStyle);
   }
 }
 

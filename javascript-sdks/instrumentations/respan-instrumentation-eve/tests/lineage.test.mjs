@@ -98,10 +98,8 @@ test("composes an authored step.started hook and stamps delegated lineage", () =
     __respan_eve: { spoofed: true },
   });
   assert.deepEqual(stamped, {
-    "ai.settings.context.__respan_eve.lineage.rootSessionId":
-      "session-root",
-    "ai.settings.context.__respan_eve.lineage.sessionId":
-      "session-parent",
+    "ai.settings.context.__respan_eve.lineage.rootSessionId": "session-root",
+    "ai.settings.context.__respan_eve.lineage.sessionId": "session-parent",
     "ai.settings.context.__respan_eve.lineage.callId": "call-parent",
     "ai.settings.context.__respan_eve.lineage.turn.id": "turn-parent",
     "ai.settings.context.__respan_eve.lineage.turn.sequence": 4,

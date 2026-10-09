@@ -21,8 +21,7 @@ function translateSpan(name, attributes, options = {}) {
     spanContext() {
       return {
         spanId: options.spanId ?? "0123456789abcdef",
-        traceId:
-          options.traceId ?? "11111111111111111111111111111111",
+        traceId: options.traceId ?? "11111111111111111111111111111111",
       };
     },
   };
@@ -203,7 +202,10 @@ test("maps legacy embedding input, vector, and model while stripping raw aliases
   assert.equal(attrs["gen_ai.usage.input_tokens"], 3);
   assert.equal(attrs["gen_ai.usage.prompt_tokens"], 3);
   assert.equal(attrs["traceloop.entity.input"], "embed this");
-  assert.equal(attrs["traceloop.entity.output"], JSON.stringify([0.1, 0.2, 0.3]));
+  assert.equal(
+    attrs["traceloop.entity.output"],
+    JSON.stringify([0.1, 0.2, 0.3]),
+  );
   assert.equal(attrs["ai.usage.tokens"], undefined);
   assertRawVendorAttrsStripped(attrs);
   assertNoOffContractAliases(attrs);
@@ -248,6 +250,7 @@ test("preserves authored step.started runtime context in canonical metadata", ()
           flags: [true, false],
           nested: { count: 3 },
         },
+        unsafe: { self: "[circular]" },
       },
     },
   });
@@ -296,11 +299,9 @@ test("drop-marks structural wrappers and reparents children until wrapper end", 
   assert.equal(wrapper.attributes["respan.internal.drop_span"], true);
   assert.equal(wrapper.attributes["respan.entity.log_type"], "task");
 
-  const child = makeSpan(
-    "ai.generateText.doGenerate",
-    "child-span",
-    { spanId: "wrapper-span" },
-  );
+  const child = makeSpan("ai.generateText.doGenerate", "child-span", {
+    spanId: "wrapper-span",
+  });
   translator.onStart(child, undefined);
   assert.equal(
     child.attributes["respan.internal.export_parent_span_id"],
@@ -320,11 +321,9 @@ test("drop-marks structural wrappers and reparents children until wrapper end", 
   assert.equal(wrapper.attributes["respan.internal.drop_span"], true);
   assert.equal(wrapper.attributes["respan.entity.log_type"], "task");
 
-  const lateChild = makeSpan(
-    "ai.generateText.doGenerate",
-    "late-child-span",
-    { spanId: "wrapper-span" },
-  );
+  const lateChild = makeSpan("ai.generateText.doGenerate", "late-child-span", {
+    spanId: "wrapper-span",
+  });
   translator.onStart(lateChild, undefined);
   assert.equal(
     lateChild.attributes["respan.internal.export_parent_span_id"],
@@ -354,11 +353,9 @@ test("uses an empty export-parent sentinel for children of root wrappers", () =>
   const wrapper = makeSpan("ai.streamText", "root-wrapper", undefined);
   translator.onStart(wrapper, undefined);
 
-  const child = makeSpan(
-    "ai.streamText.doStream",
-    "root-child",
-    { spanId: "root-wrapper" },
-  );
+  const child = makeSpan("ai.streamText.doStream", "root-child", {
+    spanId: "root-wrapper",
+  });
   translator.onStart(child, undefined);
   assert.equal(child.attributes["respan.internal.export_parent_span_id"], "");
 
@@ -417,10 +414,8 @@ test("reattaches detached Eve subagent usage to its caller session", () => {
       "gen_ai.usage.cache_creation.input_tokens": 0,
       "ai.telemetry.functionId": "eve-typescript-run",
       "ai.settings.context.eve.session.id": "session-child",
-      "ai.settings.context.__respan_eve.lineage.rootSessionId":
-        "session-root",
-      "ai.settings.context.__respan_eve.lineage.sessionId":
-        "session-parent",
+      "ai.settings.context.__respan_eve.lineage.rootSessionId": "session-root",
+      "ai.settings.context.__respan_eve.lineage.sessionId": "session-parent",
       "ai.settings.context.__respan_eve.lineage.callId": "call-parent",
       "ai.settings.context.__respan_eve.lineage.turn.id": "turn-parent",
       "ai.settings.context.__respan_eve.lineage.turn.sequence": 4,
@@ -609,14 +604,7 @@ test("merges an exact delegated child trace and suppresses late usage duplicatio
   const parentTraceId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
   const childTraceId = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
-  function makeSpan(
-    name,
-    scope,
-    attributes,
-    spanId,
-    traceId,
-    parentSpanId,
-  ) {
+  function makeSpan(name, scope, attributes, spanId, traceId, parentSpanId) {
     return {
       name,
       instrumentationScope: { name: scope },
@@ -646,10 +634,8 @@ test("merges an exact delegated child trace and suppresses late usage duplicatio
   translator.onEnd(parent);
 
   const lineage = {
-    "ai.settings.context.__respan_eve.lineage.rootSessionId":
-      "session-parent",
-    "ai.settings.context.__respan_eve.lineage.sessionId":
-      "session-parent",
+    "ai.settings.context.__respan_eve.lineage.rootSessionId": "session-parent",
+    "ai.settings.context.__respan_eve.lineage.sessionId": "session-parent",
     "ai.settings.context.__respan_eve.lineage.turn.id": "turn-parent",
     "ai.settings.context.__respan_eve.lineage.turn.sequence": 0,
   };
@@ -775,10 +761,8 @@ test("does not guess detached subagent lineage across ambiguous callers", () => 
         "gen_ai.usage.input_tokens": 12,
         "gen_ai.usage.output_tokens": 5,
         "ai.settings.context.eve.session.id": `session-child-${suffix}`,
-        "ai.settings.context.__respan_eve.lineage.rootSessionId":
-          `session-root-${suffix}`,
-        "ai.settings.context.__respan_eve.lineage.sessionId":
-          `session-parent-${suffix}`,
+        "ai.settings.context.__respan_eve.lineage.rootSessionId": `session-root-${suffix}`,
+        "ai.settings.context.__respan_eve.lineage.sessionId": `session-parent-${suffix}`,
       },
       { translator },
     );
@@ -841,14 +825,13 @@ test("maps AI SDK 7 execute_tool children with canonical tool input and output",
     attrs["traceloop.entity.input"],
     JSON.stringify({ name: "search", arguments: { query: "eve" } }),
   );
-  assert.equal(
-    attrs["traceloop.entity.output"],
-    JSON.stringify({ hits: 2 }),
-  );
+  assert.equal(attrs["traceloop.entity.output"], JSON.stringify({ hits: 2 }));
   assert.equal(attrs["respan.internal.span_name.kind"], "tool");
   assert.equal(attrs["respan.internal.span_name.detail"], "search");
   assert.equal(
-    Object.keys(attrs).some((key) => key.startsWith("gen_ai.tool.")),
+    Object.keys(attrs).some(
+      (key) => key.startsWith("gen_ai.tool.") && key !== "gen_ai.tool.call.id",
+    ),
     false,
   );
   assertRawVendorAttrsStripped(attrs);
@@ -899,28 +882,17 @@ test("maps delegated session lineage without treating session IDs as span parent
     "gen_ai.request.model": "gpt-4.1",
     "ai.settings.context.eve.session.id": "session-child",
     "ai.settings.context.eve.turn.id": "turn-child",
-    "ai.settings.context.__respan_eve.lineage.rootSessionId":
-      "session-root",
-    "ai.settings.context.__respan_eve.lineage.sessionId":
-      "session-parent",
+    "ai.settings.context.__respan_eve.lineage.rootSessionId": "session-root",
+    "ai.settings.context.__respan_eve.lineage.sessionId": "session-parent",
     "ai.settings.context.__respan_eve.lineage.callId": "call-parent",
     "ai.settings.context.__respan_eve.lineage.turn.id": "turn-parent",
     "ai.settings.context.__respan_eve.lineage.turn.sequence": 4,
     "ai.settings.context.tenant": "acme",
   });
 
-  assert.equal(
-    attrs["respan.sessions.session_identifier"],
-    "session-child",
-  );
-  assert.equal(
-    attrs["respan.threads.thread_identifier"],
-    "session-child",
-  );
-  assert.equal(
-    attrs["respan.trace.trace_group_identifier"],
-    "session-root",
-  );
+  assert.equal(attrs["respan.sessions.session_identifier"], "session-child");
+  assert.equal(attrs["respan.threads.thread_identifier"], "session-child");
+  assert.equal(attrs["respan.trace.trace_group_identifier"], "session-root");
   assert.equal(attrs["respan.entity.log_parent_id"], undefined);
   assert.equal(attrs["respan.entity.log_root_id"], undefined);
   assert.deepEqual(JSON.parse(attrs["respan.metadata"]), {
@@ -950,10 +922,8 @@ test("maps lineage mirrored directly onto an ai.eve.turn root", () => {
     {
       "ai.telemetry.functionId": "research-agent",
       "eve.session.id": "session-child",
-      "ai.settings.context.__respan_eve.lineage.rootSessionId":
-        "session-root",
-      "ai.settings.context.__respan_eve.lineage.sessionId":
-        "session-parent",
+      "ai.settings.context.__respan_eve.lineage.rootSessionId": "session-root",
+      "ai.settings.context.__respan_eve.lineage.sessionId": "session-parent",
       "ai.settings.context.__respan_eve.lineage.callId": "call-parent",
       "ai.settings.context.__respan_eve.lineage.turn.id": "turn-parent",
       "ai.settings.context.__respan_eve.lineage.turn.sequence": 4,
@@ -962,18 +932,9 @@ test("maps lineage mirrored directly onto an ai.eve.turn root", () => {
   );
 
   assert.equal(attrs["respan.entity.log_type"], "agent");
-  assert.equal(
-    attrs["respan.sessions.session_identifier"],
-    "session-child",
-  );
-  assert.equal(
-    attrs["respan.threads.thread_identifier"],
-    "session-child",
-  );
-  assert.equal(
-    attrs["respan.trace.trace_group_identifier"],
-    "session-root",
-  );
+  assert.equal(attrs["respan.sessions.session_identifier"], "session-child");
+  assert.equal(attrs["respan.threads.thread_identifier"], "session-child");
+  assert.equal(attrs["respan.trace.trace_group_identifier"], "session-root");
   assert.deepEqual(JSON.parse(attrs["respan.metadata"]), {
     eve: {
       root_session_id: "session-root",
@@ -989,4 +950,20 @@ test("maps lineage mirrored directly onto an ai.eve.turn root", () => {
   });
   assertRawVendorAttrsStripped(attrs);
   assertNoOffContractAliases(attrs);
+});
+
+test("preserves exact native legacy model identifiers without inventing aliases", () => {
+  for (const model of [
+    "CustomModel-V2",
+    "deepseek/deepseek-chat",
+    "o3-mini-2025-01-31",
+    "claude-3-5-sonnet-latest",
+    "gemini-2.0-flash-001",
+  ]) {
+    const attrs = translate("ai.generateText.doGenerate", {
+      "ai.model.id": model,
+      "ai.response.text": "native response",
+    });
+    assert.equal(attrs["gen_ai.request.model"], model);
+  }
 });

@@ -1,0 +1,8 @@
+{
+  "summary": "Support current BeeAI, Eve, and Flue JavaScript APIs with canonical native spans and privacy-safe lifecycle handling",
+  "packages": {
+    "@respan/instrumentation-beeai": "minor",
+    "@respan/instrumentation-eve": "minor",
+    "@respan/instrumentation-flue": "minor"
+  }
+}

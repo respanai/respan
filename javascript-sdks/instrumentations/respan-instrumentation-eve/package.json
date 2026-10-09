@@ -31,15 +31,16 @@
   },
   "dependencies": {
     "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/core": "^2.10.0",
     "@opentelemetry/sdk-trace-base": "^2.10.0",
     "@opentelemetry/semantic-conventions": "^1.43.0",
-    "@respan/respan-sdk": "^1.1.7",
-    "@respan/tracing": "workspace:^",
+    "@respan/respan-sdk": "^1.2.0",
+    "@respan/tracing": "^1.6.0",
     "@traceloop/ai-semantic-conventions": "^0.13.0"
   },
   "peerDependencies": {
     "ai": ">=7.0.26 <8.0.0",
-    "eve": ">=0.26.0 <0.27.0"
+    "eve": ">=0.26.0 <0.76.0"
   },
   "peerDependenciesMeta": {
     "ai": {
@@ -50,9 +51,10 @@
     }
   },
   "devDependencies": {
+    "@opentelemetry/sdk-trace-node": "^2.10.0",
     "@types/node": "^22.15.29",
-    "ai": "^7.0.26",
-    "eve": "^0.26.1",
+    "ai": "^7.0.136",
+    "eve": "^0.75.1",
     "typescript": "^5.7.3",
     "zod": "^4.4.3"
   }
