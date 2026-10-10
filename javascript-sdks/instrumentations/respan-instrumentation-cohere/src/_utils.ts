@@ -8,7 +8,8 @@ export function isRecord(value: unknown): value is Record<string, any> {
 }
 
 export function safeJson(value: unknown): string {
-  if (value === undefined || value === null) return "";
+  if (value === undefined) return "";
+  if (value === null) return "null";
   if (typeof value === "string") return value;
   try {
     return JSON.stringify(value);
@@ -64,7 +65,8 @@ export function normalizeRole(role: unknown): string {
 }
 
 export function cohereContentToString(value: unknown): string {
-  if (value === undefined || value === null) return "";
+  if (value === undefined) return "";
+  if (value === null) return "null";
   if (typeof value === "string") return value;
   if (Array.isArray(value)) {
     const textParts = value

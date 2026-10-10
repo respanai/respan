@@ -1,243 +1,304 @@
-import { context, trace, TraceFlags } from "@opentelemetry/api";
-import { hrTime } from "@opentelemetry/core";
-import type { ReadableSpan } from "@opentelemetry/sdk-trace-base";
 import {
-  ATTR_GEN_AI_COMPLETION,
-  ATTR_GEN_AI_PROMPT,
-  ATTR_GEN_AI_USAGE_COMPLETION_TOKENS,
+  context,
+  trace,
+  SpanKind,
+  SpanStatusCode,
+  type Context,
+  type Span,
+} from "@opentelemetry/api";
+import {
+  ATTR_ERROR_TYPE,
+  ATTR_HTTP_RESPONSE_STATUS_CODE,
+} from "@opentelemetry/semantic-conventions";
+import {
+  ATTR_ERROR_MESSAGE,
+  ATTR_GEN_AI_SYSTEM,
+  ATTR_GEN_AI_REQUEST_MODEL,
+  ATTR_GEN_AI_RESPONSE_MODEL,
+  ATTR_GEN_AI_RESPONSE_ID,
   ATTR_GEN_AI_USAGE_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_OUTPUT_TOKENS,
   ATTR_GEN_AI_USAGE_PROMPT_TOKENS,
+  ATTR_GEN_AI_USAGE_COMPLETION_TOKENS,
+  ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
+  ATTR_GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
+  ATTR_GEN_AI_RESPONSE_FINISH_REASONS,
+  ATTR_GEN_AI_TOOL_CALL_ID,
 } from "@opentelemetry/semantic-conventions/incubating";
-import { buildReadableSpan, injectSpan } from "@respan/tracing";
-import { RespanLogType, RespanSpanAttributes } from "@respan/respan-sdk";
-import { SpanAttributes } from "@traceloop/ai-semantic-conventions";
+import { RespanSpanAttributes, RespanLogType } from "@respan/respan-sdk";
 import {
-  ANTHROPIC_CHAT_ENTITY_NAME,
+  SpanAttributes,
+  LLMRequestTypeValues,
+} from "@traceloop/ai-semantic-conventions";
+import {
+  capture,
+  refresh,
+  guard,
+  data,
+  snapshot,
+  attributesOf,
+  type CaptureOptions,
+  type CapturePolicy,
+} from "./_privacy.js";
+import {
   INSTRUMENTATION_LIBRARY_NAME,
   PACKAGE_VERSION,
-  extractToolCalls,
-  extractToolExecutions,
-  formatInputMessages,
-  formatOutputMessage,
-  formatTools,
-  resolveErrorStatusCode,
   safeJson,
-  stringifyStructured,
-  type ToolExecution,
+  textOrJson,
+  messages,
+  tools,
+  toolCalls,
 } from "./_helpers.js";
-
-const COMPLETION_ZERO = `${ATTR_GEN_AI_COMPLETION}.0`;
-const COMPLETION_TOOL_CALLS = `${COMPLETION_ZERO}.tool_calls`;
-const LLM_IS_STREAMING =
-  (SpanAttributes as unknown as Record<string, string>).LLM_IS_STREAMING ??
-  "llm.is_streaming";
-const STATUS_CODE_ATTR = "status_code";
-
-function buildInstrumentedReadableSpan(opts: {
-  name: string;
-  startTime: [number, number];
-  endTime: [number, number];
-  attributes: Record<string, any>;
-  statusCode?: number;
-  errorMessage?: string;
-}): ReadableSpan {
-  const activeSpanContext = trace.getSpan(context.active())?.spanContext();
-  const span = buildReadableSpan({
-    name: opts.name,
-    traceId: activeSpanContext?.traceId,
-    parentId: activeSpanContext?.spanId,
-    startTimeHr: opts.startTime,
-    endTimeHr: opts.endTime,
-    attributes: opts.attributes,
-    statusCode: opts.statusCode,
-    errorMessage: opts.errorMessage,
-  }) as ReadableSpan & {
-    instrumentationScope?: { name: string; version?: string };
-    spanContext: () => ReturnType<ReadableSpan["spanContext"]>;
-  };
-
-  const originalSpanContext = span.spanContext.bind(span);
-  const mutableSpan = span as typeof span & {
-    spanContext: () => ReturnType<ReadableSpan["spanContext"]>;
-  };
-  mutableSpan.spanContext = () => ({
-    ...originalSpanContext(),
-    traceFlags: activeSpanContext?.traceFlags ?? TraceFlags.SAMPLED,
-  });
-  mutableSpan.instrumentationScope = {
-    name: INSTRUMENTATION_LIBRARY_NAME,
-    version: PACKAGE_VERSION,
-  };
-  return mutableSpan;
+export type Operation =
+  | "messages"
+  | "countTokens"
+  | "batches.create"
+  | "batches.results"
+  | "completion"
+  | "agent"
+  | "tool";
+export interface Session {
+  ctx: Context;
+  span: Span;
+  policy: CapturePolicy;
+  headers(response: unknown): void;
+  input(value: unknown): void;
+  finish(value?: unknown, error?: unknown, success?: boolean): void;
 }
-
-function setPromptAttrs(attrs: Record<string, any>, messages: Record<string, any>[]): void {
-  messages.forEach((message, index) => {
-    const prefix = `${ATTR_GEN_AI_PROMPT}.${index}`;
-    attrs[`${prefix}.role`] = message.role;
-    attrs[`${prefix}.content`] = stringifyStructured(message.content ?? "");
-    if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
-      attrs[`${prefix}.tool_calls`] = safeJson(message.tool_calls);
-    }
-    if (message.tool_call_id) {
-      attrs[`${prefix}.tool_call_id`] = String(message.tool_call_id);
-    }
-  });
-}
-
-function buildBaseChatAttrs(kwargs: Record<string, any>, model?: string): Record<string, any> {
+export function start(
+  operation: Operation,
+  body: unknown,
+  options: CaptureOptions = {},
+  ctx = context.active(),
+  toolId?: unknown,
+): Session | undefined {
+  const policy = capture(options, ctx);
+  if (!policy.emit) return;
+  const llm = operation === "messages" || operation === "completion";
+  const name =
+    operation === "tool"
+      ? (data(body, "name") ?? "tool")
+      : `anthropic.${operation}`;
   const attrs: Record<string, any> = {
-    [SpanAttributes.TRACELOOP_ENTITY_NAME]: ANTHROPIC_CHAT_ENTITY_NAME,
-    [SpanAttributes.TRACELOOP_ENTITY_PATH]: ANTHROPIC_CHAT_ENTITY_NAME,
+    [SpanAttributes.TRACELOOP_ENTITY_NAME]: name,
+    [SpanAttributes.TRACELOOP_ENTITY_PATH]: "",
     [RespanSpanAttributes.RESPAN_LOG_METHOD]: "ts_tracing",
-    [RespanSpanAttributes.RESPAN_LOG_TYPE]: RespanLogType.CHAT,
-    [RespanSpanAttributes.LLM_REQUEST_TYPE]: RespanLogType.CHAT,
-    [RespanSpanAttributes.LLM_SYSTEM]: "anthropic",
-    [LLM_IS_STREAMING]: kwargs.stream === true,
+    [RespanSpanAttributes.RESPAN_LOG_TYPE]:
+      operation === "agent"
+        ? RespanLogType.AGENT
+        : operation === "tool"
+          ? RespanLogType.TOOL
+          : llm
+            ? operation === "completion"
+              ? RespanLogType.TEXT
+              : RespanLogType.CHAT
+            : RespanLogType.TASK,
   };
-
-  const resolvedModel = model ?? kwargs.model;
-  if (resolvedModel) {
-    attrs[RespanSpanAttributes.GEN_AI_REQUEST_MODEL] = resolvedModel;
+  if (llm) {
+    attrs[ATTR_GEN_AI_SYSTEM] = "anthropic";
+    attrs[SpanAttributes.LLM_REQUEST_TYPE] =
+      operation === "completion"
+        ? LLMRequestTypeValues.COMPLETION
+        : LLMRequestTypeValues.CHAT;
+    const model = data(body, "model");
+    if (typeof model === "string") attrs[ATTR_GEN_AI_REQUEST_MODEL] = model;
   }
-
-  const inputMessages = formatInputMessages(kwargs.messages ?? [], kwargs.system);
-  attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safeJson(inputMessages);
-  setPromptAttrs(attrs, inputMessages);
-
-  const tools = formatTools(kwargs.tools);
-  if (tools) {
-    attrs[SpanAttributes.LLM_REQUEST_FUNCTIONS] = safeJson(tools);
-  }
-
-  return attrs;
-}
-
-function buildSuccessAttrs(kwargs: Record<string, any>, message: any): Record<string, any> {
-  const attrs = buildBaseChatAttrs(kwargs, message?.model ?? kwargs.model);
-  const outputMessage = formatOutputMessage(message);
-  attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safeJson([outputMessage]);
-  attrs[`${COMPLETION_ZERO}.role`] = outputMessage.role ?? "assistant";
-  attrs[`${COMPLETION_ZERO}.content`] = stringifyStructured(
-    outputMessage.content ?? "",
-  );
-
-  if (message?.usage) {
-    const inputTokens = message.usage.input_tokens ?? 0;
-    const outputTokens = message.usage.output_tokens ?? 0;
-    attrs[ATTR_GEN_AI_USAGE_INPUT_TOKENS] = inputTokens;
-    attrs[ATTR_GEN_AI_USAGE_OUTPUT_TOKENS] = outputTokens;
-    attrs[ATTR_GEN_AI_USAGE_PROMPT_TOKENS] = inputTokens;
-    attrs[ATTR_GEN_AI_USAGE_COMPLETION_TOKENS] = outputTokens;
-    attrs[SpanAttributes.LLM_USAGE_TOTAL_TOKENS] = inputTokens + outputTokens;
-  }
-
-  const toolCalls = extractToolCalls(message);
-  if (toolCalls) {
-    attrs[COMPLETION_TOOL_CALLS] = safeJson(toolCalls);
-  }
-
-  return attrs;
-}
-
-function buildErrorAttrs(kwargs: Record<string, any>): Record<string, any> {
-  return buildBaseChatAttrs(kwargs);
-}
-
-function emitSpan(
-  name: string,
-  attrs: Record<string, any>,
-  startTime: [number, number],
-  errorMessage?: string,
-  statusCode?: number,
-): void {
-  try {
-    const span = buildInstrumentedReadableSpan({
-      name,
-      startTime,
-      endTime: hrTime(),
-      attributes: attrs,
-      statusCode,
-      errorMessage,
-    });
-    injectSpan(span);
-  } catch {
-    // Never break the application.
-  }
-}
-
-export function emitSuccessSpan(
-  kwargs: Record<string, any>,
-  startTime: [number, number],
-  message: any,
-): void {
-  try {
-    emitSpan(
-      ANTHROPIC_CHAT_ENTITY_NAME,
-      buildSuccessAttrs(kwargs, message),
-      startTime,
+  if (operation === "tool" && typeof toolId === "string")
+    attrs[ATTR_GEN_AI_TOOL_CALL_ID] = toolId;
+  const span = trace
+    .getTracer(INSTRUMENTATION_LIBRARY_NAME, PACKAGE_VERSION)
+    .startSpan(
+      String(name),
+      { kind: llm ? SpanKind.CLIENT : SpanKind.INTERNAL, attributes: attrs },
+      ctx,
     );
-  } catch {
-    // Never break the application.
+  if (!span.isRecording()) {
+    span.end();
+    return;
   }
-}
-
-export function emitErrorSpan(
-  kwargs: Record<string, any>,
-  startTime: [number, number],
-  err: unknown,
-): void {
-  try {
-    const errorMessage = String(err);
-    const statusCode = resolveErrorStatusCode(err);
-    const attrs = buildErrorAttrs(kwargs);
-    attrs["error.message"] = errorMessage;
-    attrs[STATUS_CODE_ATTR] = statusCode;
-    emitSpan(ANTHROPIC_CHAT_ENTITY_NAME, attrs, startTime, errorMessage, statusCode);
-  } catch {
-    // Never break the application.
-  }
-}
-
-export function emitToolSpan(toolExecution: ToolExecution): void {
-  const startTime = hrTime();
-  const attrs: Record<string, any> = {
-    [SpanAttributes.TRACELOOP_ENTITY_NAME]: toolExecution.name,
-    [SpanAttributes.TRACELOOP_ENTITY_PATH]: toolExecution.name,
-    [RespanSpanAttributes.RESPAN_LOG_TYPE]: RespanLogType.TOOL,
-    [SpanAttributes.TRACELOOP_ENTITY_INPUT]: safeJson([
-      { role: "tool", content: stringifyStructured(toolExecution.input) },
-    ]),
-    [SpanAttributes.TRACELOOP_ENTITY_OUTPUT]: safeJson({
-      role: "tool",
-      content: stringifyStructured(toolExecution.output),
-    }),
+  if (!(span.spanContext().traceFlags & 1))
+    policy.inputs = policy.outputs = false;
+  guard(span, policy);
+  let ended = false;
+  let promptAttributes: Record<string, any> | undefined;
+  const session: Session = {
+    ctx: trace.setSpan(ctx, span),
+    span,
+    policy,
+    headers(response) {
+      const status =
+        response instanceof Response
+          ? response.status
+          : data(response, "status");
+      if (typeof status === "number") {
+        span.setAttribute(ATTR_HTTP_RESPONSE_STATUS_CODE, status);
+      }
+    },
+    input(value) {
+      if (!refresh(policy).inputs) return;
+      const b = snapshot(value);
+      if (b === undefined) return;
+      if (llm) {
+        const inputMessages =
+          operation === "completion"
+            ? [{ role: "user", content: b.prompt }]
+            : messages(b);
+        span.setAttribute(
+          SpanAttributes.TRACELOOP_ENTITY_INPUT,
+          safeJson(inputMessages),
+        );
+        const definitions = tools(b.tools);
+        if (definitions.length)
+          span.setAttribute(
+            SpanAttributes.LLM_REQUEST_FUNCTIONS,
+            safeJson(definitions),
+          );
+        let inherited: Record<string, unknown> = {};
+        try {
+          const prior = data(
+            attributesOf(policy.parent),
+            RespanSpanAttributes.RESPAN_METADATA,
+          );
+          if (typeof prior === "string") inherited = JSON.parse(prior);
+        } catch {}
+        span.setAttribute(
+          RespanSpanAttributes.RESPAN_METADATA,
+          safeJson({
+            ...inherited,
+            anthropic_operation: operation,
+            request: b,
+          }),
+        );
+        promptAttributes = {};
+        for (const [index, message] of inputMessages.entries()) {
+          const p = `${SpanAttributes.LLM_PROMPTS}.${index}`;
+          if (message.role !== undefined)
+            promptAttributes[`${p}.role`] = message.role;
+          promptAttributes[`${p}.content`] = textOrJson(message.content);
+          if (message.tool_calls)
+            promptAttributes[`${p}.tool_calls`] = safeJson(message.tool_calls);
+          if (message.tool_call_id)
+            promptAttributes[`${p}.tool_call_id`] = message.tool_call_id;
+        }
+      } else if (operation === "agent") {
+        let inherited: Record<string, unknown> = {};
+        try {
+          const prior = data(
+            attributesOf(policy.parent),
+            RespanSpanAttributes.RESPAN_METADATA,
+          );
+          if (typeof prior === "string") inherited = JSON.parse(prior);
+        } catch {}
+        span.setAttribute(
+          RespanSpanAttributes.RESPAN_METADATA,
+          safeJson({ ...inherited, request: b, tools: b.tools }),
+        );
+      } else
+        span.setAttribute(SpanAttributes.TRACELOOP_ENTITY_INPUT, safeJson(b));
+    },
+    finish(value, error, success = true) {
+      if (ended) return;
+      ended = true;
+      try {
+        refresh(policy);
+        if (error !== undefined) {
+          const status = data(error, "status");
+          if (typeof status === "number") {
+            span.setAttribute(ATTR_HTTP_RESPONSE_STATUS_CODE, status);
+          }
+          const type = data(error, "name");
+          if (typeof type === "string")
+            span.setAttribute(ATTR_ERROR_TYPE, type);
+          const message = data(error, "message");
+          span.setStatus({
+            code: SpanStatusCode.ERROR,
+            ...(policy.inputs && policy.outputs && typeof message === "string"
+              ? { message }
+              : {}),
+          });
+          if (policy.inputs && policy.outputs && typeof message === "string")
+            span.setAttribute(ATTR_ERROR_MESSAGE, message);
+        } else {
+          if (policy.outputs && value !== undefined) {
+            const output = snapshot(value);
+            span.setAttribute(
+              SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+              safeJson(output),
+            );
+            if (llm && output) {
+              if (typeof output.model === "string")
+                span.setAttribute(ATTR_GEN_AI_RESPONSE_MODEL, output.model);
+              if (typeof output.id === "string")
+                span.setAttribute(ATTR_GEN_AI_RESPONSE_ID, output.id);
+              const content =
+                operation === "completion" ? output.completion : output.content;
+              if (content !== undefined) {
+                span.setAttribute(
+                  `${SpanAttributes.LLM_COMPLETIONS}.0.role`,
+                  output.role ?? "assistant",
+                );
+                span.setAttribute(
+                  `${SpanAttributes.LLM_COMPLETIONS}.0.content`,
+                  textOrJson(content),
+                );
+                const calls = toolCalls(content);
+                if (calls.length)
+                  span.setAttribute(
+                    `${SpanAttributes.LLM_COMPLETIONS}.0.tool_calls`,
+                    safeJson(calls),
+                  );
+              }
+              if (typeof output.stop_reason === "string")
+                span.setAttribute(ATTR_GEN_AI_RESPONSE_FINISH_REASONS, [
+                  output.stop_reason,
+                ]);
+              const u = output.usage ?? {};
+              for (const [key, modern, legacy] of [
+                [
+                  "input_tokens",
+                  ATTR_GEN_AI_USAGE_INPUT_TOKENS,
+                  ATTR_GEN_AI_USAGE_PROMPT_TOKENS,
+                ],
+                [
+                  "output_tokens",
+                  ATTR_GEN_AI_USAGE_OUTPUT_TOKENS,
+                  ATTR_GEN_AI_USAGE_COMPLETION_TOKENS,
+                ],
+              ] as const)
+                if (typeof u[key] === "number") {
+                  span.setAttribute(modern, u[key]);
+                  span.setAttribute(legacy, u[key]);
+                }
+              if (typeof u.total_tokens === "number")
+                span.setAttribute(
+                  SpanAttributes.LLM_USAGE_TOTAL_TOKENS,
+                  u.total_tokens,
+                );
+              if (typeof u.cache_read_input_tokens === "number")
+                span.setAttribute(
+                  ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
+                  u.cache_read_input_tokens,
+                );
+              if (typeof u.cache_creation_input_tokens === "number")
+                span.setAttribute(
+                  ATTR_GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
+                  u.cache_creation_input_tokens,
+                );
+            }
+          }
+          if (success) span.setStatus({ code: SpanStatusCode.OK });
+        }
+      } catch {
+      } finally {
+        if (refresh(policy).inputs && promptAttributes)
+          span.setAttributes(promptAttributes);
+        promptAttributes = undefined;
+        span.end();
+      }
+    },
   };
-
-  if (toolExecution.id) {
-    attrs.tool_call_id = toolExecution.id;
-  }
-  if (toolExecution.isError) {
-    attrs["error.message"] = stringifyStructured(toolExecution.output);
-    attrs[STATUS_CODE_ATTR] = 500;
-  }
-
-  emitSpan(
-    `${toolExecution.name}.tool`,
-    attrs,
-    startTime,
-    toolExecution.isError ? stringifyStructured(toolExecution.output) : undefined,
-    toolExecution.isError ? 500 : undefined,
-  );
-}
-
-export function emitToolSpansFromMessages(messages: any[] | undefined): void {
-  for (const toolExecution of extractToolExecutions(messages)) {
-    try {
-      emitToolSpan(toolExecution);
-    } catch {
-      // Never break the application.
-    }
-  }
+  try {
+    session.input(body);
+  } catch {}
+  return session;
 }

@@ -1,329 +1,243 @@
-import { hrTime } from "@opentelemetry/core";
-import {
-  STREAM_INSTRUMENTED,
-  TOOL_USE_JSON_BUFFER_KEY,
-} from "./_helpers.js";
-import { emitErrorSpan, emitSuccessSpan } from "./_span_emitter.js";
-import { emitToolSpansFromMessages } from "./_span_emitter.js";
-
-export interface StreamState {
-  message: any;
-  usage: Record<string, any>;
-  stopReason: string | null;
-  stopSequence: string | null;
-  contentBlocks: Map<number, any>;
+import { context } from "@opentelemetry/api";
+import { RespanSpanAttributes } from "@respan/respan-sdk";
+import { safeJson } from "./_helpers.js";
+import { data, snapshot, refresh } from "./_privacy.js";
+import type { Session } from "./_span_emitter.js";
+interface State {
+  message: Record<string, any>;
+  blocks: Map<number, any>;
+  json: Map<number, string>;
+  events: unknown[];
 }
-
-function cloneContentBlock(block: any): any {
-  if (!block || typeof block !== "object") return block;
-  if (Array.isArray(block)) return block.map((entry) => cloneContentBlock(entry));
-  return { ...block };
-}
-
-export function createStreamState(): StreamState {
-  return {
-    message: null,
-    usage: {},
-    stopReason: null,
-    stopSequence: null,
-    contentBlocks: new Map<number, any>(),
-  };
-}
-
-export function buildMessageFromStreamState(
-  state: StreamState,
-  kwargs: Record<string, any>,
-): any {
-  const content = Array.from(state.contentBlocks.entries())
-    .sort((left, right) => left[0] - right[0])
-    .map(([, block]) => {
-      const normalized = cloneContentBlock(block);
-      if (normalized && typeof normalized === "object") {
-        const jsonBuffer = normalized[TOOL_USE_JSON_BUFFER_KEY];
-        delete normalized[TOOL_USE_JSON_BUFFER_KEY];
-
-        if (
-          normalized.type === "tool_use" &&
-          typeof normalized.input === "string" &&
-          typeof jsonBuffer === "string"
-        ) {
-          try {
-            normalized.input = jsonBuffer.trim() ? JSON.parse(jsonBuffer) : {};
-          } catch {
-            normalized.input = jsonBuffer;
-          }
-        }
-      }
-      return normalized;
-    });
-
-  return {
-    ...(state.message ?? {}),
-    model: state.message?.model ?? kwargs.model,
-    content,
-    usage: state.usage,
-    stop_reason: state.stopReason ?? state.message?.stop_reason ?? null,
-    stop_sequence: state.stopSequence ?? state.message?.stop_sequence ?? null,
-  };
-}
-
-export function updateStreamState(state: StreamState, event: any): void {
-  if (!event || typeof event !== "object") return;
-
+function update(state: State, event: any): void {
   if (event.type === "message_start") {
-    state.message = { ...(event.message ?? {}) };
-    state.usage = { ...(event.message?.usage ?? {}) };
-
-    if (Array.isArray(event.message?.content)) {
-      for (const [index, block] of event.message.content.entries()) {
-        state.contentBlocks.set(index, cloneContentBlock(block));
-      }
-    }
-    return;
+    state.message = { ...event.message };
+    for (const [index, block] of (event.message.content ?? []).entries())
+      state.blocks.set(index, block);
   }
-
-  if (event.type === "content_block_start") {
-    state.contentBlocks.set(event.index, cloneContentBlock(event.content_block));
-    return;
-  }
-
+  if (event.type === "content_block_start")
+    state.blocks.set(event.index, event.content_block);
   if (event.type === "content_block_delta") {
-    const existingBlock = state.contentBlocks.get(event.index) ?? {};
+    const block = state.blocks.get(event.index) ?? {};
     const delta = event.delta ?? {};
-
-    if (delta.type === "text_delta") {
-      existingBlock.type ??= "text";
-      existingBlock.text = `${existingBlock.text ?? ""}${delta.text ?? ""}`;
-      state.contentBlocks.set(event.index, existingBlock);
-      return;
-    }
-
     if (delta.type === "input_json_delta") {
-      existingBlock.type ??= "tool_use";
-      const nextBuffer =
-        `${existingBlock[TOOL_USE_JSON_BUFFER_KEY] ?? ""}${delta.partial_json ?? ""}`;
-      existingBlock[TOOL_USE_JSON_BUFFER_KEY] = nextBuffer;
-
+      const text =
+        (state.json.get(event.index) ?? "") + (delta.partial_json ?? "");
+      state.json.set(event.index, text);
       try {
-        existingBlock.input = nextBuffer.trim() ? JSON.parse(nextBuffer) : {};
+        block.input = JSON.parse(text);
       } catch {
-        existingBlock.input = nextBuffer;
+        block.input = text;
       }
-
-      state.contentBlocks.set(event.index, existingBlock);
+    } else if (delta.type === "text_delta")
+      block.text = (block.text ?? "") + (delta.text ?? "");
+    else if (delta.type === "thinking_delta")
+      block.thinking = (block.thinking ?? "") + (delta.thinking ?? "");
+    else if (delta.type === "signature_delta")
+      block.signature = (block.signature ?? "") + (delta.signature ?? "");
+    else if (delta.type === "citations_delta")
+      block.citations = [...(block.citations ?? []), delta.citation];
+    else if (delta.type === "compaction_delta") {
+      // The native SDK treats these as final replacement values, including null.
+      block.content = delta.content;
+      if (Object.hasOwn(delta, "encrypted_content"))
+        block.encrypted_content = delta.encrypted_content;
     }
-    return;
+    // Unknown deltas remain in canonical metadata; never replace the block type.
+    state.blocks.set(event.index, block);
   }
-
   if (event.type === "message_delta") {
-    state.stopReason = event.delta?.stop_reason ?? state.stopReason;
-    state.stopSequence = event.delta?.stop_sequence ?? state.stopSequence;
-    if (event.usage && typeof event.usage === "object") {
-      state.usage = { ...state.usage, ...event.usage };
-    }
+    Object.assign(state.message, event.delta);
+    if (event.usage)
+      state.message.usage = { ...state.message.usage, ...event.usage };
   }
-}
-
-export function wrapStreamingCreateResult(
-  streamResult: any,
-  kwargs: Record<string, any>,
-  startTime: [number, number],
-): any {
   if (
-    !streamResult ||
-    typeof streamResult !== "object" ||
-    streamResult[STREAM_INSTRUMENTED]
+    (event.type === undefined || event.type === "completion") &&
+    event.completion !== undefined
   ) {
-    return streamResult;
+    const prior = state.message.completion ?? "";
+    Object.assign(state.message, event);
+    state.message.completion = prior + event.completion;
   }
-
-  Object.defineProperty(streamResult, STREAM_INSTRUMENTED, {
-    value: true,
-    configurable: true,
-    enumerable: false,
-  });
-
-  const state = createStreamState();
-  let hasEmitted = false;
-
-  const emitFinalSpan = (error?: unknown) => {
-    if (hasEmitted) return;
-    hasEmitted = true;
-
-    if (error) {
-      emitErrorSpan(kwargs, startTime, error);
-      return;
-    }
-
-    emitSuccessSpan(kwargs, startTime, buildMessageFromStreamState(state, kwargs));
-  };
-
-  const originalAsyncIterator = streamResult[Symbol.asyncIterator]?.bind(streamResult);
-  if (typeof originalAsyncIterator !== "function") {
-    emitSuccessSpan(kwargs, startTime, streamResult);
-    return streamResult;
-  }
-
-  streamResult[Symbol.asyncIterator] = function () {
-    const iterator = originalAsyncIterator();
-
-    return {
-      async next(...args: any[]) {
-        try {
-          const result = await iterator.next(...args);
-          if (result.done) {
-            emitFinalSpan();
-          } else {
-            updateStreamState(state, result.value);
-          }
-          return result;
-        } catch (err) {
-          emitFinalSpan(err);
-          throw err;
-        }
-      },
-
-      async return(value?: any) {
-        try {
-          const result = typeof iterator.return === "function"
-            ? await iterator.return(value)
-            : { done: true, value };
-          emitFinalSpan();
-          return result;
-        } catch (err) {
-          emitFinalSpan(err);
-          throw err;
-        }
-      },
-
-      async throw(err?: any) {
-        emitFinalSpan(err);
-        if (typeof iterator.throw === "function") {
-          return iterator.throw(err);
-        }
-        throw err;
-      },
-
-      [Symbol.asyncIterator]() {
-        return this;
-      },
-    };
-  };
-
-  return streamResult;
 }
-
-export function instrumentCreateResult(
-  result: any,
-  kwargs: Record<string, any>,
-  startTime: [number, number],
-): any {
-  if (!result || typeof result !== "object") {
-    return result;
+export function observeIterable<T extends object>(
+  stream: T,
+  session: Session,
+  mode: "sse" | "rows" | "agent" = "sse",
+): T {
+  const target = stream as any;
+  const state: State = {
+    message: {},
+    blocks: new Map(),
+    json: new Map(),
+    events: [],
+  };
+  const controller = data(target, "controller");
+  let started = false;
+  const abort = () => {
+    if (!started) session.finish(undefined, undefined, false);
+  };
+  if (controller instanceof AbortController)
+    controller.signal.addEventListener("abort", abort, { once: true });
+  const complete = (error?: unknown, success = true) => {
+    if (controller instanceof AbortController)
+      controller.signal.removeEventListener("abort", abort);
+    if (mode === "sse" && refresh(session.policy).outputs) {
+      let metadata: Record<string, unknown> = {};
+      try {
+        const prior = (session.span as any).attributes;
+        const json = data(prior, RespanSpanAttributes.RESPAN_METADATA);
+        if (typeof json === "string") metadata = JSON.parse(json);
+      } catch {}
+      session.span.setAttribute(
+        RespanSpanAttributes.RESPAN_METADATA,
+        safeJson({ ...metadata, stream_events: state.events }),
+      );
+    }
+    const value =
+      mode === "rows"
+        ? state.events
+        : mode === "agent"
+          ? undefined
+          : {
+              ...state.message,
+              ...(state.blocks.size
+                ? {
+                    content: [...state.blocks.entries()]
+                      .sort(([a], [b]) => a - b)
+                      .map(([, v]) => v),
+                  }
+                : {}),
+            };
+    session.finish(value, error, success);
+  };
+  const factory = data(target, "iterator");
+  const original =
+    typeof factory === "function" ? factory : target[Symbol.asyncIterator];
+  if (typeof original !== "function") {
+    session.finish(stream);
+    return stream;
   }
-
-  let hasHandled = false;
-
-  const handleSuccess = (value: any) => {
-    if (kwargs?.stream === true) {
-      return wrapStreamingCreateResult(value, kwargs, startTime);
+  const wrapped = function (this: any, ...args: any[]) {
+    const iterator = context.with(session.ctx, () =>
+      Reflect.apply(original, this, args),
+    ) as any;
+    for (const key of ["next", "return", "throw"]) {
+      const method = iterator[key];
+      if (typeof method !== "function") continue;
+      Object.defineProperty(iterator, key, {
+        configurable: true,
+        writable: true,
+        value: function (...a: any[]) {
+          if (key === "next") started = true;
+          let result: any;
+          try {
+            result = context.with(session.ctx, () =>
+              Reflect.apply(method, iterator, a),
+            );
+          } catch (error) {
+            complete(error);
+            throw error;
+          }
+          const observe = (item: any) => {
+            if (
+              !item.done &&
+              key === "next" &&
+              refresh(session.policy).outputs
+            ) {
+              const copy = snapshot(item.value);
+              if (mode === "sse") {
+                state.events.push(copy);
+                update(state, snapshot(copy));
+              } else if (mode === "rows") state.events.push(copy);
+            }
+            if (
+              (item.done && mode !== "agent") ||
+              key === "return" ||
+              key === "throw"
+            )
+              complete(key === "throw" ? a[0] : undefined, key === "next");
+          };
+          if (result && typeof result.then === "function")
+            void result
+              .then(observe, (error: unknown) => complete(error))
+              .catch(() => {});
+          else observe(result);
+          return result;
+        },
+      });
     }
-
-    if (!hasHandled) {
-      hasHandled = true;
-      emitSuccessSpan(kwargs, startTime, value);
-    }
+    return iterator;
+  };
+  try {
+    if (typeof data(target, "iterator") === "function")
+      Object.defineProperty(target, "iterator", {
+        value: wrapped,
+        writable: true,
+        configurable: true,
+      });
+    else
+      Object.defineProperty(target, Symbol.asyncIterator, {
+        value: wrapped,
+        writable: true,
+        configurable: true,
+      });
+  } catch {}
+  return stream;
+}
+/** Observe the SDK's lazy parser, never APIPromise.then/catch/raw helper methods. */
+export function observePromise<T>(
+  result: T,
+  session: Session,
+  streaming = false,
+  rows = false,
+): T {
+  const target = result as any;
+  const parser = data(target, "parseResponse");
+  const responsePromise = data(target, "responsePromise");
+  if (responsePromise instanceof Promise)
+    void responsePromise
+      .then(
+        (props: any) => {
+          session.headers(data(props, "response"));
+          if (!data(target, "parsedPromise")) session.finish();
+        },
+        (error: unknown) => session.finish(undefined, error),
+      )
+      .catch(() => {});
+  const success = (value: any) => {
+    if (streaming || rows)
+      return observeIterable(value, session, rows ? "rows" : "sse");
+    session.finish(value);
     return value;
   };
-
-  const handleError = (err: unknown) => {
-    if (hasHandled) return;
-    hasHandled = true;
-    emitErrorSpan(kwargs, startTime, err);
-  };
-
-  const originalThen = typeof result.then === "function" ? result.then.bind(result) : null;
-  if (originalThen) {
-    result.then = function (onfulfilled?: any, onrejected?: any) {
-      return originalThen(
-        (value: any) => {
-          const instrumentedValue = handleSuccess(value);
-          return onfulfilled ? onfulfilled(instrumentedValue) : instrumentedValue;
-        },
-        (reason: any) => {
-          handleError(reason);
-          if (onrejected) {
-            return onrejected(reason);
-          }
-          throw reason;
-        },
-      );
-    };
-  }
-
-  const originalCatch = typeof result.catch === "function" ? result.catch.bind(result) : null;
-  if (originalCatch) {
-    result.catch = function (onrejected?: any) {
-      return originalCatch((reason: any) => {
-        handleError(reason);
-        if (onrejected) {
-          return onrejected(reason);
+  if (typeof parser === "function") {
+    Object.defineProperty(target, "parseResponse", {
+      configurable: true,
+      writable: true,
+      value: function (this: any, ...args: any[]) {
+        let parsed: any;
+        try {
+          parsed = context.with(session.ctx, () =>
+            Reflect.apply(parser, this, args),
+          );
+        } catch (error) {
+          session.finish(undefined, error);
+          throw error;
         }
-        throw reason;
-      });
-    };
-  }
-
-  const originalWithResponse =
-    typeof result.withResponse === "function" ? result.withResponse.bind(result) : null;
-  if (originalWithResponse) {
-    result.withResponse = async function () {
-      try {
-        const response = await originalWithResponse();
-        return {
-          ...response,
-          data: handleSuccess(response.data),
-        };
-      } catch (err) {
-        handleError(err);
-        throw err;
-      }
-    };
-  }
-
+        if (parsed && typeof parsed.then === "function") {
+          void parsed
+            .then(success, (error: unknown) => session.finish(undefined, error))
+            .catch(() => {});
+          return parsed;
+        }
+        return success(parsed);
+      },
+    });
+  } else if (target instanceof Promise)
+    void target
+      .then(success, (error: unknown) => session.finish(undefined, error))
+      .catch(() => {});
+  else success(target);
   return result;
-}
-
-export interface PatchedMessagesTarget {
-  messagesPrototype: any;
-  originalCreate: any;
-}
-
-export function patchMessagesPrototype(messagesPrototype: any): PatchedMessagesTarget | null {
-  if (!messagesPrototype || typeof messagesPrototype.create !== "function") {
-    return null;
-  }
-
-  const patchedTarget = {
-    messagesPrototype,
-    originalCreate: messagesPrototype.create,
-  };
-
-  messagesPrototype.create = function (
-    this: any,
-    body: any,
-    options?: any,
-  ) {
-    const startTime = hrTime();
-    try {
-      emitToolSpansFromMessages(body?.messages);
-      const result = patchedTarget.originalCreate.call(this, body, options);
-      return instrumentCreateResult(result, body, startTime);
-    } catch (err: any) {
-      emitErrorSpan(body, startTime, err);
-      throw err;
-    }
-  };
-
-  return patchedTarget;
 }

@@ -1,22 +1,18 @@
-/**
- * Respan instrumentation plugin for the Cohere TypeScript SDK.
- *
- * The current Cohere SDK exposes both v1 and v2 clients. This package patches
- * the SDK methods directly so chat, streaming chat, generation, embeddings,
- * and rerank all emit spans in the Respan span contract.
- */
-
+/** Native Cohere adapter: preserve SDK objects and observe their lifecycle. */
+import { context } from "@opentelemetry/api";
+import { ATTR_HTTP_RESPONSE_STATUS_CODE } from "@opentelemetry/semantic-conventions";
 import {
-  COHERE_PATCHED,
-} from "./_constants.js";
+  capture,
+  data,
+  internalCall,
+  type CaptureOptions,
+} from "./_privacy.js";
 import {
-  captureStreamEvent,
-  createStreamState,
-  emitSpanRecord,
   startSpanRecord,
+  emitSpanRecord,
+  createStreamState,
+  captureStreamEvent,
   streamResultFromState,
-  type CohereApiVersion,
-  type CohereOperation,
   type OperationConfig,
   type SpanRecord,
 } from "./_mapping.js";
@@ -31,313 +27,273 @@ export {
   normalizeCohereAttrs,
   normalizeCohereSpan,
 } from "./_translator.js";
-
-export interface CohereInstrumentorOptions {
+export interface CohereInstrumentorOptions extends CaptureOptions {
   sdkModule?: any;
-  traceContent?: boolean;
 }
-
-interface PatchedMethod {
+type Patch = {
   target: any;
   method: string;
-  original: (...args: any[]) => any;
-}
-
-const V1_METHODS: Array<[CohereOperation, boolean]> = [
-  ["chat", false],
-  ["chatStream", true],
-  ["generate", false],
-  ["generateStream", true],
-  ["embed", false],
-  ["rerank", false],
-];
-
-const V2_METHODS: Array<[CohereOperation, boolean]> = [
-  ["chat", false],
-  ["chatStream", true],
-  ["embed", false],
-  ["rerank", false],
-];
-
-function isThenable(value: any): boolean {
-  return value !== null && value !== undefined && typeof value.then === "function";
-}
-
-function findPrototypeWithMethod(instance: any, method: string): any | null {
-  let target = instance;
-  while (target) {
-    const descriptor = Object.getOwnPropertyDescriptor(target, method);
-    if (descriptor && typeof descriptor.value === "function") return target;
-    target = Object.getPrototypeOf(target);
+  original: Function;
+  wrapped: Function;
+  owners: Set<CohereInstrumentor>;
+};
+const patches = new WeakMap<object, Map<string, Patch>>();
+const methods = [
+  "chat",
+  "chatStream",
+  "generate",
+  "generateStream",
+  "embed",
+  "rerank",
+] as const;
+function findTarget(instance: any, method: string): any {
+  for (let target = instance; target; target = Object.getPrototypeOf(target)) {
+    if (
+      typeof Object.getOwnPropertyDescriptor(target, method)?.value ===
+      "function"
+    )
+      return target;
   }
-  return null;
 }
-
-function patchMethod(
-  target: any,
-  method: string,
-  config: OperationConfig,
-  traceContent: boolean,
-): PatchedMethod | null {
-  if (!target || typeof target[method] !== "function") return null;
-  if ((target[method] as any)[COHERE_PATCHED]) return null;
-
-  const original = target[method];
-  const wrapped = function wrappedCohereMethod(this: any, ...args: any[]) {
-    const request = args[0] ?? {};
-    const record = startSpanRecord(config, request, traceContent);
-
-    let result: any;
-    try {
-      result = original.apply(this, args);
-    } catch (error) {
-      emitSpanRecord(config, record, undefined, error);
-      throw error;
-    }
-
-    if (config.streaming) {
-      return instrumentStreamingResult(result, config, record);
-    }
-
-    instrumentPromiseResult(result, config, record);
-    return result;
-  };
-
-  Object.defineProperty(wrapped, COHERE_PATCHED, {
-    configurable: true,
-    enumerable: false,
-    value: true,
-  });
-  target[method] = wrapped;
-  return { target, method, original };
-}
-
-function instrumentPromiseResult(
+function observe(
   result: any,
   config: OperationConfig,
   record: SpanRecord,
 ): void {
-  if (!isThenable(result)) {
-    emitSpanRecord(config, record, result);
-    return;
+  const resolved = (value: any) => {
+    try {
+      if (config.streaming) wrapStream(value, config, record);
+      else emitSpanRecord(config, record, value);
+    } catch {
+      emitSpanRecord(config, record, undefined);
+    }
+  };
+  const rejected = (error: unknown) => {
+    emitSpanRecord(config, record, undefined, error);
+  };
+  try {
+    const rawPromise = data(result, "innerPromise");
+    if (rawPromise && typeof rawPromise.then === "function")
+      rawPromise.then(
+        (value: any) => {
+          const status = data(data(value, "rawResponse"), "status");
+          if (
+            record.admitted &&
+            typeof status === "number" &&
+            Number.isInteger(status) &&
+            status >= 100 &&
+            status <= 599
+          )
+            record.span.setAttribute(ATTR_HTTP_RESPONSE_STATUS_CODE, status);
+        },
+        () => undefined,
+      );
+    if (result && typeof result.then === "function") {
+      // An observer branch leaves HttpResponsePromise and withRawResponse() intact.
+      result.then(resolved, rejected);
+    } else resolved(result);
+  } catch {
+    /* Telemetry must not affect native results. */
   }
-
-  let emitted = false;
-  Promise.resolve(result).then(
-    (value) => {
-      if (emitted) return;
-      emitted = true;
-      emitSpanRecord(config, record, value);
-    },
-    (error) => {
-      if (emitted) return;
-      emitted = true;
-      emitSpanRecord(config, record, undefined, error);
-    },
-  );
 }
-
-function instrumentStreamingResult(
-  result: any,
-  config: OperationConfig,
-  record: SpanRecord,
-): any {
-  if (!isThenable(result)) {
-    return wrapStream(result, config, record);
-  }
-
-  let emitted = false;
-  return Promise.resolve(result).then(
-    (stream: any) => wrapStream(stream, config, record, () => {
-      emitted = true;
-    }),
-    (error: unknown) => {
-      if (!emitted) {
-        emitted = true;
-        emitSpanRecord(config, record, undefined, error);
-      }
-      throw error;
-    },
-  );
-}
-
 function wrapStream(
   stream: any,
   config: OperationConfig,
   record: SpanRecord,
-  markEmitted?: () => void,
-): any {
+): void {
   if (!stream || typeof stream[Symbol.asyncIterator] !== "function") {
     emitSpanRecord(config, record, stream);
-    markEmitted?.();
-    return stream;
+    return;
   }
-
-  const originalAsyncIterator = stream[Symbol.asyncIterator].bind(stream);
+  const original = stream[Symbol.asyncIterator];
   const state = createStreamState();
-  let emitted = false;
-
-  const emitFinal = (error?: unknown) => {
-    if (emitted) return;
-    emitted = true;
-    markEmitted?.();
-    if (error !== undefined) {
-      emitSpanRecord(config, record, undefined, error);
-      return;
-    }
-    emitSpanRecord(config, record, streamResultFromState(config, state));
-  };
-
-  stream[Symbol.asyncIterator] = function patchedCohereAsyncIterator() {
-    const iterator = originalAsyncIterator();
-    return {
-      async next(...args: any[]) {
-        try {
-          const item = await iterator.next(...args);
-          if (item.done) {
-            emitFinal();
-          } else {
-            captureStreamEvent(state, item.value);
+  const finish = (error?: unknown) =>
+    emitSpanRecord(
+      config,
+      record,
+      error === undefined ? streamResultFromState(config, state) : undefined,
+      error,
+    );
+  const wrapped = function (this: any, ...args: any[]) {
+    const iterator = original.apply(this, args);
+    for (const method of ["next", "return", "throw"] as const) {
+      const originalMethod = iterator[method];
+      if (typeof originalMethod !== "function") continue;
+      Object.defineProperty(iterator, method, {
+        configurable: true,
+        value: function (this: any, ...callArgs: any[]) {
+          let pending: any;
+          try {
+            pending = originalMethod.apply(this, callArgs);
+          } catch (error) {
+            finish(error);
+            throw error;
           }
-          return item;
-        } catch (error) {
-          emitFinal(error);
-          throw error;
-        }
-      },
-      async return(value?: any) {
-        try {
-          const result = typeof iterator.return === "function"
-            ? await iterator.return(value)
-            : { done: true, value };
-          emitFinal();
-          return result;
-        } catch (error) {
-          emitFinal(error);
-          throw error;
-        }
-      },
-      async throw(error?: any) {
-        emitFinal(error);
-        if (typeof iterator.throw === "function") {
-          return iterator.throw(error);
-        }
-        throw error;
-      },
-      [Symbol.asyncIterator]() {
-        return this;
-      },
-    };
+          Promise.resolve(pending).then(
+            (item: any) => {
+              try {
+                if (method === "throw") finish(callArgs[0]);
+                else if (method === "return" || item.done) finish();
+                else captureStreamEvent(state, item.value, record.policy);
+              } catch {
+                /* Keep native iterator results unchanged. */
+              }
+            },
+            (error) => finish(error),
+          );
+          return pending;
+        },
+      });
+    }
+    return iterator;
   };
-
-  return stream;
-}
-
-function createConfig(
-  operation: CohereOperation,
-  apiVersion: CohereApiVersion,
-  streaming: boolean,
-): OperationConfig {
-  return { operation, apiVersion, streaming };
-}
-
-export class CohereInstrumentor {
-  public readonly name = "cohere";
-  private static readonly _sharedState = {
-    activeInstances: 0,
-    patchedMethods: [] as PatchedMethod[],
-  };
-
-  private readonly _sdkModule?: any;
-  private readonly _traceContent: boolean;
-  private _isInstrumented = false;
-
-  constructor(options: CohereInstrumentorOptions = {}) {
-    this._sdkModule = options.sdkModule;
-    this._traceContent = options.traceContent ?? true;
+  try {
+    Object.defineProperty(stream, Symbol.asyncIterator, {
+      configurable: true,
+      writable: true,
+      value: wrapped,
+    });
+  } catch {
+    finish();
   }
-
-  async activate(): Promise<void> {
-    if (this._isInstrumented) return;
-
-    const sdkModule = this._sdkModule ?? await import("cohere-ai").catch(() => null);
-    if (!sdkModule?.CohereClient) {
-      console.warn(
-        "[Respan] Failed to activate Cohere instrumentation - cohere-ai not found",
+  const controller = stream.controller;
+  if (controller?.signal)
+    controller.signal.addEventListener("abort", () => finish(), { once: true });
+}
+function acquire(
+  target: any,
+  method: string,
+  config: OperationConfig,
+  owner: CohereInstrumentor,
+): Patch | undefined {
+  if (!target) return;
+  let map = patches.get(target);
+  if (!map) patches.set(target, (map = new Map()));
+  let patch = map.get(method);
+  if (patch && target[method] === patch.wrapped) {
+    patch.owners.add(owner);
+    return patch;
+  }
+  const original = target[method];
+  patch = {
+    target,
+    method,
+    original,
+    wrapped: undefined as any,
+    owners: new Set([owner]),
+  };
+  const owned = patch;
+  owned.wrapped = function (this: any, ...args: any[]) {
+    const ctx = context.active();
+    if (ctx.getValue(internalCall)) return original.apply(this, args);
+    const owners = [...owned.owners].filter((item) => item.isActive());
+    if (!owners.length) return original.apply(this, args);
+    const policy = capture(
+      {
+        traceContent: owners.every(
+          (item) => item.options.traceContent !== false,
+        ),
+        recordInputs: owners.every(
+          (item) => item.options.recordInputs !== false,
+        ),
+        recordOutputs: owners.every(
+          (item) => item.options.recordOutputs !== false,
+        ),
+      },
+      ctx,
+    );
+    if (!policy.emit) return original.apply(this, args);
+    const record = startSpanRecord(config, args[0], policy, ctx);
+    let result: any;
+    try {
+      result = context.with(record.context.setValue(internalCall, true), () =>
+        original.apply(this, args),
       );
-      return;
+    } catch (error) {
+      emitSpanRecord(config, record, undefined, error);
+      throw error;
     }
-
-    const shared = CohereInstrumentor._sharedState;
-    if (shared.activeInstances === 0) {
-      try {
-        this._patchSdkModule(sdkModule);
-      } catch (error) {
-        console.warn("[Respan] Failed to activate Cohere instrumentation:", error);
-        this._restorePatchedMethods();
-        return;
-      }
-      if (shared.patchedMethods.length === 0) {
-        console.warn(
-          "[Respan] Failed to activate Cohere instrumentation - no supported SDK methods found",
-        );
-        return;
-      }
-    }
-
-    shared.activeInstances += 1;
-    this._isInstrumented = true;
+    observe(result, config, record);
+    return result;
+  };
+  Object.defineProperty(target, method, {
+    ...Object.getOwnPropertyDescriptor(target, method),
+    value: owned.wrapped,
+  });
+  map.set(method, owned);
+  return owned;
+}
+export class CohereInstrumentor {
+  readonly name = "cohere";
+  readonly options: Readonly<CohereInstrumentorOptions>;
+  private active = false;
+  private generation = 0;
+  private activation?: Promise<void>;
+  private owned: Patch[] = [];
+  constructor(options: CohereInstrumentorOptions = {}) {
+    this.options = Object.freeze({ ...options });
   }
-
+  activate(): Promise<void> {
+    if (this.active) return Promise.resolve();
+    if (this.activation) return this.activation;
+    const generation = this.generation;
+    const pending = this.install(generation);
+    this.activation = pending;
+    void pending.finally(() => {
+      if (this.activation === pending) this.activation = undefined;
+    });
+    return pending;
+  }
+  private async install(generation: number): Promise<void> {
+    const sdk =
+      this.options.sdkModule ??
+      (await import("cohere-ai").catch(() => undefined));
+    if (generation !== this.generation || !sdk?.CohereClient) return;
+    try {
+      const client = new sdk.CohereClient({ token: "respan-placeholder" });
+      const targets: Array<[any, "v1" | "v2"]> = [[client, "v1"]];
+      if (client.v2) targets.push([client.v2, "v2"]);
+      if (sdk.CohereClientV2) {
+        const v2 = new sdk.CohereClientV2({ token: "respan-placeholder" });
+        if (v2.clientV2) targets.push([v2.clientV2, "v2"]);
+      }
+      for (const [target, apiVersion] of targets)
+        for (const method of [
+          ...methods,
+          ...(apiVersion === "v2" ? ["parse" as const] : []),
+        ]) {
+          const operation = method;
+          const patch = acquire(
+            findTarget(target, method),
+            method,
+            { operation, apiVersion, streaming: method.endsWith("Stream") },
+            this,
+          );
+          if (patch && !this.owned.includes(patch)) this.owned.push(patch);
+        }
+      this.active = this.owned.length > 0;
+    } catch {
+      this.deactivate();
+    }
+  }
   deactivate(): void {
-    if (!this._isInstrumented) return;
-
-    const shared = CohereInstrumentor._sharedState;
-    shared.activeInstances = Math.max(0, shared.activeInstances - 1);
-    this._isInstrumented = false;
-
-    if (shared.activeInstances === 0) {
-      this._restorePatchedMethods();
+    this.generation++;
+    this.activation = undefined;
+    this.active = false;
+    for (const patch of this.owned) {
+      patch.owners.delete(this);
+      if (patch.owners.size) continue;
+      if (patch.target[patch.method] === patch.wrapped)
+        Object.defineProperty(patch.target, patch.method, {
+          ...Object.getOwnPropertyDescriptor(patch.target, patch.method),
+          value: patch.original,
+        });
+      if (patches.get(patch.target)?.get(patch.method) === patch)
+        patches.get(patch.target)!.delete(patch.method);
     }
+    this.owned = [];
   }
-
   isActive(): boolean {
-    return this._isInstrumented;
-  }
-
-  private _patchSdkModule(sdkModule: any): void {
-    const client = new sdkModule.CohereClient({ token: "respan-placeholder" });
-    for (const [operation, streaming] of V1_METHODS) {
-      this._patchInstanceMethod(client, operation, createConfig(operation, "v1", streaming));
-    }
-
-    const v2Client = client.v2;
-    if (v2Client) {
-      for (const [operation, streaming] of V2_METHODS) {
-        this._patchInstanceMethod(v2Client, operation, createConfig(operation, "v2", streaming));
-      }
-    }
-  }
-
-  private _patchInstanceMethod(
-    instance: any,
-    operation: CohereOperation,
-    config: OperationConfig,
-  ): void {
-    const target = findPrototypeWithMethod(instance, operation);
-    const patched = patchMethod(target, operation, config, this._traceContent);
-    if (patched) {
-      CohereInstrumentor._sharedState.patchedMethods.push(patched);
-    }
-  }
-
-  private _restorePatchedMethods(): void {
-    const shared = CohereInstrumentor._sharedState;
-    for (const patched of shared.patchedMethods.reverse()) {
-      if (patched.target?.[patched.method]?.[COHERE_PATCHED]) {
-        patched.target[patched.method] = patched.original;
-      }
-    }
-    shared.patchedMethods = [];
+    return this.active;
   }
 }

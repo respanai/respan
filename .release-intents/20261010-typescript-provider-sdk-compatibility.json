@@ -1,0 +1,9 @@
+{
+  "summary": "Support current Anthropic, Bedrock, Azure OpenAI, and Cohere native SDK APIs with sampled spans, preserved helpers, complete content, and immutable capture controls",
+  "packages": {
+    "@respan/instrumentation-anthropic": "minor",
+    "@respan/instrumentation-aws-bedrock": "minor",
+    "@respan/instrumentation-azure-openai": "minor",
+    "@respan/instrumentation-cohere": "minor"
+  }
+}

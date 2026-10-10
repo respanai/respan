@@ -22,7 +22,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "yarn build && node --test tests/*.test.mjs",
+    "test": "tsc -p tsconfig.json && node --test tests/*.test.mjs",
     "publish:package": "yarn npm publish",
     "release": "yarn build && yarn version patch && yarn publish:package"
   },
@@ -32,12 +32,12 @@
     "@opentelemetry/core": "^2.10.0",
     "@opentelemetry/sdk-trace-base": "^2.10.0",
     "@opentelemetry/semantic-conventions": "^1.43.0",
-    "@respan/respan-sdk": "^1.1.7",
-    "@respan/tracing": "^1.1.4",
+    "@respan/respan-sdk": "^1.2.0",
+    "@respan/tracing": "^1.3.2",
     "@traceloop/ai-semantic-conventions": "^0.13.0"
   },
   "peerDependencies": {
-    "@anthropic-ai/sdk": ">=0.30.0"
+    "@anthropic-ai/sdk": ">=0.30.0 <1.0.0"
   },
   "peerDependenciesMeta": {
     "@anthropic-ai/sdk": {
@@ -45,7 +45,8 @@
     }
   },
   "devDependencies": {
-    "@anthropic-ai/sdk": "^0.39.0",
+    "@anthropic-ai/sdk": "0.133.0",
+    "@opentelemetry/context-async-hooks": "^2.10.0",
     "@types/node": "^22.15.29",
     "typescript": "^5.7.3"
   }

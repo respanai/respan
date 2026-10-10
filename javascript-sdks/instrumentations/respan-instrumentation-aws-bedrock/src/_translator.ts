@@ -1,3 +1,4 @@
+import { snapshot } from "./_privacy.js";
 import {
   ASSISTANT_ROLE,
   BODY_KEY,
@@ -42,15 +43,20 @@ export interface BedrockResponse {
   toolCalls: Record<string, unknown>[];
   usage: Record<string, number>;
   rawPayload?: unknown;
+  hasContent?: boolean;
+  stopReason?: string;
+  embedding?: unknown;
 }
 
 export function safeJson(value: unknown): string {
   try {
-    return JSON.stringify(toSerializableValue(value), (_key, innerValue) =>
-      typeof innerValue === "bigint" ? innerValue.toString() : innerValue,
+    return JSON.stringify(
+      toSerializableValue(snapshot(value)),
+      (_key, innerValue) =>
+        typeof innerValue === "bigint" ? innerValue.toString() : innerValue,
     );
   } catch {
-    return String(value);
+    return "null";
   }
 }
 
@@ -73,12 +79,10 @@ export function toSerializableValue(value: unknown): unknown {
     return value.toString();
   }
   if (value instanceof Uint8Array) {
-    const decoded = decodeBytes(value);
-    return loadJson(decoded) ?? decoded;
+    return Array.from(value);
   }
   if (value instanceof ArrayBuffer) {
-    const decoded = decodeBytes(new Uint8Array(value));
-    return loadJson(decoded) ?? decoded;
+    return Array.from(new Uint8Array(value));
   }
   if (Array.isArray(value)) {
     return value.map((item) => toSerializableValue(item));
@@ -102,7 +106,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function field(value: unknown, name: string, defaultValue?: unknown): unknown {
-  return isRecord(value) ? value[name] ?? defaultValue : defaultValue;
+  return isRecord(value) ? (value[name] ?? defaultValue) : defaultValue;
 }
 
 function coerceInt(value: unknown): number | undefined {
@@ -162,22 +166,20 @@ export function captureInvokeResponsePayload(response: unknown): unknown {
 }
 
 function normalizeTextContent(content: unknown): unknown {
-  if (content === undefined || content === null) {
-    return "";
-  }
+  if (content === undefined) return "";
+  if (content === null) return null;
   if (typeof content === "string") {
     return content;
   }
   if (Array.isArray(content)) {
     const normalized = content
       .map((item) => normalizeTextContent(item))
-      .filter((item) => item !== undefined && item !== null && item !== "" && !(Array.isArray(item) && item.length === 0));
+      .filter((item) => item !== undefined);
     if (normalized.length === 0) {
       return "";
     }
-    if (normalized.every((item) => typeof item === "string")) {
+    if (normalized.every((item) => typeof item === "string"))
       return normalized.join("\n");
-    }
     return normalized;
   }
   if (isRecord(content)) {
@@ -186,7 +188,7 @@ function normalizeTextContent(content: unknown): unknown {
       return text;
     }
     if (content.json !== undefined) {
-      return toSerializableValue(content.json);
+      return { json: toSerializableValue(content.json) };
     }
     if (isRecord(content.toolUse)) {
       return normalizeToolCall(content.toolUse);
@@ -232,6 +234,35 @@ function normalizeMessage(
   return normalized;
 }
 
+function normalizeMessages(messages: unknown[]): Record<string, unknown>[] {
+  return messages.flatMap((message) => {
+    const content = field(message, CONTENT_KEY);
+    const blocks = Array.isArray(content) ? content : [];
+    const results = blocks.filter(
+      (block) =>
+        isRecord(block) &&
+        (isRecord(block.toolResult) || block.type === "tool_result"),
+    );
+    if (!results.length) return [normalizeMessage(message)];
+    const output: Record<string, unknown>[] = [];
+    const ordinary = blocks.filter((block) => !results.includes(block));
+    if (ordinary.length)
+      output.push(
+        normalizeMessage({
+          ...(message as Record<string, unknown>),
+          content: ordinary,
+        }),
+      );
+    for (const block of results)
+      output.push(
+        isRecord(block.toolResult)
+          ? normalizeToolResult(block.toolResult)
+          : normalizeAnthropicToolResult(block),
+      );
+    return output;
+  });
+}
+
 function normalizeBedrockRole(role: unknown): string {
   if (role === "assistant" || role === "model") {
     return ASSISTANT_ROLE;
@@ -266,13 +297,13 @@ function normalizePromptFromBody(body: unknown): Record<string, unknown>[] {
   ];
   const rawMessages = body[MESSAGES_KEY];
   if (Array.isArray(rawMessages)) {
-    messages.push(...rawMessages.map((message) => normalizeMessage(message)));
+    messages.push(...normalizeMessages(rawMessages));
     return messages;
   }
 
   for (const key of ["prompt", "inputText", "input_text", INPUT_KEY]) {
     const value = body[key];
-    if (value) {
+    if (value !== undefined) {
       messages.push({
         [ROLE_KEY]: USER_ROLE,
         [CONTENT_KEY]: normalizeTextContent(value),
@@ -283,18 +314,22 @@ function normalizePromptFromBody(body: unknown): Record<string, unknown>[] {
   return messages;
 }
 
-function normalizeConverseMessages(apiParams: Record<string, unknown>): Record<string, unknown>[] {
+function normalizeConverseMessages(
+  apiParams: Record<string, unknown>,
+): Record<string, unknown>[] {
   const messages: Record<string, unknown>[] = [
     ...normalizeSystemMessages(apiParams[SYSTEM_KEY]),
   ];
   const rawMessages = apiParams[MESSAGES_KEY];
   if (Array.isArray(rawMessages)) {
-    messages.push(...rawMessages.map((message) => normalizeMessage(message)));
+    messages.push(...normalizeMessages(rawMessages));
   }
   return messages;
 }
 
-function normalizeAnthropicToolUse(block: Record<string, unknown>): Record<string, unknown> {
+function normalizeAnthropicToolUse(
+  block: Record<string, unknown>,
+): Record<string, unknown> {
   return {
     id: block.id ?? "",
     [TYPE_KEY]: FUNCTION_TOOL_TYPE,
@@ -305,7 +340,9 @@ function normalizeAnthropicToolUse(block: Record<string, unknown>): Record<strin
   };
 }
 
-function normalizeToolCall(block: Record<string, unknown>): Record<string, unknown> {
+function normalizeToolCall(
+  block: Record<string, unknown>,
+): Record<string, unknown> {
   return {
     id: block.toolUseId ?? "",
     [TYPE_KEY]: FUNCTION_TOOL_TYPE,
@@ -316,7 +353,9 @@ function normalizeToolCall(block: Record<string, unknown>): Record<string, unkno
   };
 }
 
-function normalizeAnthropicToolResult(block: Record<string, unknown>): Record<string, unknown> {
+function normalizeAnthropicToolResult(
+  block: Record<string, unknown>,
+): Record<string, unknown> {
   return {
     [ROLE_KEY]: TOOL_ROLE,
     tool_call_id: block.tool_use_id ?? "",
@@ -324,7 +363,9 @@ function normalizeAnthropicToolResult(block: Record<string, unknown>): Record<st
   };
 }
 
-function normalizeToolResult(block: Record<string, unknown>): Record<string, unknown> {
+function normalizeToolResult(
+  block: Record<string, unknown>,
+): Record<string, unknown> {
   return {
     [ROLE_KEY]: TOOL_ROLE,
     tool_call_id: block.toolUseId ?? "",
@@ -332,7 +373,9 @@ function normalizeToolResult(block: Record<string, unknown>): Record<string, unk
   };
 }
 
-function extractToolCallsFromContent(content: unknown): Record<string, unknown>[] {
+function extractToolCallsFromContent(
+  content: unknown,
+): Record<string, unknown>[] {
   const toolCalls: Record<string, unknown>[] = [];
   const blocks = Array.isArray(content) ? content : [content];
   for (const block of blocks) {
@@ -348,7 +391,7 @@ function extractToolCallsFromContent(content: unknown): Record<string, unknown>[
     }
 
     const functionPayload = isRecord(toolCall?.[FUNCTION_KEY])
-      ? toolCall[FUNCTION_KEY] as Record<string, unknown>
+      ? (toolCall[FUNCTION_KEY] as Record<string, unknown>)
       : undefined;
     if (toolCall && functionPayload?.[NAME_KEY]) {
       toolCalls.push(toolCall);
@@ -357,11 +400,17 @@ function extractToolCallsFromContent(content: unknown): Record<string, unknown>[
   return toolCalls;
 }
 
-function normalizeToolDefinition(tool: unknown): Record<string, unknown> | undefined {
+function normalizeToolDefinition(
+  tool: unknown,
+): Record<string, unknown> | undefined {
   if (!isRecord(tool)) {
     return undefined;
   }
 
+  if (isRecord(tool.systemTool))
+    return { type: "system", system: toSerializableValue(tool.systemTool) };
+  if (isRecord(tool.cachePoint))
+    return toSerializableValue(tool) as Record<string, unknown>;
   const toolSpec = isRecord(tool.toolSpec) ? tool.toolSpec : tool;
   const name = toolSpec[NAME_KEY];
   if (typeof name !== "string" || !name) {
@@ -380,7 +429,15 @@ function normalizeToolDefinition(tool: unknown): Record<string, unknown> | undef
     [NAME_KEY]: name,
     parameters: toSerializableValue(schema),
   };
-  if (toolSpec[DESCRIPTION_KEY]) {
+  for (const [key, value] of Object.entries(toolSpec)) {
+    if (
+      ![NAME_KEY, DESCRIPTION_KEY, INPUT_SCHEMA_KEY, "input_schema"].includes(
+        key,
+      )
+    )
+      functionPayload[key] = toSerializableValue(value);
+  }
+  if (toolSpec[DESCRIPTION_KEY] !== undefined) {
     functionPayload[DESCRIPTION_KEY] = toolSpec[DESCRIPTION_KEY];
   }
 
@@ -394,26 +451,28 @@ function extractToolsFromBody(body: unknown): Record<string, unknown>[] {
   if (!isRecord(body) || !Array.isArray(body[TOOLS_KEY])) {
     return [];
   }
-  return body[TOOLS_KEY]
-    .map((tool) => normalizeToolDefinition(tool))
-    .filter((tool): tool is Record<string, unknown> => tool !== undefined);
+  return body[TOOLS_KEY].map((tool) => normalizeToolDefinition(tool)).filter(
+    (tool): tool is Record<string, unknown> => tool !== undefined,
+  );
 }
 
-function extractToolsFromConverse(apiParams: Record<string, unknown>): Record<string, unknown>[] {
+function extractToolsFromConverse(
+  apiParams: Record<string, unknown>,
+): Record<string, unknown>[] {
   const toolConfig = apiParams[TOOL_CONFIG_KEY];
   if (!isRecord(toolConfig) || !Array.isArray(toolConfig[TOOLS_KEY])) {
     return [];
   }
-  return toolConfig[TOOLS_KEY]
-    .map((tool) => normalizeToolDefinition(tool))
-    .filter((tool): tool is Record<string, unknown> => tool !== undefined);
+  return toolConfig[TOOLS_KEY].map((tool) =>
+    normalizeToolDefinition(tool),
+  ).filter((tool): tool is Record<string, unknown> => tool !== undefined);
 }
 
 export function parseBedrockRequest(params: {
   operationName: string;
   apiParams?: Record<string, unknown>;
 }): BedrockRequest {
-  const apiParams = params.apiParams ?? {};
+  const apiParams = snapshot(params.apiParams) ?? {};
   const rawModelId = apiParams[MODEL_ID_KEY];
   const modelId = typeof rawModelId === "string" ? rawModelId : undefined;
 
@@ -463,12 +522,16 @@ function usageFromMapping(value: unknown): Record<string, number> {
     coerceInt(value.inputTokens) ??
     coerceInt(value.prompt_tokens) ??
     coerceInt(value.promptTokens) ??
-    coerceInt(value.inputTextTokenCount);
+    coerceInt(value.inputTextTokenCount) ??
+    coerceInt(value.inputTokenCount) ??
+    coerceInt(value.prompt_token_count);
   const completionTokens =
     coerceInt(value.output_tokens) ??
     coerceInt(value.outputTokens) ??
     coerceInt(value.completion_tokens) ??
-    coerceInt(value.completionTokens);
+    coerceInt(value.completionTokens) ??
+    coerceInt(value.outputTokenCount) ??
+    coerceInt(value.generation_token_count);
   let totalTokens =
     coerceInt(value.total_tokens) ??
     coerceInt(value.totalTokens) ??
@@ -481,19 +544,34 @@ function usageFromMapping(value: unknown): Record<string, number> {
   if (completionTokens !== undefined) {
     result.output_tokens = completionTokens;
   }
-  if (
-    totalTokens === undefined &&
-    (promptTokens !== undefined || completionTokens !== undefined)
-  ) {
-    totalTokens = (promptTokens ?? 0) + (completionTokens ?? 0);
-  }
   if (totalTokens !== undefined) {
     result.total_tokens = totalTokens;
+  }
+  for (const [output, keys] of Object.entries({
+    cache_read_input_tokens: [
+      "cache_read_input_tokens",
+      "cacheReadInputTokens",
+    ],
+    cache_creation_input_tokens: [
+      "cache_creation_input_tokens",
+      "cacheWriteInputTokens",
+    ],
+  })) {
+    for (const key of keys) {
+      const n = coerceInt(value[key]);
+      if (n !== undefined) {
+        result[output] = n;
+        break;
+      }
+    }
   }
   return result;
 }
 
-function mergeUsage(target: Record<string, number>, source: Record<string, number>): void {
+function mergeUsage(
+  target: Record<string, number>,
+  source: Record<string, number>,
+): void {
   for (const [key, value] of Object.entries(source)) {
     if (Number.isInteger(value)) {
       target[key] = value;
@@ -501,7 +579,9 @@ function mergeUsage(target: Record<string, number>, source: Record<string, numbe
   }
 }
 
-function responseFromAnthropicPayload(payload: Record<string, unknown>): BedrockResponse {
+function responseFromAnthropicPayload(
+  payload: Record<string, unknown>,
+): BedrockResponse {
   const content = payload[CONTENT_KEY];
   return {
     content: extractTextFromResponseContent(content),
@@ -509,10 +589,15 @@ function responseFromAnthropicPayload(payload: Record<string, unknown>): Bedrock
     toolCalls: extractToolCallsFromContent(content),
     usage: usageFromMapping(payload[USAGE_KEY]),
     rawPayload: payload,
+    hasContent: true,
+    stopReason:
+      typeof payload.stop_reason === "string" ? payload.stop_reason : undefined,
   };
 }
 
-function responseFromConversePayload(payload: Record<string, unknown>): BedrockResponse {
+function responseFromConversePayload(
+  payload: Record<string, unknown>,
+): BedrockResponse {
   const output = payload[OUTPUT_KEY];
   const message = isRecord(output) ? output[MESSAGE_KEY] : undefined;
   if (!isRecord(message)) {
@@ -534,7 +619,9 @@ function responseFromConversePayload(payload: Record<string, unknown>): BedrockR
   };
 }
 
-function responseFromTitanPayload(payload: Record<string, unknown>): BedrockResponse {
+function responseFromTitanPayload(
+  payload: Record<string, unknown>,
+): BedrockResponse {
   let content = "";
   const usage: Record<string, number> = {};
   const inputTokens = coerceInt(payload.inputTextTokenCount);
@@ -550,11 +637,10 @@ function responseFromTitanPayload(payload: Record<string, unknown>): BedrockResp
       usage.output_tokens = outputTokens;
     }
   }
-  if (Object.keys(usage).length > 0 && usage.total_tokens === undefined) {
-    usage.total_tokens = (usage.input_tokens ?? 0) + (usage.output_tokens ?? 0);
-  }
+
   return {
     content,
+    hasContent: true,
     role: ASSISTANT_ROLE,
     toolCalls: [],
     usage,
@@ -591,7 +677,7 @@ export function parseBedrockResponse(params: {
   operationName: string;
   responsePayload: unknown;
 }): BedrockResponse {
-  const payload = loadJson(params.responsePayload);
+  const payload = loadJson(snapshot(params.responsePayload));
   if (!isRecord(payload)) {
     return {
       content: "",
@@ -602,8 +688,22 @@ export function parseBedrockResponse(params: {
     };
   }
 
-  if (params.operationName === CONVERSE_OPERATION) {
-    return responseFromConversePayload(payload);
+  if (Array.isArray(payload.embedding) || Array.isArray(payload.embeddings))
+    return {
+      content: "",
+      role: ASSISTANT_ROLE,
+      toolCalls: [],
+      usage: usageFromMapping(payload.usage ?? payload),
+      rawPayload: payload,
+      embedding: payload.embedding ?? payload.embeddings,
+    };
+  if (params.operationName === CONVERSE_OPERATION || isRecord(payload.output)) {
+    const result = responseFromConversePayload(payload);
+    result.hasContent =
+      isRecord(payload.output) && isRecord(payload.output.message);
+    result.stopReason =
+      typeof payload.stopReason === "string" ? payload.stopReason : undefined;
+    return result;
   }
 
   if (CONTENT_KEY in payload && Array.isArray(payload[CONTENT_KEY])) {
@@ -618,6 +718,7 @@ export function parseBedrockResponse(params: {
     const value = payload[key];
     if (typeof value === "string") {
       return {
+        hasContent: true,
         content: value,
         role: ASSISTANT_ROLE,
         toolCalls: [],
@@ -663,86 +764,117 @@ export function parseBedrockStreamResponse(params: {
   operationName: string;
   events: unknown[];
 }): BedrockResponse {
-  const textParts: string[] = [];
-  const toolCalls: Record<string, unknown>[] = [];
+  const events = snapshot(params.events) ?? [];
+  const text: string[] = [];
   const usage: Record<string, number> = {};
-  const rawPayloads: unknown[] = [];
-
-  for (const event of params.events) {
-    if (!isRecord(event)) {
-      rawPayloads.push(toSerializableValue(event));
-      continue;
-    }
-    rawPayloads.push(toSerializableValue(event));
-
-    if (params.operationName === CONVERSE_STREAM_OPERATION) {
-      const contentBlockDelta = event.contentBlockDelta;
-      const delta = isRecord(contentBlockDelta) ? contentBlockDelta.delta : undefined;
-      const text = isRecord(delta) ? delta[TEXT_KEY] : undefined;
-      if (typeof text === "string") {
-        textParts.push(text);
+  const tools = new Map<number, Record<string, any>>();
+  let stopReason: string | undefined;
+  let hasContent = false;
+  for (const event of events) {
+    if (!isRecord(event)) continue;
+    const p =
+      params.operationName === CONVERSE_STREAM_OPERATION
+        ? event
+        : parseChunkPayload(event);
+    if (!isRecord(p)) continue;
+    const converse =
+      params.operationName === CONVERSE_STREAM_OPERATION ||
+      p.contentBlockStart !== undefined ||
+      p.contentBlockDelta !== undefined ||
+      p.metadata !== undefined;
+    if (converse) {
+      const start = isRecord(p.contentBlockStart)
+        ? p.contentBlockStart
+        : undefined;
+      if (start && isRecord(start.start) && isRecord(start.start.toolUse)) {
+        const tool = start.start.toolUse;
+        const index = coerceInt(start.contentBlockIndex) ?? 0;
+        tools.set(index, {
+          id: tool.toolUseId,
+          type: FUNCTION_TOOL_TYPE,
+          function: {
+            name: tool.name,
+            arguments: tool.input === undefined ? "" : toJsonAttr(tool.input),
+          },
+        });
+        hasContent = true;
       }
-
-      const contentBlockStart = event.contentBlockStart;
-      const start = isRecord(contentBlockStart) ? contentBlockStart.start : undefined;
-      const toolUse = isRecord(start) ? start.toolUse : undefined;
-      if (isRecord(toolUse)) {
-        const toolCall = normalizeToolCall(toolUse);
-        const functionPayload = toolCall[FUNCTION_KEY];
-        if (isRecord(functionPayload) && functionPayload[NAME_KEY]) {
-          toolCalls.push(toolCall);
+      const deltaBlock = isRecord(p.contentBlockDelta)
+        ? p.contentBlockDelta
+        : undefined;
+      const delta =
+        deltaBlock && isRecord(deltaBlock.delta) ? deltaBlock.delta : undefined;
+      if (delta) {
+        if (typeof delta.text === "string") {
+          text.push(delta.text);
+          hasContent = true;
+        }
+        if (
+          isRecord(delta.toolUse) &&
+          typeof delta.toolUse.input === "string"
+        ) {
+          const tool = tools.get(coerceInt(deltaBlock?.contentBlockIndex) ?? 0);
+          if (tool) tool.function.arguments += delta.toolUse.input;
         }
       }
-
-      if (isRecord(event.metadata)) {
-        mergeUsage(usage, usageFromMapping(event.metadata[USAGE_KEY]));
-      }
-      continue;
-    }
-
-    const payload = parseChunkPayload(event);
-    if (!isRecord(payload)) {
-      continue;
-    }
-    rawPayloads.push(payload);
-
-    const payloadType = payload[TYPE_KEY];
-    if (payloadType === "content_block_delta") {
-      const delta = payload.delta;
-      const text = isRecord(delta) ? delta[TEXT_KEY] : undefined;
-      if (typeof text === "string") {
-        textParts.push(text);
-      }
-    } else if (payloadType === "content_block_start") {
-      const contentBlock = payload.content_block;
-      if (isRecord(contentBlock) && contentBlock[TYPE_KEY] === "tool_use") {
-        const toolCall = normalizeAnthropicToolUse(contentBlock);
-        const functionPayload = toolCall[FUNCTION_KEY];
-        if (isRecord(functionPayload) && functionPayload[NAME_KEY]) {
-          toolCalls.push(toolCall);
-        }
-      }
-    } else if (payloadType === "message_start" && isRecord(payload[MESSAGE_KEY])) {
-      mergeUsage(usage, usageFromMapping((payload[MESSAGE_KEY] as Record<string, unknown>)[USAGE_KEY]));
-    } else if (payloadType === "message_delta") {
-      mergeUsage(usage, usageFromMapping(payload[USAGE_KEY]));
+      if (isRecord(p.metadata))
+        mergeUsage(usage, usageFromMapping(p.metadata.usage));
+      if (
+        isRecord(p.messageStop) &&
+        typeof p.messageStop.stopReason === "string"
+      )
+        stopReason = p.messageStop.stopReason;
     } else {
-      for (const key of ["completion", "generation", "outputText"]) {
-        const value = payload[key];
-        if (typeof value === "string") {
-          textParts.push(value);
+      const index = coerceInt(p.index) ?? 0;
+      if (p.type === "content_block_start" && isRecord(p.content_block)) {
+        hasContent = true;
+        const block = p.content_block;
+        if (block.type === "tool_use")
+          tools.set(index, {
+            id: block.id,
+            type: FUNCTION_TOOL_TYPE,
+            function: {
+              name: block.name,
+              arguments:
+                isRecord(block.input) && Object.keys(block.input).length === 0
+                  ? ""
+                  : toJsonAttr(block.input ?? {}),
+            },
+          });
+        if (typeof block.text === "string") text.push(block.text);
+      }
+      if (p.type === "content_block_delta" && isRecord(p.delta)) {
+        hasContent = true;
+        if (typeof p.delta.text === "string") text.push(p.delta.text);
+        const tool = tools.get(index);
+        if (tool && typeof p.delta.partial_json === "string")
+          tool.function.arguments += p.delta.partial_json;
+      }
+      if (p.type === "message_start" && isRecord(p.message))
+        mergeUsage(usage, usageFromMapping(p.message.usage));
+      if (isRecord(p.delta) && typeof p.delta.stop_reason === "string")
+        stopReason = p.delta.stop_reason;
+      for (const key of ["completion", "generation", "outputText"])
+        if (typeof p[key] === "string") {
+          text.push(p[key]);
+          hasContent = true;
           break;
         }
-      }
-      mergeUsage(usage, usageFromMapping(payload[USAGE_KEY] ?? payload));
+      mergeUsage(usage, usageFromMapping(p.usage ?? p));
+      if (isRecord(p["amazon-bedrock-invocationMetrics"]))
+        mergeUsage(
+          usage,
+          usageFromMapping(p["amazon-bedrock-invocationMetrics"]),
+        );
     }
   }
-
   return {
-    content: textParts.join(""),
+    content: text.join(""),
     role: ASSISTANT_ROLE,
-    toolCalls,
+    toolCalls: [...tools.entries()].sort(([a], [b]) => a - b).map(([, t]) => t),
     usage,
-    rawPayload: rawPayloads,
+    rawPayload: events,
+    hasContent,
+    stopReason,
   };
 }

@@ -1,577 +1,543 @@
-import { hrTime } from "@opentelemetry/core";
-import type { ReadableSpan } from "@opentelemetry/sdk-trace-base";
+import {
+  context,
+  trace,
+  SpanKind,
+  SpanStatusCode,
+  TraceFlags,
+  type Context,
+  type Span,
+} from "@opentelemetry/api";
 import {
   ATTR_GEN_AI_USAGE_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_OUTPUT_TOKENS,
+  ATTR_HTTP_RESPONSE_STATUS_CODE,
+  ATTR_ERROR_TYPE,
 } from "@opentelemetry/semantic-conventions/incubating";
 import { RespanSpanAttributes } from "@respan/respan-sdk";
+import { SpanAttributes } from "@traceloop/ai-semantic-conventions";
 import {
-  buildReadableSpan,
-  injectSpan,
-} from "@respan/tracing";
-import { SpanAttributes as TraceloopSpanAttributes } from "@traceloop/ai-semantic-conventions";
-import {
-  COHERE_SYSTEM,
   INSTRUMENTATION_NAME,
-  MESSAGE_CONTENT_SUFFIX,
-  MESSAGE_ROLE_SUFFIX,
-  MESSAGE_TOOL_CALL_ID_SUFFIX,
-  MESSAGE_TOOL_CALLS_SUFFIX,
   PACKAGE_VERSION,
+  COHERE_SYSTEM,
   RESPAN_LOG_METHOD_TS_TRACING,
 } from "./_constants.js";
+import { logTypeForOperation, requestTypeForOperation } from "./_translator.js";
+import { data, guard, refresh, snapshot, type Policy } from "./_privacy.js";
 import {
-  logTypeForOperation,
-  normalizeCohereAttrs,
-  requestTypeForOperation,
-} from "./_translator.js";
-import {
-  activeSpanContext,
   cohereContentToString,
-  errorMessage,
   isRecord,
   normalizeRole,
-  safeJson,
-  setDefault,
-  setIfPresent,
-  type SpanAttributes,
+  type SpanAttributes as Attributes,
 } from "./_utils.js";
-
-const LLM_USAGE_CACHE_READ_INPUT_TOKENS = "llm.usage.cache_read_input_tokens";
-
 export type CohereOperation =
   | "chat"
   | "chatStream"
   | "generate"
   | "generateStream"
   | "embed"
-  | "rerank";
-
+  | "rerank"
+  | "parse";
 export type CohereApiVersion = "v1" | "v2";
-
 export interface OperationConfig {
   operation: CohereOperation;
   apiVersion: CohereApiVersion;
   streaming: boolean;
 }
-
 export interface SpanRecord {
-  activeTraceId?: string;
-  activeSpanId?: string;
-  startTime: [number, number];
-  attrs: SpanAttributes;
+  span: Span;
+  context: Context;
+  policy: Policy;
+  attrs: Attributes;
+  ended: boolean;
+  admitted: boolean;
+  prompts: Attributes;
 }
-
 export interface StreamState {
   events: unknown[];
   textParts: string[];
   toolCallParts: unknown[];
-  finalResponse?: unknown;
+  finalResponse?: any;
+  content?: Record<number, any>;
+  tools?: Record<number, any>;
+  usage?: any;
 }
-
-function cohereSpanName(operation: CohereOperation): string {
-  if (operation === "chatStream") return "cohere.chat";
-  if (operation === "generateStream") return "cohere.generate";
-  return `cohere.${operation}`;
+function json(value: unknown): string {
+  return JSON.stringify(value) ?? "";
 }
-
-function modelFromRequest(request: any): unknown {
-  return request?.model;
+function put(attrs: Attributes, key: string, value: unknown): void {
+  if (value !== undefined && value !== null) attrs[key] = value;
 }
-
-function setRequestParams(attrs: SpanAttributes, request: any): void {
-  setIfPresent(attrs, TraceloopSpanAttributes.LLM_REQUEST_MAX_TOKENS, request?.maxTokens);
-  setIfPresent(attrs, TraceloopSpanAttributes.LLM_REQUEST_TEMPERATURE, request?.temperature);
-  setIfPresent(attrs, TraceloopSpanAttributes.LLM_REQUEST_TOP_P, request?.p ?? request?.topP);
-  setIfPresent(attrs, TraceloopSpanAttributes.LLM_TOP_K, request?.k);
-  setIfPresent(attrs, TraceloopSpanAttributes.LLM_FREQUENCY_PENALTY, request?.frequencyPenalty);
-  setIfPresent(attrs, TraceloopSpanAttributes.LLM_PRESENCE_PENALTY, request?.presencePenalty);
+function number(attrs: Attributes, key: string, value: unknown): void {
+  if (typeof value === "number" && Number.isFinite(value)) attrs[key] = value;
 }
-
-function v1ToolToFunction(tool: any): Record<string, any> | undefined {
-  if (!isRecord(tool) || tool.name === undefined) return undefined;
-
-  const properties: Record<string, any> = {};
-  const required: string[] = [];
-  if (isRecord(tool.parameterDefinitions)) {
-    for (const [name, definition] of Object.entries(tool.parameterDefinitions)) {
-      if (!isRecord(definition)) continue;
-      const property: Record<string, any> = {};
-      setIfPresent(property, "type", definition.type);
-      setIfPresent(property, "description", definition.description);
-      properties[name] = property;
-      if (definition.required === true) required.push(name);
-    }
+function spanName(operation: CohereOperation): string {
+  return `cohere.${operation.replace("Stream", "")}`;
+}
+function requestParams(attrs: Attributes, request: any): void {
+  for (const [field, key] of [
+    ["maxTokens", SpanAttributes.LLM_REQUEST_MAX_TOKENS],
+    ["temperature", SpanAttributes.LLM_REQUEST_TEMPERATURE],
+    ["p", SpanAttributes.LLM_REQUEST_TOP_P],
+    ["k", SpanAttributes.LLM_TOP_K],
+    ["frequencyPenalty", SpanAttributes.LLM_FREQUENCY_PENALTY],
+    ["presencePenalty", SpanAttributes.LLM_PRESENCE_PENALTY],
+  ])
+    number(attrs, key, data(request, field));
+}
+function toolDefinition(tool: any): any {
+  if (!isRecord(tool)) return tool;
+  if (tool.type === "function") return tool;
+  if (tool.name === undefined) return tool;
+  const properties: any = {},
+    required: string[] = [];
+  for (const [key, value] of Object.entries(tool.parameterDefinitions ?? {})) {
+    properties[key] = value;
+    if ((value as any)?.required === true) required.push(key);
   }
-
-  const parameters =
-    Object.keys(properties).length > 0
-      ? { type: "object", properties, ...(required.length ? { required } : {}) }
-      : undefined;
-
   return {
     type: "function",
     function: {
-      name: String(tool.name),
-      ...(tool.description ? { description: String(tool.description) } : {}),
-      ...(parameters ? { parameters } : {}),
+      name: tool.name,
+      ...(tool.description !== undefined
+        ? { description: tool.description }
+        : {}),
+      parameters: {
+        type: "object",
+        properties,
+        ...(required.length ? { required } : {}),
+      },
     },
   };
 }
-
-function normalizeToolDefinition(tool: any): Record<string, any> | undefined {
-  if (!isRecord(tool)) return undefined;
-  if (tool.type === "function" && isRecord(tool.function)) {
-    return {
-      type: "function",
-      function: {
-        name: String(tool.function.name ?? ""),
-        ...(tool.function.description
-          ? { description: String(tool.function.description) }
-          : {}),
-        ...(tool.function.parameters
-          ? { parameters: tool.function.parameters }
-          : {}),
-      },
-    };
-  }
-  return v1ToolToFunction(tool);
+function toolCall(call: any): any {
+  if (!isRecord(call)) return call;
+  if (call.function !== undefined) return call;
+  return {
+    ...(call.id !== undefined ? { id: call.id } : {}),
+    type: "function",
+    function: {
+      name: call.name,
+      arguments: json(call.parameters ?? call.arguments ?? {}),
+    },
+  };
 }
-
-function normalizeToolDefinitions(tools: unknown): Record<string, any>[] {
-  if (!Array.isArray(tools)) return [];
-  return tools
-    .map(normalizeToolDefinition)
-    .filter((tool): tool is Record<string, any> => tool !== undefined);
+function messages(config: OperationConfig, request: any): any[] {
+  if (config.apiVersion === "v2") return request?.messages ?? [];
+  const history = (request?.chatHistory ?? []).map((m: any) => ({
+    ...m,
+    role: normalizeRole(m.role),
+    content: m.message ?? m.content,
+    ...(m.toolCalls !== undefined ? { toolCalls: m.toolCalls } : {}),
+  }));
+  if (request?.preamble !== undefined)
+    history.unshift({ role: "system", content: request.preamble });
+  if (request?.message !== undefined)
+    history.push({ role: "user", content: request.message });
+  if (request?.toolResults !== undefined)
+    history.push({ role: "tool", content: request.toolResults });
+  return history;
 }
-
-function normalizeToolCall(call: any): Record<string, any> | undefined {
-  if (!isRecord(call)) return undefined;
-
-  if (isRecord(call.function)) {
-    return {
-      ...(call.id ? { id: String(call.id) } : {}),
-      type: String(call.type ?? "function"),
-      function: {
-        ...(call.function.name ? { name: String(call.function.name) } : {}),
-        ...(call.function.arguments !== undefined
-          ? {
-              arguments:
-                typeof call.function.arguments === "string"
-                  ? call.function.arguments
-                  : safeJson(call.function.arguments),
-            }
-          : {}),
-      },
-    };
-  }
-
-  if (call.name !== undefined) {
-    return {
-      type: "function",
-      function: {
-        name: String(call.name),
-        arguments:
-          call.parameters !== undefined
-            ? safeJson(call.parameters)
-            : call.arguments !== undefined
-              ? safeJson(call.arguments)
-              : "{}",
-      },
-    };
-  }
-
-  return undefined;
-}
-
-function setIndexedMessages(
-  attrs: SpanAttributes,
-  prefix: string,
-  messages: Record<string, any>[],
-): void {
-  messages.forEach((message, index) => {
-    const attrPrefix = `${prefix}.${index}`;
-    attrs[`${attrPrefix}.${MESSAGE_ROLE_SUFFIX}`] = normalizeRole(message.role);
-    attrs[`${attrPrefix}.${MESSAGE_CONTENT_SUFFIX}`] = cohereContentToString(
-      message.content,
+function indexed(attrs: Attributes, prefix: string, values: any[]): void {
+  values.forEach((message, index) => {
+    if (!isRecord(message)) return;
+    put(attrs, `${prefix}.${index}.role`, normalizeRole(message.role));
+    if (message.content !== undefined)
+      attrs[`${prefix}.${index}.content`] = cohereContentToString(
+        message.content,
+      );
+    const calls = message.toolCalls ?? message.tool_calls;
+    if (calls !== undefined)
+      attrs[`${prefix}.${index}.tool_calls`] = json(
+        Array.isArray(calls) ? calls.map(toolCall) : calls,
+      );
+    put(
+      attrs,
+      `${prefix}.${index}.tool_call_id`,
+      message.toolCallId ?? message.tool_call_id,
     );
-    if (message.tool_calls !== undefined) {
-      attrs[`${attrPrefix}.${MESSAGE_TOOL_CALLS_SUFFIX}`] = safeJson(
-        message.tool_calls,
-      );
-    }
-    if (message.tool_call_id !== undefined) {
-      attrs[`${attrPrefix}.${MESSAGE_TOOL_CALL_ID_SUFFIX}`] = String(
-        message.tool_call_id,
-      );
-    }
   });
 }
-
-function v1ChatInputMessages(request: any): Record<string, any>[] {
-  const messages: Record<string, any>[] = [];
-  if (Array.isArray(request?.chatHistory)) {
-    for (const message of request.chatHistory) {
-      if (!isRecord(message)) continue;
-      messages.push({
-        role: message.role,
-        content: message.message ?? message.content ?? "",
-        tool_call_id: message.toolCallId ?? message.tool_call_id,
-      });
-    }
-  }
-  if (request?.message !== undefined) {
-    messages.push({ role: "user", content: request.message });
-  }
-  return messages;
-}
-
-function v2InputMessages(request: any): Record<string, any>[] {
-  if (!Array.isArray(request?.messages)) return [];
-  return request.messages
-    .filter(isRecord)
-    .map((message) => ({
-      role: message.role,
-      content: message.content,
-      tool_calls: message.toolCalls ?? message.tool_calls,
-      tool_call_id: message.toolCallId ?? message.tool_call_id,
-    }));
-}
-
-function buildInputValue(config: OperationConfig, request: any): unknown {
-  if (config.operation === "chat" || config.operation === "chatStream") {
-    return config.apiVersion === "v2"
-      ? v2InputMessages(request)
-      : v1ChatInputMessages(request);
-  }
-  if (config.operation === "generate" || config.operation === "generateStream") {
-    return request?.prompt;
-  }
-  if (config.operation === "embed") {
-    return request?.texts ?? request?.images ?? request;
-  }
-  if (config.operation === "rerank") {
-    return {
-      query: request?.query,
-      documents: request?.documents,
-      topN: request?.topN,
-    };
-  }
+function input(config: OperationConfig, request: any): unknown {
+  if (config.operation.startsWith("chat")) return messages(config, request);
+  if (config.operation.startsWith("generate")) return request?.prompt;
+  if (config.operation === "embed")
+    return request?.inputs ?? request?.texts ?? request?.images;
   return request;
 }
-
-function setPromptAttrs(
-  attrs: SpanAttributes,
-  config: OperationConfig,
-  request: any,
-): void {
-  if (config.operation === "chat" || config.operation === "chatStream") {
-    setIndexedMessages(
-      attrs,
-      TraceloopSpanAttributes.LLM_PROMPTS,
-      config.apiVersion === "v2" ? v2InputMessages(request) : v1ChatInputMessages(request),
-    );
-    return;
-  }
-
-  if (
-    (config.operation === "generate" || config.operation === "generateStream") &&
-    request?.prompt !== undefined
-  ) {
-    attrs[`${TraceloopSpanAttributes.LLM_PROMPTS}.0.${MESSAGE_ROLE_SUFFIX}`] = "user";
-    attrs[`${TraceloopSpanAttributes.LLM_PROMPTS}.0.${MESSAGE_CONTENT_SUFFIX}`] =
-      cohereContentToString(request.prompt);
-  }
-
-  if (config.operation === "rerank" && request?.query !== undefined) {
-    attrs[`${TraceloopSpanAttributes.LLM_PROMPTS}.0.${MESSAGE_ROLE_SUFFIX}`] = "user";
-    attrs[`${TraceloopSpanAttributes.LLM_PROMPTS}.0.${MESSAGE_CONTENT_SUFFIX}`] =
-      cohereContentToString(request.query);
-  }
-}
-
 export function buildStartAttributes(
   config: OperationConfig,
   request: any,
   traceContent: boolean,
-): SpanAttributes {
-  const entityName = cohereSpanName(config.operation);
-  const attrs: SpanAttributes = {
-    [TraceloopSpanAttributes.TRACELOOP_ENTITY_NAME]: entityName,
-    [TraceloopSpanAttributes.TRACELOOP_ENTITY_PATH]: entityName,
+): Attributes {
+  if (config.operation === "parse" || config.operation === "rerank")
+    return {
+      [SpanAttributes.TRACELOOP_ENTITY_NAME]: spanName(config.operation),
+      [SpanAttributes.TRACELOOP_ENTITY_PATH]: "",
+      [RespanSpanAttributes.RESPAN_LOG_METHOD]: RESPAN_LOG_METHOD_TS_TRACING,
+      [RespanSpanAttributes.RESPAN_LOG_TYPE]:
+        config.operation === "parse" ? "tool" : "task",
+      ...(traceContent
+        ? {
+            [SpanAttributes.TRACELOOP_ENTITY_INPUT]: json(
+              config.operation === "parse"
+                ? { name: "cohere.parse", arguments: snapshot(request) }
+                : snapshot(request),
+            ),
+          }
+        : {}),
+    };
+  const attrs: Attributes = {
+    [SpanAttributes.TRACELOOP_ENTITY_NAME]: spanName(config.operation),
+    [SpanAttributes.TRACELOOP_ENTITY_PATH]: "",
     [RespanSpanAttributes.RESPAN_LOG_METHOD]: RESPAN_LOG_METHOD_TS_TRACING,
-    [RespanSpanAttributes.RESPAN_LOG_TYPE]: logTypeForOperation(config.operation),
-    [TraceloopSpanAttributes.LLM_SYSTEM]: COHERE_SYSTEM,
-    [TraceloopSpanAttributes.LLM_REQUEST_TYPE]: requestTypeForOperation(config.operation),
+    [RespanSpanAttributes.RESPAN_LOG_TYPE]: logTypeForOperation(
+      config.operation,
+    ),
+    [SpanAttributes.LLM_SYSTEM]: COHERE_SYSTEM,
+    [SpanAttributes.LLM_REQUEST_TYPE]: requestTypeForOperation(
+      config.operation,
+    ),
   };
-
-  setIfPresent(attrs, TraceloopSpanAttributes.LLM_REQUEST_MODEL, modelFromRequest(request));
-  setRequestParams(attrs, request);
-
+  const model = data(request, "model");
+  if (typeof model === "string")
+    attrs[SpanAttributes.LLM_REQUEST_MODEL] = model;
+  requestParams(attrs, request);
   if (traceContent) {
-    setDefault(attrs, TraceloopSpanAttributes.TRACELOOP_ENTITY_INPUT, safeJson(buildInputValue(config, request)));
-    setPromptAttrs(attrs, config, request);
-    const tools = normalizeToolDefinitions(request?.tools);
-    if (tools.length > 0) {
-      attrs[TraceloopSpanAttributes.LLM_REQUEST_FUNCTIONS] = safeJson(tools);
-    }
+    const copied = snapshot(request);
+    attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = json(input(config, copied));
+    if (config.operation.startsWith("chat"))
+      indexed(attrs, SpanAttributes.LLM_PROMPTS, messages(config, copied));
+    if (config.operation.startsWith("generate") && copied?.prompt !== undefined)
+      indexed(attrs, SpanAttributes.LLM_PROMPTS, [
+        { role: "user", content: copied.prompt },
+      ]);
+    if (copied?.tools !== undefined)
+      attrs[SpanAttributes.LLM_REQUEST_FUNCTIONS] = json(
+        copied.tools.map(toolDefinition),
+      );
   }
-
-  return normalizeCohereAttrs(attrs, config.operation);
+  return attrs;
 }
-
-function extractUsage(value: any): {
-  inputTokens?: number;
-  outputTokens?: number;
-  totalTokens?: number;
-} {
-  const inputTokens =
-    value?.usage?.tokens?.inputTokens ??
-    value?.usage?.billedUnits?.inputTokens ??
-    value?.meta?.tokens?.inputTokens ??
-    value?.meta?.billedUnits?.inputTokens ??
-    value?.token_count?.prompt_tokens;
-  const outputTokens =
-    value?.usage?.tokens?.outputTokens ??
-    value?.usage?.billedUnits?.outputTokens ??
-    value?.meta?.tokens?.outputTokens ??
-    value?.meta?.billedUnits?.outputTokens ??
-    value?.token_count?.response_tokens;
-  const totalTokens =
-    value?.token_count?.total_tokens ??
-    (typeof inputTokens === "number" && typeof outputTokens === "number"
-      ? inputTokens + outputTokens
-      : undefined);
-
-  return { inputTokens, outputTokens, totalTokens };
-}
-
-function setUsage(attrs: SpanAttributes, value: any): void {
-  const usage = extractUsage(value);
-  setIfPresent(attrs, ATTR_GEN_AI_USAGE_INPUT_TOKENS, usage.inputTokens);
-  setIfPresent(attrs, TraceloopSpanAttributes.LLM_USAGE_PROMPT_TOKENS, usage.inputTokens);
-  setIfPresent(attrs, ATTR_GEN_AI_USAGE_OUTPUT_TOKENS, usage.outputTokens);
-  setIfPresent(attrs, TraceloopSpanAttributes.LLM_USAGE_COMPLETION_TOKENS, usage.outputTokens);
-  setIfPresent(attrs, TraceloopSpanAttributes.LLM_USAGE_TOTAL_TOKENS, usage.totalTokens);
-  setIfPresent(
+function usageAttributes(attrs: Attributes, value: any): void {
+  const usage = data(value, "usage") ?? data(value, "meta");
+  const tokens = data(usage, "tokens") ?? data(usage, "billedUnits");
+  const old = data(value, "token_count");
+  const input =
+    data(tokens, "inputTokens") ??
+    data(tokens, "input_tokens") ??
+    data(old, "prompt_tokens");
+  const output =
+    data(tokens, "outputTokens") ??
+    data(tokens, "output_tokens") ??
+    data(old, "response_tokens");
+  number(attrs, ATTR_GEN_AI_USAGE_INPUT_TOKENS, input);
+  number(attrs, SpanAttributes.LLM_USAGE_PROMPT_TOKENS, input);
+  number(attrs, ATTR_GEN_AI_USAGE_OUTPUT_TOKENS, output);
+  number(attrs, SpanAttributes.LLM_USAGE_COMPLETION_TOKENS, output);
+  number(
     attrs,
-    LLM_USAGE_CACHE_READ_INPUT_TOKENS,
-    value?.usage?.cachedTokens ?? value?.meta?.cachedTokens,
+    SpanAttributes.LLM_USAGE_TOTAL_TOKENS,
+    data(tokens, "totalTokens") ??
+      data(tokens, "total_tokens") ??
+      data(old, "total_tokens"),
+  );
+  number(
+    attrs,
+    "llm.usage.cache_read_input_tokens",
+    data(usage, "cachedTokens"),
   );
 }
-
-function setRerankUsage(attrs: SpanAttributes, value: any): void {
-  const searchUnits =
-    value?.usage?.billedUnits?.searchUnits ??
-    value?.meta?.billedUnits?.searchUnits;
-  setIfPresent(attrs, TraceloopSpanAttributes.LLM_USAGE_TOTAL_TOKENS, searchUnits);
-}
-
-function chatOutputMessage(config: OperationConfig, result: any): Record<string, any> {
-  if (config.apiVersion === "v2") {
-    const message = result?.message ?? {};
-    return {
-      role: message.role ?? "assistant",
-      content: message.content,
-      tool_calls: Array.isArray(message.toolCalls)
-        ? message.toolCalls.map(normalizeToolCall).filter(Boolean)
-        : undefined,
-    };
-  }
-
-  return {
-    role: "assistant",
-    content: result?.text,
-    tool_calls: Array.isArray(result?.toolCalls)
-      ? result.toolCalls.map(normalizeToolCall).filter(Boolean)
-      : undefined,
-  };
-}
-
-function generationOutput(result: any): string {
-  return cohereContentToString(result?.generations?.[0]?.text ?? result?.text ?? "");
-}
-
-function embeddingOutput(result: any): unknown {
-  return result?.embeddings ?? result;
-}
-
-function setCompletionAttrs(
-  attrs: SpanAttributes,
+function outputAttributes(
+  attrs: Attributes,
   config: OperationConfig,
   result: any,
 ): void {
-  if (config.operation === "chat" || config.operation === "chatStream") {
-    const message = chatOutputMessage(config, result);
-    setIndexedMessages(attrs, TraceloopSpanAttributes.LLM_COMPLETIONS, [message]);
-    attrs[TraceloopSpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safeJson([message]);
+  if (config.operation === "parse") {
+    if (result !== undefined)
+      attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = json(result);
     return;
   }
-
-  if (config.operation === "generate" || config.operation === "generateStream") {
-    const content = generationOutput(result);
-    attrs[`${TraceloopSpanAttributes.LLM_COMPLETIONS}.0.${MESSAGE_ROLE_SUFFIX}`] = "assistant";
-    attrs[`${TraceloopSpanAttributes.LLM_COMPLETIONS}.0.${MESSAGE_CONTENT_SUFFIX}`] = content;
-    attrs[TraceloopSpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safeJson(content);
-    return;
-  }
-
-  if (config.operation === "embed") {
-    attrs[TraceloopSpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safeJson(embeddingOutput(result));
-    return;
-  }
-
-  if (config.operation === "rerank") {
-    attrs[TraceloopSpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safeJson(result?.results ?? result);
-  }
+  if (config.operation.startsWith("chat")) {
+    const message =
+      config.apiVersion === "v2"
+        ? result?.message
+        : {
+            role: "assistant",
+            content: result?.text,
+            ...(result?.toolCalls !== undefined
+              ? { toolCalls: result.toolCalls }
+              : {}),
+          };
+    if (message !== undefined) {
+      attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = json([message]);
+      indexed(attrs, SpanAttributes.LLM_COMPLETIONS, [message]);
+    }
+  } else if (config.operation.startsWith("generate")) {
+    const generations =
+      result?.generations ??
+      (result?.text !== undefined ? [{ text: result.text }] : undefined);
+    if (generations !== undefined) {
+      attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = json(generations);
+      indexed(
+        attrs,
+        SpanAttributes.LLM_COMPLETIONS,
+        generations.map((g: any) => ({ role: "assistant", content: g.text })),
+      );
+    }
+  } else if (config.operation === "embed") {
+    if (result?.embeddings !== undefined)
+      attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = json(result.embeddings);
+  } else if (result?.results !== undefined)
+    attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = json(result.results);
 }
-
 export function applySuccessAttributes(
-  attrs: SpanAttributes,
+  attrs: Attributes,
   config: OperationConfig,
   result: any,
-): SpanAttributes {
-  if (config.operation === "rerank") {
-    setRerankUsage(attrs, result);
-  } else {
-    setUsage(attrs, result);
-  }
-  setCompletionAttrs(attrs, config, result);
-  return normalizeCohereAttrs(attrs, config.operation);
+): Attributes {
+  if (config.operation !== "rerank" && config.operation !== "parse")
+    usageAttributes(attrs, result);
+  outputAttributes(attrs, config, snapshot(result));
+  return attrs;
 }
-
+function metadata(record: SpanRecord, value: Record<string, unknown>): void {
+  let inherited: any = {};
+  const existing = (record.span as any).attributes?.[
+    RespanSpanAttributes.RESPAN_METADATA
+  ];
+  if (typeof existing === "string") {
+    try {
+      inherited = JSON.parse(existing);
+    } catch {
+      /* Ignore malformed inherited metadata. */
+    }
+  }
+  record.span.setAttribute(
+    RespanSpanAttributes.RESPAN_METADATA,
+    json({ ...(isRecord(inherited) ? inherited : {}), ...value }),
+  );
+}
 export function startSpanRecord(
   config: OperationConfig,
   request: any,
-  traceContent: boolean,
+  policy: Policy,
+  parentContext: Context = context.active(),
 ): SpanRecord {
-  const active = activeSpanContext();
-  return {
-    activeTraceId: active?.traceId,
-    activeSpanId: active?.spanId,
-    startTime: hrTime(),
-    attrs: buildStartAttributes(config, request, traceContent),
+  const attrs = buildStartAttributes(config, request, false);
+  const span = trace
+    .getTracer(INSTRUMENTATION_NAME, PACKAGE_VERSION)
+    .startSpan(
+      spanName(config.operation),
+      { kind: SpanKind.CLIENT, attributes: attrs },
+      parentContext,
+    );
+  const admitted =
+    span.isRecording() &&
+    (span.spanContext().traceFlags & TraceFlags.SAMPLED) !== 0;
+  policy.emit &&= admitted;
+  refresh(policy);
+  guard(span, policy);
+  const record: SpanRecord = {
+    span,
+    policy,
+    attrs,
+    ended: false,
+    admitted,
+    prompts: {},
+    context: trace.setSpan(parentContext, span),
   };
+  if (admitted && policy.inputs) {
+    const captured = buildStartAttributes(config, request, true);
+    // Canonical payloads and usage must survive the standard OTel attribute budget.
+    // Indexed projections are attempted only after all canonical fields at completion.
+    for (const key of Object.keys(captured)) {
+      if (key.startsWith(`${SpanAttributes.LLM_PROMPTS}.`)) {
+        record.prompts[key] = captured[key];
+        delete captured[key];
+      }
+    }
+    span.setAttributes(captured);
+    if (policy.outputs && config.operation !== "parse")
+      metadata(record, { cohere_request: snapshot(request) });
+  }
+  return record;
 }
-
 export function emitSpanRecord(
   config: OperationConfig,
   record: SpanRecord,
   result: any,
   error?: unknown,
 ): void {
-  const attrs = { ...record.attrs };
-  if (error === undefined) {
-    applySuccessAttributes(attrs, config, result);
-  } else {
-    attrs.status_code = 500;
-    attrs["error.message"] = errorMessage(error);
-    normalizeCohereAttrs(attrs, config.operation);
+  if (record.ended) return;
+  record.ended = true;
+  try {
+    refresh(record.policy);
+    if (record.admitted) {
+      const attrs: Attributes = {};
+      if (error === undefined) {
+        if (config.operation !== "rerank" && config.operation !== "parse")
+          usageAttributes(attrs, result);
+        if (record.policy.outputs)
+          outputAttributes(attrs, config, snapshot(result));
+        if (
+          record.policy.inputs &&
+          record.policy.outputs &&
+          result !== undefined &&
+          config.operation !== "parse"
+        )
+          metadata(record, { cohere_response: snapshot(result) });
+      } else {
+        const status = data(error, "statusCode") ?? data(error, "status");
+        if (
+          typeof status === "number" &&
+          Number.isInteger(status) &&
+          status >= 100 &&
+          status <= 599
+        )
+          number(attrs, ATTR_HTTP_RESPONSE_STATUS_CODE, status);
+        if (record.policy.inputs && record.policy.outputs) {
+          const message = data(error, "message");
+          const name = data(error, "name");
+          if (typeof name === "string") attrs[ATTR_ERROR_TYPE] = name;
+          record.span.setStatus({
+            code: SpanStatusCode.ERROR,
+            ...(typeof message === "string" ? { message } : {}),
+          });
+          if (typeof message === "string")
+            record.span.addEvent("exception", { "exception.message": message });
+        } else record.span.setStatus({ code: SpanStatusCode.ERROR });
+      }
+      record.span.setAttributes(attrs);
+      if (record.policy.inputs) record.span.setAttributes(record.prompts);
+    }
+  } catch {
+    /* The SDK result or error always wins. */
+  } finally {
+    record.span.end();
   }
-
-  const span = buildReadableSpan({
-    name: cohereSpanName(config.operation),
-    traceId: record.activeTraceId,
-    parentId: record.activeSpanId,
-    startTimeHr: record.startTime,
-    endTimeHr: hrTime(),
-    attributes: attrs,
-    statusCode: error === undefined ? 200 : 500,
-    errorMessage: error === undefined ? undefined : errorMessage(error),
-    mergePropagated: true,
-  }) as ReadableSpan & {
-    instrumentationScope?: { name: string; version?: string };
-  };
-
-  span.instrumentationScope = {
-    name: INSTRUMENTATION_NAME,
-    version: PACKAGE_VERSION,
-  };
-  injectSpan(span);
 }
-
 export function createStreamState(): StreamState {
   return {
     events: [],
     textParts: [],
     toolCallParts: [],
+    content: {},
+    tools: {},
   };
 }
-
-export function captureStreamEvent(state: StreamState, event: any): void {
-  state.events.push(event);
-
-  if (event?.eventType === "stream-end" && event.response !== undefined) {
-    state.finalResponse = event.response;
+export function captureStreamEvent(
+  state: StreamState,
+  event: any,
+  policy?: Policy,
+): void {
+  if (policy) {
+    refresh(policy);
+    if (!policy.emit) return;
   }
-  if (event?.eventType === "text-generation" && typeof event.text === "string") {
-    state.textParts.push(event.text);
+  const type = data(event, "type") ?? data(event, "eventType");
+  const delta = data(event, "delta");
+  if (type === "message-end")
+    state.usage = { usage: snapshotUsage(data(delta, "usage")) };
+  if (type === "stream-end")
+    state.usage = {
+      meta: snapshotUsage(data(data(event, "response"), "meta")),
+    };
+  if (policy && !policy.outputs) return;
+  const copied = snapshot(event);
+  if (!copied) return;
+  state.events.push(copied);
+  if (type === "stream-end" && copied.response !== undefined)
+    state.finalResponse = copied.response;
+  if (type === "text-generation" && typeof copied.text === "string")
+    state.textParts.push(copied.text);
+  if (type === "tool-calls-generation" && copied.toolCalls !== undefined)
+    state.toolCallParts = copied.toolCalls;
+  const index = copied.index ?? 0;
+  if (type === "content-start")
+    state.content![index] = copied.delta?.message?.content ?? {};
+  if (type === "content-delta") {
+    const content = copied.delta?.message?.content;
+    const text = content?.text ?? copied.delta?.text;
+    if (typeof text === "string") {
+      state.textParts.push(text);
+      const item = (state.content![index] ??= { type: "text", text: "" });
+      item.text = (item.text ?? "") + text;
+    }
   }
-  if (event?.eventType === "tool-calls-generation" && event.toolCalls !== undefined) {
-    state.toolCallParts.push(event.toolCalls);
+  if (type === "tool-call-start")
+    state.tools![index] =
+      copied.delta?.message?.toolCalls ??
+      copied.delta?.message?.tool_calls ??
+      {};
+  if (type === "tool-call-delta") {
+    const call =
+      copied.delta?.message?.toolCalls ?? copied.delta?.message?.tool_calls;
+    if (call) {
+      const stored = (state.tools![index] ??= {});
+      if (call.id !== undefined) stored.id = call.id;
+      if (call.type !== undefined) stored.type = call.type;
+      stored.function ??= {};
+      if (call.function?.name !== undefined)
+        stored.function.name =
+          (stored.function.name ?? "") + call.function.name;
+      if (call.function?.arguments !== undefined)
+        stored.function.arguments =
+          (stored.function.arguments ?? "") + call.function.arguments;
+    }
   }
-
-  if (event?.type === "content-delta") {
-    const text =
-      event.delta?.message?.content?.text ??
-      event.delta?.message?.content ??
-      event.delta?.text;
-    if (typeof text === "string") state.textParts.push(text);
-  }
-  if (event?.type === "tool-call-delta" || event?.type === "tool-call-start") {
-    state.toolCallParts.push(event.delta ?? event);
-  }
-  if (event?.type === "message-end") {
-    state.finalResponse = event.delta ?? event;
-  }
+  if (type === "message-end") state.finalResponse = copied.delta;
 }
-
+function snapshotUsage(usage: any): any {
+  if (!usage) return undefined;
+  const out: any = {};
+  for (const lane of ["tokens", "billedUnits"]) {
+    const source = data(usage, lane);
+    const target: any = {};
+    for (const field of [
+      "inputTokens",
+      "outputTokens",
+      "totalTokens",
+      "searchUnits",
+    ]) {
+      const value = data(source, field);
+      if (typeof value === "number") target[field] = value;
+    }
+    if (Object.keys(target).length) out[lane] = target;
+  }
+  const cached = data(usage, "cachedTokens");
+  if (typeof cached === "number") out.cachedTokens = cached;
+  return out;
+}
 export function streamResultFromState(
   config: OperationConfig,
   state: StreamState,
 ): unknown {
-  if (state.finalResponse !== undefined) {
-    if (
-      config.apiVersion === "v2" &&
-      isRecord(state.finalResponse) &&
-      state.finalResponse.message === undefined &&
-      (state.textParts.length > 0 || state.toolCallParts.length > 0)
-    ) {
-      return {
-        ...state.finalResponse,
-        message: {
-          role: "assistant",
-          content: state.textParts.length
-            ? [{ type: "text", text: state.textParts.join("") }]
-            : undefined,
-          toolCalls: state.toolCallParts.length ? state.toolCallParts : undefined,
-        },
-      };
-    }
-    return state.finalResponse;
-  }
-
-  if (config.operation === "generateStream") {
-    return {
-      generations: [{ text: state.textParts.join("") }],
-    };
-  }
-
-  if (config.apiVersion === "v2") {
-    return {
-      message: {
-        role: "assistant",
-        content: state.textParts.length
-          ? [{ type: "text", text: state.textParts.join("") }]
-          : undefined,
-        toolCalls: state.toolCallParts.length ? state.toolCallParts : undefined,
-      },
-    };
-  }
-
+  if (config.operation === "generateStream")
+    return (
+      state.finalResponse ?? {
+        generations: state.textParts.length
+          ? [{ text: state.textParts.join("") }]
+          : [],
+        ...state.usage,
+      }
+    );
+  if (config.apiVersion === "v1")
+    return (
+      state.finalResponse ?? {
+        text: state.textParts.join(""),
+        toolCalls: state.toolCallParts,
+        ...state.usage,
+      }
+    );
+  const content = Object.values(state.content ?? {}),
+    tools = Object.values(state.tools ?? {});
   return {
-    text: state.textParts.join(""),
-    toolCalls: state.toolCallParts.length ? state.toolCallParts : undefined,
-    events: state.events,
+    ...state.finalResponse,
+    ...state.usage,
+    message: {
+      role: "assistant",
+      ...(content.length ? { content } : {}),
+      ...(tools.length ? { toolCalls: tools } : {}),
+    },
   };
 }

@@ -1,96 +1,93 @@
-/**
- * Respan instrumentation plugin for the Anthropic SDK.
- *
- * Monkey-patches `messages.create()` on the Anthropic client prototype
- * to emit OTEL spans with GenAI attributes for both standard and streaming
- * message responses.
- *
- * ```typescript
- * import { Respan } from "@respan/respan";
- * import { AnthropicInstrumentor } from "@respan/instrumentation-anthropic";
- *
- * const respan = new Respan({
- *   instrumentations: [new AnthropicInstrumentor()],
- * });
- * await respan.initialize();
- * ```
- */
-
+/** Native Anthropic SDK adapter using the active OpenTelemetry tracer. */
 import { loadAnthropicConstructors } from "./_helpers.js";
-import { patchMessagesPrototype, type PatchedMessagesTarget } from "./_streaming.js";
-
+import { acquire, release, type Patch } from "./_instrumentation.js";
+import type { CaptureOptions } from "./_privacy.js";
+export interface AnthropicInstrumentorOptions extends CaptureOptions {
+  sdkModule?: { default?: any; Anthropic?: any };
+  clientClass?: new (...args: any[]) => any;
+}
 export class AnthropicInstrumentor {
-  public readonly name = "anthropic";
-  private static readonly _sharedState = {
-    activeInstances: 0,
-    patchedTargets: [] as PatchedMessagesTarget[],
-  };
-
-  private _isInstrumented = false;
-
-  async activate(): Promise<void> {
-    if (this._isInstrumented) return;
-
-    const anthropicConstructors = await loadAnthropicConstructors();
-    if (anthropicConstructors.length === 0) {
-      console.warn(
-        "[Respan] Failed to activate Anthropic instrumentation — @anthropic-ai/sdk not found",
-      );
-      return;
-    }
-
-    const sharedState = AnthropicInstrumentor._sharedState;
-
-    try {
-      for (const Anthropic of anthropicConstructors) {
-        const tempClient = new Anthropic({ apiKey: "sk-placeholder" });
-        const messagesProto = Object.getPrototypeOf(tempClient.messages);
-
-        if (
-          !messagesProto ||
-          typeof messagesProto.create !== "function" ||
-          sharedState.patchedTargets.some((target) => target.messagesPrototype === messagesProto)
-        ) {
-          continue;
-        }
-
-        const patchedTarget = patchMessagesPrototype(messagesProto);
-        if (patchedTarget) {
-          sharedState.patchedTargets.push(patchedTarget);
-        }
-      }
-
-      if (sharedState.patchedTargets.length === 0) {
-        console.warn(
-          "[Respan] Failed to activate Anthropic instrumentation — no compatible Messages prototypes found",
-        );
-        return;
-      }
-
-      sharedState.activeInstances += 1;
-      this._isInstrumented = true;
-    } catch (err) {
-      console.warn("[Respan] Failed to activate Anthropic instrumentation:", err);
-    }
+  readonly name = "anthropic";
+  readonly options: AnthropicInstrumentorOptions;
+  private patches: Patch[] = [];
+  private activation?: Promise<void>;
+  private epoch = 0;
+  constructor(options: AnthropicInstrumentorOptions = {}) {
+    this.options = { ...options };
   }
-
-  deactivate(): void {
-    if (!this._isInstrumented) return;
-
-    const sharedState = AnthropicInstrumentor._sharedState;
-    sharedState.activeInstances = Math.max(0, sharedState.activeInstances - 1);
-    this._isInstrumented = false;
-
-    if (sharedState.activeInstances > 0 || sharedState.patchedTargets.length === 0) return;
-
-    try {
-      for (const patchedTarget of sharedState.patchedTargets) {
-        patchedTarget.messagesPrototype.create = patchedTarget.originalCreate;
+  isActive(): boolean {
+    return this.patches.length > 0;
+  }
+  activate(): Promise<void> {
+    if (this.isActive()) return Promise.resolve();
+    if (this.activation) return this.activation;
+    const epoch = this.epoch;
+    const pending = (async () => {
+      const provided =
+        this.options.clientClass ??
+        this.options.sdkModule?.default ??
+        this.options.sdkModule?.Anthropic;
+      const constructors = provided
+        ? [provided]
+        : await loadAnthropicConstructors();
+      if (epoch !== this.epoch) return;
+      try {
+        for (const Constructor of constructors) {
+          const client = new Constructor({
+            apiKey: "fixture-instrumentation-discovery",
+          });
+          for (const resource of [client.messages, client.beta?.messages]) {
+            if (!resource) continue;
+            const prototype = Object.getPrototypeOf(resource);
+            for (const [key, op] of [
+              ["create", "messages"],
+              ["countTokens", "countTokens"],
+              ["toolRunner", "agent"],
+            ] as const) {
+              const patch = acquire(prototype, key, op, this);
+              if (patch && !this.patches.includes(patch))
+                this.patches.push(patch);
+            }
+            if (resource.batches) {
+              const p = Object.getPrototypeOf(resource.batches);
+              for (const [key, op] of [
+                ["create", "batches.create"],
+                ["results", "batches.results"],
+              ] as const) {
+                const patch = acquire(p, key, op, this);
+                if (patch && !this.patches.includes(patch))
+                  this.patches.push(patch);
+              }
+            }
+          }
+          if (client.completions) {
+            const patch = acquire(
+              Object.getPrototypeOf(client.completions),
+              "create",
+              "completion",
+              this,
+            );
+            if (patch && !this.patches.includes(patch))
+              this.patches.push(patch);
+          }
+        }
+      } catch (error) {
+        this.deactivate();
+        throw error;
       }
-    } catch {
-      /* ignore */
-    }
-
-    sharedState.patchedTargets = [];
+    })();
+    this.activation = pending;
+    void pending
+      .finally(() => {
+        if (this.activation === pending) this.activation = undefined;
+      })
+      .catch(() => {});
+    return pending;
+  }
+  deactivate(): void {
+    this.epoch++;
+    this.activation = undefined;
+    for (const patch of this.patches) release(patch, this);
+    this.patches = [];
   }
 }

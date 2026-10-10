@@ -1,408 +1,241 @@
-/**
- * Respan instrumentation plugin for the AWS Bedrock Runtime TypeScript SDK.
- *
- * The plugin patches `BedrockRuntimeClient.prototype.send` from
- * `@aws-sdk/client-bedrock-runtime` and emits canonical Respan chat spans for
- * InvokeModel, InvokeModelWithResponseStream, Converse, and ConverseStream.
- */
-
-import { hrTime } from "@opentelemetry/core";
+/** Native AWS Bedrock instrumentation; transport and SDK return values stay native. */
+import { context } from "@opentelemetry/api";
 import {
   AWS_BEDROCK_INSTRUMENTATION_NAME,
-  BODY_KEY,
-  CONVERSE_OPERATION,
-  CONVERSE_STREAM_OPERATION,
-  INVOKE_MODEL_OPERATION,
-  INVOKE_MODEL_STREAM_OPERATION,
-  STREAMING_OPERATIONS,
   SUPPORTED_OPERATIONS,
+  STREAMING_OPERATIONS,
 } from "./_constants.js";
-import {
-  emitBedrockSpan,
-  responsePayloadForInvoke,
-} from "./_otel_emitter.js";
+import { startBedrockSession, type BedrockSession } from "./_otel_emitter.js";
+import { data, type CaptureOptions } from "./_privacy.js";
 
-type HrTime = [number, number];
 type AnyFunction = (...args: any[]) => any;
 type PatchablePrototype = { send?: AnyFunction };
-type InstrumentedPrototype = PatchablePrototype & Record<PropertyKey, unknown>;
-type PatchableClientConstructor = {
-  prototype?: PatchablePrototype;
-};
-
+type PatchableClientConstructor = { prototype?: PatchablePrototype };
 export interface AWSBedrockRuntimeModule {
   BedrockRuntimeClient?: PatchableClientConstructor;
 }
-
-export interface AWSBedrockInstrumentorOptions {
+export interface AWSBedrockInstrumentorOptions extends CaptureOptions {
   sdkModule?: AWSBedrockRuntimeModule;
   clientClass?: PatchableClientConstructor;
 }
-
-interface CommandLike {
-  input?: Record<string, unknown>;
-  constructor?: { name?: string };
+interface Patch {
+  prototype: PatchablePrototype;
+  original: AnyFunction;
+  wrapped: AnyFunction;
+  descriptor?: PropertyDescriptor;
+  owners: Set<AWSBedrockInstrumentor>;
 }
-
-const ORIGINAL_SEND = Symbol.for("respan.instrumentation.awsBedrock.originalSend");
-const PATCHED_BY = Symbol.for("respan.instrumentation.awsBedrock.patchedBy");
-const INSTRUMENTOR_LOG_PREFIX = "[respan] AWSBedrockInstrumentor";
-
-function isPromiseLike(value: unknown): value is Promise<unknown> {
-  return Boolean(
-    value &&
-      (typeof value === "object" || typeof value === "function") &&
-      typeof (value as Promise<unknown>).then === "function",
-  );
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function operationNameFromCommand(command: unknown): string | undefined {
-  const commandName =
+const registryKey = Symbol.for("respan.instrumentation.awsBedrock.registry.v2");
+const globalRegistry = globalThis as typeof globalThis & {
+  [registryKey]?: WeakMap<object, Patch>;
+};
+const registry = (globalRegistry[registryKey] ??= new WeakMap<object, Patch>());
+function operation(command: any): string | undefined {
+  const proto =
     command && typeof command === "object"
-      ? (command as CommandLike).constructor?.name
+      ? Object.getPrototypeOf(command)
       : undefined;
-  switch (commandName) {
-    case "InvokeModelCommand":
-      return INVOKE_MODEL_OPERATION;
-    case "InvokeModelWithResponseStreamCommand":
-      return INVOKE_MODEL_STREAM_OPERATION;
-    case "ConverseCommand":
-      return CONVERSE_OPERATION;
-    case "ConverseStreamCommand":
-      return CONVERSE_STREAM_OPERATION;
-    default:
-      return undefined;
-  }
+  const ctor = data(proto, "constructor");
+  const name = data(ctor, "name");
+  if (typeof name !== "string" || !name.endsWith("Command")) return undefined;
+  const op = name.slice(0, -7);
+  return SUPPORTED_OPERATIONS.has(op) ? op : undefined;
 }
-
-function commandInput(command: unknown): Record<string, unknown> | undefined {
-  if (!isRecord(command)) {
-    return undefined;
-  }
-  return isRecord(command.input) ? command.input : undefined;
-}
-
-function statusCodeFromResponse(response: unknown): number {
-  if (!isRecord(response) || !isRecord(response.$metadata)) {
-    return 200;
-  }
-  const statusCode = response.$metadata.httpStatusCode;
-  return typeof statusCode === "number" ? statusCode : 200;
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function statusCodeFromError(error: unknown): number {
-  if (!isRecord(error)) {
-    return 500;
-  }
-  const metadataStatus = isRecord(error.$metadata)
-    ? error.$metadata.httpStatusCode
-    : undefined;
-  const value = metadataStatus ?? error.statusCode ?? error.status;
-  return typeof value === "number" && value >= 400 ? value : 500;
-}
-
-function streamKeyForResponse(response: Record<string, unknown>): string | undefined {
-  if (response.stream !== undefined) {
-    return "stream";
-  }
-  if (response[BODY_KEY] !== undefined) {
-    return BODY_KEY;
-  }
-  return undefined;
-}
-
-function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
-  return Boolean(
-    value &&
-      typeof value === "object" &&
-      typeof (value as AsyncIterable<unknown>)[Symbol.asyncIterator] === "function",
-  );
-}
-
-function isIterable(value: unknown): value is Iterable<unknown> {
-  return Boolean(
-    value &&
-      typeof value === "object" &&
-      typeof (value as Iterable<unknown>)[Symbol.iterator] === "function",
-  );
-}
-
-function wrapStreamingResponse(params: {
-  response: unknown;
-  operationName: string;
-  apiParams?: Record<string, unknown>;
-  startTimeHr: HrTime;
-}): unknown {
-  if (!isRecord(params.response)) {
-    return params.response;
-  }
-
-  const key = streamKeyForResponse(params.response);
-  if (!key) {
-    emitBedrockSpan({
-      operationName: params.operationName,
-      apiParams: params.apiParams,
-      startTimeHr: params.startTimeHr,
-      responsePayload: params.response,
-      statusCode: statusCodeFromResponse(params.response),
-    });
-    return params.response;
-  }
-
-  const stream = params.response[key];
-  if (!stream || (!isAsyncIterable(stream) && !isIterable(stream))) {
-    emitBedrockSpan({
-      operationName: params.operationName,
-      apiParams: params.apiParams,
-      startTimeHr: params.startTimeHr,
-      responsePayload: params.response,
-      statusCode: statusCodeFromResponse(params.response),
-    });
-    return params.response;
-  }
-
-  params.response[key] = instrumentStream({
-    stream,
-    operationName: params.operationName,
-    apiParams: params.apiParams,
-    startTimeHr: params.startTimeHr,
-  });
-  return params.response;
-}
-
-function instrumentStream(params: {
-  stream: AsyncIterable<unknown> | Iterable<unknown>;
-  operationName: string;
-  apiParams?: Record<string, unknown>;
-  startTimeHr: HrTime;
-}): AsyncIterable<unknown> {
-  let emitted = false;
-  const events: unknown[] = [];
-
-  const emit = (error?: unknown): void => {
-    if (emitted) {
-      return;
+function wrapStream(stream: any, session: BedrockSession): boolean {
+  const original = stream?.[Symbol.asyncIterator];
+  if (typeof original !== "function") return false;
+  const observed = new WeakSet<object>();
+  const wrapped = function (this: any) {
+    const iterator = Reflect.apply(original, this, []) as any;
+    if (observed.has(iterator)) return iterator;
+    observed.add(iterator);
+    for (const key of ["next", "return", "throw"] as const) {
+      const method = iterator[key];
+      if (typeof method !== "function") continue;
+      Object.defineProperty(iterator, key, {
+        configurable: true,
+        writable: true,
+        value: function (this: unknown, ...args: unknown[]) {
+          let result: any;
+          try {
+            result = context.with(session.ctx, () =>
+              Reflect.apply(method, this, args),
+            );
+          } catch (error) {
+            session.finish(undefined, error);
+            throw error;
+          }
+          const observe = (value: any) => {
+            if (key === "next" && !value.done) session.event(value.value);
+            if (value.done || key === "return" || key === "throw")
+              session.finish();
+          };
+          if (result && typeof result.then === "function")
+            void result
+              .then(observe, (error: unknown) =>
+                session.finish(undefined, error),
+              )
+              .catch(() => {});
+          else observe(result);
+          return result;
+        },
+      });
     }
-    emitted = true;
-    emitBedrockSpan({
-      operationName: params.operationName,
-      apiParams: params.apiParams,
-      startTimeHr: params.startTimeHr,
-      streamEvents: events,
-      errorMessage: error === undefined ? undefined : errorMessage(error),
-      statusCode: error === undefined ? 200 : statusCodeFromError(error),
-    });
+    return iterator;
   };
-
-  const iterable: AsyncIterable<unknown> = {
-    [Symbol.asyncIterator]: async function*() {
-      try {
-        if (isAsyncIterable(params.stream)) {
-          for await (const event of params.stream) {
-            events.push(event);
-            yield event;
-          }
-        } else {
-          for (const event of params.stream) {
-            events.push(event);
-            yield event;
-          }
-        }
-      } catch (error) {
-        emit(error);
-        throw error;
-      } finally {
-        emit();
-      }
-    },
-  };
-
-  return new Proxy(iterable, {
-    get(target, property, receiver) {
-      if (property in target) {
-        return Reflect.get(target, property, receiver);
-      }
-      const value = (params.stream as unknown as Record<PropertyKey, unknown>)[property];
-      return typeof value === "function" ? value.bind(params.stream) : value;
-    },
-  });
-}
-
-function handleSuccess(params: {
-  response: unknown;
-  operationName: string;
-  apiParams?: Record<string, unknown>;
-  startTimeHr: HrTime;
-}): unknown {
-  if (STREAMING_OPERATIONS.has(params.operationName)) {
-    return wrapStreamingResponse(params);
-  }
-
-  const responsePayload =
-    params.operationName === INVOKE_MODEL_OPERATION
-      ? responsePayloadForInvoke(params.response)
-      : params.response;
-
-  emitBedrockSpan({
-    operationName: params.operationName,
-    apiParams: params.apiParams,
-    startTimeHr: params.startTimeHr,
-    responsePayload,
-    statusCode: statusCodeFromResponse(params.response),
-  });
-  return params.response;
-}
-
-function instrumentedSend(
-  originalSend: AnyFunction,
-  instance: unknown,
-  args: unknown[],
-): unknown {
-  const command = args[0];
-  const operationName = operationNameFromCommand(command);
-  if (!operationName || !SUPPORTED_OPERATIONS.has(operationName)) {
-    return originalSend.apply(instance, args);
-  }
-
-  const apiParams = commandInput(command);
-  const startTimeHr = hrTime();
-  let result: unknown;
   try {
-    result = originalSend.apply(instance, args);
-  } catch (error) {
-    emitBedrockSpan({
-      operationName,
-      apiParams,
-      startTimeHr,
-      errorMessage: errorMessage(error),
-      statusCode: statusCodeFromError(error),
+    Object.defineProperty(stream, Symbol.asyncIterator, {
+      value: wrapped,
+      writable: true,
+      configurable: true,
     });
+    return true;
+  } catch {
+    return false;
+  }
+}
+function complete(
+  session: BedrockSession,
+  op: string,
+  response: any,
+  error?: unknown,
+): void {
+  if (error !== undefined) {
+    session.finish(undefined, error);
+    return;
+  }
+  session.response(response);
+  if (STREAMING_OPERATIONS.has(op)) {
+    const stream = data(response, "stream") ?? data(response, "body");
+    if (stream && wrapStream(stream, session)) return;
+  }
+  session.finish(response);
+}
+function instrument(patch: Patch, instance: unknown, args: unknown[]): unknown {
+  const op = operation(args[0]);
+  if (!op || !patch.owners.size)
+    return Reflect.apply(patch.original, instance, args);
+  const options: CaptureOptions = {};
+  for (const owner of patch.owners) {
+    if (owner.options.traceContent === false) options.traceContent = false;
+    if (owner.options.recordInputs === false) options.recordInputs = false;
+    if (owner.options.recordOutputs === false) options.recordOutputs = false;
+  }
+  let session: BedrockSession | undefined;
+  try {
+    session = startBedrockSession(op, data(args[0], "input"), options);
+  } catch {
+    /* Fail open for telemetry only. */
+  }
+  if (!session) return Reflect.apply(patch.original, instance, args);
+  const callArgs = [...args];
+  const cbIndex =
+    typeof callArgs.at(-1) === "function" ? callArgs.length - 1 : -1;
+  if (cbIndex >= 0) {
+    const callback = callArgs[cbIndex] as AnyFunction;
+    callArgs[cbIndex] = function (this: unknown, ...values: unknown[]) {
+      complete(session!, op, values[1], values[0] ?? undefined);
+      return Reflect.apply(callback, this, values);
+    };
+  }
+  try {
+    const result = context.with(session.ctx, () =>
+      Reflect.apply(patch.original, instance, callArgs),
+    );
+    if (cbIndex < 0) {
+      if (result && typeof result.then === "function")
+        void result
+          .then(
+            (response: any) => complete(session!, op, response),
+            (error: unknown) => session!.finish(undefined, error),
+          )
+          .catch(() => {});
+      else complete(session, op, result);
+    }
+    return result;
+  } catch (error) {
+    session.finish(undefined, error);
     throw error;
   }
-
-  if (isPromiseLike(result)) {
-    return result.then(
-      (response) =>
-        handleSuccess({
-          response,
-          operationName,
-          apiParams,
-          startTimeHr,
-        }),
-      (error) => {
-        emitBedrockSpan({
-          operationName,
-          apiParams,
-          startTimeHr,
-          errorMessage: errorMessage(error),
-          statusCode: statusCodeFromError(error),
-        });
-        throw error;
-      },
-    );
-  }
-
-  return handleSuccess({
-    response: result,
-    operationName,
-    apiParams,
-    startTimeHr,
-  });
 }
-
 export class AWSBedrockInstrumentor {
   public readonly name = AWS_BEDROCK_INSTRUMENTATION_NAME;
-
-  private readonly _sdkModule?: AWSBedrockRuntimeModule;
-  private readonly _clientClass?: PatchableClientConstructor;
-  private readonly _patchedPrototypes: InstrumentedPrototype[] = [];
-  private _isInstrumented = false;
-
+  readonly options: AWSBedrockInstrumentorOptions;
+  private patch?: Patch;
+  private activation?: Promise<void>;
+  private epoch = 0;
   constructor(options: AWSBedrockInstrumentorOptions = {}) {
-    this._sdkModule = options.sdkModule;
-    this._clientClass = options.clientClass;
+    this.options = { ...options };
   }
-
-  async activate(): Promise<void> {
-    if (this._isInstrumented) {
-      return;
-    }
-
-    const clientClass = await this._resolveClientClass();
-    if (!clientClass?.prototype) {
-      throw new Error(
-        "AWSBedrockInstrumentor requires BedrockRuntimeClient from @aws-sdk/client-bedrock-runtime.",
-      );
-    }
-
-    this._patchPrototype(clientClass.prototype);
-    this._isInstrumented = true;
+  isActive(): boolean {
+    return !!this.patch;
   }
-
+  activate(): Promise<void> {
+    if (this.patch) return Promise.resolve();
+    if (this.activation) return this.activation;
+    const epoch = this.epoch;
+    const pending = (async () => {
+      const ctor =
+        this.options.clientClass ??
+        this.options.sdkModule?.BedrockRuntimeClient ??
+        (await import("@aws-sdk/client-bedrock-runtime")).BedrockRuntimeClient;
+      if (epoch !== this.epoch) return;
+      const prototype = ctor?.prototype;
+      if (!prototype || typeof prototype.send !== "function")
+        throw new Error(
+          "AWSBedrockInstrumentor requires BedrockRuntimeClient.prototype.send.",
+        );
+      let patch = registry.get(prototype);
+      if (!patch || prototype.send !== patch.wrapped) {
+        const original = prototype.send;
+        patch = {
+          prototype,
+          original,
+          wrapped: undefined as unknown as AnyFunction,
+          descriptor: Object.getOwnPropertyDescriptor(prototype, "send"),
+          owners: new Set(),
+        };
+        const state = patch;
+        patch.wrapped = function (this: unknown, ...args: unknown[]) {
+          return instrument(state, this, args);
+        };
+        Object.defineProperty(prototype, "send", {
+          value: patch.wrapped,
+          writable: true,
+          configurable: true,
+        });
+        registry.set(prototype, patch);
+      }
+      patch.owners.add(this);
+      this.patch = patch;
+    })();
+    this.activation = pending;
+    void pending
+      .finally(() => {
+        if (this.activation === pending) this.activation = undefined;
+      })
+      .catch(() => {});
+    return pending;
+  }
   deactivate(): void {
-    for (const prototype of this._patchedPrototypes) {
-      const original = prototype[ORIGINAL_SEND];
-      if (typeof original === "function") {
-        prototype.send = original as AnyFunction;
+    this.epoch++;
+    this.activation = undefined;
+    const patch = this.patch;
+    this.patch = undefined;
+    if (!patch) return;
+    patch.owners.delete(this);
+    if (!patch.owners.size) {
+      if (patch.prototype.send === patch.wrapped) {
+        if (patch.descriptor)
+          Object.defineProperty(patch.prototype, "send", patch.descriptor);
+        else delete patch.prototype.send;
       }
-      delete prototype[ORIGINAL_SEND];
-      delete prototype[PATCHED_BY];
+      if (registry.get(patch.prototype) === patch)
+        registry.delete(patch.prototype);
     }
-    this._patchedPrototypes.length = 0;
-    this._isInstrumented = false;
-  }
-
-  private async _resolveClientClass(): Promise<PatchableClientConstructor | undefined> {
-    if (this._clientClass) {
-      return this._clientClass;
-    }
-    if (this._sdkModule?.BedrockRuntimeClient) {
-      return this._sdkModule.BedrockRuntimeClient;
-    }
-
-    const sdkModule = await import("@aws-sdk/client-bedrock-runtime");
-    return (sdkModule as unknown as AWSBedrockRuntimeModule).BedrockRuntimeClient;
-  }
-
-  private _patchPrototype(prototype: PatchablePrototype): void {
-    const mutablePrototype = prototype as InstrumentedPrototype;
-    const original = mutablePrototype.send;
-    if (typeof original !== "function") {
-      throw new Error(
-        "AWSBedrockInstrumentor requires BedrockRuntimeClient.prototype.send to be a function.",
-      );
-    }
-
-    if (mutablePrototype[ORIGINAL_SEND]) {
-      return;
-    }
-
-    mutablePrototype[ORIGINAL_SEND] = original;
-    mutablePrototype[PATCHED_BY] = this;
-    mutablePrototype.send = function patchedBedrockSend(...args: unknown[]): unknown {
-      try {
-        return instrumentedSend(original, this, args);
-      } catch (error) {
-        console.warn(`${INSTRUMENTOR_LOG_PREFIX} send wrapper failed:`, error);
-        return original.apply(this, args);
-      }
-    };
-    this._patchedPrototypes.push(mutablePrototype);
   }
 }
-
-export {
-  buildBedrockAttrs,
-  emitBedrockSpan,
-} from "./_otel_emitter.js";
+export { buildBedrockAttrs, emitBedrockSpan } from "./_otel_emitter.js";
 export {
   parseBedrockRequest,
   parseBedrockResponse,

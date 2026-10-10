@@ -31,8 +31,8 @@
     "@opentelemetry/core": "^2.10.0",
     "@opentelemetry/sdk-trace-base": "^2.10.0",
     "@opentelemetry/semantic-conventions": "^1.43.0",
-    "@respan/respan-sdk": "workspace:^",
-    "@respan/tracing": "workspace:^",
+    "@respan/respan-sdk": "^1.1.7",
+    "@respan/tracing": "^1.1.6",
     "@traceloop/ai-semantic-conventions": "^0.13.0"
   },
   "peerDependencies": {
@@ -44,7 +44,10 @@
     }
   },
   "devDependencies": {
-    "@aws-sdk/client-bedrock-runtime": "^3.1048.0",
+    "@aws-sdk/client-bedrock-runtime": "^3.1149.0",
+    "@opentelemetry/context-async-hooks": "^2.10.0",
+    "@smithy/eventstream-codec": "^4.5.2",
+    "@smithy/util-utf8": "^4.5.2",
     "@types/node": "^22.15.29",
     "typescript": "^5.7.3"
   }

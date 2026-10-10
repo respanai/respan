@@ -1,10 +1,10 @@
 export const AWS_BEDROCK_INSTRUMENTATION_NAME = "aws-bedrock";
-export const AWS_BEDROCK_INSTRUMENTATION_PACKAGE = "@respan/instrumentation-aws-bedrock";
+export const AWS_BEDROCK_INSTRUMENTATION_PACKAGE =
+  "@respan/instrumentation-aws-bedrock";
 export const AWS_BEDROCK_CHAT_SPAN_NAME = "aws_bedrock.chat";
 export const AWS_BEDROCK_SYSTEM_NAME = "bedrock";
 export const PACKAGE_VERSION = "1.0.0";
 export const RESPAN_LOG_METHOD_TS_TRACING = "ts_tracing";
-export const STATUS_CODE_ATTR = "status_code";
 
 export const INVOKE_MODEL_OPERATION = "InvokeModel";
 export const INVOKE_MODEL_STREAM_OPERATION = "InvokeModelWithResponseStream";
