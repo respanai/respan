@@ -5,22 +5,31 @@ from __future__ import annotations
 import importlib
 import importlib.metadata
 import logging
+import os
 import re
+from collections import OrderedDict
 from collections.abc import Mapping
 from contextlib import contextmanager
 from threading import RLock
 from typing import Any
+from weakref import WeakKeyDictionary
 
 from opentelemetry import baggage, trace
 from opentelemetry import context as otel_context
-from opentelemetry.semconv_ai import SpanAttributes
+from opentelemetry.sdk.trace import SpanProcessor
+from opentelemetry.semconv._incubating.attributes.error_attributes import ERROR_MESSAGE
+from opentelemetry.semconv.attributes.error_attributes import ERROR_TYPE
+from opentelemetry.semconv_ai import (
+    SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY,
+    SpanAttributes,
+)
 from opentelemetry.trace import Status, StatusCode
 from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE, RESPAN_TRACE_GROUP_ID
+from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
 from respan_tracing.core.tracer import RespanTracer
 from respan_tracing.utils.span_factory import read_propagated_attributes
 
 from respan_instrumentation_temporal._constants import (
-    MAX_ATTRIBUTE_CHARS,
     TASK_LOG_TYPE,
     TEMPORAL_CAPTURED_INPUT,
     TEMPORAL_CLIENT_CONNECT_TARGET,
@@ -80,7 +89,7 @@ def _apply_respan_baggage(attrs: dict[str, Any], context: Any) -> None:
             attrs.setdefault(key, safe_baggage_value(key, value))
 
 
-def _json_dumps(value: Any, *, max_chars: int = MAX_ATTRIBUTE_CHARS) -> str:
+def _json_dumps(value: Any, *, max_chars: int | None = None) -> str:
     return json_dumps(value, max_bytes=max_chars)
 
 
@@ -129,10 +138,13 @@ def _canonical_attributes(
     attributes: Mapping[str, Any] | None,
     *,
     capture_content: bool,
-    max_attribute_chars: int,
+    max_attribute_chars: int | None,
 ) -> dict[str, Any]:
     source = dict(attributes or {})
     captured_input = source.pop(TEMPORAL_CAPTURED_INPUT, None)
+    captured_output = source.pop(_CAPTURED_OUTPUT, _MISSING)
+    if callable(captured_input) and capture_content:
+        captured_input = captured_input()
     temporal_attributes = {
         key: source.pop(key)
         for key in tuple(source)
@@ -170,91 +182,367 @@ def _canonical_attributes(
     source[SpanAttributes.TRACELOOP_ENTITY_INPUT] = _json_dumps(
         input_payload, max_chars=max_attribute_chars
     )
-    source[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = _json_dumps(
-        {"status": "completed", "content_captured": capture_content},
-        max_chars=max_attribute_chars,
-    )
+    if capture_content and captured_output is not _MISSING:
+        source[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = _json_dumps(
+            captured_output, max_chars=max_attribute_chars
+        )
     return source
 
 
-def _set_success_output(span: Any, *, capture_content: bool, max_chars: int) -> None:
-    span.set_attribute("status_code", 200)
-    span.set_attribute(
-        SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
-        _json_dumps(
-            {"status": "completed", "content_captured": capture_content},
-            max_chars=max_chars,
-        ),
+def _attempt(function: Any, default: Any = None) -> Any:
+    try:
+        return function()
+    except BaseException:  # noqa: BLE001 - telemetry cannot change native behavior
+        return default
+
+
+_CAPTURED_OUTPUT = "__respan_temporal_captured_output__"
+_OBSERVED: WeakKeyDictionary[Any, Any] = WeakKeyDictionary()
+_CONTEXT_DECISIONS: OrderedDict[tuple[int, int], Any] = OrderedDict()
+_PROVIDERS: WeakKeyDictionary[Any, Any] = WeakKeyDictionary()
+_POLICY_LOCK = RLock()
+
+
+def _span_key(span: Any) -> Any:
+    value = _attempt(span.get_span_context, trace.INVALID_SPAN_CONTEXT)
+    return (value.trace_id, value.span_id) if value.is_valid else None
+
+
+def _remember(span: Any, decision: Any) -> None:
+    key = _span_key(span)
+    if key is not None:
+        with _POLICY_LOCK:
+            _OBSERVED[span] = decision
+            _CONTEXT_DECISIONS[key] = decision
+            while len(_CONTEXT_DECISIONS) > 4096:
+                _CONTEXT_DECISIONS.popitem(last=False)
+
+
+def _decision(span: Any) -> Any:
+    with _POLICY_LOCK:
+        return _OBSERVED.get(span) or _CONTEXT_DECISIONS.get(_span_key(span))
+
+
+class _PrivacyObserver(SpanProcessor):
+    def on_start(self, span: Any, parent_context: Any = None) -> None:
+        contexts = (otel_context.get_current(), parent_context)
+        allowed, parents = _parent_decisions(contexts)
+        _attempt(lambda: _remember(span, _PrivacyDecision(allowed, contexts, parents)))
+
+    def on_end(self, span: Any) -> None:
+        key = (span.context.trace_id, span.context.span_id)
+        with _POLICY_LOCK:
+            state = _CONTEXT_DECISIONS.get(key)
+        if state is not None:
+            _attempt(state.allowed, False)
+
+    def shutdown(self) -> None:
+        pass
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool:
+        return True
+
+
+def _observe_provider() -> None:
+    provider = trace.get_tracer_provider()
+    with _POLICY_LOCK:
+        if provider not in _PROVIDERS and callable(
+            getattr(provider, "add_span_processor", None)
+        ):
+            observer = _PrivacyObserver()
+            provider.add_span_processor(observer)
+            _PROVIDERS[provider] = observer
+
+
+def _context_allows(context: Any) -> bool:
+    return (
+        otel_context.get_value(ENABLE_CONTENT_TRACING_KEY, context=context) is not False
+        and baggage.get_baggage(ENABLE_CONTENT_TRACING_KEY, context=context) != "false"
+        and not _suppressed(context)
+        and os.getenv("TRACELOOP_TRACE_CONTENT", "true").strip().lower()
+        not in {"false", "0", "off", "no"}
     )
 
 
-def _set_error_output(
-    span: Any,
-    exc: BaseException,
-    *,
-    capture_content: bool,
-    max_chars: int,
-    record_exception: bool,
-) -> None:
-    message = safe_error_message(exc, capture_content=capture_content)
-    span.set_status(Status(StatusCode.ERROR, message))
-    span.set_attribute("status_code", 500)
-    span.set_attribute("error.message", message)
-    span.set_attribute(
-        SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
-        _json_dumps(
-            {
-                "status": "error",
-                "error": type(exc).__name__,
-                "message": message,
-                "content_captured": capture_content,
-            },
-            max_chars=max_chars,
-        ),
+def _suppressed(context: Any) -> bool:
+    return bool(
+        otel_context.get_value(
+            otel_context._SUPPRESS_INSTRUMENTATION_KEY, context=context
+        )
+        or otel_context.get_value(
+            SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY, context=context
+        )
     )
 
 
-class _CanonicalSpanProxy:
+def _parent_decisions(contexts: tuple[Any, ...]) -> tuple[bool, list[Any]]:
+    allowed = True
+    parents = []
+    for context in contexts:
+        allowed = allowed and bool(
+            _attempt(lambda context=context: _context_allows(context), False)
+        )
+        parent = _attempt(
+            lambda context=context: trace.get_current_span(context), trace.INVALID_SPAN
+        )
+        if not _attempt(
+            lambda parent=parent: parent.get_span_context().is_valid, False
+        ):
+            continue
+        state = _attempt(lambda parent=parent: _decision(parent))
+        if state is not None:
+            parents.append(state)
+            allowed = allowed and bool(_attempt(state.allowed, False))
+        elif _attempt(parent.is_recording, False):
+            # An application-owned recording ancestor has no observed privacy
+            # decision. Do not assume that a late provider permitted content.
+            allowed = False
+    return allowed, parents
+
+
+class _PrivacyDecision:
+    def __init__(
+        self, allowed: bool, contexts: tuple[Any, ...], parents: list[Any]
+    ) -> None:
+        self.denied = not allowed
+        self.contexts = contexts
+        self.parents = parents
+        if self.denied:
+            self.deny_chain()
+
+    def deny_chain(self) -> None:
+        pending = [self]
+        seen: set[int] = set()
+        while pending:
+            decision = pending.pop()
+            if id(decision) in seen:
+                continue
+            seen.add(id(decision))
+            decision.denied = True
+            pending.extend(decision.parents)
+
+    def allowed(self) -> bool:
+        pending = [self]
+        seen: set[int] = set()
+        current = otel_context.get_current()
+        while pending:
+            decision = pending.pop()
+            if id(decision) in seen:
+                continue
+            seen.add(id(decision))
+            if decision.denied or not all(
+                bool(_attempt(lambda c=c: _context_allows(c), False))
+                for c in (*decision.contexts, current)
+            ):
+                self.deny_chain()
+                return False
+            pending.extend(decision.parents)
+        return True
+
+
+class _CanonicalSpanProxy(trace.Span):
     def __init__(
         self,
         span: Any,
         *,
         capture_content: bool,
-        max_attribute_chars: int,
+        max_attribute_chars: int | None,
+        attributes: Any = None,
+        name: str = "",
+        contexts: tuple[Any, ...] = (),
+        parents: list[Any] | None = None,
         on_end: Any = None,
     ) -> None:
         self._span = span
         self._capture_content = capture_content
         self._max_attribute_chars = max_attribute_chars
-        self._has_error = False
+        self._source = attributes
+        self._name = name
+        self._contexts = contexts
+        self._parents = parents or []
         self._on_end = on_end
         self._ended = False
-
-    def record_exception(self, exception: Exception, *args: Any, **kwargs: Any) -> None:
-        self._has_error = True
-        _set_error_output(
-            self._span,
-            exception,
-            capture_content=self._capture_content,
-            max_chars=self._max_attribute_chars,
-            record_exception=False,
+        self._has_error = False
+        self._scrubbed = False
+        self._owned_content: set[str] = set()
+        self._error_type = None
+        self._error_message: str | None = None
+        self._decision = _attempt(lambda: _decision(span)) or _PrivacyDecision(
+            capture_content, contexts, self._parents
         )
+        if not capture_content:
+            self._decision.deny_chain()
+        if self.get_span_context().is_valid:
+            _attempt(lambda: _remember(self, self._decision))
+            _attempt(lambda: _remember(span, self._decision))
+
+    @property
+    def _denied(self) -> bool:
+        return self._decision.denied
+
+    def allowed(self) -> bool:
+        allowed = self._decision.allowed()
+        if not allowed and not self._scrubbed:
+            self._scrub()
+        return allowed
+
+    def _scrub(self) -> None:
+        self._scrubbed = True
+        attributes = getattr(self._span, "_attributes", None)
+        for key in self._owned_content:
+            if attributes is not None:
+                _attempt(lambda key=key: attributes.pop(key, None))
+            else:
+                _attempt(lambda key=key: self._span.set_attribute(key, "[REDACTED]"))
+        # OTel spans have no public attribute deletion API: replace every
+        # content-bearing field already owned by this adapter before end.
+        safe = _attempt(
+            lambda: _canonical_attributes(
+                self._name,
+                self._source,
+                capture_content=False,
+                max_attribute_chars=self._max_attribute_chars,
+            ),
+            {},
+        )
+        for key, value in safe.items():
+            if key != _INTERNAL_WORKFLOW_ID:
+                _attempt(
+                    lambda key=key, value=value: self._span.set_attribute(key, value)
+                )
+        if self._has_error:
+            self._error(None)
+
+    def capture_baggage(self, attrs: dict[str, Any]) -> None:
+        if self.is_recording() and self.allowed():
+            for key, value in attrs.items():
+                self._owned_content.add(key)
+                _attempt(
+                    lambda key=key, value=value: self._span.set_attribute(key, value)
+                )
+
+    def capture_input(self, value: Any) -> None:
+        if self.is_recording() and self.allowed():
+            _attempt(
+                lambda: self._span.set_attribute(
+                    SpanAttributes.TRACELOOP_ENTITY_INPUT,
+                    _json_dumps(value, max_chars=self._max_attribute_chars),
+                )
+            )
+
+    def capture_output(self, value: Any) -> None:
+        if self.is_recording() and self.allowed():
+            self._owned_content.add(SpanAttributes.TRACELOOP_ENTITY_OUTPUT)
+            _attempt(
+                lambda: self._span.set_attribute(
+                    SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+                    _json_dumps(value, max_chars=self._max_attribute_chars),
+                )
+            )
+
+    def _error(self, message: str | None) -> None:
+        if self._denied:
+            self._error_message = None
+            _attempt(lambda: self._span.set_status(Status(StatusCode.ERROR)))
+            attributes = getattr(self._span, "_attributes", None)
+            if attributes is not None:
+                _attempt(lambda: attributes.pop(ERROR_MESSAGE, None))
+        else:
+            if message is not None:
+                self._error_message = message
+            _attempt(
+                lambda: self._span.set_status(
+                    Status(StatusCode.ERROR, self._error_message)
+                )
+            )
+            if self._error_message is not None:
+                self._owned_content.add(ERROR_MESSAGE)
+                _attempt(
+                    lambda: self._span.set_attribute(ERROR_MESSAGE, self._error_message)
+                )
+        if self._error_type:
+            _attempt(lambda: self._span.set_attribute(ERROR_TYPE, self._error_type))
+        # Exceptions are diagnostics, never a successful native operation result.
+        # Preserve a previously captured actual result only while privacy permits.
+
+    def record_exception(
+        self, exception: BaseException, *args: Any, **kwargs: Any
+    ) -> None:
+        self._has_error = True
+        self._error_type = type(exception).__name__
+        if self.is_recording():
+            self._error(safe_error_message(exception, capture_content=self.allowed()))
+        # Never delegate raw exception events: native OTel can include traceback,
+        # repr and exception text after privacy has been disabled.
+
+    def set_status(self, status: Any, description: str | None = None) -> None:
+        code = getattr(status, "status_code", status)
+        if code == StatusCode.ERROR:
+            self._has_error = True
+            native_description = getattr(status, "description", description)
+            message = None
+            if self.allowed() and type(native_description) is str:
+                message = (
+                    safe_error_message(
+                        RuntimeError(native_description), capture_content=True
+                    )
+                    if native_description
+                    else ""
+                )
+            self._error(message)
+        else:
+            _attempt(lambda: self._span.set_status(status, description))
+
+    def set_attribute(self, key: str, value: Any) -> None:
+        if key in (
+            SpanAttributes.TRACELOOP_ENTITY_INPUT,
+            SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+        ):
+            self._owned_content.add(key)
+            if self.is_recording() and self.allowed():
+                _attempt(
+                    lambda key=key, value=value: self._span.set_attribute(key, value)
+                )
+        elif key == ERROR_MESSAGE:
+            self._owned_content.add(ERROR_MESSAGE)
+            if self.allowed():
+                if type(value) is str:
+                    self._error_message = value
+                _attempt(
+                    lambda key=key, value=value: self._span.set_attribute(key, value)
+                )
+        else:
+            _attempt(lambda key=key, value=value: self._span.set_attribute(key, value))
+
+    def set_attributes(self, attributes: Any) -> None:
+        for key, value in attributes.items():
+            self.set_attribute(key, value)
+
+    def add_event(
+        self, name: str, attributes: Any = None, timestamp: Any = None
+    ) -> None:
+        # Native exception events contain raw traceback/text. This adapter emits
+        # sanitized status and error fields instead, which can be scrubbed before
+        # end when a later privacy decision denies content.
+        self.allowed()
+
+    def update_name(self, name: str) -> None:
+        _attempt(lambda: self._span.update_name(name))
+
+    def get_span_context(self) -> Any:
+        return _attempt(self._span.get_span_context, trace.INVALID_SPAN_CONTEXT)
+
+    def is_recording(self) -> bool:
+        return bool(_attempt(self._span.is_recording, False)) and not self._ended
 
     def end(self, *args: Any, **kwargs: Any) -> None:
         if self._ended:
             return
+        self.allowed()
         self._ended = True
-        if not self._has_error:
-            _set_success_output(
-                self._span,
-                capture_content=self._capture_content,
-                max_chars=self._max_attribute_chars,
-            )
-        try:
-            self._span.end(*args, **kwargs)
-        finally:
-            if self._on_end is not None:
-                self._on_end()
+        _attempt(lambda: self._span.end(*args, **kwargs))
+        if self._on_end is not None:
+            _attempt(self._on_end)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._span, name)
@@ -262,7 +550,7 @@ class _CanonicalSpanProxy:
 
 class _CanonicalTracer:
     def __init__(
-        self, tracer: Any, *, capture_content: bool, max_attribute_chars: int
+        self, tracer: Any, *, capture_content: bool, max_attribute_chars: int | None
     ) -> None:
         self._tracer = tracer
         self._capture_content = capture_content
@@ -270,108 +558,110 @@ class _CanonicalTracer:
         self._workflow_groups: dict[int, str] = {}
         self._workflow_contexts: dict[str, Any] = {}
 
-    def _apply_parent_and_group(
-        self, name: str, attrs: dict[str, Any], context: Any
-    ) -> tuple[Any, str | None]:
-        _apply_respan_baggage(attrs, context)
+    def start_span(self, name: str, *args: Any, **kwargs: Any) -> _CanonicalSpanProxy:
+        _attempt(_observe_provider)
+        # Temporal passes context positionally for completed workflow spans.
+        supplied = kwargs.get("context", args[0] if args else None)
+        contexts = (otel_context.get_current(), supplied)
+        allowed, parents = _parent_decisions(contexts)
+        allowed = (
+            allowed
+            and self._capture_content
+            and os.getenv("TRACELOOP_TRACE_CONTENT", "true").strip().lower()
+            not in {"false", "0", "off", "no"}
+        )
+        source = kwargs.get("attributes")
+        attrs = _attempt(
+            lambda: _canonical_attributes(
+                name,
+                source,
+                capture_content=False,
+                max_attribute_chars=self._max_attribute_chars,
+            ),
+            {},
+        )
         workflow_id = attrs.pop(_INTERNAL_WORKFLOW_ID, None)
-        parent = trace.get_current_span(context)
-        parent_context = parent.get_span_context()
-        if not parent_context.is_valid and isinstance(workflow_id, str):
-            fallback_context = self._workflow_contexts.get(workflow_id)
-            if fallback_context is not None:
-                context = trace.set_span_in_context(
-                    trace.NonRecordingSpan(fallback_context)
-                )
-                parent_context = fallback_context
+        parent_context = _attempt(
+            lambda: trace.get_current_span(supplied).get_span_context(),
+            trace.INVALID_SPAN_CONTEXT,
+        )
         if not parent_context.is_valid:
             attrs[SpanAttributes.TRACELOOP_ENTITY_PATH] = ""
-        group = attrs.get(RESPAN_TRACE_GROUP_ID)
-        if not group and parent_context.is_valid:
-            group = self._workflow_groups.get(parent_context.trace_id)
-            if group:
-                attrs[RESPAN_TRACE_GROUP_ID] = group
-        return context, workflow_id if isinstance(workflow_id, str) else None
-
-    @contextmanager
-    def start_as_current_span(self, name: str, *args: Any, **kwargs: Any):
-        attrs = _canonical_attributes(
-            name,
-            kwargs.get("attributes"),
-            capture_content=self._capture_content,
-            max_attribute_chars=self._max_attribute_chars,
-        )
-        context, workflow_id = self._apply_parent_and_group(
-            name, attrs, kwargs.get("context")
-        )
-        if context is not None:
-            kwargs["context"] = context
+        elif parent_context.trace_id in self._workflow_groups:
+            attrs.setdefault(
+                RESPAN_TRACE_GROUP_ID, self._workflow_groups[parent_context.trace_id]
+            )
         kwargs["attributes"] = attrs
-        with self._tracer.start_as_current_span(name, *args, **kwargs) as span:
-            span_context = span.get_span_context()
-            group = attrs.get(RESPAN_TRACE_GROUP_ID)
-            if group and span_context.is_valid:
-                self._workflow_groups[span_context.trace_id] = group
-            if (
-                workflow_id
-                and span_context.is_valid
-                and name.startswith(("StartWorkflow:", "StartActivity:"))
-            ):
-                self._workflow_contexts[workflow_id] = span_context
-            try:
-                yield span
-            except BaseException as exc:
-                _set_error_output(
-                    span,
-                    exc,
-                    capture_content=self._capture_content,
-                    max_chars=self._max_attribute_chars,
-                    record_exception=True,
-                )
-                raise
-            else:
-                _set_success_output(
-                    span,
-                    capture_content=self._capture_content,
-                    max_chars=self._max_attribute_chars,
-                )
-            finally:
-                if workflow_id and name.startswith("CompleteWorkflow:"):
-                    self._workflow_contexts.pop(workflow_id, None)
-
-    def start_span(self, name: str, *args: Any, **kwargs: Any) -> _CanonicalSpanProxy:
-        attrs = _canonical_attributes(
-            name,
-            kwargs.get("attributes"),
-            capture_content=self._capture_content,
-            max_attribute_chars=self._max_attribute_chars,
+        # Suppression must precede sampler callbacks and all vendor payload access.
+        suppressed = any(
+            bool(_attempt(lambda c=c: _suppressed(c), True)) for c in contexts
         )
-        context, workflow_id = self._apply_parent_and_group(
-            name, attrs, kwargs.get("context")
+        span = (
+            trace.INVALID_SPAN
+            if suppressed
+            else _attempt(
+                lambda: self._tracer.start_span(name, *args, **kwargs),
+                trace.INVALID_SPAN,
+            )
         )
-        if context is not None:
-            kwargs["context"] = context
-        kwargs["attributes"] = attrs
-        span = self._tracer.start_span(name, *args, **kwargs)
-        span_context = span.get_span_context()
         group = attrs.get(RESPAN_TRACE_GROUP_ID)
+        span_context = _attempt(span.get_span_context, trace.INVALID_SPAN_CONTEXT)
         if group and span_context.is_valid:
             self._workflow_groups[span_context.trace_id] = group
-        if (
-            workflow_id
-            and span_context.is_valid
-            and name.startswith(("StartWorkflow:", "StartActivity:"))
-        ):
-            self._workflow_contexts[workflow_id] = span_context
         on_end = None
         if workflow_id and name.startswith("CompleteWorkflow:"):
             on_end = lambda: self._workflow_contexts.pop(workflow_id, None)
-        return _CanonicalSpanProxy(
+        proxy = _CanonicalSpanProxy(
             span,
-            capture_content=self._capture_content,
+            capture_content=allowed,
             max_attribute_chars=self._max_attribute_chars,
+            attributes=source,
+            name=name,
+            contexts=contexts,
+            parents=parents,
             on_end=on_end,
         )
+        if proxy.is_recording() and proxy.allowed():
+            baggage_attrs: dict[str, Any] = {}
+            _attempt(lambda: _apply_respan_baggage(baggage_attrs, supplied))
+            proxy.capture_baggage(baggage_attrs)
+            full = _attempt(
+                lambda: _canonical_attributes(
+                    name,
+                    source,
+                    capture_content=True,
+                    max_attribute_chars=self._max_attribute_chars,
+                ),
+                {},
+            )
+            for key in (
+                SpanAttributes.TRACELOOP_ENTITY_INPUT,
+                SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+            ):
+                if key in full:
+                    proxy.set_attribute(key, full[key])
+        return proxy
+
+    @contextmanager
+    def start_as_current_span(self, name: str, *args: Any, **kwargs: Any):
+        kwargs.pop("end_on_exit", None)
+        kwargs.pop("record_exception", None)
+        kwargs.pop("set_status_on_exception", None)
+        span = self.start_span(name, *args, **kwargs)
+        token = None
+        if span.get_span_context().is_valid:
+            token = _attempt(
+                lambda: otel_context.attach(trace.set_span_in_context(span))
+            )
+        try:
+            yield span
+        except BaseException as exc:
+            span.record_exception(exc)
+            raise
+        finally:
+            span.end()
+            if token is not None:
+                _attempt(lambda: otel_context.detach(token))
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._tracer, name)
@@ -382,7 +672,7 @@ def _build_interceptor(
     *,
     tracer: Any,
     capture_content: bool,
-    max_attribute_chars: int,
+    max_attribute_chars: int | None,
     always_create_workflow_spans: bool,
 ) -> Any:
     canonical_tracer = _CanonicalTracer(
@@ -403,25 +693,154 @@ def _build_interceptor(
             kind: Any,
             context: Any = None,
         ):
-            enriched = dict(attributes or {})
-            if capture_content:
-                captured: dict[str, Any] = {}
-                if input_with_headers is not None:
-                    captured.update(_extract_temporal_input(input_with_headers))
-                if input_with_ctx is not None:
-                    captured.update(_extract_temporal_input(input_with_ctx))
-                if captured:
-                    enriched[TEMPORAL_CAPTURED_INPUT] = captured
-            context = _context_with_respan_baggage(context)
-            with super()._start_as_current_span(
-                name,
-                attributes=enriched,
-                input_with_headers=input_with_headers,
-                input_with_ctx=input_with_ctx,
-                kind=kind,
-                context=context,
-            ):
-                yield None
+            enriched = _attempt(lambda: dict(attributes or {}), {})
+            # Defer payload access until after the real sampler and privacy gate.
+            enriched[TEMPORAL_CAPTURED_INPUT] = lambda: {
+                **(
+                    _extract_temporal_input(input_with_headers)
+                    if input_with_headers is not None
+                    else {}
+                ),
+                **(
+                    _extract_temporal_input(input_with_ctx)
+                    if input_with_ctx is not None
+                    else {}
+                ),
+            }
+            allowed, _ = _parent_decisions((otel_context.get_current(), context))
+            if not capture_content or not allowed:
+                context = _attempt(
+                    lambda: baggage.set_baggage(
+                        ENABLE_CONTENT_TRACING_KEY, "false", context=context
+                    ),
+                    context,
+                )
+            token = (
+                _attempt(lambda: otel_context.attach(context))
+                if context is not None
+                else None
+            )
+            try:
+                with canonical_tracer.start_as_current_span(
+                    name, attributes=enriched, kind=kind, context=context
+                ) as span:
+                    propagated_token = None
+                    if span.is_recording() and span.allowed():
+                        propagated = _attempt(
+                            lambda: _context_with_respan_baggage(
+                                otel_context.get_current()
+                            )
+                        )
+                        if propagated is not None:
+                            propagated_token = _attempt(
+                                lambda: otel_context.attach(propagated)
+                            )
+                            attrs: dict[str, Any] = {}
+                            _attempt(lambda: _apply_respan_baggage(attrs, propagated))
+                            span.capture_baggage(attrs)
+                    if input_with_headers is not None:
+                        updated = _attempt(
+                            lambda: self._context_to_headers(input_with_headers.headers)
+                        )
+                        if updated is not None:
+                            input_with_headers.headers = updated
+                    try:
+                        yield None
+                    finally:
+                        # Observe before the propagated operation context detaches.
+                        span.allowed()
+                        if propagated_token is not None:
+                            _attempt(lambda: otel_context.detach(propagated_token))
+            finally:
+                if token is not None:
+                    _attempt(lambda: otel_context.detach(token))
+
+        def _context_from_headers(self, headers: Any) -> Any:
+            return _attempt(
+                lambda: super(
+                    RespanTemporalTracingInterceptor, self
+                )._context_from_headers(headers)
+            )
+
+        def _completed_workflow_span(self, params: Any) -> Any:
+            return _attempt(
+                lambda: super(
+                    RespanTemporalTracingInterceptor, self
+                )._completed_workflow_span(params)
+            )
+
+        def intercept_activity(self, next: Any) -> Any:
+            from temporalio.worker import ActivityInboundInterceptor
+
+            class CaptureActivity(ActivityInboundInterceptor):
+                async def execute_activity(self, input: Any) -> Any:
+                    span = trace.get_current_span()
+                    if isinstance(span, _CanonicalSpanProxy):
+                        span.capture_input({"args": input.args})
+                    result = await super().execute_activity(input)
+                    if isinstance(span, _CanonicalSpanProxy):
+                        span.capture_output(result)
+                    return result
+
+            return super().intercept_activity(CaptureActivity(next))
+
+        def intercept_client(self, next: Any) -> Any:
+            from temporalio.client import OutboundInterceptor
+
+            class CaptureClient(OutboundInterceptor):
+                async def query_workflow(self, input: Any) -> Any:
+                    result = await super().query_workflow(input)
+                    span = trace.get_current_span()
+                    if isinstance(span, _CanonicalSpanProxy):
+                        span.capture_output(result)
+                    return result
+
+            return super().intercept_client(CaptureClient(next))
+
+        def workflow_interceptor_class(self, input: Any) -> type:
+            native = super().workflow_interceptor_class(input)
+            from temporalio import workflow
+            from temporalio.worker import WorkflowInboundInterceptor
+
+            class CaptureWorkflow(native):
+                async def execute_workflow(self, value: Any) -> Any:
+                    self._respan_input = {"args": value.args}
+                    self._respan_result = _MISSING
+                    # Keep the native replay-aware context and completed spans;
+                    # the only addition is data passed through its extern hook.
+                    with self._top_level_workflow_context(success_is_complete=True):
+                        self._completed_span(
+                            f"RunWorkflow:{workflow.info().workflow_type}",
+                            kind=trace.SpanKind.SERVER,
+                        )
+                        result = await WorkflowInboundInterceptor.execute_workflow(
+                            self, value
+                        )
+                        self._respan_result = result
+                        return result
+
+                def _completed_span(self, span_name: str, **kwargs: Any) -> None:
+                    attributes = dict(kwargs.pop("additional_attributes", None) or {})
+                    outbound = kwargs.get("add_to_outbound")
+                    if outbound is not None:
+                        attributes[TEMPORAL_CAPTURED_INPUT] = {
+                            "args": getattr(outbound, "args", ())
+                        }
+                    if span_name.startswith(("RunWorkflow:", "CompleteWorkflow:")):
+                        attributes[TEMPORAL_CAPTURED_INPUT] = getattr(
+                            self, "_respan_input", {}
+                        )
+                    if span_name.startswith("CompleteWorkflow:"):
+                        result = getattr(self, "_respan_result", _MISSING)
+                        if result is not _MISSING:
+                            attributes[_CAPTURED_OUTPUT] = result
+                    return _attempt(
+                        lambda: super(CaptureWorkflow, self)._completed_span(
+                            span_name, additional_attributes=attributes, **kwargs
+                        )
+                    )
+
+            return CaptureWorkflow
 
     RespanTemporalTracingInterceptor.__name__ = "RespanTemporalTracingInterceptor"
     return RespanTemporalTracingInterceptor(
@@ -437,7 +856,7 @@ class TemporalInstrumentor:
     _patches_applied = False
     _activation_count = 0
     _lock = RLock()
-    _shared_config: tuple[bool, bool, int] | None = None
+    _shared_config: tuple[bool, bool, int | None] | None = None
     _client_class: type[Any] | None = None
     _original_connect_descriptor_holder: tuple[Any, ...] = ()
     _installed_connect_function: Any = None
@@ -448,11 +867,15 @@ class TemporalInstrumentor:
         *,
         capture_content: bool = True,
         always_create_workflow_spans: bool = False,
-        max_attribute_chars: int = MAX_ATTRIBUTE_CHARS,
+        max_attribute_chars: int | None = None,
     ) -> None:
         self._capture_content = capture_content
         self._always_create_workflow_spans = always_create_workflow_spans
-        self._max_attribute_chars = max(512, int(max_attribute_chars))
+        self._max_attribute_chars = (
+            max(512, int(max_attribute_chars))
+            if max_attribute_chars is not None
+            else None
+        )
         self._is_instrumented = False
         self._interceptor: Any = None
         self._base_interceptor_class: type | None = None
@@ -467,6 +890,7 @@ class TemporalInstrumentor:
     def _ensure_interceptor(self) -> Any:
         if self._interceptor is not None:
             return self._interceptor
+        _attempt(_observe_provider)
         otel_module = importlib.import_module(TEMPORAL_OTEL_MODULE)
         self._base_interceptor_class = otel_module.TracingInterceptor
         self._interceptor = _build_interceptor(
@@ -492,7 +916,9 @@ class TemporalInstrumentor:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> Any:
-        interceptor = self._ensure_interceptor()
+        interceptor = _attempt(self._ensure_interceptor)
+        if interceptor is None:
+            return await wrapped(*args, **kwargs)
         connect_kwargs = dict(kwargs)
         interceptors = list(connect_kwargs.get("interceptors") or ())
         base_class = self._base_interceptor_class

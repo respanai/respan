@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import os
+
+logger = logging.getLogger(__name__)
 from typing import Any
 
 from respan_instrumentation_pytest._constants import (
@@ -63,8 +66,8 @@ def _enabled(config: Any) -> bool:
     cli_value = config.getoption("respan_tracing")
     if cli_value is not None:
         return bool(cli_value)
-    if _env_bool(ENV_ENABLED, False):
-        return True
+    if os.getenv(ENV_ENABLED) is not None:
+        return _env_bool(ENV_ENABLED, False)
     return bool(config.getini("respan_tracing"))
 
 
@@ -91,14 +94,24 @@ def pytest_configure(config: Any) -> None:
         capture_content=_capture_content(config),
         workflow_name=_workflow_name(config),
     )
-    instrumentor.activate()
-    pluginmanager.register(instrumentor, PYTEST_RUNTIME_PLUGIN_NAME)
+    try:
+        instrumentor.activate()
+        if instrumentor._is_instrumented:
+            pluginmanager.register(instrumentor, PYTEST_RUNTIME_PLUGIN_NAME)
+            config._respan_pytest_owner = instrumentor
+    except Exception:  # noqa: BLE001 - telemetry faults must preserve native pytest behavior.
+        instrumentor.deactivate()
+        logger.debug("Pytest telemetry registration failed")
 
 
 def pytest_unconfigure(config: Any) -> None:
     pluginmanager = config.pluginmanager
     instrumentor = pluginmanager.get_plugin(PYTEST_RUNTIME_PLUGIN_NAME)
-    if instrumentor is None:
+    if instrumentor is None or instrumentor is not getattr(
+        config, "_respan_pytest_owner", None
+    ):
         return
-    instrumentor.deactivate()
-    pluginmanager.unregister(instrumentor)
+    try:
+        instrumentor.deactivate()
+    finally:
+        pluginmanager.unregister(instrumentor)

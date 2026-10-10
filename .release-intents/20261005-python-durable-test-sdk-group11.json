@@ -1,0 +1,9 @@
+{
+  "summary": "Support current Burr, Restate, Temporal, and pytest native lifecycle, durable execution and privacy-safe tracing examples",
+  "packages": {
+    "respan-instrumentation-burr": "minor",
+    "respan-instrumentation-restate": "minor",
+    "respan-instrumentation-temporal": "minor",
+    "respan-instrumentation-pytest": "minor"
+  }
+}
