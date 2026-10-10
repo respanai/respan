@@ -12,8 +12,13 @@ packages = [
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
 respan-tracing = "^2.17.0"
-respan-sdk = ">=2.6.1"
-opentelemetry-semantic-conventions-ai = ">=0.4.1"
+respan-sdk = ">=2.6.26"
+opentelemetry-semantic-conventions-ai = ">=0.4.1,<0.6"
+opentelemetry-semantic-conventions = ">=0.59b0,<1"
+cursor-sdk = { version = ">=1.0.24,<2", optional = true }
+
+[tool.poetry.extras]
+native = ["cursor-sdk"]
 
 [tool.poetry.plugins."respan.instrumentations"]
 cursor-sdk = "respan_instrumentation_cursor_sdk:CursorSDKInstrumentor"

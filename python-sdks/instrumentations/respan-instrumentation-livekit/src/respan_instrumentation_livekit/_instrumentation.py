@@ -1,290 +1,481 @@
-"""LiveKit Agents instrumentation plugin for Respan."""
+"""Preserve native LiveKit tracing while observing released stream/tool boundaries."""
 
 from __future__ import annotations
 
-import functools
 import importlib
 import logging
-import time
-from collections.abc import Callable
-from typing import Any
+import threading
+import weakref
+from collections import OrderedDict
+from contextvars import ContextVar
+from functools import wraps
 
 from opentelemetry import trace
-from opentelemetry.semconv_ai import SpanAttributes
+from opentelemetry.semconv.attributes.error_attributes import ERROR_TYPE
+from opentelemetry.semconv.attributes.http_attributes import HTTP_RESPONSE_STATUS_CODE
+from opentelemetry.trace import NonRecordingSpan, Status, StatusCode
 from respan_tracing.core.tracer import RespanTracer
 
-from respan_instrumentation_livekit._constants import (
-    LIVEKIT_INSTRUMENTATION_NAME,
+from ._constants import (
     LIVEKIT_RESPAN_PROVIDER_NAME_ATTR,
     LIVEKIT_RESPAN_TOOL_DEFINITIONS_ATTR,
 )
-from respan_instrumentation_livekit._otel_emitter import emit_livekit_tool_span
-from respan_instrumentation_livekit._processor import LiveKitSpanProcessor
-from respan_instrumentation_livekit._serialization import get_value, safe_json
-from respan_instrumentation_livekit._translator import normalize_livekit_tools
+from ._guard import TracerGuard, install_detach
+from ._policy import key, suppressed
+from ._processor import LiveKitSpanProcessor
+from ._serialization import get_value, safe_json
+from ._translator import build_tool_span_attrs, normalize_livekit_tools
 
 logger = logging.getLogger(__name__)
-
-_ORIGINAL_UTILS_EXECUTE_FUNCTION_CALL: Callable[..., Any] | None = None
-_ORIGINAL_EXPORTED_EXECUTE_FUNCTION_CALL: Callable[..., Any] | None = None
-_ORIGINAL_LLM_STREAM_MAIN_TASK: Callable[..., Any] | None = None
-_PATCHED_UTILS_MODULE: Any = None
-_PATCHED_LLM_MODULE: Any = None
-_PATCHED_LLM_STREAM_CLASS: Any = None
-_ACTIVE_INSTANCES = 0
-
-_MODEL_PROVIDER_PREFIXES = (
-    ("claude", "anthropic"),
-    ("gemini", "google"),
-    ("gpt-", "openai"),
-    ("o1", "openai"),
-    ("o3", "openai"),
-    ("o4", "openai"),
-)
+_LOCK = threading.RLock()
+_RUNTIME = None
+_OWNERS = 0
+_STREAM = ContextVar("respan_livekit_native_stream", default=None)
 
 
-def _provider_name_from_llm(llm: Any) -> str | None:
-    module_parts = type(llm).__module__.lower().split(".")
-    try:
-        plugin_index = module_parts.index("plugins")
-        plugin_name = module_parts[plugin_index + 1]
-    except (ValueError, IndexError):
-        plugin_name = ""
-    if plugin_name:
-        return "openai" if plugin_name in {"azure", "azure_openai"} else plugin_name
-
-    model = str(get_value(llm, "model") or "").lower()
-    for prefix, provider_name in _MODEL_PROVIDER_PREFIXES:
-        if model.startswith(prefix):
-            return provider_name
-
-    provider = get_value(llm, "provider")
-    return str(provider).lower() if provider else None
-
-
-def _active_span_processors() -> tuple[Any, tuple[Any, ...] | None]:
-    tracer_provider = trace.get_tracer_provider()
-    active_span_processor = getattr(tracer_provider, "_active_span_processor", None)
-    processors = (
-        getattr(active_span_processor, "_span_processors", None)
-        if active_span_processor is not None
-        else None
-    )
-    return active_span_processor, processors
+def _raw_usage(values):
+    if not isinstance(values, dict):
+        return {}
+    result = {}
+    for target, names in {
+        "input": ("prompt_tokens", "input_tokens"),
+        "output": ("completion_tokens", "output_tokens"),
+        "total": ("total_tokens",),
+        "cache_read": ("prompt_cached_tokens", "cache_read_tokens"),
+        "cache_creation": ("cache_creation_tokens",),
+        "reasoning": ("reasoning_tokens",),
+    }.items():
+        for name in names:
+            v = values.get(name)
+            if type(v) is int and v >= 0:
+                result[target] = v
+                break
+    for name, target, field in [
+        ("prompt_tokens_details", "cache_read", "cached_tokens"),
+        ("completion_tokens_details", "reasoning", "reasoning_tokens"),
+    ]:
+        details = values.get(name)
+        v = details.get(field) if isinstance(details, dict) else None
+        if type(v) is int and v >= 0:
+            result[target] = v
+    return result
 
 
-def _register_processor(processor: LiveKitSpanProcessor) -> None:
-    tracer_provider = trace.get_tracer_provider()
-    active_span_processor, processors = _active_span_processors()
-    if active_span_processor is not None and processors is not None:
-        remaining_processors = tuple(
-            existing for existing in processors if existing is not processor
-        )
-        active_span_processor._span_processors = (processor, *remaining_processors)
-        return
+class Runtime:
+    def __init__(self, provider, capture):
+        self.provider = provider
+        self.capture = capture
+        self.active = True
+        self.hooks = []
+        self.calls = OrderedDict()
+        self.usages = OrderedDict()
+        self.processor = LiveKitSpanProcessor(capture)
+        self.processor.on_drained = self.drained
+        self.tracer = provider.get_tracer("respan.instrumentation.livekit")
+        self.native = None
+        self.previous = None
+        self.installed = None
 
-    if hasattr(tracer_provider, "add_span_processor"):
-        tracer_provider.add_span_processor(processor)
+    def patch(self, owner, name, replacement):
+        original = getattr(owner, name)
+        self.hooks.append((owner, name, original, replacement))
+        setattr(owner, name, replacement)
+        return original
 
-
-def _unregister_processor(processor: LiveKitSpanProcessor) -> None:
-    active_span_processor, processors = _active_span_processors()
-    if active_span_processor is None or processors is None:
-        return
-    active_span_processor._span_processors = tuple(
-        existing for existing in processors if existing is not processor
-    )
-
-
-def _patch_execute_function_call(utils_module: Any, llm_module: Any) -> None:
-    global _ORIGINAL_UTILS_EXECUTE_FUNCTION_CALL
-    global _ORIGINAL_EXPORTED_EXECUTE_FUNCTION_CALL
-    global _PATCHED_UTILS_MODULE
-    global _PATCHED_LLM_MODULE
-
-    if _ORIGINAL_UTILS_EXECUTE_FUNCTION_CALL is not None:
-        return
-
-    original = utils_module.execute_function_call
-    exported_original = getattr(llm_module, "execute_function_call", None)
-
-    @functools.wraps(original)
-    async def wrapped_execute_function_call(*args: Any, **kwargs: Any) -> Any:
-        start_time_ns = time.time_ns()
-        result = await original(*args, **kwargs)
-
-        tool_call = args[0] if args else kwargs.get("tool_call")
-        tool_name = (
-            get_value(get_value(result, "fnc_call"), "name")
-            or get_value(tool_call, "name")
-            or "livekit.tool"
-        )
-        arguments = (
-            get_value(get_value(result, "fnc_call"), "arguments")
-            or get_value(tool_call, "arguments")
-            or {}
-        )
-        call_id = get_value(get_value(result, "fnc_call"), "call_id") or get_value(
-            tool_call, "call_id"
-        )
-        raw_exception = get_value(result, "raw_exception")
-        fnc_call_out = get_value(result, "fnc_call_out")
-        output = get_value(result, "raw_output")
-        if output is None and fnc_call_out is not None:
-            output = get_value(fnc_call_out, "output")
-
-        emit_livekit_tool_span(
-            tool_name=str(tool_name),
-            arguments=arguments,
-            output=output,
-            call_id=str(call_id) if call_id else None,
-            start_time_ns=start_time_ns,
-            error=raw_exception if isinstance(raw_exception, BaseException) else None,
-        )
-        return result
-
-    _ORIGINAL_UTILS_EXECUTE_FUNCTION_CALL = original
-    _ORIGINAL_EXPORTED_EXECUTE_FUNCTION_CALL = exported_original
-    _PATCHED_UTILS_MODULE = utils_module
-    _PATCHED_LLM_MODULE = llm_module
-    utils_module.execute_function_call = wrapped_execute_function_call
-    if exported_original is not None:
-        llm_module.execute_function_call = wrapped_execute_function_call
-
-
-def _restore_execute_function_call() -> None:
-    global _ORIGINAL_UTILS_EXECUTE_FUNCTION_CALL
-    global _ORIGINAL_EXPORTED_EXECUTE_FUNCTION_CALL
-    global _PATCHED_UTILS_MODULE
-    global _PATCHED_LLM_MODULE
-
-    if _PATCHED_UTILS_MODULE is not None and _ORIGINAL_UTILS_EXECUTE_FUNCTION_CALL:
-        _PATCHED_UTILS_MODULE.execute_function_call = (
-            _ORIGINAL_UTILS_EXECUTE_FUNCTION_CALL
-        )
-    if _PATCHED_LLM_MODULE is not None and _ORIGINAL_EXPORTED_EXECUTE_FUNCTION_CALL:
-        _PATCHED_LLM_MODULE.execute_function_call = (
-            _ORIGINAL_EXPORTED_EXECUTE_FUNCTION_CALL
-        )
-
-    _ORIGINAL_UTILS_EXECUTE_FUNCTION_CALL = None
-    _ORIGINAL_EXPORTED_EXECUTE_FUNCTION_CALL = None
-    _PATCHED_UTILS_MODULE = None
-    _PATCHED_LLM_MODULE = None
-
-
-def _patch_llm_stream_main_task(llm_stream_class: Any) -> None:
-    global _ORIGINAL_LLM_STREAM_MAIN_TASK
-    global _PATCHED_LLM_STREAM_CLASS
-
-    if _ORIGINAL_LLM_STREAM_MAIN_TASK is not None:
-        return
-
-    original = llm_stream_class._main_task
-
-    @functools.wraps(original)
-    async def wrapped_main_task(self: Any, *args: Any, **kwargs: Any) -> Any:
-        current_span = trace.get_current_span()
+    def permitted(self, span):
+        if key(span) not in self.processor.policy.open:
+            return False
         try:
-            current_span.set_attribute(SpanAttributes.LLM_IS_STREAMING, True)
-            provider_name = _provider_name_from_llm(getattr(self, "_llm", None))
-            if provider_name:
-                current_span.set_attribute(
-                    LIVEKIT_RESPAN_PROVIDER_NAME_ATTR,
-                    provider_name,
-                )
-        except Exception:
-            logger.debug("Failed to classify LiveKit LLM stream", exc_info=True)
-        tool_definitions = normalize_livekit_tools(getattr(self, "_tools", None))
-        if tool_definitions:
+            result = self.processor.policy.observe(span)
+            self.apply_call_bounds()
+            return result
+        except Exception:  # noqa: BLE001 - telemetry observes without replacing native behavior.
+            self.processor.policy.veto(key(span))
+            return False
+
+    def remember(self, mapping, value, *state):
+        ident = id(value)
+
+        def released(ref):
+            existing = mapping.get(ident)
+            if existing is not None and existing[0] is ref:
+                mapping.pop(ident, None)
+
+        mapping[ident] = (weakref.ref(value, released), *state)
+
+    def apply_call_bounds(self):
+        for ident, state in list(self.calls.items()):
+            if state[3] and not self.processor.policy.bound(state[2]):
+                self.calls[ident] = (*state[:3], False)
+
+    def usage(self, state, values, raw=False):
+        if not state["span"].is_recording():
+            return
+        if raw:
+            state["raw_usage"] = True
+        if raw or not state["raw_usage"]:
+            self.processor.source_usage[key(state["span"])] = _raw_usage(values)
+
+    def observe_chunk(self, state, chunk):
+        span = state["span"]
+        if not span.is_recording():
+            return
+        usage = get_value(chunk, "usage")
+        if usage is not None and not state["raw_usage"]:
+            saved = self.usages.get(id(usage))
+            if saved is not None and saved[0]() is usage:
+                values = saved[1]
+            else:
+                # Coerced DTO values cannot establish original source types.
+                values = {}
+            self.usage(state, values)
+        # Correlate the actual SDK call object, never a globally ambiguous call-id.
+        for call in get_value(get_value(chunk, "delta"), "tool_calls", []) or []:
+            self.remember(
+                self.calls,
+                call,
+                span.get_span_context(),
+                key(span),
+                self.processor.policy.bound(key(span)),
+            )
+        self.permitted(span)
+
+    def restore(self):
+        for owner, name, original, replacement in reversed(self.hooks):
+            if getattr(owner, name, None) is replacement:
+                setattr(owner, name, original)
+        self.hooks.clear()
+        if self.native is not None:
+            owned_inner = next(
+                (owned for name, _, owned in self.installed or () if name == "_tracer"),
+                None,
+            )
+            for name, old, owned in self.installed or ():
+                if (
+                    name == "_tracer_provider"
+                    and owned_inner is not None
+                    and self.native._tracer is not owned_inner
+                ):
+                    continue
+                if getattr(self.native, name, None) is owned:
+                    setattr(self.native, name, old)
+
+    def drained(self):
+        global _RUNTIME
+        self.apply_call_bounds()
+        if self.active:
+            return
+        with self.processor.policy.lock:
+            if any(
+                self.processor.policy.owned(s[0])
+                for s in self.processor.policy.open.values()
+                if s[0] is not None
+            ):
+                return
+        self.restore()
+        _remove_processor(self.provider, self.processor)
+        self.processor.shutdown()
+        self.calls.clear()
+        self.usages.clear()
+        with _LOCK:
+            if _RUNTIME is self:
+                _RUNTIME = None
+
+    def install(self):
+        llm = importlib.import_module("livekit.agents.llm")
+        module = importlib.import_module("livekit.agents.llm.llm")
+        utils = importlib.import_module("livekit.agents.llm.utils")
+        telemetry = importlib.import_module("livekit.agents.telemetry")
+        self.native = telemetry.tracer
+        previous_provider = self.native._tracer_provider
+        previous_tracer = self.native._tracer
+        self.installed = [("_tracer_provider", previous_provider, self.provider)]
+        # Keep the SDK's DynamicTracer and any existing native redaction processor.
+        self.native.set_provider(self.provider)
+        native_inner = self.native._tracer
+        guard = TracerGuard(native_inner, self)
+        self.native._tracer = guard
+        self.installed = [
+            ("_tracer_provider", previous_provider, self.provider),
+            ("_tracer", previous_tracer, guard),
+        ]
+        _add_processor(self.provider, self.processor)
+        install_detach(self)
+        original = llm.LLMStream._main_task
+
+        @wraps(original)
+        async def main(stream, *args, **kwargs):
+            if not self.active:
+                return await original(stream, *args, **kwargs)
+            span = trace.get_current_span()
+            if key(span) not in self.processor.policy.open:
+                return await original(stream, *args, **kwargs)
+            state = {"span": span, "raw_usage": False, "runtime": self}
+            token = _STREAM.set(state)
+            # No usage event is different from a provider-reported zero count.
+            if span.is_recording():
+                self.processor.source_usage[key(span)] = {}
+                module_parts = type(stream._llm).__module__.split(".")
+                if len(module_parts) > 2 and module_parts[:2] == ["livekit", "plugins"]:
+                    span.set_attribute(
+                        LIVEKIT_RESPAN_PROVIDER_NAME_ATTR, module_parts[2]
+                    )
             try:
-                current_span.set_attribute(
-                    LIVEKIT_RESPAN_TOOL_DEFINITIONS_ATTR,
-                    safe_json(tool_definitions),
-                )
-            except Exception:
-                logger.debug("Failed to attach LiveKit tool definitions", exc_info=True)
-        return await original(self, *args, **kwargs)
+                if self.permitted(span):
+                    try:
+                        definitions = normalize_livekit_tools(stream._tools)
+                        if definitions:
+                            span.set_attribute(
+                                LIVEKIT_RESPAN_TOOL_DEFINITIONS_ATTR,
+                                safe_json(definitions, schema=True),
+                            )
+                    except Exception:  # noqa: BLE001 - telemetry observes without replacing native behavior.
+                        self.processor.policy.veto(key(span))
+                source_send = stream._event_ch.send_nowait
 
-    _ORIGINAL_LLM_STREAM_MAIN_TASK = original
-    _PATCHED_LLM_STREAM_CLASS = llm_stream_class
-    llm_stream_class._main_task = wrapped_main_task
+                def send(value):
+                    result = source_send(value)
+                    try:
+                        self.observe_chunk(state, value)
+                    except Exception:  # noqa: BLE001 - telemetry observes without replacing native behavior.
+                        self.processor.policy.veto(key(span))
+                    return result
+
+                stream._event_ch.send_nowait = send
+                try:
+                    return await original(stream, *args, **kwargs)
+                except BaseException as exc:
+                    status = get_value(exc, "status_code")
+                    if (
+                        span.is_recording()
+                        and type(status) is int
+                        and 100 <= status <= 599
+                    ):
+                        span.set_attribute(HTTP_RESPONSE_STATUS_CODE, status)
+                    raise
+                finally:
+                    if stream._event_ch.send_nowait is send:
+                        stream._event_ch.send_nowait = source_send
+                    self.permitted(span)
+            finally:
+                _STREAM.reset(token)
+
+        self.patch(llm.LLMStream, "_main_task", main)
+        if hasattr(llm.LLMStream, "_record_genai_request"):
+            request = llm.LLMStream._record_genai_request
+
+            @wraps(request)
+            def record(stream, span):
+                if (
+                    self.active
+                    and key(span) in self.processor.policy.open
+                    and not self.permitted(span)
+                ):
+                    stream._record_content = False
+                return request(stream, span)
+
+            self.patch(llm.LLMStream, "_record_genai_request", record)
+        if hasattr(module, "_chat_ctx_to_otel_events"):
+            events = module._chat_ctx_to_otel_events
+
+            @wraps(events)
+            def messages(*args, **kwargs):
+                if self.active and not self.permitted(trace.get_current_span()):
+                    return []
+                return events(*args, **kwargs)
+
+            self.patch(module, "_chat_ctx_to_otel_events", messages)
+        original_init = llm.CompletionUsage.__init__
+
+        @wraps(original_init)
+        def usage_init(value, *args, **kwargs):
+            result = original_init(value, *args, **kwargs)
+            try:
+                state = _STREAM.get()
+                if self.active or (state is not None and state["runtime"] is self):
+                    names = {
+                        "prompt_tokens",
+                        "completion_tokens",
+                        "total_tokens",
+                        "prompt_cached_tokens",
+                        "cache_read_tokens",
+                        "cache_creation_tokens",
+                        "reasoning_tokens",
+                    }
+                    self.remember(
+                        self.usages,
+                        value,
+                        {
+                            k: v
+                            for k, v in kwargs.items()
+                            if k in names
+                            and k in type(value).model_fields
+                            and type(v) is int
+                            and v >= 0
+                        },
+                    )
+            except Exception:  # noqa: BLE001 - telemetry observes without replacing native behavior.
+                logger.debug("Skipped source usage observation")
+            return result
+
+        self.patch(llm.CompletionUsage, "__init__", usage_init)
+        event_type = importlib.import_module("openai._streaming").ServerSentEvent
+        event_json = event_type.json
+
+        @wraps(event_json)
+        def parsed(event, *args, **kwargs):
+            result = event_json(event, *args, **kwargs)
+            state = _STREAM.get()
+            if (
+                state is not None
+                and state["runtime"] is self
+                and isinstance(result, dict)
+            ):
+                try:
+                    if ("choices" in result or "usage" in result) and (
+                        not state["raw_usage"] or isinstance(result.get("usage"), dict)
+                    ):
+                        self.usage(state, result.get("usage"), raw=True)
+                except Exception:  # noqa: BLE001 - telemetry observes without replacing native behavior.
+                    state["raw_usage"] = True
+                    if state["span"].is_recording():
+                        self.processor.source_usage[key(state["span"])] = {}
+            return result
+
+        self.patch(event_type, "json", parsed)
+        execute = utils.execute_function_call
+
+        @wraps(execute)
+        async def tool(*args, **kwargs):
+            if not self.active or suppressed():
+                return await execute(*args, **kwargs)
+            call = args[0] if args else kwargs.get("tool_call")
+            parent_context = None
+            saved = self.calls.pop(id(call), None)
+            if saved is not None and saved[0]() is call:
+                parent_context = trace.set_span_in_context(NonRecordingSpan(saved[1]))
+            span = self.tracer.start_span("livekit.tool", context=parent_context)
+            if saved is not None and (
+                not saved[3] or not self.processor.policy.bound(saved[2])
+            ):
+                self.processor.policy.veto(key(span))
+            result = None
+            error = None
+            with trace.use_span(
+                span,
+                end_on_exit=False,
+                record_exception=False,
+                set_status_on_exception=False,
+            ):
+                try:
+                    result = await execute(*args, **kwargs)
+                    candidate = get_value(result, "raw_exception")
+                    error = candidate if isinstance(candidate, BaseException) else None
+                    return result
+                except BaseException as exc:
+                    error = exc
+                    raise
+                finally:
+                    try:
+                        capture = self.permitted(span)
+                        if span.is_recording():
+                            if error is not None:
+                                span.set_attribute(ERROR_TYPE, type(error).__name__)
+                                span.set_status(Status(StatusCode.ERROR))
+                                status = get_value(error, "status_code")
+                                if type(status) is int and 100 <= status <= 599:
+                                    span.set_attribute(
+                                        HTTP_RESPONSE_STATUS_CODE, status
+                                    )
+                            span.set_attributes(
+                                build_tool_span_attrs(
+                                    tool_name=get_value(call, "name"),
+                                    arguments=get_value(call, "arguments"),
+                                    output=get_value(result, "raw_output"),
+                                    call_id=get_value(call, "call_id"),
+                                    capture=capture,
+                                    capture_output=error is None and result is not None,
+                                )
+                            )
+                            self.permitted(span)
+                    except Exception:  # noqa: BLE001 - telemetry observes without replacing native behavior.
+                        self.processor.policy.veto(key(span))
+                    finally:
+                        span.end()
+
+        self.patch(utils, "execute_function_call", tool)
+        if hasattr(llm, "execute_function_call"):
+            self.patch(llm, "execute_function_call", tool)
 
 
-def _restore_llm_stream_main_task() -> None:
-    global _ORIGINAL_LLM_STREAM_MAIN_TASK
-    global _PATCHED_LLM_STREAM_CLASS
+def _add_processor(provider, processor):
+    provider.add_span_processor(processor)
+    active = provider._active_span_processor
+    with active._lock:
+        active._span_processors = (
+            processor,
+            *[p for p in active._span_processors if p is not processor],
+        )
 
-    if _PATCHED_LLM_STREAM_CLASS is not None and _ORIGINAL_LLM_STREAM_MAIN_TASK:
-        _PATCHED_LLM_STREAM_CLASS._main_task = _ORIGINAL_LLM_STREAM_MAIN_TASK
-    _ORIGINAL_LLM_STREAM_MAIN_TASK = None
-    _PATCHED_LLM_STREAM_CLASS = None
+
+def _remove_processor(provider, processor):
+    active = getattr(provider, "_active_span_processor", None)
+    if active is not None:
+        with active._lock:
+            active._span_processors = tuple(
+                p for p in active._span_processors if p is not processor
+            )
 
 
 class LiveKitInstrumentor:
-    """Respan instrumentor for LiveKit Agents."""
+    name = "livekit"
 
-    name = LIVEKIT_INSTRUMENTATION_NAME
-
-    def __init__(self) -> None:
-        self._processor = LiveKitSpanProcessor()
+    def __init__(self, *, capture_content=True):
+        self.capture_content = capture_content
         self._is_instrumented = False
 
-    @staticmethod
-    def _is_respan_tracing_enabled() -> bool:
-        tracer = getattr(RespanTracer, "_instance", None)
-        if tracer is None:
-            return True
-        return bool(getattr(tracer, "is_enabled", True))
+    def activate(self):
+        global _RUNTIME, _OWNERS
+        with _LOCK:
+            if self._is_instrumented:
+                return
+            enabled = getattr(RespanTracer, "_instance", None)
+            if enabled is not None and not getattr(enabled, "is_enabled", True):
+                return
+            provider = trace.get_tracer_provider()
+            if _RUNTIME is not None:
+                if (
+                    _RUNTIME.provider is not provider
+                    or _RUNTIME.capture != self.capture_content
+                ):
+                    raise ValueError(
+                        "Concurrent LiveKit owners must share provider and capture configuration"
+                    )
+                if not _RUNTIME.active:
+                    raise RuntimeError("Prior LiveKit spans are still finishing")
+            else:
+                runtime = Runtime(provider, self.capture_content)
+                try:
+                    runtime.install()
+                except Exception:
+                    runtime.active = False
+                    runtime.restore()
+                    _remove_processor(provider, runtime.processor)
+                    runtime.processor.shutdown()
+                    raise
+                _RUNTIME = runtime
+            _OWNERS += 1
+            self._is_instrumented = True
 
-    def activate(self) -> None:
-        """Register LiveKit span translation and tool execution hooks."""
-        global _ACTIVE_INSTANCES
-
-        if self._is_instrumented:
-            return
-
-        if not self._is_respan_tracing_enabled():
-            logger.info(
-                "LiveKit instrumentation skipped because Respan tracing is disabled"
-            )
-            return
-
-        try:
-            livekit_telemetry = importlib.import_module("livekit.agents.telemetry")
-            livekit_llm = importlib.import_module("livekit.agents.llm")
-            livekit_llm_utils = importlib.import_module("livekit.agents.llm.utils")
-        except ImportError as exc:
-            logger.warning(
-                "Failed to activate LiveKit instrumentation - missing dependency: %s",
-                exc,
-            )
-            return
-
-        set_tracer_provider = getattr(livekit_telemetry, "set_tracer_provider", None)
-        if callable(set_tracer_provider):
-            set_tracer_provider(trace.get_tracer_provider())
-
-        _register_processor(self._processor)
-        _patch_execute_function_call(livekit_llm_utils, livekit_llm)
-        _patch_llm_stream_main_task(livekit_llm.LLMStream)
-
-        _ACTIVE_INSTANCES += 1
-        self._is_instrumented = True
-        logger.info("LiveKit instrumentation activated")
-
-    def deactivate(self) -> None:
-        """Restore LiveKit hooks and remove the span processor."""
-        global _ACTIVE_INSTANCES
-
-        if not self._is_instrumented:
-            return
-
-        _unregister_processor(self._processor)
-        _ACTIVE_INSTANCES = max(0, _ACTIVE_INSTANCES - 1)
-        if _ACTIVE_INSTANCES == 0:
-            _restore_execute_function_call()
-            _restore_llm_stream_main_task()
-
-        self._is_instrumented = False
-        logger.info("LiveKit instrumentation deactivated")
+    def deactivate(self):
+        global _OWNERS
+        with _LOCK:
+            if not self._is_instrumented:
+                return
+            self._is_instrumented = False
+            _OWNERS -= 1
+            if _OWNERS == 0:
+                runtime = _RUNTIME
+                runtime.active = False
+                runtime.drained()
+                # The original runtime remains held by any in-flight hooks.

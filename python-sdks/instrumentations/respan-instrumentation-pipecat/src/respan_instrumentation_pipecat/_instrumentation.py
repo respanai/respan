@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import logging
 import threading
 from typing import Any
 
 from opentelemetry import context as context_api
 from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
 from respan_tracing.core.tracer import RespanTracer
 
 from respan_instrumentation_pipecat._observer_hooks import (
@@ -16,6 +18,7 @@ from respan_instrumentation_pipecat._observer_hooks import (
     install_observer_hook,
     remove_observer_hook,
 )
+from respan_instrumentation_pipecat._runtime import Runtime
 from respan_instrumentation_pipecat._translator import PipecatOpenInferenceTranslator
 
 logger = logging.getLogger(__name__)
@@ -35,6 +38,58 @@ _OBSERVER_MODULE: Any = None
 _OBSERVER_CONTEXT_ORIGINAL: Any = None
 _OBSERVER_HOOK: ObserverHook | None = None
 _CONFIG: dict[str, Any] | None = None
+_RUNTIME = None
+_LEASE = None
+_MISSING = object()
+
+
+def _native_snapshot(upstream):
+    try:
+        cls = importlib.import_module("pipecat.pipeline.worker").PipelineWorker
+        field = "_original_worker_init"
+    except ImportError:
+        cls = importlib.import_module("pipecat.pipeline.task").PipelineTask
+        field = "_original_task_init"
+    fields = {
+        name: getattr(upstream, name, _MISSING)
+        for name in (field, "_tracer", "_config", "_debug_log_filename")
+    }
+    return cls, field, inspect.getattr_static(cls, "__init__"), fields
+
+
+def _restore_native(upstream, lease):
+    if not lease["owned"]:
+        return
+    cls, field, original, fields = lease["before"]
+    _, _, wrapper, installed = lease["installed"]
+    current = inspect.getattr_static(cls, "__init__")
+    foreign = {k: getattr(upstream, k, _MISSING) for k in fields}
+    setattr(upstream, field, original if current is wrapper else current)
+    try:
+        if upstream.is_instrumented_by_opentelemetry:
+            upstream.uninstrument()
+        else:
+            upstream._uninstrument()
+    finally:
+        if inspect.getattr_static(cls, "__init__") is wrapper:
+            cls.__init__ = original
+        for k, before in fields.items():
+            expected = (
+                (original if current is wrapper else current)
+                if k == field
+                else installed[k]
+            )
+            if getattr(upstream, k, _MISSING) is not expected:
+                continue
+            replacement = before if foreign[k] is installed[k] else foreign[k]
+            if replacement is _MISSING:
+                try:
+                    delattr(upstream, k)
+                except AttributeError:
+                    pass
+            else:
+                setattr(upstream, k, replacement)
+        upstream._is_instrumented_by_opentelemetry = False
 
 
 def _load_openinference_pipecat_class() -> type:
@@ -86,6 +141,8 @@ def _same_config(left: dict[str, Any], right: dict[str, Any]) -> bool:
     if left.keys() != right.keys():
         return False
     for key, value in left.items():
+        if key == "provider" and value is not right[key]:
+            return False
         if value is right[key]:
             continue
         try:
@@ -99,7 +156,6 @@ def _same_config(left: dict[str, Any], right: dict[str, Any]) -> bool:
 
 def _patch_observer(observer_module: Any) -> tuple[Any, ObserverHook]:
     original_context = observer_module.Context
-    observer_module.Context = context_api.get_current
     try:
         hook = install_observer_hook(observer_module)
     except Exception:
@@ -127,13 +183,17 @@ class PipecatInstrumentor:
 
     name = PIPECAT_INSTRUMENTATION_NAME
 
-    def __init__(self, **instrumentor_kwargs: Any) -> None:
+    def __init__(
+        self, *, capture_content=True, tracer_provider=None, **instrumentor_kwargs: Any
+    ) -> None:
+        self.capture_content = bool(capture_content)
+        self.provider = tracer_provider
         self._instrumentor_kwargs = dict(instrumentor_kwargs)
         self._is_instrumented = False
 
     def activate(self) -> None:
         """Instrument Pipecat with shared, transactional lifecycle ownership."""
-        global _CONFIG, _OBSERVER_CONTEXT_ORIGINAL, _OBSERVER_HOOK
+        global _CONFIG, _OBSERVER_CONTEXT_ORIGINAL, _OBSERVER_HOOK, _RUNTIME, _LEASE
         global _OBSERVER_MODULE, _PROCESSOR, _PROVIDER, _REFCOUNT, _UPSTREAM
 
         if self._is_instrumented:
@@ -146,14 +206,20 @@ class PipecatInstrumentor:
         with _LOCK:
             if self._is_instrumented:
                 return
+            provider = self.provider or trace.get_tracer_provider()
+            if not isinstance(provider, TracerProvider):
+                logger.warning(
+                    "Pipecat instrumentation requires an initialized OTel SDK TracerProvider"
+                )
+                return
+            config = {
+                "provider": provider,
+                "capture_content": self.capture_content,
+                **self._instrumentor_kwargs,
+            }
             if _REFCOUNT:
-                if _CONFIG is None or not _same_config(
-                    _CONFIG, self._instrumentor_kwargs
-                ):
-                    logger.warning(
-                        "Pipecat instrumentation is already active with different settings"
-                    )
-                    return
+                if _CONFIG is None or not _same_config(_CONFIG, config):
+                    raise ValueError("Pipecat owners must share provider and settings")
                 _REFCOUNT += 1
                 self._is_instrumented = True
                 return
@@ -168,33 +234,64 @@ class PipecatInstrumentor:
                 )
                 return
 
-            provider = trace.get_tracer_provider()
-            processor = PipecatOpenInferenceTranslator()
+            runtime = Runtime(provider, self.capture_content)
+            processor = PipecatOpenInferenceTranslator(runtime)
             upstream = instrumentor_class()
+            if (
+                upstream.is_instrumented_by_opentelemetry
+                and getattr(upstream._tracer, "span_processor", None)
+                is not provider._active_span_processor
+            ):
+                raise ValueError("Foreign Pipecat delegate uses a different provider")
+            before = _native_snapshot(upstream)
+            lease = {
+                "before": before,
+                "installed": before,
+                "owned": not upstream.is_instrumented_by_opentelemetry,
+            }
+            runtime.native_owned = lease["owned"]
             original_context: Any = None
             hook: ObserverHook | None = None
             registered = False
             try:
-                _register_processor(provider, processor)
                 registered = True
+                _register_processor(provider, runtime.policy)
+                _register_processor(provider, processor)
                 original_context, hook = _patch_observer(observer_module)
-                upstream.instrument(
-                    tracer_provider=provider,
-                    **self._instrumentor_kwargs,
-                )
+                try:
+                    if lease["owned"]:
+                        upstream.instrument(
+                            tracer_provider=provider, **self._instrumentor_kwargs
+                        )
+                finally:
+                    lease["installed"] = _native_snapshot(upstream)
+                if lease["owned"] and (
+                    not upstream.is_instrumented_by_opentelemetry
+                    or lease["installed"][2] is lease["before"][2]
+                ):
+                    raise RuntimeError(
+                        "Native Pipecat delegate did not install its SDK hook; pair Pipecat<1.3 with delegate1.x, Pipecat>=1.3 with delegate2.x"
+                    )
+                runtime.install(observer_module)
             except Exception:
                 try:
-                    upstream.uninstrument()
+                    try:
+                        runtime.close()
+                    finally:
+                        _restore_native(upstream, lease)
                 except Exception:
                     logger.exception("Failed to roll back Pipecat instrumentation")
                 if hook is not None or original_context is not None:
                     _restore_observer(observer_module, original_context, hook)
                 if registered:
                     _unregister_processor(provider, processor)
+                    _unregister_processor(provider, runtime.policy)
                 logger.exception("Failed to activate Pipecat instrumentation")
                 return
 
-            _CONFIG = dict(self._instrumentor_kwargs)
+            _CONFIG = config
+            _RUNTIME = runtime
+            _LEASE = lease
             _OBSERVER_CONTEXT_ORIGINAL = original_context
             _OBSERVER_HOOK = hook
             _OBSERVER_MODULE = observer_module
@@ -207,7 +304,7 @@ class PipecatInstrumentor:
 
     def deactivate(self) -> None:
         """Release one owner and remove only the final shared activation."""
-        global _CONFIG, _OBSERVER_CONTEXT_ORIGINAL, _OBSERVER_HOOK
+        global _CONFIG, _OBSERVER_CONTEXT_ORIGINAL, _OBSERVER_HOOK, _RUNTIME, _LEASE
         global _OBSERVER_MODULE, _PROCESSOR, _PROVIDER, _REFCOUNT, _UPSTREAM
 
         if not self._is_instrumented:
@@ -221,11 +318,15 @@ class PipecatInstrumentor:
                 return
             if _UPSTREAM is not None:
                 try:
-                    _UPSTREAM.uninstrument()
+                    try:
+                        _RUNTIME.close()
+                    finally:
+                        _restore_native(_UPSTREAM, _LEASE)
                 except Exception:
                     logger.exception("Failed to deactivate Pipecat instrumentation")
             if _PROCESSOR is not None and _PROVIDER is not None:
                 _unregister_processor(_PROVIDER, _PROCESSOR)
+                _unregister_processor(_PROVIDER, _RUNTIME.policy)
             _restore_observer(
                 _OBSERVER_MODULE,
                 _OBSERVER_CONTEXT_ORIGINAL,
@@ -238,6 +339,8 @@ class PipecatInstrumentor:
             _PROCESSOR = None
             _PROVIDER = None
             _UPSTREAM = None
+            _RUNTIME = None
+            _LEASE = None
             logger.info("Pipecat instrumentation deactivated")
 
     def instrument(self) -> None:

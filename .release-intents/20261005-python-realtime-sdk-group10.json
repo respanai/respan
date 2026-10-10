@@ -1,0 +1,9 @@
+{
+  "summary": "Support current LiveKit, Pipecat, Cursor Python SDK and hook protocol, and Mirascope with canonical source data, native lifecycle preservation and privacy-safe examples",
+  "packages": {
+    "respan-instrumentation-livekit": "minor",
+    "respan-instrumentation-pipecat": "minor",
+    "respan-instrumentation-cursor-sdk": "minor",
+    "respan-instrumentation-mirascope": "minor"
+  }
+}

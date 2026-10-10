@@ -1,16 +1,26 @@
-"""Convert Cursor hook events into canonical Respan OTEL spans."""
+"""Translate version-one Cursor hook observations into canonical spans."""
 
 from __future__ import annotations
 
 import json
-import logging
-import time
+import os
+import re
+import tempfile
+import threading
+from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
+from opentelemetry import trace
+from opentelemetry.semconv._incubating.attributes.error_attributes import ERROR_MESSAGE
+from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import (
+    GEN_AI_TOOL_CALL_ID,
+)
 from opentelemetry.semconv_ai import SpanAttributes
+from opentelemetry.trace import Status, StatusCode
 from respan_sdk.constants.llm_logging import (
     LOG_TYPE_AGENT,
     LOG_TYPE_TASK,
@@ -24,36 +34,19 @@ from respan_sdk.constants.span_attributes import (
     RESPAN_THREADS_ID,
     RESPAN_TRACE_GROUP_ID,
 )
-from respan_sdk.utils.serialization import serialize_value
+from respan_sdk.utils.data_processing.id_processing import ensure_trace_id
 from respan_tracing.utils.span_factory import build_readable_span, inject_span
 
-from ._constants import (
-    CURSOR_CONVERSATION_ID,
-    CURSOR_EVENT_AFTER_AGENT_RESPONSE,
-    CURSOR_EVENT_AFTER_AGENT_THOUGHT,
-    CURSOR_EVENT_AFTER_FILE_EDIT,
-    CURSOR_EVENT_AFTER_MCP_EXECUTION,
-    CURSOR_EVENT_AFTER_SHELL_EXECUTION,
-    CURSOR_EVENT_BEFORE_SUBMIT_PROMPT,
-    CURSOR_EVENT_STOP,
-    CURSOR_GENERATION_ID,
-    CURSOR_HOOK_EVENT_NAME,
-    CURSOR_MODEL,
-    CURSOR_SUPPORTED_EVENTS,
-    CURSOR_VERSION,
-    DEFAULT_CURSOR_STATE_FILE,
-)
+from ._constants import CURSOR_SUPPORTED_EVENTS, DEFAULT_CURSOR_STATE_FILE
+from ._policy import Policy, permitted, span_key, suppressed
+from ._serialization import dumps, safe
 
-logger = logging.getLogger(__name__)
-
-_MAX_ENTITY_OUTPUT_LENGTH = 8_000
-_MAX_METADATA_VALUE_LENGTH = 1_000
+_LOCKS = {}
+_LOCKS_GUARD = threading.Lock()
 
 
 @dataclass(frozen=True)
 class CursorHookResult:
-    """Processing result for one Cursor hook event."""
-
     event_name: str
     emitted: bool
     span_name: str | None = None
@@ -62,554 +55,499 @@ class CursorHookResult:
 
 
 class CursorStateStore:
-    """Small JSON state store used across Cursor hook process invocations."""
+    """Atomic owner-only state with per-file process and thread serialization."""
 
-    def __init__(self, path: str | Path | None = None) -> None:
+    def __init__(self, path=None):
         self.path = Path(path) if path is not None else DEFAULT_CURSOR_STATE_FILE
+        with _LOCKS_GUARD:
+            self.lock = _LOCKS.setdefault(str(self.path.absolute()), threading.RLock())
 
-    def load(self) -> dict[str, Any]:
-        if not self.path.exists():
-            return {}
+    def load(self):
         try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            logger.warning("Failed to read Cursor hook state from %s", self.path)
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            return data if type(data) is dict else {}
+        except (OSError, ValueError):
             return {}
-        return payload if isinstance(payload, dict) else {}
 
-    def save(self, state: Mapping[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps(serialize_value(dict(state)), indent=2, sort_keys=True),
-            encoding="utf-8",
+    def save(self, state):
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd, name = tempfile.mkstemp(prefix=".respan-cursor-", dir=self.path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(state, stream, separators=(",", ":"), allow_nan=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(name, self.path)
+        finally:
+            if os.path.exists(name):
+                os.unlink(name)
+
+    @contextmanager
+    def transaction(self):
+        with self.lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd = os.open(str(self.path) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                if os.name == "posix":
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                elif os.name == "nt":
+                    import msvcrt
+
+                    if os.fstat(fd).st_size == 0:
+                        os.write(fd, b"0")
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+                state = self.load()
+                yield state
+                self.save(state)
+            finally:
+                if os.name == "posix":
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                elif os.name == "nt":
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                os.close(fd)
+
+
+def _string(value):
+    return value if type(value) is str else ""
+
+
+def _event_time(event):
+    value = event.get("timestamp", event.get("time"))
+    try:
+        stamp = (
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if type(value) is str
+            else datetime.now(timezone.utc)
         )
+        return (
+            stamp.replace(tzinfo=stamp.tzinfo or timezone.utc)
+            .astimezone(timezone.utc)
+            .isoformat()
+        )
+    except ValueError:
+        return datetime.now(timezone.utc).isoformat()
+
+
+def _duration(event):
+    value = event.get("duration_ms", event.get("duration"))
+    return (
+        value
+        if type(value) in (int, float) and value >= 0 and value < float("inf")
+        else 0
+    )
+
+
+def _name(value, fallback):
+    value = re.sub(r"[^\w.\-]", "_", _string(value)).strip("_")
+    return value[:80] or fallback
+
+
+def _jsonish(value):
+    if type(value) is str:
+        try:
+            return json.loads(value)
+        except ValueError:
+            return value
+    return value
 
 
 class CursorHookProcessor:
-    """Process Cursor hook JSON payloads and emit Respan spans."""
+    def __init__(self, *, state_path=None, capture_content=True):
+        self._state = CursorStateStore(state_path)
+        self.capture_content = capture_content
+        self._owned_policy = None
+        self._closed = False
+        self._used_state = False
+        self._bounds = {}
 
-    def __init__(self, *, state_path: str | Path | None = None) -> None:
-        self._state = CursorStateStore(path=state_path)
+    def close(self, *, discard_pending=True):
+        self._closed = True
+        if discard_pending and self._used_state and self.state_path.exists():
+            with self._state.transaction() as state:
+                for record in state.values():
+                    if type(record) is dict and not record.get("finished"):
+                        record["allowed"] = False
+                        for key in ("prompt", "responses", "subagents", "attachments"):
+                            record.pop(key, None)
+        if self._owned_policy is not None:
+            self._owned_policy.close()
+            self._owned_policy = None
+        self._bounds.clear()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
 
     @property
-    def state_path(self) -> Path:
+    def state_path(self):
         return self._state.path
 
-    def process_event(self, event: Mapping[str, Any]) -> CursorHookResult:
-        event_name = _string(event.get(CURSOR_HOOK_EVENT_NAME))
-        if not event_name:
-            return CursorHookResult(event_name="", emitted=False)
-        if event_name not in CURSOR_SUPPORTED_EVENTS:
-            logger.debug("Ignoring unsupported Cursor hook event: %s", event_name)
-            return CursorHookResult(event_name=event_name, emitted=False)
+    def process_event(self, event: Mapping[str, Any]):
+        name = _string(event.get("hook_event_name")) if type(event) is dict else ""
+        if self._closed or name not in CURSOR_SUPPORTED_EVENTS:
+            return CursorHookResult(name, False)
+        from ._native import current_policy
 
-        state = self._state.load()
-        if event_name == CURSOR_EVENT_BEFORE_SUBMIT_PROMPT:
-            self._handle_before_submit_prompt(event=event, state=state)
-            return CursorHookResult(event_name=event_name, emitted=False)
-        if event_name == CURSOR_EVENT_STOP:
-            return self._handle_stop(event=event, state=state)
-
-        if event_name == CURSOR_EVENT_AFTER_AGENT_THOUGHT:
-            return self._emit_agent_thought(event=event, state=state)
-        if event_name == CURSOR_EVENT_AFTER_SHELL_EXECUTION:
-            return self._emit_shell_execution(event=event, state=state)
-        if event_name == CURSOR_EVENT_AFTER_FILE_EDIT:
-            return self._emit_file_edit(event=event, state=state)
-        if event_name == CURSOR_EVENT_AFTER_MCP_EXECUTION:
-            return self._emit_mcp_execution(event=event, state=state)
-        if event_name == CURSOR_EVENT_AFTER_AGENT_RESPONSE:
-            return self._emit_agent_response(event=event, state=state)
-
-        return CursorHookResult(event_name=event_name, emitted=False)
-
-    def _handle_before_submit_prompt(
-        self,
-        *,
-        event: Mapping[str, Any],
-        state: dict[str, Any],
-    ) -> None:
-        generation_id = _generation_id(event)
-        attachments = event.get("attachments")
-        state[generation_id] = {
-            "prompt": _string(event.get("prompt")),
-            "attachments_count": (
-                len(attachments) if isinstance(attachments, list) else 0
-            ),
-            "start_time": _event_time(event),
-            "child_count": 0,
-        }
-        self._state.save(state)
-
-    def _handle_stop(
-        self,
-        *,
-        event: Mapping[str, Any],
-        state: dict[str, Any],
-    ) -> CursorHookResult:
-        generation_id = _string(event.get(CURSOR_GENERATION_ID))
-        generation_state = state.get(generation_id)
-        if not generation_id or not isinstance(generation_state, Mapping):
-            return CursorHookResult(event_name=CURSOR_EVENT_STOP, emitted=False)
-
-        stop_status = _string(event.get("status")).strip().lower() or "cancelled"
-        is_cancelled = stop_status in {"aborted", "canceled", "cancelled", "stopped"}
-        user_prompt = _string(generation_state.get("prompt")) or "[No prompt captured]"
-        child_count = generation_state.get("child_count")
-        start_time = _string(generation_state.get("start_time")) or _event_time(event)
-
-        result = self._emit_span(
-            event=event,
-            span_name=f"Cursor generation {_short_id(generation_id)}",
-            span_id=_root_span_id(event),
-            parent_id=None,
-            log_type=LOG_TYPE_AGENT,
-            entity_path="",
-            entity_input=[{"role": "user", "content": user_prompt}],
-            entity_output={"status": stop_status},
-            metadata={
-                "cursor.event": CURSOR_EVENT_STOP,
-                "cursor.stop_status": stop_status,
-                "cursor.child_count": (
-                    child_count if isinstance(child_count, int) else 0
-                ),
-                "cursor.attachments_count": generation_state.get(
-                    "attachments_count", 0
-                ),
-                "cursor.loop_count": event.get("loop_count"),
-            },
-            start_time=start_time,
-            end_time=_event_time(event),
-            status_code=499 if is_cancelled else 200,
-            error_message="Cursor generation cancelled" if is_cancelled else None,
-        )
-
-        if result.emitted:
-            del state[generation_id]
-            self._state.save(state)
-        return result
-
-    def _emit_agent_thought(
-        self,
-        *,
-        event: Mapping[str, Any],
-        state: dict[str, Any],
-    ) -> CursorHookResult:
-        child_index = self._next_child_index(event=event, state=state)
-        text = _string(event.get("text"))
-        duration_ms = _duration_ms(event)
-        end_time = _event_time(event)
-        start_time = _subtract_ms(end_time, duration_ms)
-        span_name = f"Cursor thinking {child_index}"
-        return self._emit_span(
-            event=event,
-            span_name=span_name,
-            span_id=f"{_generation_id(event)}-thinking-{child_index}",
-            parent_id=_root_span_id(event),
-            log_type=LOG_TYPE_TASK,
-            entity_path=f"thinking.{child_index}",
-            entity_input={
-                "type": "reasoning",
-                "index": child_index,
-            },
-            entity_output=text,
-            metadata={
-                "cursor.event": CURSOR_EVENT_AFTER_AGENT_THOUGHT,
-                "cursor.duration_ms": duration_ms,
-                "cursor.index": child_index,
-            },
-            start_time=start_time,
-            end_time=end_time,
-        )
-
-    def _emit_shell_execution(
-        self,
-        *,
-        event: Mapping[str, Any],
-        state: dict[str, Any],
-    ) -> CursorHookResult:
-        child_index = self._next_child_index(event=event, state=state)
-        command = _string(event.get("command"))
-        duration_ms = _duration_ms(event)
-        end_time = _event_time(event)
-        start_time = _subtract_ms(end_time, duration_ms)
-        span_name = _compact_name("Cursor shell", command)
-        return self._emit_span(
-            event=event,
-            span_name=span_name,
-            span_id=f"{_generation_id(event)}-shell-{child_index}",
-            parent_id=_root_span_id(event),
-            log_type=LOG_TYPE_TOOL,
-            entity_path=f"shell.{child_index}",
-            entity_input={"command": command},
-            entity_output=_string(event.get("output")),
-            metadata={
-                "cursor.event": CURSOR_EVENT_AFTER_SHELL_EXECUTION,
-                "cursor.command": _metadata_string(command),
-                "cursor.duration_ms": duration_ms,
-                "cursor.index": child_index,
-            },
-            start_time=start_time,
-            end_time=end_time,
-        )
-
-    def _emit_file_edit(
-        self,
-        *,
-        event: Mapping[str, Any],
-        state: dict[str, Any],
-    ) -> CursorHookResult:
-        child_index = self._next_child_index(event=event, state=state)
-        file_path = _string(event.get("file_path"))
-        edits = event.get("edits")
-        edit_count = len(edits) if isinstance(edits, list) else 0
-        end_time = _event_time(event)
-        start_time = _subtract_ms(end_time, _duration_ms(event, default_ms=100))
-        span_name = _compact_name("Cursor edit", Path(file_path).name or file_path)
-        return self._emit_span(
-            event=event,
-            span_name=span_name,
-            span_id=f"{_generation_id(event)}-file-{child_index}",
-            parent_id=_root_span_id(event),
-            log_type=LOG_TYPE_TOOL,
-            entity_path=f"file_edit.{child_index}",
-            entity_input={
-                "file_path": file_path,
-                "edit_count": edit_count,
-            },
-            entity_output=_format_edits(edits),
-            metadata={
-                "cursor.event": CURSOR_EVENT_AFTER_FILE_EDIT,
-                "cursor.file_path": _metadata_string(file_path),
-                "cursor.edit_count": edit_count,
-                "cursor.index": child_index,
-            },
-            start_time=start_time,
-            end_time=end_time,
-        )
-
-    def _emit_mcp_execution(
-        self,
-        *,
-        event: Mapping[str, Any],
-        state: dict[str, Any],
-    ) -> CursorHookResult:
-        child_index = self._next_child_index(event=event, state=state)
-        tool_name = _string(event.get("tool_name"))
-        duration_ms = _duration_ms(event)
-        end_time = _event_time(event)
-        start_time = _subtract_ms(end_time, duration_ms)
-        span_name = _compact_name("Cursor MCP", tool_name)
-        return self._emit_span(
-            event=event,
-            span_name=span_name,
-            span_id=f"{_generation_id(event)}-mcp-{child_index}",
-            parent_id=_root_span_id(event),
-            log_type=LOG_TYPE_TOOL,
-            entity_path=f"mcp.{child_index}",
-            entity_input=_jsonish(event.get("tool_input")),
-            entity_output=_jsonish(event.get("result_json")),
-            metadata={
-                "cursor.event": CURSOR_EVENT_AFTER_MCP_EXECUTION,
-                "cursor.tool_name": _metadata_string(tool_name),
-                "cursor.duration_ms": duration_ms,
-                "cursor.index": child_index,
-            },
-            start_time=start_time,
-            end_time=end_time,
-        )
-
-    def _emit_agent_response(
-        self,
-        *,
-        event: Mapping[str, Any],
-        state: dict[str, Any],
-    ) -> CursorHookResult:
-        generation_id = _generation_id(event)
-        generation_state = state.get(generation_id)
-        if not isinstance(generation_state, Mapping):
-            generation_state = {}
-
-        user_prompt = _string(generation_state.get("prompt")) or "[No prompt captured]"
-        response_text = _string(event.get("text"))
-        child_count = generation_state.get("child_count")
-        start_time = _string(generation_state.get("start_time")) or _event_time(event)
-        end_time = _event_time(event)
-
-        result = self._emit_span(
-            event=event,
-            span_name=f"Cursor generation {_short_id(generation_id)}",
-            span_id=_root_span_id(event),
-            parent_id=None,
-            log_type=LOG_TYPE_AGENT,
-            entity_path="",
-            entity_input=[{"role": "user", "content": user_prompt}],
-            entity_output=[{"role": "assistant", "content": response_text}],
-            metadata={
-                "cursor.event": CURSOR_EVENT_AFTER_AGENT_RESPONSE,
-                "cursor.child_count": (
-                    child_count if isinstance(child_count, int) else 0
-                ),
-                "cursor.attachments_count": generation_state.get(
-                    "attachments_count", 0
-                ),
-            },
-            start_time=start_time,
-            end_time=end_time,
-        )
-
-        if result.emitted and generation_id in state:
-            del state[generation_id]
-            self._state.save(state)
-
-        return result
-
-    def _next_child_index(
-        self,
-        *,
-        event: Mapping[str, Any],
-        state: dict[str, Any],
-    ) -> int:
-        generation_id = _generation_id(event)
-        generation_state = state.get(generation_id)
-        if not isinstance(generation_state, dict):
-            generation_state = {}
-        child_index = int(generation_state.get("child_count") or 0) + 1
-        generation_state["child_count"] = child_index
-        state[generation_id] = generation_state
-        self._state.save(state)
-        return child_index
-
-    def _emit_span(
-        self,
-        *,
-        event: Mapping[str, Any],
-        span_name: str,
-        span_id: str,
-        parent_id: str | None,
-        log_type: str,
-        entity_path: str,
-        entity_input: Any,
-        entity_output: Any,
-        metadata: Mapping[str, Any],
-        start_time: str,
-        end_time: str,
-        status_code: int = 200,
-        error_message: str | None = None,
-    ) -> CursorHookResult:
-        trace_id = _trace_id(event)
-        attrs = _base_attributes(
-            event=event,
-            log_type=log_type,
-            entity_name=span_name,
-            entity_path=entity_path,
-            entity_input=entity_input,
-            entity_output=entity_output,
-            metadata=metadata,
-        )
-        if status_code >= 400:
-            attrs["status_code"] = status_code
-        if error_message:
-            attrs["error.message"] = error_message
-        span = build_readable_span(
-            name=span_name,
-            trace_id=trace_id,
-            span_id=span_id,
-            parent_id=parent_id,
-            start_time_iso=start_time,
-            end_time_iso=end_time,
-            attributes=attrs,
-            status_code=status_code,
-            error_message=error_message,
-        )
-        emitted = inject_span(span=span)
-        return CursorHookResult(
-            event_name=_string(event.get(CURSOR_HOOK_EVENT_NAME)),
-            emitted=bool(emitted),
-            span_name=span_name,
-            trace_id=trace_id,
-            span_id=span_id,
-        )
-
-
-def _base_attributes(
-    *,
-    event: Mapping[str, Any],
-    log_type: str,
-    entity_name: str,
-    entity_path: str,
-    entity_input: Any,
-    entity_output: Any,
-    metadata: Mapping[str, Any],
-) -> dict[str, Any]:
-    conversation_id = _conversation_id(event)
-    workflow_name = _workflow_name(event)
-    attrs: dict[str, Any] = {
-        RESPAN_LOG_METHOD: LogMethodChoices.TRACING_INTEGRATION.value,
-        RESPAN_LOG_TYPE: log_type,
-        RESPAN_THREADS_ID: f"cursor_{conversation_id}",
-        RESPAN_TRACE_GROUP_ID: workflow_name,
-        SpanAttributes.TRACELOOP_WORKFLOW_NAME: workflow_name,
-        SpanAttributes.TRACELOOP_ENTITY_NAME: entity_name,
-        SpanAttributes.TRACELOOP_ENTITY_PATH: entity_path,
-        SpanAttributes.TRACELOOP_ENTITY_INPUT: _json_string(entity_input),
-        SpanAttributes.TRACELOOP_ENTITY_OUTPUT: _json_string(entity_output),
-    }
-
-    common_metadata = {
-        "cursor.conversation_id": conversation_id,
-        "cursor.generation_id": _generation_id(event),
-        "cursor.model": _string(event.get(CURSOR_MODEL)),
-        "cursor.version": _string(event.get(CURSOR_VERSION)),
-    }
-    for key, value in {**common_metadata, **metadata}.items():
-        if value in (None, ""):
-            continue
-        attrs[f"{RESPAN_METADATA}.{key}"] = _metadata_value(value)
-
-    return attrs
-
-
-def _format_edits(edits: Any) -> list[dict[str, Any]] | str:
-    if not isinstance(edits, list):
-        return "No edits"
-
-    formatted: list[dict[str, Any]] = []
-    for index, edit in enumerate(edits, start=1):
-        if isinstance(edit, Mapping):
-            formatted.append(
+        policy = current_policy()
+        if policy is None:
+            if self._owned_policy is None:
+                provider = trace.get_tracer_provider()
+                if not hasattr(provider, "add_span_processor"):
+                    return CursorHookResult(name, False)
+                self._owned_policy = Policy()
+                provider.add_span_processor(self._owned_policy)
+            policy = self._owned_policy
+        parent_span = trace.get_current_span()
+        parent = span_key(parent_span)
+        if not permitted():
+            policy.deny(parent)
+        allowed = self.capture_content and permitted() and policy.enroll(parent_span)
+        sampled = not suppressed()
+        if name in (
+            "workspaceOpen",
+            "sessionStart",
+            "sessionEnd",
+            "beforeTabFileRead",
+            "afterTabFileEdit",
+        ):
+            if not sampled or not self._sampled(None):
+                return CursorHookResult(name, False)
+            data = (
                 {
-                    "index": index,
-                    "start_line": edit.get("startLine")
-                    or _nested_get(edit, ("start", "line")),
-                    "end_line": edit.get("endLine")
-                    or _nested_get(edit, ("end", "line")),
-                    "old": _truncate(
-                        _string(edit.get("oldText") or edit.get("old")), 500
+                    k: event[k]
+                    for k in (
+                        "session_id",
+                        "reason",
+                        "duration_ms",
+                        "is_background_agent",
+                        "composer_mode",
+                        "final_status",
+                        "workspace_roots",
+                        "file_path",
+                        "content",
+                        "edits",
+                    )
+                    if k in event
+                }
+                if allowed
+                else None
+            )
+            return self._emit(
+                event,
+                _name(name, "hook"),
+                LOG_TYPE_TOOL if name == "afterTabFileEdit" else LOG_TYPE_TASK,
+                None,
+                None,
+                None,
+                data,
+                None,
+                allowed,
+                error=_string(event.get("error_message"))
+                if name == "sessionEnd" and event.get("reason") == "error"
+                else None,
+            )
+        conversation = _string(event.get("conversation_id"))
+        generation = _string(event.get("generation_id"))
+        if not conversation or not generation:
+            return CursorHookResult(name, False)
+        key = json.dumps([conversation, generation], separators=(",", ":"))
+        trace_id = f"cursor:{conversation}:{generation}"
+        root_id = f"{conversation}:{generation}:root"
+        self._used_state = True
+        with self._state.transaction() as state:
+            record = state.get(key)
+            if type(record) is not dict:
+                record = {
+                    "start_time": _event_time(event),
+                    "allowed": allowed,
+                    "sampled": self._sampled(trace_id) and sampled,
+                    "parent": list(parent) if parent else None,
+                    "child_count": 0,
+                    "responses": [],
+                }
+                state[key] = record
+            original_parent = tuple(record["parent"]) if record.get("parent") else None
+            bound = self._bounds.setdefault(key, policy.watch(original_parent))
+            record["allowed"] = bool(
+                record.get("allowed")
+                and allowed
+                and bound.allowed
+                and (policy is None or policy.ancestors(original_parent))
+            )
+            record["sampled"] = bool(record.get("sampled") and sampled)
+            capture = record["allowed"] and record["sampled"]
+            if not capture:
+                for field in ("prompt", "responses", "subagents"):
+                    record.pop(field, None)
+            if record.get("finished"):
+                return CursorHookResult(name, False)
+            if name == "beforeSubmitPrompt":
+                if capture:
+                    record["prompt"] = safe(event.get("prompt"))
+                    record["attachments"] = safe(event.get("attachments"))
+                return CursorHookResult(name, False)
+            if name == "stop":
+                status = _string(event.get("status"))
+                result = self._emit(
+                    event,
+                    "agent",
+                    LOG_TYPE_AGENT,
+                    trace_id,
+                    root_id,
+                    None,
+                    {
+                        "prompt": record.get("prompt"),
+                        "attachments": record.get("attachments"),
+                    },
+                    record.get("responses") or None,
+                    capture,
+                    start=record["start_time"],
+                    error=_string(event.get("error_message")) or status
+                    if status
+                    in ("error", "aborted", "cancelled", "canceled", "stopped")
+                    else None,
+                    metadata={
+                        "cursor.stop_status": status,
+                        "cursor.child_count": record["child_count"],
+                        "cursor.loop_count": event.get("loop_count"),
+                    },
+                    emit=record["sampled"],
+                )
+                if result.emitted or not record["sampled"]:
+                    state[key] = {
+                        "finished": True,
+                        "allowed": record["allowed"],
+                        "sampled": record["sampled"],
+                    }
+                    self._bounds.pop(key, None)
+                self._bound(state)
+                return result
+            record["child_count"] += 1
+            span_id = f"{root_id}:event:{record['child_count']}"
+            metadata = {"cursor.index": record["child_count"]}
+            if name == "afterAgentResponse":
+                output = event.get("text")
+                if capture:
+                    record.setdefault("responses", []).append(safe(output))
+                return self._emit(
+                    event,
+                    "response",
+                    LOG_TYPE_TASK,
+                    trace_id,
+                    span_id,
+                    root_id,
+                    None,
+                    output,
+                    capture,
+                    metadata=metadata,
+                    emit=record["sampled"],
+                )
+            if name == "afterAgentThought":
+                entity, output, kind = None, event.get("text"), LOG_TYPE_TASK
+                label = "reasoning"
+            elif name == "afterShellExecution":
+                entity, output, kind = (
+                    {"command": event.get("command")},
+                    event.get("output"),
+                    LOG_TYPE_TOOL,
+                )
+                label = "Shell"
+            elif name == "afterFileEdit":
+                entity, output, kind = (
+                    {"file_path": event.get("file_path")},
+                    event.get("edits"),
+                    LOG_TYPE_TOOL,
+                )
+                label = "Write"
+            elif name in ("afterMCPExecution", "postToolUse", "postToolUseFailure"):
+                entity = _jsonish(event.get("tool_input"))
+                output = _jsonish(
+                    event.get(
+                        "result_json" if name == "afterMCPExecution" else "tool_output"
+                    )
+                )
+                kind, label = LOG_TYPE_TOOL, _name(event.get("tool_name"), "tool")
+                metadata["cursor.failure_type"] = (
+                    event.get("failure_type") if name == "postToolUseFailure" else None
+                )
+            elif name == "subagentStart":
+                subkey = _string(event.get("subagent_id")) or _string(
+                    event.get("subagent_type")
+                )
+                record.setdefault("subagents", {})[subkey] = {
+                    "span_id": span_id,
+                    "start": _event_time(event),
+                    "input": safe(event.get("task")) if capture else None,
+                    "tool_call_id": _string(event.get("tool_call_id")),
+                }
+                return CursorHookResult(name, False)
+            elif name == "subagentStop":
+                subkey = _string(event.get("subagent_id")) or _string(
+                    event.get("subagent_type")
+                )
+                sub = record.get("subagents", {}).pop(subkey, {})
+                return self._emit(
+                    event,
+                    _name(event.get("subagent_type"), "subagent"),
+                    LOG_TYPE_AGENT,
+                    trace_id,
+                    sub.get("span_id", span_id),
+                    root_id,
+                    sub.get("input"),
+                    event.get("summary"),
+                    capture,
+                    start=sub.get("start"),
+                    error=_string(event.get("error_message"))
+                    or _string(event.get("status"))
+                    if event.get("status") in ("error", "aborted")
+                    else None,
+                    call_id=sub.get("tool_call_id"),
+                    metadata=metadata,
+                    emit=record["sampled"],
+                )
+            else:
+                fields = {
+                    "preToolUse": ("tool_name", "tool_input"),
+                    "beforeShellExecution": ("command", "cwd"),
+                    "beforeMCPExecution": (
+                        "tool_name",
+                        "tool_input",
+                        "mcp_server_name",
                     ),
-                    "new": _truncate(
-                        _string(edit.get("newText") or edit.get("new")), 500
+                    "beforeReadFile": ("file_path", "content", "attachments"),
+                    "preCompact": (
+                        "trigger",
+                        "context_usage_percent",
+                        "context_tokens",
+                        "context_window_size",
+                        "message_count",
+                        "messages_to_compact",
+                        "is_first_compaction",
                     ),
                 }
+                entity = (
+                    {k: event[k] for k in fields.get(name, ()) if k in event}
+                    if capture
+                    else None
+                )
+                output, kind, label = None, LOG_TYPE_TASK, name
+            result = self._emit(
+                event,
+                label,
+                kind,
+                trace_id,
+                span_id,
+                root_id,
+                entity,
+                output,
+                capture,
+                error=_string(event.get("error_message"))
+                or _string(event.get("failure_type"))
+                if name == "postToolUseFailure"
+                else None,
+                call_id=_string(event.get("tool_use_id")),
+                metadata=metadata,
+                emit=record["sampled"],
             )
-        else:
-            formatted.append({"index": index, "value": _truncate(str(edit), 500)})
-    return formatted
+            self._bound(state)
+            return result
 
+    @staticmethod
+    def _bound(state):
+        if len(state) > 1024:
+            for key in list(state):
+                if type(state[key]) is dict and state[key].get("finished"):
+                    del state[key]
+                    if len(state) <= 1024:
+                        break
 
-def _conversation_id(event: Mapping[str, Any]) -> str:
-    return _string(event.get(CURSOR_CONVERSATION_ID)) or "unknown"
+    @staticmethod
+    def _sampled(trace_id):
+        provider = trace.get_tracer_provider()
+        sampler = getattr(provider, "sampler", None)
+        if sampler is None:
+            return False
+        try:
+            return sampler.should_sample(
+                None, ensure_trace_id(trace_id), "agent", attributes={}
+            ).decision.is_sampled()
+        except Exception:  # noqa: BLE001 - Fail closed for custom sampler faults.
+            return False
 
-
-def _generation_id(event: Mapping[str, Any]) -> str:
-    return _string(event.get(CURSOR_GENERATION_ID)) or "unknown"
-
-
-def _trace_id(event: Mapping[str, Any]) -> str:
-    return f"cursor:{_conversation_id(event)}:{_generation_id(event)}"
-
-
-def _root_span_id(event: Mapping[str, Any]) -> str:
-    return f"{_generation_id(event)}-root"
-
-
-def _workflow_name(event: Mapping[str, Any]) -> str:
-    return f"cursor_{_conversation_id(event)}"
-
-
-def _event_time(event: Mapping[str, Any]) -> str:
-    timestamp = event.get("timestamp") or event.get("time")
-    if isinstance(timestamp, str) and timestamp:
-        return timestamp
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _subtract_ms(timestamp: str, duration_ms: int) -> str:
-    try:
-        normalized = timestamp.replace("Z", "+00:00")
-        end_time = datetime.fromisoformat(normalized)
-    except ValueError:
-        end_time = datetime.now(timezone.utc)
-    start_time = end_time - timedelta(milliseconds=max(duration_ms, 0))
-    return start_time.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _duration_ms(event: Mapping[str, Any], *, default_ms: int = 100) -> int:
-    raw_value = event.get("duration_ms")
-    if raw_value is None:
-        raw_value = event.get("duration")
-    if isinstance(raw_value, int | float):
-        if raw_value < 0:
-            return default_ms
-        return int(raw_value)
-    return default_ms
-
-
-def _json_string(value: Any) -> str:
-    if isinstance(value, str):
-        return _truncate(value, _MAX_ENTITY_OUTPUT_LENGTH)
-    return json.dumps(serialize_value(value), default=str)
-
-
-def _jsonish(value: Any) -> Any:
-    if not isinstance(value, str):
-        return value
-    stripped = value.strip()
-    if not stripped:
-        return ""
-    if stripped[:1] not in {"{", "["}:
-        return stripped
-    try:
-        return json.loads(stripped)
-    except json.JSONDecodeError:
-        return stripped
-
-
-def _metadata_value(value: Any) -> str | int | float | bool:
-    if isinstance(value, bool | int | float):
-        return value
-    return _metadata_string(str(value))
-
-
-def _metadata_string(value: str) -> str:
-    return _truncate(value, _MAX_METADATA_VALUE_LENGTH)
-
-
-def _string(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    return str(value)
-
-
-def _truncate(value: str, limit: int) -> str:
-    if len(value) <= limit:
-        return value
-    return f"{value[: limit - 3]}..."
-
-
-def _short_id(value: str) -> str:
-    return value if len(value) <= 24 else f"{value[:21]}..."
-
-
-def _compact_name(prefix: str, value: str) -> str:
-    value = value.strip()
-    if not value:
-        return prefix
-    return f"{prefix}: {_truncate(value, 64)}"
-
-
-def _nested_get(payload: Mapping[str, Any], path: tuple[str, ...]) -> Any:
-    cursor: Any = payload
-    for part in path:
-        if not isinstance(cursor, Mapping):
-            return None
-        cursor = cursor.get(part)
-    return cursor
-
-
-def monotonic_ns() -> int:
-    """Expose monotonic time for tests without making it part of the API."""
-
-    return time.monotonic_ns()
+    def _emit(
+        self,
+        event,
+        name,
+        kind,
+        trace_id,
+        span_id,
+        parent,
+        entity_input,
+        entity_output,
+        allowed,
+        *,
+        start=None,
+        error=None,
+        call_id=None,
+        metadata=None,
+        emit=True,
+    ):
+        event_name = _string(event.get("hook_event_name"))
+        if not emit:
+            return CursorHookResult(event_name, False)
+        attrs = {
+            RESPAN_LOG_METHOD: LogMethodChoices.TRACING_INTEGRATION.value,
+            RESPAN_LOG_TYPE: kind,
+            SpanAttributes.TRACELOOP_ENTITY_NAME: name,
+            SpanAttributes.TRACELOOP_ENTITY_PATH: "" if parent is None else name,
+            SpanAttributes.TRACELOOP_WORKFLOW_NAME: "cursor-sdk",
+        }
+        if _string(event.get("conversation_id")):
+            attrs[RESPAN_THREADS_ID] = "cursor_" + event["conversation_id"]
+            attrs[RESPAN_TRACE_GROUP_ID] = "cursor_" + event["conversation_id"]
+        meta = {
+            k: v
+            for k, v in {
+                "cursor.event": event_name,
+                "cursor.version": event.get("cursor_version"),
+                "cursor.model_id": event.get("model_id", event.get("model")),
+                **(metadata or {}),
+            }.items()
+            if v is not None and v != "" and type(v) in (str, int, float, bool)
+        }
+        attrs[RESPAN_METADATA] = dumps(meta)
+        attrs.update({f"{RESPAN_METADATA}.{k}": v for k, v in safe(meta).items()})
+        if kind == LOG_TYPE_TOOL and call_id:
+            attrs[GEN_AI_TOOL_CALL_ID] = call_id
+        if allowed and permitted():
+            if entity_input is not None:
+                attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = dumps(entity_input)
+            if entity_output is not None and error is None:
+                attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = dumps(entity_output)
+            if error:
+                attrs[ERROR_MESSAGE] = safe(error)
+        end = _event_time(event)
+        if start is None:
+            start = (
+                datetime.fromisoformat(end) - timedelta(milliseconds=_duration(event))
+            ).isoformat()
+        span = build_readable_span(
+            name=name if kind != LOG_TYPE_TOOL else "tool." + name,
+            trace_id=trace_id,
+            span_id=span_id,
+            parent_id=parent,
+            start_time_iso=start,
+            end_time_iso=end,
+            attributes=attrs,
+            merge_propagated=True,
+        )
+        if error:
+            span._status = Status(StatusCode.ERROR, safe(error) if allowed else None)
+        emitted = inject_span(span=span)
+        return CursorHookResult(event_name, bool(emitted), name, trace_id, span_id)

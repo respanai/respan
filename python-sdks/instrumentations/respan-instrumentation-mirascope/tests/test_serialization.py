@@ -45,7 +45,7 @@ def test_serialization_does_not_stringify_arbitrary_mapping_keys() -> None:
 
     assert SecretKey.stringify_calls == 0
     assert "key-secret" not in encoded
-    assert json.loads(encoded) == {"<SecretKey>": "safe"}
+    assert json.loads(encoded) == {}
 
 
 def test_serialization_redacts_secrets_embedded_in_direct_text() -> None:
@@ -82,3 +82,19 @@ def test_serialization_reads_only_the_bounded_mapping_prefix() -> None:
 
     assert value.iterated == 50
     assert len(json.loads(encoded)) == 50
+
+
+def test_escaped_quoted_auth_arguments_remain_json_and_idempotent():
+    from respan_instrumentation_mirascope._serialization import safe_text
+
+    original = json.dumps(
+        {
+            "token": 'Bearer fixture-token\\" quoted suffix',
+            "api_key": 'secret with spaces "quoted"',
+        }
+    )
+    redacted = safe_text(original, complete=True)
+    assert json.loads(redacted)
+    assert "fixture-token" not in redacted and "secret with spaces" not in redacted
+    assert safe_text(redacted, complete=True) == redacted
+    assert "fixture-token" in original

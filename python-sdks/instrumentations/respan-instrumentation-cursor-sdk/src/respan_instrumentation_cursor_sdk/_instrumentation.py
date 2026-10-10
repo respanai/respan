@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from . import _native
 from ._processor import CursorHookProcessor
 
 
@@ -19,16 +20,27 @@ class CursorSDKInstrumentor:
 
     name = "cursor-sdk"
 
-    def __init__(self, *, state_path: str | Path | None = None) -> None:
+    def __init__(
+        self, *, state_path: str | Path | None = None, capture_content: bool = True
+    ) -> None:
         self._state_path = Path(state_path) if state_path is not None else None
         self._processor: CursorHookProcessor | None = None
         self._is_instrumented = False
+        self._capture_content = capture_content
 
     def activate(self) -> None:
-        self._processor = CursorHookProcessor(state_path=self._state_path)
+        if self._is_instrumented:
+            return
+        _native.activate(self, self._capture_content)
+        self._processor = CursorHookProcessor(
+            state_path=self._state_path, capture_content=self._capture_content
+        )
         self._is_instrumented = True
 
     def deactivate(self) -> None:
+        _native.deactivate(self)
+        if self._processor is not None:
+            self._processor.close()
         self._processor = None
         self._is_instrumented = False
 
@@ -46,5 +58,8 @@ class CursorSDKInstrumentor:
     def create_processor(
         *,
         state_path: str | Path | None = None,
+        capture_content: bool = True,
     ) -> CursorHookProcessor:
-        return CursorHookProcessor(state_path=state_path)
+        return CursorHookProcessor(
+            state_path=state_path, capture_content=capture_content
+        )

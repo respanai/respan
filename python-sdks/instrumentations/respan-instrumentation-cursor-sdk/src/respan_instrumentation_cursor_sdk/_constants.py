@@ -27,6 +27,20 @@ CURSOR_SUPPORTED_EVENTS = frozenset(
         CURSOR_EVENT_AFTER_MCP_EXECUTION,
         CURSOR_EVENT_AFTER_AGENT_RESPONSE,
         CURSOR_EVENT_STOP,
+        "sessionStart",
+        "sessionEnd",
+        "preToolUse",
+        "postToolUse",
+        "postToolUseFailure",
+        "subagentStart",
+        "subagentStop",
+        "beforeShellExecution",
+        "beforeMCPExecution",
+        "beforeReadFile",
+        "beforeTabFileRead",
+        "afterTabFileEdit",
+        "preCompact",
+        "workspaceOpen",
     }
 )
 

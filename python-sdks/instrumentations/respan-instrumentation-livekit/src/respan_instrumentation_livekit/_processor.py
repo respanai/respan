@@ -1,157 +1,142 @@
-"""Span processor that normalizes LiveKit native LLM spans."""
+"""Normalize owned native LiveKit spans before downstream exporters."""
 
 from __future__ import annotations
 
-import json
-from typing import Any
+from livekit.agents.telemetry import trace_types
+from opentelemetry import trace
+from opentelemetry.sdk.trace import SpanProcessor
+from opentelemetry.semconv._incubating.attributes import gen_ai_attributes as GenAI
+from opentelemetry.semconv._incubating.attributes.error_attributes import ERROR_MESSAGE
+from opentelemetry.semconv_ai import SpanAttributes as AI
+from opentelemetry.trace import Status, StatusCode
+from respan_sdk.constants.llm_logging import LogMethodChoices
+from respan_sdk.constants.span_attributes import RESPAN_LOG_METHOD, RESPAN_LOG_TYPE
 
-from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor
-from opentelemetry.semconv_ai import SpanAttributes
-from respan_sdk.constants.llm_logging import LOG_TYPE_TASK
-from respan_sdk.constants.span_attributes import (
-    RESPAN_LOG_TYPE,
-    RESPAN_SPAN_CUSTOM_ID,
-    RESPAN_TRACE_GROUP_ID,
-)
-from respan_sdk.utils.data_processing.id_processing import (
-    format_span_id,
-    format_trace_id,
-)
-from respan_tracing.utils.preprocessing.span_processing import is_processable_span
-
-from respan_instrumentation_livekit._constants import (
-    ATTR_LLM_METRICS,
-    LIVEKIT_RESPAN_PROVIDER_NAME_ATTR,
-    LIVEKIT_RESPAN_TOOL_DEFINITIONS_ATTR,
-    LIVEKIT_SCOPE_NAME,
-)
-from respan_instrumentation_livekit._otel_emitter import (
-    register_livekit_tool_parent_context,
-)
-from respan_instrumentation_livekit._translator import (
+from ._policy import CapturePolicy, key, private_attributes
+from ._serialization import text
+from ._translator import (
     build_livekit_llm_attrs,
+    build_native_tool_attrs,
     is_livekit_llm_span,
+    usage_attributes,
 )
-
-
-def _mutable_attrs(span: ReadableSpan) -> dict[str, Any] | None:
-    attrs = getattr(span, "_attributes", None)
-    if attrs is None:
-        return None
-    return dict(attrs)
-
-
-def _span_context_ids(span: ReadableSpan) -> tuple[str | None, str | None]:
-    context = getattr(span, "context", None)
-    if context is None and hasattr(span, "get_span_context"):
-        context = span.get_span_context()
-    trace_id = getattr(context, "trace_id", 0) or 0
-    span_id = getattr(context, "span_id", 0) or 0
-    if trace_id == 0 or span_id == 0:
-        return None, None
-    return format_trace_id(trace_id=trace_id), format_span_id(span_id=span_id)
-
-
-def _tool_call_ids(attrs: dict[str, Any]) -> list[str]:
-    value = attrs.get(f"{SpanAttributes.LLM_COMPLETIONS}.0.tool_calls")
-    if not value:
-        return []
-    try:
-        parsed = json.loads(value) if isinstance(value, str) else value
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(parsed, list):
-        return []
-
-    call_ids: list[str] = []
-    for tool_call in parsed:
-        if not isinstance(tool_call, dict):
-            continue
-        call_id = tool_call.get("id") or tool_call.get("call_id")
-        if call_id:
-            call_ids.append(str(call_id))
-    return call_ids
-
-
-def _register_tool_parent_contexts(span: ReadableSpan, attrs: dict[str, Any]) -> None:
-    trace_id, parent_id = _span_context_ids(span)
-    if not trace_id or not parent_id:
-        return
-    custom_identifier = attrs.get(RESPAN_SPAN_CUSTOM_ID)
-    for call_id in _tool_call_ids(attrs):
-        register_livekit_tool_parent_context(
-            call_id=call_id,
-            trace_id=trace_id,
-            parent_id=parent_id,
-            custom_identifier=str(custom_identifier) if custom_identifier else None,
-        )
-
-
-def _workflow_span_name(attrs: dict[str, Any]) -> str | None:
-    workflow_name = attrs.get(RESPAN_TRACE_GROUP_ID) or attrs.get(
-        SpanAttributes.TRACELOOP_WORKFLOW_NAME
-    )
-    return str(workflow_name) if workflow_name else None
-
-
-def _rename_span_to_workflow(span: ReadableSpan, attrs: dict[str, Any]) -> None:
-    workflow_span_name = _workflow_span_name(attrs)
-    if workflow_span_name:
-        span._name = workflow_span_name
-
-
-def _scope_name(span: ReadableSpan) -> str | None:
-    scope = getattr(span, "instrumentation_scope", None)
-    return getattr(scope, "name", None)
-
-
-def _mark_framework_span_exportable(span: ReadableSpan, attrs: dict[str, Any]) -> None:
-    """Keep LiveKit's non-GenAI spans (``job_entrypoint``, ``user_turn``,
-    ``llm_node``, ``tts_node``, ...) from being dropped as auto-instrumentation
-    noise. Without them the exported LLM spans lose their parents and the
-    trace loses its root."""
-    if is_processable_span(span):
-        return
-    attrs[RESPAN_LOG_TYPE] = LOG_TYPE_TASK
-    span._attributes = attrs
 
 
 class LiveKitSpanProcessor(SpanProcessor):
-    """Translate LiveKit ``llm_request`` spans before Respan export."""
+    def __init__(self, capture_content=True):
+        self.policy = CapturePolicy(capture_content)
+        self.active = True
+        self.on_drained = None
+        self.source_usage = {}
 
-    def on_start(self, span: Any, parent_context: Any = None) -> None:
-        return None
+    def on_start(self, span, parent_context=None):
+        if self.active:
+            try:
+                self.policy.start(span, parent_context)
+            except Exception:  # noqa: BLE001 - privacy observation cannot replace native span creation.
+                self.policy.open[key(span)] = [
+                    span,
+                    False,
+                    key(trace.get_current_span(parent_context)),
+                ]
 
-    def on_end(self, span: ReadableSpan) -> None:
-        attrs = _mutable_attrs(span)
-        if attrs is None:
+    def on_end(self, span):
+        if key(span) not in self.policy.open:
             return
-        scope_name = _scope_name(span)
-        if (
-            scope_name not in (None, LIVEKIT_SCOPE_NAME)
-            and ATTR_LLM_METRICS not in attrs
-            and LIVEKIT_RESPAN_TOOL_DEFINITIONS_ATTR not in attrs
-        ):
+        source_usage = self.source_usage.pop(key(span), {})
+        try:
+            capture = self.policy.end(span)
+        except Exception:  # noqa: BLE001 - callbacks cannot replace native values/errors.
+            state = self.policy.open.pop(key(span), [None, False, None])
+            state[0] = None
+            state[1] = False
+            self.policy.closed[key(span)] = state
+            capture = False
+        if not self.policy.owned(span):
             return
-        if not is_livekit_llm_span(span_name=span.name, attrs=attrs):
-            if scope_name == LIVEKIT_SCOPE_NAME:
-                _mark_framework_span_exportable(span=span, attrs=attrs)
-            return
+        try:
+            original = dict(span.attributes or {})
+            attrs = dict(original)
+            if is_livekit_llm_span(span.name, attrs):
+                translated = build_livekit_llm_attrs(
+                    span_name=span.name,
+                    attrs=attrs,
+                    events=span.events,
+                    capture=capture,
+                    source_usage=source_usage,
+                )
+                for k in list(attrs):
+                    if k.startswith(("gen_ai.usage.", "llm.usage.")):
+                        attrs.pop(k, None)
+                attrs.update(translated)
+            elif (
+                span.name == "function_tool"
+                and getattr(span.instrumentation_scope, "name", None)
+                == "livekit-agents"
+            ):
+                attrs.update(build_native_tool_attrs(original, capture=capture))
+                if original.get(trace_types.ATTR_FUNCTION_TOOL_IS_ERROR) is True:
+                    span._status = Status(StatusCode.ERROR)
+            else:
+                attrs.setdefault(RESPAN_LOG_TYPE, "task")
+                attrs.setdefault(
+                    RESPAN_LOG_METHOD, LogMethodChoices.TRACING_INTEGRATION.value
+                )
+                attrs.setdefault(AI.TRACELOOP_ENTITY_NAME, text(span.name))
+                attrs.setdefault(AI.TRACELOOP_ENTITY_PATH, "")
+            for k in list(attrs):
+                if k.startswith(("lk.", "langfuse.")) or k in {
+                    "status_code",
+                    ERROR_MESSAGE,
+                    "tools",
+                    "tool_calls",
+                    "model",
+                    "prompt_tokens",
+                    "completion_tokens",
+                    "total_request_tokens",
+                }:
+                    attrs.pop(k, None)
+                elif isinstance(attrs[k], str):
+                    attrs[k] = text(attrs[k])
+                if attrs.get(RESPAN_LOG_TYPE) == "task" and k.startswith(
+                    ("gen_ai.", "llm.")
+                ):
+                    attrs.pop(k, None)
+                if (
+                    attrs.get(RESPAN_LOG_TYPE) == "tool"
+                    and k.startswith("gen_ai.tool.")
+                    and k != GenAI.GEN_AI_TOOL_CALL_ID
+                ):
+                    attrs.pop(k, None)
+            if span.status.status_code is StatusCode.ERROR:
+                attrs.pop(AI.TRACELOOP_ENTITY_OUTPUT, None)
+                for k in list(attrs):
+                    if k.startswith(AI.LLM_COMPLETIONS + "."):
+                        attrs.pop(k, None)
+                span._status = Status(
+                    StatusCode.ERROR, text(span.status.description) if capture else None
+                )
+            if not capture:
+                attrs = private_attributes(attrs)
+            span._attributes = attrs
+            span._events = ()
+        except Exception:  # noqa: BLE001 - telemetry observes without replacing native behavior.
+            fallback = private_attributes(dict(span.attributes or {}))
+            for name in list(fallback):
+                if name.startswith(("gen_ai.usage.", "llm.usage.")):
+                    fallback.pop(name, None)
+            fallback.update(usage_attributes(source_usage))
+            span._attributes = fallback
+            span._events = ()
+            if span.status.status_code is StatusCode.ERROR:
+                span._status = Status(StatusCode.ERROR)
+        if self.on_drained is not None:
+            self.on_drained()
 
-        translated = build_livekit_llm_attrs(
-            span_name=span.name,
-            attrs=attrs,
-            events=tuple(getattr(span, "events", ()) or ()),
-        )
-        attrs.update(translated)
-        attrs.pop(LIVEKIT_RESPAN_PROVIDER_NAME_ATTR, None)
-        attrs.pop(LIVEKIT_RESPAN_TOOL_DEFINITIONS_ATTR, None)
-        _rename_span_to_workflow(span=span, attrs=attrs)
-        _register_tool_parent_contexts(span=span, attrs=attrs)
-        span._attributes = attrs
+    def shutdown(self):
+        self.policy.open.clear()
+        self.policy.closed.clear()
+        self.source_usage.clear()
 
-    def shutdown(self) -> None:
-        return None
-
-    def force_flush(self, timeout_millis: int = 30000) -> bool:
+    def force_flush(self, timeout_millis=30000):
         return True

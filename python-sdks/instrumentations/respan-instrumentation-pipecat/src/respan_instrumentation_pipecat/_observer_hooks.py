@@ -6,9 +6,11 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+from openinference.semconv.trace import SpanAttributes as OI
+from opentelemetry.semconv._incubating.attributes.error_attributes import ERROR_MESSAGE
 from opentelemetry.trace import Status, StatusCode
-from respan_sdk.constants import ERROR_MESSAGE_ATTR
 
+from respan_instrumentation_pipecat._runtime import _SCOPE
 from respan_instrumentation_pipecat._serialization import (
     exception_message,
     exception_status_code,
@@ -36,32 +38,32 @@ def _safe_getattr(value: Any, name: str, default: Any = None) -> Any:
         return default
 
 
-def _frame_error(frame: Any) -> tuple[str, str, int] | None:
+def _frame_error(frame: Any) -> tuple[str, str, int | None] | None:
     if type(frame).__name__ != "ErrorFrame":
         return None
     exception = _safe_getattr(frame, "exception")
     if isinstance(exception, BaseException):
         return (
-            exception_message(exception),
+            exception_message(exception)
+            or (safe_text(frame.error) if isinstance(frame.error, str) else None),
             safe_type_name(exception),
             exception_status_code(exception),
         )
     raw_error = _safe_getattr(frame, "error")
-    message = (
-        safe_text(raw_error)
-        if isinstance(raw_error, str)
-        else "Pipecat operation failed"
-    )
-    return message, "PipecatError", 500
+    message = safe_text(raw_error) if isinstance(raw_error, str) else None
+    return message, type(frame).__module__ + "." + type(frame).__name__, None
 
 
 def _mark_span(span: Any, *, message: str, error_type: str, status_code: int) -> None:
     if span is None:
         return
-    span.set_attribute(ERROR_MESSAGE_ATTR, message)
-    span.set_attribute(RESPAN_PIPECAT_ERROR_STATUS, status_code)
+    current = _SCOPE.get()
+    if isinstance(message, str) and (not current or current[0].allowed(current[1])):
+        span.set_attribute(ERROR_MESSAGE, message)
+    if status_code is not None:
+        span.set_attribute(RESPAN_PIPECAT_ERROR_STATUS, status_code)
     span.set_attribute(RESPAN_PIPECAT_ERROR_TYPE, error_type)
-    span.set_status(Status(StatusCode.ERROR, message))
+    span.set_status(Status(StatusCode.ERROR))
 
 
 def _record_error_frame(observer: Any, data: Any) -> None:
@@ -125,12 +127,17 @@ def _message_text(message: Any) -> str | None:
 
 
 def _record_semantic_frame(observer: Any, data: Any) -> None:
+    current = _SCOPE.get()
+    if current and not current[0].allowed(current[1]):
+        return
     frame = _safe_getattr(data, "frame")
     frame_name = type(frame).__name__
     turn_span = _safe_getattr(observer, "_turn_span")
     if turn_span is None:
         return
     if frame_name == "LLMContextFrame":
+        if current and observer._config.hide_inputs:
+            return
         observer._respan_llm_text_chunks = []
         observer._respan_seen_llm_frame_ids = set()
         context = _safe_getattr(frame, "context")
@@ -145,10 +152,12 @@ def _record_semantic_frame(observer: Any, data: Any) -> None:
             existing = _safe_getattr(observer, "_turn_user_text", [])
             if not existing:
                 observer._turn_user_text = list(user_text)
-            turn_span.set_attribute("input.value", " ".join(user_text))
+            turn_span.set_attribute(OI.INPUT_VALUE, " ".join(user_text))
     elif frame_name == "LLMFullResponseEndFrame":
         turn_span.set_attribute(RESPAN_PIPECAT_LLM_COMPLETED, True)
     elif frame_name == "LLMTextFrame":
+        if current and observer._config.hide_outputs:
+            return
         text = _safe_getattr(frame, "text")
         if isinstance(text, str) and text:
             frame_id = _safe_getattr(frame, "id", id(frame))
@@ -166,6 +175,9 @@ def _record_semantic_frame(observer: Any, data: Any) -> None:
 
 
 def _prepare_turn_end(observer: Any, data: Any) -> None:
+    current = _SCOPE.get()
+    if current and not current[0].allowed(current[1]):
+        return
     frame = _safe_getattr(data, "frame")
     if type(frame).__name__ not in {"EndFrame", "CancelFrame"}:
         return
@@ -180,11 +192,13 @@ def install_observer_hook(observer_module: Any) -> ObserverHook:
     hook: ObserverHook
 
     async def wrapped(instance: Any, data: Any) -> None:
-        if hook.active:
+        current = _SCOPE.get()
+        owned = current is not None and current[1] is instance
+        if hook.active and owned:
             _record_error_frame(instance, data)
             _prepare_turn_end(instance, data)
         await original(instance, data)
-        if hook.active:
+        if hook.active and owned:
             _record_semantic_frame(instance, data)
 
     hook = ObserverHook(

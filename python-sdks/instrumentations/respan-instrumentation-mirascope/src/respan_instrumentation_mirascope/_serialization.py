@@ -1,163 +1,193 @@
-"""Small, defensive serializers for Mirascope messages and response values."""
+"""Safe capture of known Mirascope values, including complete tool payloads."""
 
 from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import re
 from collections.abc import Mapping, Sequence
 from itertools import islice
 from typing import Any
 
-_MAX_DEPTH = 6
+_MAX_DEPTH = 64
 _MAX_ITEMS = 50
 _MAX_STRING_LENGTH = 8_000
 _MAX_JSON_LENGTH = 16_000
 _REDACTED = "[REDACTED]"
-_SENSITIVE_KEYS = {
-    "api-key",
-    "api_key",
-    "apikey",
-    "authorization",
-    "bearer",
-    "cookie",
-    "password",
-    "refresh_token",
-    "secret",
-    "set-cookie",
-    "token",
-}
-_SENSITIVE_TEXT_PATTERNS = (
-    re.compile(r"(?i)\bbearer\s+[a-z0-9._~+/=-]+"),
-    re.compile(
-        r"(?i)\b(api[-_ ]?key|authorization|cookie|password|refresh[-_ ]?token|"
-        r"secret|token)([\"']?\s*[:=]\s*[\"']?)([^\s,;\"'}]+)"
-    ),
+_SENSITIVE = re.compile(
+    r"(?:^|[._-])(?:api[_-]?key|authorization|cookie|password|secret|token|credential)(?:$|[._-])"
+    r"|(?:api[_-]?key|authorization|cookie|password|secret|token|credential)$",
+    re.IGNORECASE,
+)
+_QUOTED = re.compile(
+    r"(?i)([\"']?(?:[a-z0-9_-]*[_-])?(?:api[_-]?key|authorization|cookie|password|secret|token|credential)[\"']?\s*[:=]\s*)([\"'])((?:\\.|(?!\2).)*)\2",
+    re.DOTALL,
+)
+_UNFINISHED_QUOTED = re.compile(
+    r"(?i)([\"']?(?:[a-z0-9_-]*[_-])?(?:api[_-]?key|authorization|cookie|password|secret|token|credential)[\"']?\s*[:=]\s*)([\"'])((?:\\.|(?!\2).)*)\Z",
+    re.DOTALL,
+)
+_BARE = re.compile(
+    r"(?i)([\"']?(?:[a-z0-9_-]*[_-])?(?:api[_-]?key|authorization|cookie|password|secret|token|credential)[\"']?\s*[:=]\s*)(?!['\"\[{])[^,;)\s}\"']+"
 )
 
 
-def _bounded_string(value: str) -> str:
-    if len(value) <= _MAX_STRING_LENGTH:
-        return value
-    return f"{value[:_MAX_STRING_LENGTH]}...[truncated]"
-
-
-def safe_text(value: Any) -> str:
-    """Return bounded, redacted text without invoking arbitrary object reprs."""
+def safe_text(value: Any, *, complete: bool = False) -> str:
     if isinstance(value, str):
         text = value
     elif value is None:
         return ""
-    elif isinstance(value, bool | int | float):
+    elif type(value) in (bool, int, float):
         text = str(value)
-    elif isinstance(value, bytes):
-        return f"<bytes:{len(value)}>"
     else:
         return f"<{type(value).__name__}>"
-    text = _SENSITIVE_TEXT_PATTERNS[0].sub("Bearer [REDACTED]", text)
-    text = _SENSITIVE_TEXT_PATTERNS[1].sub(
-        lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]",
-        text,
+    text = _QUOTED.sub(lambda m: f"{m[1]}{m[2]}{_REDACTED}{m[2]}", text)
+    text = _UNFINISHED_QUOTED.sub(lambda m: f"{m[1]}{m[2]}{_REDACTED}", text)
+    text = re.sub(r"(?i)(https?://)[^\s/@]+@", r"\1[REDACTED]@", text)
+    text = re.sub(r"(?i)\b(bearer|basic)\s+[^\s,;\"'\\]+", r"\1 [REDACTED]", text)
+    text = _BARE.sub(r"\1[REDACTED]", text)
+    return (
+        text
+        if complete or len(text) <= _MAX_STRING_LENGTH
+        else text[:_MAX_STRING_LENGTH] + "...[truncated]"
     )
-    return _bounded_string(text)
 
 
 def safe_exception_text(exc: BaseException) -> str:
-    """Render an exception message without invoking an overridden ``__str__``."""
     try:
-        args = exc.args
-    except Exception:  # noqa: BLE001 - custom exceptions may override attributes
+        args = BaseException.args.__get__(exc)
+    except Exception:  # noqa: BLE001 - diagnostics must preserve native exceptions.
         args = ()
-    values = args[:4] if isinstance(args, tuple) else ()
-    message = ": ".join(filter(None, (safe_text(value) for value in values)))
-    return _bounded_string(message or type(exc).__name__)
+    return safe_text(": ".join(v for v in args[:4] if isinstance(v, str)))
 
 
-def _safe_key(value: Any) -> str:
-    if isinstance(value, str | bool | int | float) or value is None:
-        return safe_text(value)
-    return f"<{type(value).__name__}>"
+def _vector(value: Any) -> bool:
+    if isinstance(value, list | tuple) and len(value) > _MAX_ITEMS:
+        return all(type(v) in (int, float) for v in value)
+    if type(value) is dict and len(value) > _MAX_ITEMS:
+        return all(
+            (type(k) is int and k >= 0 or isinstance(k, str) and k.isdecimal())
+            and type(v) in (int, float)
+            for k, v in value.items()
+        )
+    return False
 
 
-def _is_sensitive_key(value: Any) -> bool:
-    key = _safe_key(value).strip().lower()
-    return key in _SENSITIVE_KEYS or key.endswith(
-        ("_api_key", "_password", "_secret", "_token")
-    )
-
-
-def json_value(value: Any, *, _depth: int = 0, _seen: set[int] | None = None) -> Any:
-    if value is None or isinstance(value, bool | int | float):
+def json_value(
+    value: Any,
+    *,
+    _depth: int = 0,
+    _seen: set[int] | None = None,
+    complete: bool = False,
+    schema: bool = False,
+    _properties: bool = False,
+    _sensitive_property: bool = False,
+) -> Any:
+    complete = complete or _vector(value)
+    if value is None or type(value) in (bool, int):
         return value
+    if type(value) is float:
+        return value if math.isfinite(value) else None
     if isinstance(value, str):
-        return safe_text(value)
+        return safe_text(value, complete=complete)
     if isinstance(value, bytes):
         return f"<bytes:{len(value)}>"
     if _depth >= _MAX_DEPTH:
         return f"<{type(value).__name__}:max-depth>"
     seen = _seen if _seen is not None else set()
-    if id(value) in seen:
+    identity = id(value)
+    if identity in seen:
         return "<cycle>"
-    seen.add(id(value))
+    seen.add(identity)
     try:
-        if dataclasses.is_dataclass(value) and not isinstance(value, type):
-            value = {
-                field.name: getattr(value, field.name)
-                for field in dataclasses.fields(value)
-            }
-        elif callable(getattr(value, "model_dump", None)):
-            value = value.model_dump()
-        elif callable(getattr(value, "to_dict", None)):
-            value = value.to_dict()
-        elif isinstance(value, Mapping | Sequence) and not isinstance(
-            value, str | bytes
-        ):
-            pass
-        elif callable(value):
-            return {
-                "name": safe_text(getattr(value, "__name__", value.__class__.__name__)),
-                "description": safe_text(getattr(value, "__doc__", "") or ""),
-            }
-        elif hasattr(value, "__dict__"):
-            value = {
-                key: item
-                for key, item in vars(value).items()
-                if not key.startswith("_")
-            }
-        else:
-            return f"<{type(value).__name__}>"
-
+        if type(value).__module__.startswith(("mirascope.", "openai.")):
+            if dataclasses.is_dataclass(value) and not isinstance(value, type):
+                value = {
+                    f.name: getattr(value, f.name)
+                    for f in dataclasses.fields(value)
+                    if not f.name.startswith("_")
+                }
+            else:
+                fields = getattr(type(value), "model_fields", {})
+                if isinstance(fields, Mapping) and fields:
+                    value = {
+                        getattr(f, "alias", None) or name: field_value
+                        for name, f in fields.items()
+                        if (field_value := getattr(value, name, None)) is not None
+                        or not schema
+                    }
+                else:
+                    return f"<{type(value).__name__}>"
         if isinstance(value, Mapping):
-            normalized: dict[str, Any] = {}
-            for key, item in islice(value.items(), _MAX_ITEMS):
-                normalized_key = _safe_key(key)
-                normalized[normalized_key] = (
-                    _REDACTED
-                    if _is_sensitive_key(normalized_key)
-                    else json_value(item, _depth=_depth + 1, _seen=seen)
+            result = {}
+            iterator = value.items() if complete else islice(value.items(), _MAX_ITEMS)
+            for key, item in iterator:
+                if not isinstance(key, str) and type(key) is not int:
+                    continue
+                key = str(key)
+                sensitive = bool(_SENSITIVE.search(key))
+                structural = schema and _properties and isinstance(item, dict | bool)
+                credential_default = (
+                    schema
+                    and _sensitive_property
+                    and key in {"default", "example", "examples", "const", "enum"}
                 )
-            return normalized
+                if credential_default or sensitive and not structural:
+                    result[key] = (
+                        [_REDACTED for _ in item]
+                        if credential_default and isinstance(item, list | tuple)
+                        else _REDACTED
+                    )
+                else:
+                    result[key] = json_value(
+                        item,
+                        _depth=_depth + 1,
+                        _seen=seen,
+                        complete=complete,
+                        schema=schema
+                        and key
+                        not in {"default", "example", "examples", "const", "enum"},
+                        _properties=schema
+                        and key
+                        in {"properties", "patternProperties", "$defs", "definitions"},
+                        _sensitive_property=_sensitive_property
+                        or _properties
+                        and sensitive,
+                    )
+            return result
         if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+            items = value if complete else islice(value, _MAX_ITEMS)
             return [
-                json_value(item, _depth=_depth + 1, _seen=seen)
-                for item in islice(value, _MAX_ITEMS)
+                json_value(
+                    v,
+                    _depth=_depth + 1,
+                    _seen=seen,
+                    complete=complete,
+                    schema=schema,
+                    _sensitive_property=_sensitive_property,
+                )
+                for v in items
             ]
-        return value
-    except Exception:  # noqa: BLE001 - serializer must tolerate arbitrary vendor values
+        return f"<{type(value).__name__}>"
+    except Exception:  # noqa: BLE001 - telemetry cannot replace native results.
         return f"<{type(value).__name__}:unserializable>"
     finally:
-        seen.discard(id(value))
+        seen.discard(identity)
 
 
-def json_string(value: Any) -> str:
-    encoded = json.dumps(json_value(value), ensure_ascii=False, sort_keys=True)
-    if len(encoded) <= _MAX_JSON_LENGTH:
+def json_string(value: Any, *, complete: bool = False, schema: bool = False) -> str:
+    complete = complete or _vector(value)
+    encoded = json.dumps(
+        json_value(value, complete=complete, schema=schema),
+        ensure_ascii=False,
+        sort_keys=True,
+        allow_nan=False,
+    )
+    if complete or len(encoded) <= _MAX_JSON_LENGTH:
         return encoded
     return json.dumps(
-        {
-            "preview": encoded[: _MAX_JSON_LENGTH - 200],
-            "truncated": True,
-        },
+        {"preview": encoded[: _MAX_JSON_LENGTH - 200], "truncated": True},
         ensure_ascii=False,
         sort_keys=True,
     )

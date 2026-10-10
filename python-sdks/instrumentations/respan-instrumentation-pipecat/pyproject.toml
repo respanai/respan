@@ -11,12 +11,13 @@ packages = [
 
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
-respan-tracing = "^2.16.1"
-respan-sdk = ">=2.5.0"
-pipecat-ai = ">=1.1.0"
-openinference-instrumentation-pipecat = ">=1.0.2"
+respan-tracing = "^2.17.0"
+respan-sdk = ">=2.7.6"
+pipecat-ai = ">=1.1.0,<2"
+openinference-instrumentation-pipecat = ">=1.0.2,<3"
 openinference-semantic-conventions = ">=0.1.28"
-opentelemetry-semantic-conventions-ai = ">=0.4.1"
+opentelemetry-semantic-conventions-ai = ">=0.4.13,<0.6"
+opentelemetry-semantic-conventions = ">=0.60b0,<1"
 
 [tool.poetry.plugins."respan.instrumentations"]
 pipecat = "respan_instrumentation_pipecat:PipecatInstrumentor"

@@ -1,180 +1,194 @@
-"""Bounded and privacy-safe serialization for Pipecat spans."""
+"""Serialize known SDK values without consuming iterators or arbitrary hooks."""
 
 from __future__ import annotations
 
 import json
 import math
 import re
-from collections.abc import Mapping, Sequence
-from itertools import islice
-from numbers import Integral, Real
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-MAX_ATTRIBUTE_BYTES = 16_000
+from pydantic import BaseModel
+
 MAX_ITEMS = 50
+MAX_BYTES = 16_000
 MAX_DEPTH = 8
-MAX_TEXT_BYTES = 8_000
-
-_SENSITIVE_PARTS = (
-    "api_key",
-    "apikey",
-    "authorization",
-    "client_secret",
-    "password",
-    "secret",
-    "token",
+_SECRET = re.compile(
+    r"(?i)(api[_-]?key|virtual[_-]?key|authorization|password|secret|access[_-]?token|refresh[_-]?token)"
 )
-_INLINE_SECRET = re.compile(
-    r"(?i)([\"']?(?:api[_-]?key|authorization|client[_-]?secret|password|secret|token)[\"']?)"
-    r"(\s*[:=]\s*[\"']?\s*)([^\s,;&\"'}]+)"
+_INLINE = re.compile(
+    r"""(?i)(["']?(?:api[_-]?key|authorization|password|secret|access[_-]?token|refresh[_-]?token)["']?\s*[:=]\s*["']?)([^\s,;&"'}]+)"""
 )
-_BEARER_TOKEN = re.compile(r"(?i)\bbearer\s+[^\s,;&]+")
-_MEMORY_ADDRESS = re.compile(r"(?i)\b0x[0-9a-f]{6,}\b")
-
-
-def safe_type_name(value: Any) -> str:
-    value_type = value if isinstance(value, type) else type(value)
-    module = getattr(value_type, "__module__", "")
-    qualname = getattr(value_type, "__qualname__", None) or getattr(
-        value_type, "__name__", "object"
-    )
-    candidate = f"{module}.{qualname}" if module and module != "builtins" else qualname
-    stable = re.sub(r"[^A-Za-z0-9_.-]+", ".", candidate).strip(".")
-    return (stable or "object")[:256]
-
-
-def truncate_utf8(value: str, max_bytes: int = MAX_TEXT_BYTES) -> str:
-    encoded = value.encode("utf-8")
-    if len(encoded) <= max_bytes:
-        return value
-    suffix = "...[truncated]"
-    budget = max(0, max_bytes - len(suffix.encode("utf-8")))
-    return encoded[:budget].decode("utf-8", errors="ignore") + suffix
-
-
-def is_sensitive_key(value: str) -> bool:
-    normalized = value.lower().replace("-", "_")
-    return any(
-        normalized == part or normalized.endswith(f"_{part}") or part in normalized
-        for part in _SENSITIVE_PARTS
-    )
+_AUTH = re.compile(r"(?i)\b(bearer|basic)\s+[^\s,;&\"'\\]+")
+_QUOTED_DOUBLE = re.compile(
+    r'''(?i)(["']?(?:api[_-]?key|virtual[_-]?key|authorization|password|secret|access[_-]?token|refresh[_-]?token)["']?\s*[:=]\s*")((?:\\.|[^"\\])*)"'''
+)
+_QUOTED_SINGLE = re.compile(
+    r"""(?i)(["']?(?:api[_-]?key|virtual[_-]?key|authorization|password|secret|access[_-]?token|refresh[_-]?token)["']?\s*[:=]\s*')((?:\\.|[^'\\])*)' """.rstrip()
+)
+_URL = re.compile(r'https?://[^\s"<>]+')
 
 
 def sanitize_endpoint(value: str) -> str:
     try:
-        candidate = value if "://" in value else f"//{value}"
-        parsed = urlsplit(candidate)
+        parsed = urlsplit(value)
         if not parsed.hostname:
             return "<redacted-endpoint>"
-        port = f":{parsed.port}" if parsed.port is not None else ""
-        scheme = parsed.scheme if "://" in value else ""
-        result = urlunsplit((scheme, f"{parsed.hostname}{port}", parsed.path, "", ""))
-        return result if scheme else result.removeprefix("//")
-    except Exception:  # noqa: BLE001 - malformed endpoints are fully redacted
+        host = parsed.hostname
+        if ":" in host:
+            host = f"[{host}]"
+        if parsed.port:
+            host += f":{parsed.port}"
+        return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
+    except (ValueError, TypeError):
         return "<redacted-endpoint>"
 
 
-def safe_text(value: str, *, endpoint: bool = False) -> str:
-    if endpoint:
-        value = sanitize_endpoint(value)
-    value = _BEARER_TOKEN.sub("Bearer <redacted>", value)
-    value = _INLINE_SECRET.sub(
-        lambda match: f"{match.group(1)}{match.group(2)}<redacted>", value
-    )
-    value = _MEMORY_ADDRESS.sub("0x<redacted>", value)
-    return truncate_utf8(value)
+def safe_text(value: str, *, complete: bool = False) -> str:
+    value = _QUOTED_DOUBLE.sub(lambda m: m.group(1) + '<redacted>"', value)
+    value = _QUOTED_SINGLE.sub(lambda m: m.group(1) + "<redacted>'", value)
+    value = _AUTH.sub(lambda m: m.group(1) + " <redacted>", value)
+    value = _INLINE.sub(lambda m: m.group(1) + "<redacted>", value)
+    value = _URL.sub(lambda m: sanitize_endpoint(m.group()), value)
+    if complete or len(value.encode()) <= MAX_BYTES:
+        return value
+    return value.encode()[:MAX_BYTES].decode(errors="ignore") + "...[truncated]"
 
 
-def _stable_key(value: Any) -> str:
-    if value is None or isinstance(value, (str, bool, int)):
-        return safe_text(str(value))[:256]
-    if isinstance(value, float) and math.isfinite(value):
-        return str(value)[:256]
-    return f"<{safe_type_name(value)}>"
+def safe_type_name(value: Any) -> str:
+    cls = type(value)
+    return f"{cls.__module__}.{cls.__name__}"[:256]
 
 
-def _summary(value: Any, reason: str | None = None) -> dict[str, str]:
-    result = {"type": safe_type_name(value)}
-    if reason:
-        result["truncated"] = reason
-    return result
+def fields(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, BaseModel):
+        raw = object.__getattribute__(value, "__dict__")
+        extra = object.__getattribute__(value, "__pydantic_extra__")
+        return {**raw, **(extra or {})}
+    return None
 
 
-def jsonable(value: Any, *, depth: int = 0) -> Any:
-    if depth > MAX_DEPTH:
-        return _summary(value, "max_depth")
-    if value is None or isinstance(value, bool):
+def jsonable(
+    value: Any,
+    *,
+    complete: bool = False,
+    depth: int = 0,
+    schema=False,
+    properties=False,
+    credential=False,
+    tool_definitions=False,
+) -> Any:
+    if value is None or isinstance(value, (bool, int)):
         return value
     if isinstance(value, str):
-        return safe_text(value)
-    if isinstance(value, Integral):
-        return int(value)
-    if isinstance(value, Real):
-        number = float(value)
-        return number if math.isfinite(number) else None
-    if isinstance(value, bytes):
-        return {"type": "bytes", "length": len(value)}
-    if isinstance(value, Mapping):
-        try:
-            source = list(islice(value.items(), MAX_ITEMS + 1))
-        except Exception:  # noqa: BLE001 - hostile mappings become stable summaries
-            return _summary(value)
-        result: dict[str, Any] = {}
-        for key, item in source[:MAX_ITEMS]:
-            key_text = _stable_key(key)
-            result[key_text] = (
-                "<redacted>"
-                if is_sensitive_key(key_text)
-                else jsonable(item, depth=depth + 1)
-            )
-        if len(source) > MAX_ITEMS:
+        if complete:
+            try:
+                structured = json.loads(value)
+            except (TypeError, ValueError):
+                structured = None
+            if isinstance(structured, (dict, list)):
+                return json.dumps(
+                    jsonable(
+                        structured,
+                        complete=True,
+                        depth=depth + 1,
+                        schema=schema,
+                        properties=properties,
+                        credential=credential,
+                        tool_definitions=tool_definitions,
+                    ),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                )
+        return safe_text(value, complete=complete)
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if depth > MAX_DEPTH and not complete:
+        return {"type": safe_type_name(value), "truncated": "max_depth"}
+    if depth > 64:
+        return {"type": safe_type_name(value), "truncated": "max_depth"}
+    data = fields(value)
+    if data is not None:
+        pairs = list(data.items())
+        result = {}
+        for key, item in pairs if complete else pairs[:MAX_ITEMS]:
+            if not isinstance(key, (str, int)) or isinstance(key, bool):
+                continue
+            name = str(key)
+            if type(item).__name__ in {"Omit", "NotGiven"}:
+                continue
+            sensitive = bool(_SECRET.search(name) or name.lower() == "key")
+            if (sensitive and not properties) or (
+                credential
+                and name in {"default", "example", "examples", "const", "enum"}
+            ):
+                result[name] = "<redacted>"
+            else:
+                nested_schema = (
+                    schema
+                    or (tool_definitions and name in {"parameters", "input_schema"})
+                    or name in {"json_schema"}
+                )
+                result[name] = jsonable(
+                    item,
+                    complete=complete,
+                    depth=depth + 1,
+                    schema=nested_schema,
+                    properties=nested_schema
+                    and name
+                    in {"properties", "patternProperties", "$defs", "definitions"},
+                    credential=credential or (properties and sensitive),
+                    tool_definitions=tool_definitions or name in {"tools", "functions"},
+                )
+        if not complete and len(pairs) > MAX_ITEMS:
             result["__truncated__"] = True
         return result
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        try:
-            source = list(islice(iter(value), MAX_ITEMS + 1))
-        except Exception:  # noqa: BLE001 - hostile sequences become stable summaries
-            return _summary(value)
-        items = [jsonable(item, depth=depth + 1) for item in source[:MAX_ITEMS]]
-        if len(source) > MAX_ITEMS:
-            return {"items": items, "truncated": True, "count": f">{MAX_ITEMS}"}
-        return items
-    return _summary(value)
-
-
-def json_dumps(value: Any) -> str:
-    text = json.dumps(
-        jsonable(value),
-        allow_nan=False,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-    original_bytes = len(text.encode("utf-8"))
-    if original_bytes <= MAX_ATTRIBUTE_BYTES:
-        return text
-    low, high = 0, min(len(text), MAX_ATTRIBUTE_BYTES)
-    result = ""
-    while low <= high:
-        midpoint = (low + high) // 2
-        candidate = json.dumps(
-            {
-                "original_bytes": original_bytes,
-                "preview": text[:midpoint],
-                "truncated": True,
-            },
-            allow_nan=False,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
+    if isinstance(value, (list, tuple)):
+        full = complete or bool(
+            value
+            and all(
+                isinstance(v, (int, float)) and not isinstance(v, bool) for v in value
+            )
         )
-        if len(candidate.encode("utf-8")) <= MAX_ATTRIBUTE_BYTES:
-            result = candidate
-            low = midpoint + 1
-        else:
-            high = midpoint - 1
-    return result
+        result = [
+            jsonable(
+                v,
+                complete=full,
+                depth=depth + 1,
+                schema=schema,
+                credential=credential,
+                tool_definitions=tool_definitions,
+            )
+            for v in (value if full else value[:MAX_ITEMS])
+        ]
+        return (
+            result
+            if full or len(value) <= MAX_ITEMS
+            else {"items": result, "truncated": True}
+        )
+    return {"type": safe_type_name(value)}
+
+
+def json_dumps(value: Any, *, complete: bool = False, tool_definitions=False) -> str:
+    text = json.dumps(
+        jsonable(value, complete=complete, tool_definitions=tool_definitions),
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+    if complete or len(text.encode()) <= MAX_BYTES:
+        return text
+    return json.dumps(
+        {
+            "truncated": True,
+            "original_bytes": len(text.encode()),
+            "preview": text[:3000],
+        },
+        ensure_ascii=False,
+    )
 
 
 def parse_json(value: Any) -> Any:
@@ -182,42 +196,30 @@ def parse_json(value: Any) -> Any:
         return value
     try:
         return json.loads(value)
-    except (TypeError, json.JSONDecodeError):
+    except (ValueError, TypeError):
         return value
 
 
-def exception_message(exc: BaseException) -> str:
-    try:
-        arguments = exc.args
-    except Exception:  # noqa: BLE001 - hostile exceptions are summarized
-        arguments = ()
-    for argument in arguments:
-        if isinstance(argument, str):
-            return safe_text(argument)
-        if argument is None or isinstance(argument, (bool, int)):
-            return safe_text(str(argument))
-        if isinstance(argument, float) and math.isfinite(argument):
-            return safe_text(str(argument))
-    return safe_type_name(exc)
+def exception_message(exc: BaseException) -> str | None:
+    from openai import APIError
+
+    body = getattr(exc, "body", None) if isinstance(exc, APIError) else None
+    if isinstance(body, dict):
+        message = body.get("message")
+        if isinstance(message, str):
+            return safe_text(message)
+    for value in exc.args:
+        if isinstance(value, str):
+            return safe_text(value)
+    return None
 
 
-def exception_status_code(exc: BaseException) -> int:
-    for owner, attribute in ((exc, "status_code"), (exc, "status")):
-        try:
-            value = getattr(owner, attribute, None)
-        except Exception:  # noqa: BLE001 - hostile status properties are ignored
-            value = None
-        if isinstance(value, int) and 400 <= value <= 599:
-            return value
-    try:
-        response = getattr(exc, "response", None)
-    except Exception:  # noqa: BLE001 - hostile response properties are ignored
-        response = None
-    if response is not None:
-        try:
-            value = getattr(response, "status_code", None)
-        except Exception:  # noqa: BLE001 - hostile status properties are ignored
-            value = None
-        if isinstance(value, int) and 400 <= value <= 599:
-            return value
-    return 500
+def exception_status_code(error):
+    from aiohttp import ClientResponseError
+    from openai import APIStatusError
+
+    if isinstance(error, APIStatusError):
+        return error.status_code
+    if isinstance(error, ClientResponseError):
+        return error.status
+    return None
