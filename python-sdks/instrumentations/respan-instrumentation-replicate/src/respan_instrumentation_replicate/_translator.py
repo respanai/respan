@@ -1,376 +1,147 @@
-"""Translate Replicate SDK calls into canonical Respan span attributes."""
+"""Map actual native Replicate values and metrics without inferred results."""
 
-from __future__ import annotations
+from opentelemetry.semconv._incubating.attributes import gen_ai_attributes as GenAI
+from opentelemetry.semconv_ai import SpanAttributes as AI
+from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE, RESPAN_METADATA
 
-from collections.abc import Mapping, Sequence
-from itertools import islice
-from typing import Any
-
-from opentelemetry.semconv_ai import LLMRequestTypeValues, SpanAttributes
-from respan_sdk.constants.llm_logging import (
-    LOG_TYPE_TASK,
-    LOG_TYPE_TEXT,
-    LogMethodChoices,
-)
-from respan_sdk.constants.span_attributes import (
-    RESPAN_LOG_METHOD,
-    RESPAN_LOG_TYPE,
-    RESPAN_METADATA,
-    RESPAN_SPAN_ATTRIBUTES_MAP,
-    RESPAN_TRACE_GROUP_ID,
-)
-
-from respan_instrumentation_replicate._constants import (
-    ASSISTANT_ROLE,
-    DEPLOYMENT_KEY,
-    ERROR_KEY,
-    ID_KEY,
-    INPUT_KEY,
-    LOGS_KEY,
-    MAX_TEXT_LENGTH,
-    METRICS_KEY,
-    MODEL_KEY,
-    OUTPUT_KEY,
-    PREDICTION_RESPAN_MODEL_ATTR,
-    PROMPT_KEY,
-    REF_KEY,
-    REPLICATE_SYSTEM_NAME,
-    RESPAN_PARAMS_KEY,
-    RESPAN_PARAMS_MODEL_KEY,
-    STATUS_KEY,
-    USER_ROLE,
-    VERSION_KEY,
-)
-from respan_instrumentation_replicate._serialization import (
-    exception_message,
-    json_string,
-    prediction_summary,
-    safe_text,
-    sensitive_key,
-)
+from ._serialization import REDACTED, json_dumps, native_value, safe_text
 
 
-def safe_json(value: Any) -> str:
-    """Serialize arbitrary Replicate values into an OTEL-safe JSON string."""
-    return json_string(value)
-
-
-def _truncate_text(value: str) -> str:
-    return safe_text(value)[:MAX_TEXT_LENGTH]
-
-
-def _to_mapping(value: Any) -> Mapping[str, Any] | None:
-    if isinstance(value, Mapping):
-        return value
-
-    for method_name in ("model_dump", "dict"):
-        try:
-            method = getattr(value, method_name, None)
-        except Exception:  # noqa: BLE001 - vendor objects may expose hostile properties.
-            method = None
-        if callable(method):
-            try:
-                converted = method()
-            except Exception:  # noqa: BLE001,S112 - vendor conversion is best effort.
-                continue
-            if isinstance(converted, Mapping):
-                return converted
-
-    try:
-        value_dict = getattr(value, "__dict__", None)
-    except Exception:  # noqa: BLE001 - fall back to a stable type summary.
-        value_dict = None
-    if isinstance(value_dict, Mapping):
-        return value_dict
-    return None
-
-
-def _file_output_text(value: Any) -> str | None:
-    if type(value).__name__ != "FileOutput":
-        return None
-    try:
-        url = getattr(value, "url", None)
-    except Exception:  # noqa: BLE001
-        url = None
-    return safe_text(url) if url else f"<{type(value).__name__}>"
-
-
-def output_to_text(value: Any) -> str:
-    """Convert Replicate output or stream chunks to readable completion text."""
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return _truncate_text(value)
-    if isinstance(value, bytes):
-        return f"<bytes length={len(value)}>"
-    if isinstance(value, bytearray):
-        return f"<bytearray length={len(value)}>"
-
-    file_output = _file_output_text(value)
-    if file_output is not None:
-        return _truncate_text(file_output)
-
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        items = list(islice(iter(value), 51))
-        selected = items[:50]
-        if all(isinstance(item, str) for item in selected):
-            suffix = "...[truncated items]" if len(items) > 50 else ""
-            return _truncate_text("".join(selected) + suffix)
-        text_parts = [output_to_text(item) for item in selected]
-        if any(text_parts):
-            suffix = "...[truncated items]" if len(items) > 50 else ""
-            return _truncate_text("".join(text_parts) + suffix)
-
-    mapping = _to_mapping(value)
-    if mapping is not None:
-        for key in (OUTPUT_KEY, "data", "text", "content"):
-            if mapping.get(key) is not None:
-                return output_to_text(mapping[key])
-        return _truncate_text(safe_json(mapping))
-
-    return f"<{type(value).__name__}>"
-
-
-def _prediction_mapping(prediction: Any) -> Mapping[str, Any]:
-    return _to_mapping(prediction) or {}
-
-
-def model_from_ref_or_prediction(
-    *,
-    ref: Any = None,
-    kwargs: Mapping[str, Any] | None = None,
-    prediction: Any = None,
-) -> str | None:
-    kwargs = kwargs or {}
-    respan_params = _to_mapping(kwargs.get(RESPAN_PARAMS_KEY))
-    if respan_params is not None:
-        model_override = respan_params.get(RESPAN_PARAMS_MODEL_KEY)
-        if model_override:
-            return safe_text(model_override)
-
-    if prediction is not None:
-        try:
-            prediction_model_override = getattr(
-                prediction, PREDICTION_RESPAN_MODEL_ATTR, None
-            )
-        except Exception:  # noqa: BLE001 - private attribute is best-effort.
-            prediction_model_override = None
-        if prediction_model_override:
-            return safe_text(prediction_model_override)
-
-    for value in (
-        kwargs.get(MODEL_KEY),
-        kwargs.get(VERSION_KEY),
-        kwargs.get(DEPLOYMENT_KEY),
-        ref,
-    ):
-        if value:
-            return safe_text(value)
-
-    prediction_map = _prediction_mapping(prediction)
-    model = prediction_map.get(MODEL_KEY)
-    version = prediction_map.get(VERSION_KEY)
-    if model and version:
-        model_text = safe_text(model)
-        version_text = safe_text(version)
-        if version_text.startswith(f"{model_text}:"):
-            return version_text
-        return f"{model_text}:{version_text}"
-    if model:
-        return safe_text(model)
-    if version:
-        return safe_text(version)
-    return None
-
-
-def _prompt_content(input_value: Any) -> str:
-    mapping = _to_mapping(input_value)
-    if mapping is not None:
-        for key in (PROMPT_KEY, "text", "query", "input"):
-            if mapping.get(key) is not None:
-                return output_to_text(mapping[key])
-        return safe_json(mapping)
-    return output_to_text(input_value)
-
-
-def _base_llm_attrs(
-    *, span_name: str, model: str | None, stream: bool
-) -> dict[str, Any]:
-    attrs: dict[str, Any] = {
-        RESPAN_LOG_METHOD: LogMethodChoices.TRACING_INTEGRATION.value,
-        RESPAN_LOG_TYPE: LOG_TYPE_TEXT,
-        SpanAttributes.LLM_SYSTEM: REPLICATE_SYSTEM_NAME,
-        SpanAttributes.LLM_REQUEST_TYPE: LLMRequestTypeValues.CHAT.value,
-        SpanAttributes.TRACELOOP_ENTITY_NAME: span_name,
-        SpanAttributes.TRACELOOP_ENTITY_PATH: span_name,
-    }
-    if model:
-        attrs[SpanAttributes.LLM_REQUEST_MODEL] = model
-    if stream:
-        attrs[SpanAttributes.LLM_IS_STREAMING] = True
+def usage(prediction):
+    data = (
+        object.__getattribute__(prediction, "__dict__")
+        if prediction is not None
+        else {}
+    )
+    metrics = data.get("metrics") or {}
+    if type(metrics) is not dict:
+        return {}
+    attrs = {}
+    for keys, targets in [
+        (
+            (
+                "input_token_count",
+                "input_tokens",
+                "prompt_token_count",
+                "prompt_tokens",
+            ),
+            (GenAI.GEN_AI_USAGE_INPUT_TOKENS, AI.LLM_USAGE_PROMPT_TOKENS),
+        ),
+        (
+            (
+                "output_token_count",
+                "output_tokens",
+                "completion_token_count",
+                "completion_tokens",
+            ),
+            (GenAI.GEN_AI_USAGE_OUTPUT_TOKENS, AI.LLM_USAGE_COMPLETION_TOKENS),
+        ),
+        (("total_token_count", "total_tokens"), (AI.LLM_USAGE_TOTAL_TOKENS,)),
+        (("cache_read_input_tokens",), (AI.LLM_USAGE_CACHE_READ_INPUT_TOKENS,)),
+        (("cache_creation_input_tokens",), (AI.LLM_USAGE_CACHE_CREATION_INPUT_TOKENS,)),
+    ]:
+        value = next((metrics[k] for k in keys if type(metrics.get(k)) is int), None)
+        if value is not None:
+            attrs.update({t: value for t in targets})
     return attrs
 
 
-def _base_task_attrs(*, span_name: str) -> dict[str, Any]:
-    return {
-        RESPAN_LOG_METHOD: LogMethodChoices.TRACING_INTEGRATION.value,
-        RESPAN_LOG_TYPE: LOG_TYPE_TASK,
-        SpanAttributes.TRACELOOP_ENTITY_NAME: span_name,
-        SpanAttributes.TRACELOOP_ENTITY_PATH: span_name,
-    }
-
-
-def _apply_respan_params(attributes: dict[str, Any], params: Any) -> str | None:
-    params_mapping = _to_mapping(params)
-    if params_mapping is None:
-        return None
-
-    span_name = params_mapping.get("span_name")
-    workflow_name = params_mapping.get("workflow_name")
-    if workflow_name and "trace_group_identifier" not in params_mapping:
-        attributes.setdefault(RESPAN_TRACE_GROUP_ID, safe_text(workflow_name))
-
-    for key, value in params_mapping.items():
-        if key in {
-            "parent_span_id",
-            "span_id",
-            "span_name",
-            "trace_id",
-            "trace_name",
-            "workflow_name",
-        }:
-            continue
-        attr_key = RESPAN_SPAN_ATTRIBUTES_MAP.get(str(key))
-        if attr_key is None:
-            continue
-        if attr_key == RESPAN_METADATA and isinstance(value, Mapping):
-            attributes[RESPAN_METADATA] = safe_json(value)
-            for metadata_key, metadata_value in value.items():
-                attribute_key = f"{RESPAN_METADATA}.{safe_text(metadata_key)[:128]}"
-                if sensitive_key(metadata_key):
-                    attributes[attribute_key] = "[REDACTED]"
-                elif isinstance(metadata_value, str):
-                    attributes[attribute_key] = safe_text(metadata_value)
-                elif isinstance(metadata_value, bool | int | float):
-                    attributes[attribute_key] = metadata_value
-                else:
-                    attributes[attribute_key] = safe_json(metadata_value)
-        else:
-            attributes[attr_key] = (
-                safe_text(value)
-                if isinstance(value, str | bytes | bytearray)
-                else value
-                if isinstance(value, bool | int | float)
-                else safe_json(value)
-            )
-    return safe_text(span_name) if span_name else None
-
-
-def _set_request_attrs(
-    *,
-    attrs: dict[str, Any],
-    ref: Any,
-    input_value: Any,
-    kwargs: Mapping[str, Any],
-) -> None:
-    entity_input = {REF_KEY: ref, INPUT_KEY: input_value}
-    params = {key: value for key, value in kwargs.items() if key != RESPAN_PARAMS_KEY}
-    if params:
-        entity_input["params"] = params
-    attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safe_json(entity_input)
-
-    prompt_text = _prompt_content(input_value)
-    if prompt_text:
-        prompt_prefix = f"{SpanAttributes.LLM_PROMPTS}.0"
-        attrs[f"{prompt_prefix}.role"] = USER_ROLE
-        attrs[f"{prompt_prefix}.content"] = prompt_text
-
-
-def _set_prediction_metadata(attrs: dict[str, Any], prediction: Any) -> None:
-    prediction_map = _prediction_mapping(prediction)
-    for key in (ID_KEY, STATUS_KEY, ERROR_KEY, LOGS_KEY):
-        value = prediction_map.get(key)
-        if value:
-            attrs[f"{RESPAN_METADATA}.replicate_{key}"] = output_to_text(value)
-
-    metrics = prediction_map.get(METRICS_KEY)
-    if metrics:
-        attrs[f"{RESPAN_METADATA}.replicate_metrics"] = safe_json(metrics)
-    attrs[f"{RESPAN_METADATA}.replicate_prediction"] = safe_json(
-        prediction_summary(prediction)
+def attributes(
+    name, request, result, prediction, frames, *, has_result, model, operation
+):
+    attrs = {RESPAN_LOG_TYPE: "task", AI.TRACELOOP_ENTITY_NAME: name}
+    options = request.get("kwargs", {})
+    body = options.get("input")
+    if (
+        body is None
+        and operation in ("run", "async_run", "stream", "async_stream")
+        and len(request.get("args", [])) > 1
+    ):
+        body = request["args"][1]
+    messages = body.get("messages") if type(body) is dict else None
+    prompt = body.get("prompt") if type(body) is dict else None
+    file_result = type(result) is dict and "url" in result
+    if type(result) is list and result:
+        file_result = all(type(v) is dict and "url" in v for v in result)
+    embedding = (
+        type(result) is dict
+        and result.get("object") == "embedding"
+        and type(result.get("embedding")) is list
     )
-
-
-def _set_output_attrs(
-    *,
-    attrs: dict[str, Any],
-    output: Any,
-    prediction: Any,
-    error: Exception | None,
-) -> None:
-    if error is not None:
-        completion_text = exception_message(error)
-    elif output is not None:
-        completion_text = output_to_text(output)
-    else:
-        prediction_map = _prediction_mapping(prediction)
-        completion_text = output_to_text(prediction_map.get(OUTPUT_KEY))
-
-    if completion_text:
-        attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safe_json(completion_text)
-        completion_prefix = f"{SpanAttributes.LLM_COMPLETIONS}.0"
-        attrs[f"{completion_prefix}.role"] = ASSISTANT_ROLE
-        attrs[f"{completion_prefix}.content"] = completion_text
-
-
-def build_model_call_span_data(
-    *,
-    span_name: str,
-    ref: Any = None,
-    input_value: Any = None,
-    kwargs: Mapping[str, Any] | None = None,
-    output: Any = None,
-    prediction: Any = None,
-    error: Exception | None = None,
-    stream: bool = False,
-) -> tuple[str, dict[str, Any]]:
-    """Build canonical text-completion span data for Replicate model calls."""
-    kwargs = kwargs or {}
-    model = model_from_ref_or_prediction(ref=ref, kwargs=kwargs, prediction=prediction)
-    attrs = _base_llm_attrs(span_name=span_name, model=model, stream=stream)
-    resolved_span_name = _apply_respan_params(attrs, kwargs.get(RESPAN_PARAMS_KEY))
-    if resolved_span_name:
-        span_name = resolved_span_name
-        attrs[SpanAttributes.TRACELOOP_ENTITY_NAME] = span_name
-        attrs[SpanAttributes.TRACELOOP_ENTITY_PATH] = span_name
-
-    _set_request_attrs(attrs=attrs, ref=ref, input_value=input_value, kwargs=kwargs)
-    if prediction is not None:
-        _set_prediction_metadata(attrs, prediction)
-    _set_output_attrs(attrs=attrs, output=output, prediction=prediction, error=error)
-    return span_name, attrs
-
-
-def build_operation_span_data(
-    *,
-    span_name: str,
-    input_value: Any = None,
-    output: Any = None,
-    error: Exception | None = None,
-) -> tuple[str, dict[str, Any]]:
-    """Build a non-LLM task span for Replicate SDK management operations."""
-    attrs = _base_task_attrs(span_name=span_name)
-    if input_value is not None:
-        attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safe_json(input_value)
-    if output is not None:
-        attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safe_json(
-            prediction_summary(output)
+    management = operation not in ("run", "async_run", "stream", "async_stream")
+    kind = (
+        "embedding"
+        if embedding
+        else "task"
+        if management or file_result
+        else "chat"
+        if type(messages) is list
+        else "text"
+        if type(prompt) is str
+        else "task"
+    )
+    attrs[RESPAN_LOG_TYPE] = kind
+    if kind in ("chat", "text", "embedding"):
+        attrs[AI.LLM_SYSTEM] = "replicate"
+        attrs[AI.LLM_REQUEST_TYPE] = "embedding" if embedding else "chat"
+        if model is not None:
+            attrs[AI.LLM_REQUEST_MODEL] = model
+        attrs.update(usage(prediction))
+    if type(messages) is list:
+        for i, message in enumerate(messages):
+            if type(message) is dict:
+                for field in ("role", "content", "tool_calls"):
+                    if field in message:
+                        attrs[f"{AI.LLM_PROMPTS}.{i}.{field}"] = (
+                            safe_text(message[field])
+                            if type(message[field]) is str
+                            else json_dumps(message[field])
+                        )
+    elif type(prompt) is str:
+        attrs[AI.LLM_PROMPTS + ".0.role"] = "user"
+        attrs[AI.LLM_PROMPTS + ".0.content"] = safe_text(prompt)
+    if kind in ("text", "chat"):
+        text = (
+            result
+            if type(result) is str
+            else "".join(result)
+            if type(result) is list and all(type(v) is str for v in result)
+            else None
         )
-    if error is not None:
-        attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safe_json(
-            {
-                "error": type(error).__name__,
-                "message": exception_message(error),
-            }
+        if frames:
+            output_frames = [
+                frame["data"]
+                for frame in frames
+                if type(frame) is dict
+                and frame.get("event") == "output"
+                and type(frame.get("data")) is str
+            ]
+            if output_frames:
+                text = "".join(output_frames)
+                if safe_text(text) != text:
+                    # Credentials can span native SSE frames. Keep IDs/types, clear affected output data.
+                    frames = [
+                        {**frame, "data": REDACTED}
+                        if type(frame) is dict and frame.get("event") == "output"
+                        else frame
+                        for frame in frames
+                    ]
+        if text is not None:
+            attrs[AI.LLM_COMPLETIONS + ".0.role"] = "assistant"
+            attrs[AI.LLM_COMPLETIONS + ".0.content"] = safe_text(text)
+    if type(body) is dict and type(body.get("tools")) is list:
+        attrs[AI.LLM_REQUEST_FUNCTIONS] = json_dumps(body["tools"])
+    # Write complete canonical bodies last so native OTel indexed limits cannot evict them.
+    attrs[AI.TRACELOOP_ENTITY_INPUT] = json_dumps(request)
+    if frames:
+        attrs[AI.TRACELOOP_ENTITY_OUTPUT] = json_dumps(frames)
+    elif has_result:
+        attrs[AI.TRACELOOP_ENTITY_OUTPUT] = json_dumps(
+            result["embedding"] if embedding else result
         )
-    return span_name, attrs
+    if embedding and has_result:
+        attrs[RESPAN_METADATA + ".replicate.result"] = json_dumps(result)
+    native = native_value(prediction) if prediction is not None else None
+    if native is not None:
+        attrs[RESPAN_METADATA + ".replicate.prediction"] = json_dumps(native)
+    return attrs

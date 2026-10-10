@@ -1,591 +1,677 @@
-"""Ollama SDK instrumentation plugin for Respan."""
+"""Observe official Ollama HTTP/NDJSON calls without changing native outcomes."""
 
+# ruff: noqa: BLE001 -- telemetry failures preserve native results and cleanup.
 from __future__ import annotations
 
+import builtins
+import functools
 import importlib
-import inspect
+import json
 import logging
 import threading
-import time
-from collections.abc import AsyncIterator, Callable, Iterator
-from typing import Any
+import weakref
+from contextvars import ContextVar
 
+from opentelemetry import context, trace
+from opentelemetry.sdk.util import BoundedList
+from opentelemetry.semconv.attributes.error_attributes import ERROR_TYPE
+from opentelemetry.semconv.attributes.http_attributes import HTTP_RESPONSE_STATUS_CODE
+from opentelemetry.semconv_ai import SpanAttributes
+from opentelemetry.trace import SpanKind, Status, StatusCode
+from respan_sdk.constants.otlp_constants import ERROR_MESSAGE_ATTR
+from respan_sdk.constants.span_attributes import (
+    RESPAN_METADATA,
+    RESPAN_SPAN_ATTRIBUTES_MAP,
+)
 from respan_tracing.core.tracer import RespanTracer
+from respan_tracing.utils.span_factory import _PROPAGATED_ATTRIBUTES
 
-from respan_instrumentation_ollama._constants import (
-    ASYNC_CLIENT_CLASS_NAME,
-    CHAT_METHOD_NAME,
-    CLIENT_CLASS_NAME,
-    EMBED_METHOD_NAME,
-    EMBEDDINGS_METHOD_NAME,
-    GENERATE_METHOD_NAME,
-    OLLAMA_CLIENT_MODULE,
-    OLLAMA_INSTRUMENTATION_NAME,
-    STREAM_KEY,
+from ._otel_emitter import base_attributes, build_attributes
+from ._privacy import (
+    _STARTING,
+    PolicyObserver,
+    content_allowed,
+    json_text,
+    suppressed,
+    text,
+    value,
 )
-from respan_instrumentation_ollama._otel_emitter import (
-    _current_trace_parent_ids,
-    emit_chat_span,
-    emit_embedding_span,
-    emit_generate_span,
-)
-from respan_instrumentation_ollama._translator import (
-    StreamResponseAccumulator,
-    bounded_text,
-)
+from ._translator import native_value
 
 logger = logging.getLogger(__name__)
-
-_original_sync_chat = None
-_original_async_chat = None
-_original_sync_generate = None
-_original_async_generate = None
-_original_sync_embed = None
-_original_async_embed = None
-_original_sync_embeddings = None
-_original_async_embeddings = None
-
-
-def _error_status_code(exc: BaseException) -> int:
-    """Return an explicit provider status without guessing from error text."""
-    response = getattr(exc, "response", None)
-    for value in (
-        getattr(exc, "status_code", None),
-        getattr(response, "status_code", None),
-        getattr(response, "status", None),
-    ):
-        if isinstance(value, int) and not isinstance(value, bool) and value >= 400:
-            return value
-    return 500
+_LOCK = threading.RLock()
+_OWNERS = set()
+_CONFIG = None
+_PATCHES = []
+_OBSERVERS = []
+_HOOKS = []
+_PENDING = weakref.WeakSet()
+_ACTIVE = ContextVar("respan_ollama_call", default=None)
 
 
-def _error_message(exc: BaseException) -> str:
+def _provider(config):
+    return config[1] if config[1] is not None else RespanTracer().tracer_provider
+
+
+def _observer(provider):
+    with _LOCK:
+        for existing, observer in _OBSERVERS:
+            if existing is provider:
+                return observer
+        observer = PolicyObserver()
+        _OBSERVERS.append((provider, observer))
+        provider.add_span_processor(observer)
+        return observer
+
+
+def _restore_context(ambient):
     try:
-        message = str(exc)
-    except Exception:  # noqa: BLE001 - broken vendor exceptions must not escape
-        message = ""
-    return bounded_text(message or type(exc).__name__)
+        if context.get_current() is ambient:
+            return
+        runtime = context._RUNTIME_CONTEXT
+        current = getattr(runtime, "_current_context", None)
+        if current is not None:
+            current.set(ambient)
+        else:
+            runtime.attach(ambient)
+    except Exception:
+        logger.debug("Ollama context restoration failed")
 
 
-def _get_module_attr(module_path: str, attr_name: str) -> Any:
-    module = importlib.import_module(module_path)
-    attr_value = getattr(module, attr_name, None)
-    if attr_value is None:
-        raise AttributeError(f"{module_path}.{attr_name}")
-    return attr_value
-
-
-def _load_client_classes() -> tuple[type[Any], type[Any]]:
-    return (
-        _get_module_attr(OLLAMA_CLIENT_MODULE, CLIENT_CLASS_NAME),
-        _get_module_attr(OLLAMA_CLIENT_MODULE, ASYNC_CLIENT_CLASS_NAME),
-    )
-
-
-def _request_kwargs_from_call(
-    original: Callable[..., Any],
-    instance: Any,
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-) -> dict[str, Any]:
+def _detach(token, ambient):
     try:
-        bound = inspect.signature(original).bind_partial(instance, *args, **kwargs)
-    except (TypeError, ValueError):
-        return dict(kwargs)
-    bound.apply_defaults()
-    return {
-        key: value
-        for key, value in bound.arguments.items()
-        if key not in {"self", "cls"}
-    }
+        context.detach(token)
+    except Exception:
+        logger.debug("Ollama context detach failed")
+    _restore_context(ambient)
 
 
-def _close_sync_iterator(iterator: Any) -> None:
-    close = getattr(iterator, "close", None)
-    if not callable(close):
-        return
-    try:
-        close()
-    except BaseException:
-        logger.debug("Failed to close Ollama stream iterator", exc_info=True)
+def _model_only(request):
+    if type(request) is dict and type(request.get("model")) is str:
+        return {"model": text(request["model"])}
+    return {}
 
 
-async def _close_async_iterator(async_iterator: Any) -> None:
-    close = getattr(async_iterator, "aclose", None)
-    if not callable(close):
-        return
-    try:
-        await close()
-    except BaseException:
-        logger.debug("Failed to close Ollama async stream iterator", exc_info=True)
+def _propagated():
+    source = _PROPAGATED_ATTRIBUTES.get()
+    result = {}
+    if type(source) is not dict:
+        return result
+    for key, item in source.items():
+        if type(key) is str and key in RESPAN_SPAN_ATTRIBUTES_MAP:
+            target = RESPAN_SPAN_ATTRIBUTES_MAP[key]
+            if target == RESPAN_METADATA:
+                if type(item) is dict:
+                    result[target] = json_text(item)
+            elif type(item) in (str, bool, int, float):
+                result[target] = value(item)
+    return result
 
 
-def _instrument_sync_stream(
-    *,
-    iterator: Iterator[Any],
-    emit_span: Callable[..., None],
-    request_kwargs: dict[str, Any],
-    start_ns: int,
-    parent_ids: tuple[str | None, str | None],
-) -> Iterator[Any]:
-    captured = StreamResponseAccumulator()
-    error_message: str | None = None
-    status_code = 200
-    close_source = False
-    try:
-        for chunk in iterator:
-            try:
-                captured.append(chunk)
-            except Exception:  # instrumentation must never break provider iteration
-                logger.debug("Failed to capture Ollama stream chunk", exc_info=True)
-            yield chunk
-    except GeneratorExit:
-        close_source = True
-        raise
-    except BaseException as exc:
-        close_source = True
-        error_message = _error_message(exc)
-        status_code = _error_status_code(exc)
-        raise
-    finally:
-        if close_source:
-            _close_sync_iterator(iterator)
-        emit_span(
-            request_kwargs=request_kwargs,
-            response_or_chunks=captured.response(),
-            start_ns=start_ns,
-            error_message=error_message,
-            status_code=status_code,
-            parent_ids=parent_ids,
+class _Call:
+    def __init__(self, mode, request, stream, config):
+        self.ctx = context.get_current()
+        self.carrier = trace.get_current_span(self.ctx)
+        provider = _provider(config)
+        self.observer = _observer(provider)
+        self.mode, self.stream = mode, stream
+        self.span = None
+        starting = _STARTING.set(self)
+        try:
+            self.span = trace.get_tracer(__name__, tracer_provider=provider).start_span(
+                "ollama." + mode, context=self.ctx, kind=SpanKind.CLIENT
+            )
+        finally:
+            _STARTING.reset(starting)
+        self.recording = self.span.is_recording()
+        self.allowed = bool(
+            config[0]
+            and self.recording
+            and content_allowed(self.ctx)
+            and self.observer.allowed(self.carrier)
         )
+        self.request = _model_only(request) if self.recording else {}
+        self.propagated = {}
+        self.payload = None
+        self.frames = []
+        self.pending = None
+        self.http_code = None
+        self.undo = []
+        self.done = False
+        _PENDING.add(self)
+        try:
+            if self.allowed:
+                self.request = value(request)
+                self.propagated = _propagated()
+        except Exception:
+            self.allowed = False
+            self.request = _model_only(request) if self.recording else {}
 
+    def policy(self):
+        if self.done:
+            return False
+        self.allowed = bool(
+            self.allowed
+            and content_allowed(self.ctx)
+            and content_allowed()
+            and not suppressed(self.ctx)
+            and self.observer.allowed(self.carrier)
+            and self.observer.allowed(trace.get_current_span())
+        )
+        if not self.allowed:
+            self.observer.deny(self.span)
+            self.request = _model_only(self.request) if self.recording else {}
+            self.propagated.clear()
+            self.payload = self.pending = None
+            self.frames.clear()
+        return self.allowed
 
-async def _instrument_async_stream(
-    *,
-    async_iterator: AsyncIterator[Any],
-    emit_span: Callable[..., None],
-    request_kwargs: dict[str, Any],
-    start_ns: int,
-    parent_ids: tuple[str | None, str | None],
-) -> AsyncIterator[Any]:
-    captured = StreamResponseAccumulator()
-    error_message: str | None = None
-    status_code = 200
-    close_source = False
-    try:
-        async for chunk in async_iterator:
-            try:
-                captured.append(chunk)
-            except Exception:  # instrumentation must never break provider iteration
-                logger.debug(
-                    "Failed to capture Ollama async stream chunk", exc_info=True
+    def explicit_policy(self):
+        # OTel SimpleSpanProcessor suppresses instrumentation while exporting.
+        # That transient guard must not veto unrelated pending siblings.
+        if not content_allowed(self.ctx) or not content_allowed():
+            self.allowed = False
+            self.policy()
+
+    def tap(self, owner, name, replacement):
+        original = getattr(owner, name)
+        owned = replacement(original)
+        had_own = name in owner.__dict__
+        setattr(owner, name, owned)
+        self.undo.append((weakref.ref(owner), name, original, owned, had_own))
+
+    def response(self, response):
+        import httpx
+
+        if type(response) is not httpx.Response or self.done:
+            return
+        self.http_code = response.status_code
+        if not self.recording:
+            return
+
+        def json_tap(original):
+            def decoded(*args, **kwargs):
+                result = original(*args, **kwargs)
+                try:
+                    if self.policy() and type(result) is dict:
+                        self.payload = value(result)
+                except Exception:
+                    self.allowed = False
+                    self.policy()
+                return result
+
+            return decoded
+
+        def lines_tap(original):
+            def lines(*args, **kwargs):
+                for line in original(*args, **kwargs):
+                    self.line(line)
+                    yield line
+
+            return lines
+
+        def async_lines_tap(original):
+            async def lines(*args, **kwargs):
+                async for line in original(*args, **kwargs):
+                    self.line(line)
+                    yield line
+
+            return lines
+
+        self.tap(response, "json", json_tap)
+        if self.stream:
+            self.tap(response, "iter_lines", lines_tap)
+            self.tap(response, "aiter_lines", async_lines_tap)
+
+    def line(self, line):
+        try:
+            self.pending = None
+            if self.policy() and type(line) is str:
+                decoded = json.loads(line)
+                if type(decoded) is dict and not decoded.get("error"):
+                    self.pending = decoded
+        except Exception:
+            # Native JSON parsing still runs and raises its original error.
+            self.pending = None
+
+    def chunk(self, chunk):
+        if self.done:
+            return
+        try:
+            if self.policy():
+                self.frames.append(
+                    self.pending if self.pending is not None else native_value(chunk)
                 )
-            yield chunk
-    except GeneratorExit:
-        close_source = True
-        raise
-    except BaseException as exc:
-        close_source = True
-        error_message = _error_message(exc)
-        status_code = _error_status_code(exc)
-        raise
+            self.pending = None
+        except Exception:
+            self.allowed = False
+            self.policy()
+
+    def finish(self, response=None, error=None):
+        if self.done:
+            return
+        ambient = context.get_current()
+        try:
+            allowed = self.policy()
+            if self.recording:
+                payload = (self.frames or None) if self.stream else self.payload
+                if payload is None and response is not None and allowed:
+                    payload = native_value(response)
+                attrs = build_attributes(
+                    mode=self.mode,
+                    request=self.request,
+                    payload=payload,
+                    stream=self.stream,
+                    capture_content=allowed,
+                )
+                if allowed:
+                    attrs.update(self.propagated)
+                if self.http_code is not None:
+                    attrs[HTTP_RESPONSE_STATUS_CODE] = self.http_code
+                if error is not None:
+                    cls = type(error)
+                    attrs[ERROR_TYPE] = type.__getattribute__(cls, "__name__")
+                    # Exact installed exceptions only; subclasses may override hooks.
+                    import httpx
+                    import ollama._types as types
+
+                    known = any(
+                        cls is candidate
+                        for module in (builtins, httpx, types)
+                        for candidate in vars(module).values()
+                        if type(candidate) is type
+                        and issubclass(candidate, BaseException)
+                    )
+                    args = BaseException.args.__get__(error)
+                    message = (
+                        text(args[0])
+                        if allowed
+                        and known
+                        and type(args) is tuple
+                        and args
+                        and type(args[0]) is str
+                        else None
+                    )
+                    if message is not None:
+                        attrs[ERROR_MESSAGE_ATTR] = message
+                    self.span.set_status(Status(StatusCode.ERROR, message))
+                self.span.set_attributes(attrs)
+        except Exception:
+            logger.debug("Ollama telemetry mapping failed")
+        finally:
+            try:
+                if self.recording and not self.policy():
+                    self.scrub()
+            except Exception:
+                if self.recording:
+                    self.scrub()
+            # Mark done before SDK processors enter transient export suppression.
+            self.done = True
+            try:
+                self.span.end()
+            except Exception:
+                logger.debug("Ollama telemetry end failed")
+            _restore_context(ambient)
+            for ref, name, original, owned, had_own in self.undo:
+                owner = ref()
+                if owner is not None and getattr(owner, name, None) is owned:
+                    try:
+                        if had_own:
+                            setattr(owner, name, original)
+                        else:
+                            delattr(owner, name)
+                    except Exception:
+                        logger.debug("Ollama response tap restoration failed")
+            self.undo.clear()
+            self.request = None
+            self.payload = self.pending = self.ctx = self.carrier = None
+            self.frames.clear()
+            self.propagated.clear()
+            _PENDING.discard(self)
+
+    def scrub(self):
+        structural = set(base_attributes(self.mode)) | {
+            SpanAttributes.TRACELOOP_ENTITY_NAME,
+            SpanAttributes.TRACELOOP_ENTITY_PATH,
+            SpanAttributes.LLM_REQUEST_MODEL,
+            SpanAttributes.LLM_IS_STREAMING,
+            HTTP_RESPONSE_STATUS_CODE,
+            ERROR_TYPE,
+        }
+        for key in tuple(self.span.attributes or {}):
+            if key not in structural:
+                self.span._attributes.pop(key, None)
+        self.span._events = BoundedList(0)
+        if self.span.status.status_code is StatusCode.ERROR:
+            self.span._status = Status(StatusCode.ERROR)
+
+
+def _hook(response):
+    state = _ACTIVE.get()
+    if state is not None:
+        try:
+            state.response(response)
+        except Exception:
+            logger.debug("Ollama response observation failed")
+
+
+async def _async_hook(response):
+    _hook(response)
+
+
+def _transport(client):
+    import httpx
+
+    owner = client._client
+    if type(owner) not in (httpx.Client, httpx.AsyncClient):
+        return
+    with _LOCK:
+        for ref, hook in _HOOKS:
+            if ref() is owner:
+                return
+        hook = _async_hook if type(owner) is httpx.AsyncClient else _hook
+        owner.event_hooks["response"].append(hook)
+        _HOOKS.append((weakref.ref(owner), hook))
+
+
+def _enabled():
+    instance = getattr(RespanTracer, "_instance", None)
+    return instance is None or bool(getattr(instance, "is_enabled", True))
+
+
+def _start(mode, request, stream, client):
+    state = None
+    ambient = context.get_current()
+    try:
+        state = _Call.__new__(_Call)
+        state.__init__(mode, request, stream, _CONFIG)
+        _transport(client)
+        return state
+    except Exception:
+        if state is not None and getattr(state, "span", None) is not None:
+            try:
+                state.span.end()
+            except Exception:
+                logger.debug("Ollama startup span end failed")
+            _PENDING.discard(state)
+        logger.debug("Ollama telemetry startup failed")
+        return None
     finally:
-        if close_source:
-            await _close_async_iterator(async_iterator)
-        emit_span(
-            request_kwargs=request_kwargs,
-            response_or_chunks=captured.response(),
-            start_ns=start_ns,
-            error_message=error_message,
-            status_code=status_code,
-            parent_ids=parent_ids,
-        )
+        _restore_context(ambient)
 
 
-def _wrap_sync_llm_call(
-    original: Callable[..., Any],
-    *,
-    emit_span: Callable[..., None],
-) -> Callable[..., Any]:
-    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        request_kwargs = _request_kwargs_from_call(original, self, args, kwargs)
-        start_ns = time.time_ns()
-        parent_ids = _current_trace_parent_ids()
+def _run(state, operation, finish_errors=True):
+    if state.done:
+        return operation()
+    ambient = context.get_current()
+    token = None
+    active = _ACTIVE.set(state)
+    try:
         try:
-            response = original(self, *args, **kwargs)
-        except Exception as exc:
-            emit_span(
-                request_kwargs=request_kwargs,
-                start_ns=start_ns,
-                error_message=_error_message(exc),
-                status_code=_error_status_code(exc),
-                parent_ids=parent_ids,
-            )
+            token = context.attach(trace.set_span_in_context(state.span))
+        except Exception:
+            _restore_context(ambient)
+        try:
+            return operation()
+        except (StopIteration, StopAsyncIteration, GeneratorExit):
             raise
+        except BaseException as error:
+            if finish_errors:
+                state.finish(error=error)
+            raise
+    finally:
+        _ACTIVE.reset(active)
+        if token is not None:
+            _detach(token, ambient)
+        else:
+            _restore_context(ambient)
 
-        if request_kwargs.get(STREAM_KEY):
-            return _instrument_sync_stream(
-                iterator=response,
-                emit_span=emit_span,
-                request_kwargs=request_kwargs,
-                start_ns=start_ns,
-                parent_ids=parent_ids,
+
+async def _arun(state, operation, finish_errors=True):
+    if state.done:
+        return await operation()
+    ambient = context.get_current()
+    token = None
+    active = _ACTIVE.set(state)
+    try:
+        try:
+            token = context.attach(trace.set_span_in_context(state.span))
+        except Exception:
+            _restore_context(ambient)
+        try:
+            return await operation()
+        except (StopIteration, StopAsyncIteration, GeneratorExit):
+            raise
+        except BaseException as error:
+            if finish_errors:
+                state.finish(error=error)
+            raise
+    finally:
+        _ACTIVE.reset(active)
+        if token is not None:
+            _detach(token, ambient)
+        else:
+            _restore_context(ambient)
+
+
+class _Stream:
+    """Delegate every native generator operation, including pre-first close."""
+
+    def __init__(self, native, state):
+        self.native, self.state = native, state
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self._advance(lambda: next(self.native))
+
+    def _advance(self, operation):
+        try:
+            result = _run(self.state, operation, False)
+        except StopIteration:
+            self.state.finish()
+            raise
+        except BaseException as error:
+            if self.native.gi_frame is None:
+                self.state.finish(error=error)
+            raise
+        else:
+            self.state.chunk(result)
+            return result
+
+    def send(self, value):
+        return self._advance(lambda: self.native.send(value))
+
+    def throw(self, *args):
+        return self._advance(lambda: self.native.throw(*args))
+
+    def close(self):
+        try:
+            return _run(self.state, self.native.close)
+        finally:
+            self.state.finish()
+
+    def __getattr__(self, name):
+        return getattr(self.native, name)
+
+
+class _AsyncStream:
+    def __init__(self, native, state):
+        self.native, self.state = native, state
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        return await self._advance(self.native.__anext__)
+
+    async def _advance(self, operation):
+        try:
+            result = await _arun(self.state, operation, False)
+        except StopAsyncIteration:
+            self.state.finish()
+            raise
+        except BaseException as error:
+            if self.native.ag_frame is None:
+                self.state.finish(error=error)
+            raise
+        else:
+            self.state.chunk(result)
+            return result
+
+    async def asend(self, value):
+        return await self._advance(lambda: self.native.asend(value))
+
+    async def athrow(self, *args):
+        return await self._advance(lambda: self.native.athrow(*args))
+
+    async def aclose(self):
+        try:
+            return await _arun(self.state, self.native.aclose)
+        finally:
+            self.state.finish()
+
+    def __getattr__(self, name):
+        return getattr(self.native, name)
+
+
+def _mode(cls):
+    import ollama
+
+    return {
+        ollama.ChatResponse: "chat",
+        ollama.GenerateResponse: "generate",
+        ollama.EmbedResponse: "embed",
+        ollama.EmbeddingsResponse: "embeddings",
+    }.get(cls)
+
+
+def _wrap(original, asynchronous=False):
+    if asynchronous:
+
+        @functools.wraps(original)
+        async def call(client, cls, *args, stream=False, **kwargs):
+            mode = _mode(cls)
+            if _CONFIG is None or mode is None or suppressed() or not _enabled():
+                return await original(client, cls, *args, stream=stream, **kwargs)
+            state = _start(mode, kwargs.get("json", {}), stream, client)
+            if state is None:
+                return await original(client, cls, *args, stream=stream, **kwargs)
+            response = await _arun(
+                state, lambda: original(client, cls, *args, stream=stream, **kwargs)
             )
+            if stream:
+                return _AsyncStream(response, state)
+            state.finish(response=response)
+            return response
 
-        emit_span(
-            request_kwargs=request_kwargs,
-            response_or_chunks=response,
-            start_ns=start_ns,
-            parent_ids=parent_ids,
+        return call
+
+    @functools.wraps(original)
+    def call(client, cls, *args, stream=False, **kwargs):
+        mode = _mode(cls)
+        if _CONFIG is None or mode is None or suppressed() or not _enabled():
+            return original(client, cls, *args, stream=stream, **kwargs)
+        state = _start(mode, kwargs.get("json", {}), stream, client)
+        if state is None:
+            return original(client, cls, *args, stream=stream, **kwargs)
+        response = _run(
+            state, lambda: original(client, cls, *args, stream=stream, **kwargs)
         )
+        if stream:
+            return _Stream(response, state)
+        state.finish(response=response)
         return response
 
-    return wrapper
+    return call
 
 
-def _wrap_async_llm_call(
-    original: Callable[..., Any],
-    *,
-    emit_span: Callable[..., None],
-) -> Callable[..., Any]:
-    async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        request_kwargs = _request_kwargs_from_call(original, self, args, kwargs)
-        start_ns = time.time_ns()
-        parent_ids = _current_trace_parent_ids()
-        try:
-            response = await original(self, *args, **kwargs)
-        except Exception as exc:
-            emit_span(
-                request_kwargs=request_kwargs,
-                start_ns=start_ns,
-                error_message=_error_message(exc),
-                status_code=_error_status_code(exc),
-                parent_ids=parent_ids,
-            )
-            raise
+def _detach_guard(original):
+    @functools.wraps(original)
+    def detach(token):
+        for state in tuple(_PENDING):
+            if not state.done:
+                try:
+                    state.explicit_policy()
+                except Exception:
+                    logger.debug("Ollama content policy observation failed")
+        return original(token)
 
-        if request_kwargs.get(STREAM_KEY):
-            return _instrument_async_stream(
-                async_iterator=response,
-                emit_span=emit_span,
-                request_kwargs=request_kwargs,
-                start_ns=start_ns,
-                parent_ids=parent_ids,
-            )
-
-        emit_span(
-            request_kwargs=request_kwargs,
-            response_or_chunks=response,
-            start_ns=start_ns,
-            parent_ids=parent_ids,
-        )
-        return response
-
-    return wrapper
-
-
-def _wrap_sync_embedding_call(
-    original: Callable[..., Any],
-    *,
-    method_name: str,
-) -> Callable[..., Any]:
-    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        request_kwargs = _request_kwargs_from_call(original, self, args, kwargs)
-        start_ns = time.time_ns()
-        parent_ids = _current_trace_parent_ids()
-        try:
-            response = original(self, *args, **kwargs)
-        except Exception as exc:
-            emit_embedding_span(
-                request_kwargs=request_kwargs,
-                start_ns=start_ns,
-                error_message=_error_message(exc),
-                status_code=_error_status_code(exc),
-                method_name=method_name,
-                parent_ids=parent_ids,
-            )
-            raise
-
-        emit_embedding_span(
-            request_kwargs=request_kwargs,
-            response=response,
-            start_ns=start_ns,
-            method_name=method_name,
-            parent_ids=parent_ids,
-        )
-        return response
-
-    return wrapper
-
-
-def _wrap_async_embedding_call(
-    original: Callable[..., Any],
-    *,
-    method_name: str,
-) -> Callable[..., Any]:
-    async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        request_kwargs = _request_kwargs_from_call(original, self, args, kwargs)
-        start_ns = time.time_ns()
-        parent_ids = _current_trace_parent_ids()
-        try:
-            response = await original(self, *args, **kwargs)
-        except Exception as exc:
-            emit_embedding_span(
-                request_kwargs=request_kwargs,
-                start_ns=start_ns,
-                error_message=_error_message(exc),
-                status_code=_error_status_code(exc),
-                method_name=method_name,
-                parent_ids=parent_ids,
-            )
-            raise
-
-        emit_embedding_span(
-            request_kwargs=request_kwargs,
-            response=response,
-            start_ns=start_ns,
-            method_name=method_name,
-            parent_ids=parent_ids,
-        )
-        return response
-
-    return wrapper
+    return detach
 
 
 class OllamaInstrumentor:
-    """Respan instrumentor for the official Ollama Python SDK."""
+    """Instrument the four inference methods of the official Ollama SDK."""
 
-    name = OLLAMA_INSTRUMENTATION_NAME
-    _lifecycle_lock = threading.RLock()
-    _patches_applied = False
-    _activation_count = 0
+    name = "ollama"
 
-    def __init__(self) -> None:
+    def __init__(self, *, capture_content=True, tracer_provider=None):
+        self.config = (capture_content, tracer_provider)
         self._is_instrumented = False
 
-    @staticmethod
-    def _is_respan_tracing_enabled() -> bool:
-        tracer = getattr(RespanTracer, "_instance", None)
-        if tracer is None:
-            return True
-        return bool(getattr(tracer, "is_enabled", True))
-
-    def activate(self) -> None:
-        """Monkey-patch Ollama client generation and embedding methods."""
-        with type(self)._lifecycle_lock:
-            self._activate_locked()
-
-    def _activate_locked(self) -> None:
-        global _original_sync_chat, _original_async_chat
-        global _original_sync_generate, _original_async_generate
-        global _original_sync_embed, _original_async_embed
-        global _original_sync_embeddings, _original_async_embeddings
-
-        cls = type(self)
-        if self._is_instrumented:
-            return
-
-        if not self._is_respan_tracing_enabled():
-            logger.info(
-                "Ollama instrumentation skipped because Respan tracing is disabled"
-            )
-            return
-
-        if cls._patches_applied:
-            cls._activation_count += 1
+    def activate(self):
+        global _CONFIG
+        with _LOCK:
+            if self in _OWNERS:
+                return
+            if _OWNERS and self.config != _CONFIG:
+                raise ValueError(
+                    "Ollama is active with a different content/provider configuration"
+                )
+            if not _OWNERS:
+                try:
+                    sdk = importlib.import_module("ollama")
+                    _observer(_provider(self.config))
+                    for owner, name, factory in (
+                        (sdk.Client, "_request", lambda fn: _wrap(fn)),
+                        (sdk.AsyncClient, "_request", lambda fn: _wrap(fn, True)),
+                        (context, "detach", _detach_guard),
+                    ):
+                        original = getattr(owner, name)
+                        owned = factory(original)
+                        setattr(owner, name, owned)
+                        _PATCHES.append((owner, name, original, owned))
+                    _CONFIG = self.config
+                except ImportError:
+                    _cleanup()
+                    return
+                except Exception:
+                    _cleanup()
+                    logger.debug("Ollama activation failed")
+                    return
+            _OWNERS.add(self)
             self._is_instrumented = True
-            return
 
-        try:
-            Client, AsyncClient = _load_client_classes()
-        except ImportError as exc:
-            # SDK genuinely absent - expected when the app doesn't use Ollama
-            # (the ollama SDK is an optional extra).
-            logger.debug(
-                "Ollama instrumentation inactive - missing dependency: %s",
-                exc,
+    def deactivate(self):
+        with _LOCK:
+            _OWNERS.discard(self)
+            self._is_instrumented = False
+            if not _OWNERS:
+                _cleanup()
+
+
+def _cleanup():
+    global _CONFIG
+    for state in tuple(_PENDING):
+        state.finish()
+    for owner, name, original, owned in reversed(_PATCHES):
+        if getattr(owner, name, None) is owned:
+            setattr(owner, name, original)
+    _PATCHES.clear()
+    for ref, hook in _HOOKS:
+        owner = ref()
+        if owner is not None:
+            owner.event_hooks["response"][:] = [
+                item for item in owner.event_hooks["response"] if item is not hook
+            ]
+    _HOOKS.clear()
+    for provider, observer in _OBSERVERS:
+        processor = getattr(provider, "_active_span_processor", None)
+        processors = getattr(processor, "_span_processors", ())
+        if any(item is observer for item in processors):
+            processor._span_processors = tuple(
+                item for item in processors if item is not observer
             )
-            return
-        except AttributeError as exc:
-            # SDK installed but incompatible (a class moved/renamed) - surface it
-            # so a broken install isn't silently left untraced.
-            logger.warning(
-                "ollama is installed but incompatible - instrumentation inactive: %s",
-                exc,
-            )
-            return
-        except Exception as exc:  # noqa: BLE001 - plugin activation is best-effort
-            logger.warning("Failed to activate Ollama instrumentation: %s", exc)
-            return
-
-        try:
-            if _original_sync_chat is None:
-                _original_sync_chat = getattr(Client, CHAT_METHOD_NAME)
-                setattr(
-                    Client,
-                    CHAT_METHOD_NAME,
-                    _wrap_sync_llm_call(
-                        _original_sync_chat,
-                        emit_span=emit_chat_span,
-                    ),
-                )
-
-            if _original_async_chat is None:
-                _original_async_chat = getattr(AsyncClient, CHAT_METHOD_NAME)
-                setattr(
-                    AsyncClient,
-                    CHAT_METHOD_NAME,
-                    _wrap_async_llm_call(
-                        _original_async_chat,
-                        emit_span=emit_chat_span,
-                    ),
-                )
-
-            if _original_sync_generate is None:
-                _original_sync_generate = getattr(Client, GENERATE_METHOD_NAME)
-                setattr(
-                    Client,
-                    GENERATE_METHOD_NAME,
-                    _wrap_sync_llm_call(
-                        _original_sync_generate,
-                        emit_span=emit_generate_span,
-                    ),
-                )
-
-            if _original_async_generate is None:
-                _original_async_generate = getattr(AsyncClient, GENERATE_METHOD_NAME)
-                setattr(
-                    AsyncClient,
-                    GENERATE_METHOD_NAME,
-                    _wrap_async_llm_call(
-                        _original_async_generate,
-                        emit_span=emit_generate_span,
-                    ),
-                )
-
-            if _original_sync_embed is None and hasattr(Client, EMBED_METHOD_NAME):
-                _original_sync_embed = getattr(Client, EMBED_METHOD_NAME)
-                setattr(
-                    Client,
-                    EMBED_METHOD_NAME,
-                    _wrap_sync_embedding_call(
-                        _original_sync_embed,
-                        method_name=EMBED_METHOD_NAME,
-                    ),
-                )
-
-            if _original_async_embed is None and hasattr(
-                AsyncClient, EMBED_METHOD_NAME
-            ):
-                _original_async_embed = getattr(AsyncClient, EMBED_METHOD_NAME)
-                setattr(
-                    AsyncClient,
-                    EMBED_METHOD_NAME,
-                    _wrap_async_embedding_call(
-                        _original_async_embed,
-                        method_name=EMBED_METHOD_NAME,
-                    ),
-                )
-
-            if _original_sync_embeddings is None and hasattr(
-                Client,
-                EMBEDDINGS_METHOD_NAME,
-            ):
-                _original_sync_embeddings = getattr(Client, EMBEDDINGS_METHOD_NAME)
-                setattr(
-                    Client,
-                    EMBEDDINGS_METHOD_NAME,
-                    _wrap_sync_embedding_call(
-                        _original_sync_embeddings,
-                        method_name=EMBEDDINGS_METHOD_NAME,
-                    ),
-                )
-
-            if _original_async_embeddings is None and hasattr(
-                AsyncClient,
-                EMBEDDINGS_METHOD_NAME,
-            ):
-                _original_async_embeddings = getattr(
-                    AsyncClient, EMBEDDINGS_METHOD_NAME
-                )
-                setattr(
-                    AsyncClient,
-                    EMBEDDINGS_METHOD_NAME,
-                    _wrap_async_embedding_call(
-                        _original_async_embeddings,
-                        method_name=EMBEDDINGS_METHOD_NAME,
-                    ),
-                )
-        except Exception:
-            logger.exception("Failed to patch Ollama client methods")
-            self._is_instrumented = True
-            cls._patches_applied = True
-            cls._activation_count = 1
-            self._deactivate_locked()
-            return
-
-        self._is_instrumented = True
-        cls._patches_applied = True
-        cls._activation_count = 1
-        logger.info("Ollama instrumentation activated")
-
-    def deactivate(self) -> None:
-        """Restore Ollama client methods."""
-        with type(self)._lifecycle_lock:
-            self._deactivate_locked()
-
-    def _deactivate_locked(self) -> None:
-        global _original_sync_chat, _original_async_chat
-        global _original_sync_generate, _original_async_generate
-        global _original_sync_embed, _original_async_embed
-        global _original_sync_embeddings, _original_async_embeddings
-
-        cls = type(self)
-        if not self._is_instrumented:
-            return
-
-        self._is_instrumented = False
-        cls._activation_count = max(cls._activation_count - 1, 0)
-        if cls._activation_count:
-            return
-
-        try:
-            Client, AsyncClient = _load_client_classes()
-        except Exception:  # noqa: BLE001 - teardown must clear local state
-            Client = AsyncClient = None
-
-        if Client is not None:
-            if _original_sync_chat is not None:
-                setattr(Client, CHAT_METHOD_NAME, _original_sync_chat)
-            if _original_sync_generate is not None:
-                setattr(Client, GENERATE_METHOD_NAME, _original_sync_generate)
-            if _original_sync_embed is not None:
-                setattr(Client, EMBED_METHOD_NAME, _original_sync_embed)
-            if _original_sync_embeddings is not None:
-                setattr(Client, EMBEDDINGS_METHOD_NAME, _original_sync_embeddings)
-
-        if AsyncClient is not None:
-            if _original_async_chat is not None:
-                setattr(AsyncClient, CHAT_METHOD_NAME, _original_async_chat)
-            if _original_async_generate is not None:
-                setattr(AsyncClient, GENERATE_METHOD_NAME, _original_async_generate)
-            if _original_async_embed is not None:
-                setattr(AsyncClient, EMBED_METHOD_NAME, _original_async_embed)
-            if _original_async_embeddings is not None:
-                setattr(
-                    AsyncClient,
-                    EMBEDDINGS_METHOD_NAME,
-                    _original_async_embeddings,
-                )
-
-        _original_sync_chat = None
-        _original_async_chat = None
-        _original_sync_generate = None
-        _original_async_generate = None
-        _original_sync_embed = None
-        _original_async_embed = None
-        _original_sync_embeddings = None
-        _original_async_embeddings = None
-        cls._patches_applied = False
-        cls._activation_count = 0
-        logger.info("Ollama instrumentation deactivated")
+    _OBSERVERS.clear()
+    _CONFIG = None

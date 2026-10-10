@@ -1,1091 +1,788 @@
-"""Replicate SDK instrumentation plugin for Respan."""
+"""Native sampled spans around released Replicate operations and consumption."""
 
 from __future__ import annotations
 
-import contextlib
 import contextvars
 import functools
-import importlib
-import importlib.metadata
 import logging
 import threading
-import time
-from collections.abc import AsyncIterator, Callable, Iterator
-from dataclasses import dataclass
-from types import TracebackType
-from typing import Any, Self
+import types
+import weakref
+from contextlib import contextmanager
 
-from opentelemetry import trace
-from opentelemetry.sdk.util.instrumentation import InstrumentationScope
-from opentelemetry.semconv_ai import SpanAttributes
-from respan_sdk.constants import ERROR_MESSAGE_ATTR
-from respan_sdk.utils.data_processing.id_processing import (
-    format_span_id,
-    format_trace_id,
-)
-from respan_tracing.core.tracer import RespanTracer
-from respan_tracing.utils.span_factory import build_readable_span, inject_span
+from opentelemetry import context, trace
+from opentelemetry.sdk.util import BoundedList
+from opentelemetry.semconv._incubating.attributes.error_attributes import ERROR_MESSAGE
+from opentelemetry.semconv.attributes.error_attributes import ERROR_TYPE
+from opentelemetry.semconv.attributes.http_attributes import HTTP_RESPONSE_STATUS_CODE
+from opentelemetry.semconv_ai import SpanAttributes as AI
+from opentelemetry.trace import SpanKind, Status, StatusCode
+from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE, RESPAN_METADATA
+from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
 
-from respan_instrumentation_replicate._constants import (
-    ASYNC_PREFIX,
-    INPUT_KEY,
-    MAX_STREAM_CHUNKS,
-    PREDICTION_RESPAN_MODEL_ATTR,
-    REPLICATE_INSTRUMENTATION_NAME,
-    REPLICATE_PREDICTION_CREATE_SPAN_NAME,
-    REPLICATE_PREDICTION_WAIT_SPAN_NAME,
-    REPLICATE_RUN_SPAN_NAME,
-    REPLICATE_STREAM_SPAN_NAME,
-    RESPAN_PARAMS_KEY,
-    RESPAN_PARAMS_MODEL_KEY,
-)
-from respan_instrumentation_replicate._serialization import (
-    exception_message,
-    exception_status,
-    prediction_summary,
-    safe_text,
-)
-from respan_instrumentation_replicate._translator import (
-    build_model_call_span_data,
-    build_operation_span_data,
-)
+from ._policy import Policy, key, permitted, suppressed
+from ._serialization import native_value, register_native_types, safe_text
+from ._translator import attributes, usage
 
 logger = logging.getLogger(__name__)
-
 _LOCK = threading.RLock()
-_REFCOUNT = 0
-_ENABLED = False
+_MANAGER = None
+_OWNERS = set()
+_PATCHES = []
+_CURRENT = contextvars.ContextVar("replicate_native_call", default=None)
+_MISSING = object()
 
 
-@dataclass
-class _Patch:
-    owner: Any
-    name: str
-    original: Any
-    replacement: Any
+class _Manager:
+    def __init__(self, provider, capture):
+        self.provider = provider
+        self.capture = capture
+        self.policy = None
+        self.bound_provider = None
+        self.states = weakref.WeakSet()
+        self.enabled = True
+
+    def refresh(self):
+        provider = self.provider or trace.get_tracer_provider()
+        if provider is not self.bound_provider and hasattr(
+            provider, "add_span_processor"
+        ):
+            if self.policy:
+                self.policy.close()
+            self.policy = Policy(provider, self.scrub)
+            self.bound_provider = provider
+        return provider
+
+    def scrub(self):
+        for state in list(self.states):
+            if not state.done and not state.check():
+                state.scrub()
+
+    def close(self):
+        self.enabled = False
+        for state in list(self.states):
+            state.safe(state.finish)
+        if self.policy:
+            self.policy.close()
 
 
-_PATCHES: list[_Patch] = []
+class _Call:
+    def __init__(self, manager, name, args, kwargs, instance):
+        self.manager = manager
+        self.done = False
+        self.span = None
+        self.policy = None
+        self.allowed = False
+        self.request = None
+        self.frames = []
+        self.prediction = None
+        self.result = None
+        self.has_result = False
+        self.model = None
+        self.http_status = None
+        self.http_statuses = []
+        self.usage_attrs = {}
+        self.error_type = None
+        self.error_message = None
+        self.kind = "task"
+        self.name = name
+        self.operation = name.rsplit(".", 1)[-1]
+        try:
+            provider = manager.refresh()
+            self.policy = manager.policy
+            parent = trace.get_current_span()
+            self.parent = key(parent)
+            initial = (
+                manager.capture
+                and permitted()
+                and bool(self.policy and self.policy.enroll(parent))
+            )
+            self.span = provider.get_tracer("replicate").start_span(
+                name, kind=SpanKind.CLIENT, attributes={RESPAN_LOG_TYPE: "task"}
+            )
+            self.allowed = (
+                initial
+                and self.span.is_recording()
+                and bool(self.policy and self.policy.bound(key(self.span)))
+            )
+            self.structural = (
+                {
+                    k: v
+                    for k, v in (self.span.attributes or {}).items()
+                    if k.startswith(RESPAN_METADATA)
+                }
+                if self.span.is_recording()
+                else {}
+            )
+            manager.states.add(self)
+            if self.span.is_recording():
+                from replicate.prediction import Prediction
 
-_SUPPRESSED_SPAN_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
-    "respan_replicate_suppressed_span_depth",
-    default=0,
-)
+                raw = (
+                    object.__getattribute__(instance, "__dict__")
+                    if type(instance) is Prediction
+                    else {}
+                )
+                ref = (
+                    kwargs.get("model")
+                    or kwargs.get("version")
+                    or kwargs.get("deployment")
+                    or (args[0] if args else None)
+                    or raw.get("model")
+                    or raw.get("version")
+                )
+                if type(ref) is str:
+                    self.model = safe_text(ref)
+                body = (
+                    kwargs.get("input")
+                    if "input" in kwargs
+                    else args[1]
+                    if len(args) > 1
+                    else None
+                )
+                if (
+                    self.operation in ("run", "async_run", "stream", "async_stream")
+                    and type(body) is dict
+                    and all(type(k) is str for k in body)
+                ):
+                    self.kind = (
+                        "chat"
+                        if "messages" in body
+                        else "text"
+                        if "prompt" in body
+                        else "task"
+                    )
+                params = kwargs.get("respan_params")
+                if type(params) is dict and type(params.get("model")) is str:
+                    self.model = safe_text(params["model"])
+                self.span.set_attribute(RESPAN_LOG_TYPE, self.kind)
+                if self.allowed:
+                    self.request = {
+                        "args": native_value(args),
+                        "kwargs": native_value(kwargs),
+                    }
+                if type(instance) is Prediction:
+                    self.observe_prediction(instance)
+        except Exception:
+            self.scrub()
+            if self.span:
+                try:
+                    self.span.end()
+                except Exception:  # noqa: BLE001 - cleanup cannot replace native SDK outcomes.
+                    logger.debug("Replicate telemetry cleanup failed")
+            raise
+
+    def check(self):
+        if self.done:
+            return self.allowed
+        self.allowed = (
+            self.allowed
+            and permitted()
+            and bool(self.policy and self.policy.bound(key(self.span)))
+        )
+        if not self.allowed:
+            self.scrub()
+        return self.allowed
+
+    def scrub(self):
+        self.request = None
+        self.frames.clear()
+        self.prediction = None
+        self.result = None
+        self.has_result = False
+        self.error_message = None
+        if self.span and self.span.is_recording():
+            for attr in list(self.span._attributes):
+                if attr in (
+                    AI.TRACELOOP_ENTITY_INPUT,
+                    AI.TRACELOOP_ENTITY_OUTPUT,
+                    AI.LLM_REQUEST_FUNCTIONS,
+                    ERROR_MESSAGE,
+                ) or attr.startswith(
+                    (
+                        AI.LLM_PROMPTS + ".",
+                        AI.LLM_COMPLETIONS + ".",
+                        RESPAN_METADATA + ".replicate",
+                    )
+                ):
+                    self.span._attributes.pop(attr, None)
+            self.span._events = BoundedList(maxlen=self.span._events._dq.maxlen)
+            if self.span.status.status_code == StatusCode.ERROR:
+                self.span._status = Status(StatusCode.ERROR)
+
+    def discard(self):
+        # Guaranteed bodyless fallback, including when a custom observer raises.
+        self.allowed = False
+        self.request = None
+        self.frames.clear()
+        self.prediction = None
+        self.result = None
+        self.has_result = False
+        self.error_message = None
+        if self.done:
+            return
+        self.done = True
+        try:
+            if self.span and self.span.is_recording():
+                from opentelemetry.attributes import BoundedAttributes
+
+                self.span._attributes = BoundedAttributes(
+                    attributes={
+                        **self.structural,
+                        RESPAN_LOG_TYPE: self.kind,
+                        AI.TRACELOOP_ENTITY_NAME: self.name,
+                    },
+                    immutable=False,
+                )
+                if self.error_type:
+                    self.span.set_attribute(ERROR_TYPE, self.error_type)
+                self.span._events = BoundedList(maxlen=self.span._events._dq.maxlen)
+                if self.span.status.status_code == StatusCode.ERROR:
+                    self.span._status = Status(StatusCode.ERROR)
+        except Exception:  # noqa: BLE001 - discard cleanup cannot replace SDK outcomes.
+            logger.debug("Replicate telemetry discard cleanup failed")
+        try:
+            if self.span:
+                self.span.end()
+        except Exception:  # noqa: BLE001 - native consumer outcomes have priority.
+            logger.debug("Replicate telemetry discard end failed")
+        finally:
+            if self.policy:
+                self.policy.on_end(self.span)
+
+    def safe(self, fn, *args, **kwargs):
+        if self.done:
+            return None
+        try:
+            return fn(*args, **kwargs)
+        except Exception:  # noqa: BLE001 - isolate all observer faults.
+            logger.debug("Replicate telemetry observation failed")
+            self.discard()
+            return None
+
+    def observe_prediction(self, prediction):
+        if not self.span.is_recording():
+            return
+        from replicate.prediction import Prediction
+
+        if type(prediction) is not Prediction:
+            return
+        self.usage_attrs.update(usage(prediction))
+        data = object.__getattribute__(prediction, "__dict__")
+        if self.model is None and type(data.get("model")) is str:
+            self.model = safe_text(data["model"])
+        if self.check():
+            self.prediction = prediction
+
+    def observe_result(self, result):
+        if not self.span.is_recording():
+            return
+        self.observe_prediction(result)
+        if self.check():
+            self.result = native_value(result)
+            self.has_result = result is not None
+
+    def observe_frame(self, value):
+        if self.check():
+            self.frames.append(native_value(value))
+
+    def error(self, error):
+        if not self.span.is_recording():
+            return
+        self.error_type = type.__getattribute__(type(error), "__name__")
+        self.span.set_attribute(ERROR_TYPE, self.error_type)
+        self.span.set_status(Status(StatusCode.ERROR))
+        from replicate.exceptions import ModelError, ReplicateError
+
+        if type(error) is ModelError:
+            self.observe_prediction(
+                object.__getattribute__(error, "__dict__").get("prediction")
+            )
+        data = BaseException.__dict__["__dict__"].__get__(error)
+        status = data.get("status") if type(error) is ReplicateError else None
+        if type(status) is int:
+            self.http_status = status
+        if self.check():
+            message = data.get("detail") if type(error) is ReplicateError else None
+            if type(message) is not str:
+                message = next(
+                    (v for v in BaseException.args.__get__(error) if type(v) is str),
+                    None,
+                )
+            if message is not None:
+                message = safe_text(message)
+                self.error_message = message
+                self.span.set_attribute(ERROR_MESSAGE, message)
+                self.span.set_status(Status(StatusCode.ERROR, message))
+
+    def finish(self):
+        if self.done:
+            return
+        try:
+            allowed = self.check()
+            if self.span.is_recording():
+                if allowed:
+                    mapped = attributes(
+                        self.name,
+                        self.request or {},
+                        self.result,
+                        self.prediction,
+                        self.frames,
+                        has_result=self.has_result,
+                        model=self.model,
+                        operation=self.operation,
+                    )
+                    self.span.set_attributes(mapped)
+                    self.kind = mapped[RESPAN_LOG_TYPE]
+                # Usage is structural even when content is disabled; only source numeric fields.
+                if self.kind in ("chat", "text", "embedding") and self.usage_attrs:
+                    self.span.set_attributes(self.usage_attrs)
+                if self.model is not None and self.kind in (
+                    "chat",
+                    "text",
+                    "embedding",
+                ):
+                    self.span.set_attribute(AI.LLM_REQUEST_MODEL, self.model)
+                if self.http_status is not None:
+                    self.span.set_attribute(HTTP_RESPONSE_STATUS_CODE, self.http_status)
+                if self.error_type:
+                    self.span.set_attribute(ERROR_TYPE, self.error_type)
+                if allowed and self.error_message:
+                    self.span.set_attribute(ERROR_MESSAGE, self.error_message)
+                self.span.set_attributes(self.structural)
+                self.check()
+        except Exception:  # noqa: BLE001 - discard incomplete telemetry while preserving the native result.
+            self.allowed = False
+            self.scrub()
+            logger.debug("Replicate telemetry mapping failed")
+        finally:
+            self.done = True
+            try:
+                self.span.end()
+            except Exception:  # noqa: BLE001 - telemetry cleanup must preserve native outcomes.
+                logger.debug("Replicate telemetry span end failed")
+            finally:
+                if self.policy:
+                    self.policy.on_end(self.span)
+                self.request = None
+                self.frames.clear()
+                self.prediction = None
+                self.result = None
 
 
-def _spans_suppressed() -> bool:
-    return _SUPPRESSED_SPAN_DEPTH.get() > 0
-
-
-@contextlib.contextmanager
-def _suppress_nested_spans():
-    token = _SUPPRESSED_SPAN_DEPTH.set(_SUPPRESSED_SPAN_DEPTH.get() + 1)
+@contextmanager
+def _scope(state):
+    current = span_token = private_token = None
     try:
+        if state and not state.done:
+            state.safe(state.check)
+            current = _CURRENT.set(state)
+            try:
+                if not state.allowed:
+                    private_token = context.attach(
+                        context.set_value(ENABLE_CONTENT_TRACING_KEY, False)
+                    )
+                span_token = context.attach(trace.set_span_in_context(state.span))
+            except Exception:  # noqa: BLE001 - telemetry cleanup must preserve native outcomes.
+                state.allowed = False
+                state.scrub()
+                logger.debug("Replicate telemetry context attach failed")
         yield
     finally:
-        _SUPPRESSED_SPAN_DEPTH.reset(token)
+        if state and not state.done:
+            state.safe(state.check)
+        for token in (span_token, private_token):
+            if token is not None:
+                try:
+                    context.detach(token)
+                except Exception:  # noqa: BLE001 - telemetry cleanup must preserve native outcomes.
+                    if state and state.policy:
+                        try:
+                            state.policy.original_detach(token)
+                        except Exception:  # noqa: BLE001, S110 - original detach fallback cannot replace the native outcome.
+                            pass
+                    logger.debug("Replicate telemetry context cleanup failed")
+        if current is not None:
+            _CURRENT.reset(current)
 
 
-def _current_otel_parent() -> tuple[str | None, str | None]:
-    current_span = trace.get_current_span()
-    try:
-        span_context = current_span.get_span_context()
-    except Exception:  # noqa: BLE001 - non-recording spans can be hostile proxies.
-        return None, None
+class _Iterator:
+    def __init__(self, source, state):
+        self.source = source
+        self.state = state
 
-    trace_id = getattr(span_context, "trace_id", 0)
-    span_id = getattr(span_context, "span_id", 0)
-    if not isinstance(trace_id, int) or not isinstance(span_id, int):
-        return None, None
-    if trace_id == 0 or span_id == 0:
-        return None, None
-    return format_trace_id(trace_id=trace_id), format_span_id(span_id=span_id)
-
-
-def _emit_span(
-    *,
-    span_name: str,
-    attributes: dict[str, Any],
-    start_time_ns: int,
-    end_time_ns: int | None = None,
-    error: BaseException | None = None,
-    parent_context: tuple[str | None, str | None] | None = None,
-) -> None:
-    if _spans_suppressed():
-        return
-
-    trace_id, parent_id = parent_context or _current_otel_parent()
-    attributes[SpanAttributes.TRACELOOP_ENTITY_PATH] = (
-        attributes.get(SpanAttributes.TRACELOOP_ENTITY_PATH, span_name)
-        if parent_id
-        else ""
-    )
-    status_code = exception_status(error) if error is not None else 200
-    if error is not None:
-        message = exception_message(error)
-        attributes["status_code"] = status_code
-        attributes[ERROR_MESSAGE_ATTR] = message
-    else:
-        message = None
-        attributes.setdefault("status_code", 200)
-    span = build_readable_span(
-        name=span_name,
-        trace_id=trace_id,
-        parent_id=parent_id,
-        start_time_ns=start_time_ns,
-        end_time_ns=end_time_ns or time.time_ns(),
-        attributes=attributes,
-        status_code=status_code,
-        error_message=message,
-    )
-    try:
-        package_version = importlib.metadata.version("respan-instrumentation-replicate")
-    except importlib.metadata.PackageNotFoundError:
-        package_version = None
-    span._instrumentation_scope = InstrumentationScope(  # type: ignore[attr-defined]
-        REPLICATE_INSTRUMENTATION_NAME,
-        package_version,
-    )
-    inject_span(span=span)
-
-
-def _pop_respan_params(kwargs: dict[str, Any]) -> tuple[dict[str, Any], Any]:
-    call_kwargs = dict(kwargs)
-    respan_params = call_kwargs.pop(RESPAN_PARAMS_KEY, None)
-    return call_kwargs, respan_params
-
-
-def _reported_model_from_respan_params(respan_params: Any) -> str | None:
-    if not isinstance(respan_params, dict):
-        return None
-    model = respan_params.get(RESPAN_PARAMS_MODEL_KEY)
-    return safe_text(model) if model else None
-
-
-def _set_prediction_reported_model(prediction: Any, respan_params: Any) -> None:
-    reported_model = _reported_model_from_respan_params(respan_params)
-    if not reported_model:
-        return
-    try:
-        object.__setattr__(prediction, PREDICTION_RESPAN_MODEL_ATTR, reported_model)
-    except Exception:  # noqa: BLE001 - resources may reject private attributes.
+    def __del__(self):
         try:
-            setattr(prediction, PREDICTION_RESPAN_MODEL_ATTR, reported_model)
-        except Exception:  # noqa: BLE001 - best-effort metadata only.
-            return
+            self.state.discard()
+        except BaseException:  # noqa: BLE001 - telemetry cleanup must preserve native outcomes.
+            logger.debug("Replicate abandoned iterator cleanup failed")
 
-
-def _is_file_output(value: Any) -> bool:
-    return value.__class__.__name__ == "FileOutput"
-
-
-def _is_sync_iterator(value: Any) -> bool:
-    return not _is_file_output(value) and isinstance(value, Iterator)
-
-
-def _is_async_iterator(value: Any) -> bool:
-    return isinstance(value, AsyncIterator)
-
-
-class _SyncIteratorProxy:
-    def __init__(
-        self,
-        *,
-        iterator: Iterator[Any],
-        emit_once: Callable[[list[Any], BaseException | None], None],
-    ) -> None:
-        self._iterator = iterator
-        self._emit_once = emit_once
-        self._chunks: list[Any] = []
-        self._emitted = False
-
-    def __iter__(self) -> _SyncIteratorProxy:
+    def __iter__(self):
         return self
 
-    def __next__(self) -> Any:
+    def __getattr__(self, name):
+        return getattr(self.source, name)
+
+    def _pull(self, fn, *args):
         try:
-            with _suppress_nested_spans():
-                chunk = next(self._iterator)
+            with _scope(self.state):
+                value = fn(*args)
         except StopIteration:
-            self._emit(error=None)
+            self.state.safe(self.state.finish)
             raise
-        except BaseException as exc:
-            self._emit(error=exc)
+        except BaseException as error:
+            self.state.safe(self.state.error, error)
+            self.state.safe(self.state.finish)
             raise
-        if len(self._chunks) < MAX_STREAM_CHUNKS:
-            self._chunks.append(chunk)
-        return chunk
+        self.state.safe(self.state.observe_frame, value)
+        return value
 
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._iterator, name)
+    def __next__(self):
+        return self._pull(next, self.source)
 
-    def close(self) -> None:
-        error: BaseException | None = None
+    def send(self, value):
+        return self._pull(self.source.send, value)
+
+    def throw(self, *args):
+        return self._pull(self.source.throw, *args)
+
+    def close(self):
         try:
-            close = getattr(self._iterator, "close", None)
-            if callable(close):
-                close()
-        except BaseException as exc:
-            error = exc
+            with _scope(self.state):
+                return self.source.close()
+        except BaseException as error:
+            self.state.safe(self.state.error, error)
             raise
         finally:
-            self._emit(error=error)
+            self.state.safe(self.state.finish)
 
-    def __enter__(self) -> Self:
-        enter = getattr(self._iterator, "__enter__", None)
-        if callable(enter):
-            enter()
+
+class _AsyncIterator:
+    def __init__(self, source, state):
+        self.source = source
+        self.state = state
+
+    def __del__(self):
+        try:
+            self.state.discard()
+        except BaseException:  # noqa: BLE001 - telemetry cleanup must preserve native outcomes.
+            logger.debug("Replicate abandoned async iterator cleanup failed")
+
+    def __aiter__(self):
         return self
 
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> Any:
+    def __getattr__(self, name):
+        return getattr(self.source, name)
+
+    async def _pull(self, fn, *args):
         try:
-            exit_method = getattr(self._iterator, "__exit__", None)
-            if callable(exit_method):
-                return exit_method(exc_type, exc, tb)
-            self.close()
-            return None
-        finally:
-            self._emit(error=exc)
-
-    def _emit(self, *, error: BaseException | None) -> None:
-        if self._emitted:
-            return
-        self._emitted = True
-        self._emit_once(self._chunks, error)
-
-
-class _AsyncIteratorProxy:
-    def __init__(
-        self,
-        *,
-        iterator: AsyncIterator[Any],
-        emit_once: Callable[[list[Any], BaseException | None], None],
-    ) -> None:
-        self._iterator = iterator
-        self._chunks: list[Any] = []
-        self._emit_once = emit_once
-        self._emitted = False
-
-    def __aiter__(self) -> _AsyncIteratorProxy:
-        return self
-
-    async def __anext__(self) -> Any:
-        try:
-            with _suppress_nested_spans():
-                chunk = await self._iterator.__anext__()
+            with _scope(self.state):
+                value = await fn(*args)
         except StopAsyncIteration:
-            self._emit(error=None)
+            self.state.safe(self.state.finish)
             raise
-        except BaseException as exc:
-            self._emit(error=exc)
+        except BaseException as error:
+            self.state.safe(self.state.error, error)
+            self.state.safe(self.state.finish)
             raise
-        if len(self._chunks) < MAX_STREAM_CHUNKS:
-            self._chunks.append(chunk)
-        return chunk
+        self.state.safe(self.state.observe_frame, value)
+        return value
 
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._iterator, name)
+    async def __anext__(self):
+        return await self._pull(anext, self.source)
 
-    async def aclose(self) -> None:
-        error: BaseException | None = None
+    async def asend(self, value):
+        return await self._pull(self.source.asend, value)
+
+    async def athrow(self, *args):
+        return await self._pull(self.source.athrow, *args)
+
+    async def aclose(self):
         try:
-            close = getattr(self._iterator, "aclose", None)
-            if callable(close):
-                await close()
+            with _scope(self.state):
+                return await self.source.aclose()
+        except BaseException as error:
+            self.state.safe(self.state.error, error)
+            raise
+        finally:
+            self.state.safe(self.state.finish)
+
+
+def _finish_result(state, result):
+    if not state:
+        return result
+    if type(result) is types.GeneratorType:
+        return _Iterator(result, state)
+    if type(result) is types.AsyncGeneratorType:
+        return _AsyncIterator(result, state)
+    state.safe(state.observe_result, result)
+    state.safe(state.finish)
+    return result
+
+
+def _new(manager, name, args, kwargs, instance):
+    try:
+        return _Call(manager, name, args, kwargs, instance)
+    except Exception:  # noqa: BLE001 - telemetry cleanup must preserve native outcomes.
+        logger.debug("Replicate telemetry startup failed")
+        return None
+
+
+def _wrap(original, name, *, method=True, coroutine=False):
+    if coroutine:
+
+        @functools.wraps(original)
+        async def wrapper(*args, **kwargs):
+            manager = _MANAGER
+            active = _CURRENT.get()
+            call_kwargs = dict(kwargs)
+            if manager and manager.enabled:
+                call_kwargs.pop("respan_params", None)
+            if not manager or not manager.enabled or suppressed():
+                return await original(*args, **call_kwargs)
+            if active:
+                result = await original(*args, **call_kwargs)
+                active.safe(active.observe_prediction, result)
+                return result
+            values = args[1:] if method else args
+            state = _new(
+                manager, name, values, kwargs, args[0] if method and args else None
+            )
+            try:
+                with _scope(state):
+                    result = await original(*args, **call_kwargs)
+            except BaseException as error:
+                if state:
+                    state.safe(state.error, error)
+                    state.safe(state.finish)
+                raise
+            return _finish_result(state, result)
+    else:
+
+        @functools.wraps(original)
+        def wrapper(*args, **kwargs):
+            manager = _MANAGER
+            active = _CURRENT.get()
+            call_kwargs = dict(kwargs)
+            if manager and manager.enabled:
+                call_kwargs.pop("respan_params", None)
+            if not manager or not manager.enabled or suppressed():
+                return original(*args, **call_kwargs)
+            if active:
+                result = original(*args, **call_kwargs)
+                active.safe(active.observe_prediction, result)
+                return result
+            values = args[1:] if method else args
+            state = _new(
+                manager, name, values, kwargs, args[0] if method and args else None
+            )
+            try:
+                with _scope(state):
+                    result = original(*args, **call_kwargs)
+            except BaseException as error:
+                if state:
+                    state.safe(state.error, error)
+                    state.safe(state.finish)
+                raise
+            return _finish_result(state, result)
+
+    return wrapper
+
+
+def _http(original, coroutine=False):
+    if coroutine:
+
+        @functools.wraps(original)
+        async def wrapped(*args, **kwargs):
+            result = await original(*args, **kwargs)
+            state = _CURRENT.get()
+            if state:
+                state.safe(_http_result, state, result)
+            return result
+    else:
+
+        @functools.wraps(original)
+        def wrapped(*args, **kwargs):
+            result = original(*args, **kwargs)
+            state = _CURRENT.get()
+            if state:
+                state.safe(_http_result, state, result)
+            return result
+
+    return wrapped
+
+
+def _http_result(state, response):
+    if not state.span.is_recording():
+        return
+    import httpx
+
+    if type(response) is httpx.Response:
+        state.http_status = response.status_code
+        state.http_statuses.append(response.status_code)
+
+
+def _patch(owner, name, replacement):
+    original = getattr(owner, name)
+    present = name in vars(owner)
+    stored = vars(owner).get(name)
+    setattr(owner, name, replacement)
+    _PATCHES.append((owner, name, original, replacement, present, stored))
+
+
+def _restore():
+    for owner, name, original, replacement, present, stored in reversed(_PATCHES):
+        if getattr(owner, name, None) is replacement:
+            if present:
+                setattr(owner, name, stored)
             else:
-                close = getattr(self._iterator, "close", None)
-                if callable(close):
-                    result = close()
-                    if hasattr(result, "__await__"):
-                        await result
-        except BaseException as exc:
-            error = exc
-            raise
-        finally:
-            self._emit(error=error)
-
-    async def __aenter__(self) -> Self:
-        enter = getattr(self._iterator, "__aenter__", None)
-        if callable(enter):
-            await enter()
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> Any:
-        try:
-            exit_method = getattr(self._iterator, "__aexit__", None)
-            if callable(exit_method):
-                return await exit_method(exc_type, exc, tb)
-            await self.aclose()
-            return None
-        finally:
-            self._emit(error=exc)
-
-    def _emit(self, *, error: BaseException | None) -> None:
-        if self._emitted:
-            return
-        self._emitted = True
-        self._emit_once(self._chunks, error)
-
-
-def _wrap_sync_run(original: Any, *, span_name: str, stream: bool = False) -> Any:
-    @functools.wraps(original)
-    def wrapper(
-        self: Any, ref: Any, input: Any = None, *args: Any, **kwargs: Any
-    ) -> Any:
-        if not _ENABLED:
-            if stream:
-                return original(self, ref, *args, input=input, **kwargs)
-            return original(self, ref, input, *args, **kwargs)
-        call_kwargs, respan_params = _pop_respan_params(kwargs)
-        event_kwargs = {**call_kwargs, RESPAN_PARAMS_KEY: respan_params}
-        parent_context = _current_otel_parent()
-        start_ns = time.time_ns()
-        try:
-            with _suppress_nested_spans():
-                if stream:
-                    output = original(self, ref, *args, input=input, **call_kwargs)
-                else:
-                    output = original(self, ref, input, *args, **call_kwargs)
-        except BaseException as exc:
-            resolved_span_name, attrs = build_model_call_span_data(
-                span_name=span_name,
-                ref=ref,
-                input_value=input,
-                kwargs=event_kwargs,
-                error=exc,
-                stream=stream,
-            )
-            _emit_span(
-                span_name=resolved_span_name,
-                attributes=attrs,
-                start_time_ns=start_ns,
-                error=exc,
-                parent_context=parent_context,
-            )
-            raise
-
-        if _is_sync_iterator(output):
-
-            def emit_once(chunks: list[Any], error: BaseException | None) -> None:
-                resolved_span_name, attrs = build_model_call_span_data(
-                    span_name=span_name,
-                    ref=ref,
-                    input_value=input,
-                    kwargs=event_kwargs,
-                    output=chunks,
-                    error=error,
-                    stream=True,
-                )
-                _emit_span(
-                    span_name=resolved_span_name,
-                    attributes=attrs,
-                    start_time_ns=start_ns,
-                    error=error,
-                    parent_context=parent_context,
-                )
-
-            return _SyncIteratorProxy(iterator=output, emit_once=emit_once)
-
-        resolved_span_name, attrs = build_model_call_span_data(
-            span_name=span_name,
-            ref=ref,
-            input_value=input,
-            kwargs=event_kwargs,
-            output=output,
-            stream=stream,
-        )
-        _emit_span(
-            span_name=resolved_span_name,
-            attributes=attrs,
-            start_time_ns=start_ns,
-            parent_context=parent_context,
-        )
-        return output
-
-    return wrapper
-
-
-def _wrap_async_run(original: Any, *, span_name: str, stream: bool = False) -> Any:
-    @functools.wraps(original)
-    async def wrapper(
-        self: Any, ref: Any, input: Any = None, *args: Any, **kwargs: Any
-    ) -> Any:
-        if not _ENABLED:
-            if stream:
-                return await original(self, ref, input=input, **kwargs)
-            return await original(self, ref, input, *args, **kwargs)
-        call_kwargs, respan_params = _pop_respan_params(kwargs)
-        event_kwargs = {**call_kwargs, RESPAN_PARAMS_KEY: respan_params}
-        parent_context = _current_otel_parent()
-        start_ns = time.time_ns()
-        try:
-            with _suppress_nested_spans():
-                if stream:
-                    output = await original(self, ref, input=input, **call_kwargs)
-                else:
-                    output = await original(self, ref, input, *args, **call_kwargs)
-        except BaseException as exc:
-            resolved_span_name, attrs = build_model_call_span_data(
-                span_name=span_name,
-                ref=ref,
-                input_value=input,
-                kwargs=event_kwargs,
-                error=exc,
-                stream=stream,
-            )
-            _emit_span(
-                span_name=resolved_span_name,
-                attributes=attrs,
-                start_time_ns=start_ns,
-                error=exc,
-                parent_context=parent_context,
-            )
-            raise
-
-        if _is_async_iterator(output):
-
-            def emit_once(chunks: list[Any], error: BaseException | None) -> None:
-                resolved_span_name, attrs = build_model_call_span_data(
-                    span_name=span_name,
-                    ref=ref,
-                    input_value=input,
-                    kwargs=event_kwargs,
-                    output=chunks,
-                    error=error,
-                    stream=True,
-                )
-                _emit_span(
-                    span_name=resolved_span_name,
-                    attributes=attrs,
-                    start_time_ns=start_ns,
-                    error=error,
-                    parent_context=parent_context,
-                )
-
-            return _AsyncIteratorProxy(iterator=output, emit_once=emit_once)
-
-        resolved_span_name, attrs = build_model_call_span_data(
-            span_name=span_name,
-            ref=ref,
-            input_value=input,
-            kwargs=event_kwargs,
-            output=output,
-            stream=stream,
-        )
-        _emit_span(
-            span_name=resolved_span_name,
-            attributes=attrs,
-            start_time_ns=start_ns,
-            parent_context=parent_context,
-        )
-        return output
-
-    return wrapper
-
-
-def _wrap_prediction_create(original: Any, *, is_async: bool = False) -> Any:
-    if is_async:
-
-        @functools.wraps(original)
-        async def async_wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-            if not _ENABLED:
-                return await original(self, *args, **kwargs)
-            call_kwargs, respan_params = _pop_respan_params(kwargs)
-            event_kwargs = {**call_kwargs, RESPAN_PARAMS_KEY: respan_params}
-            parent_context = _current_otel_parent()
-            start_ns = time.time_ns()
-            try:
-                with _suppress_nested_spans():
-                    prediction = await original(self, *args, **call_kwargs)
-            except BaseException as exc:
-                resolved_span_name, attrs = build_model_call_span_data(
-                    span_name=REPLICATE_PREDICTION_CREATE_SPAN_NAME,
-                    ref=args[0] if args else None,
-                    input_value=call_kwargs.get(INPUT_KEY),
-                    kwargs=event_kwargs,
-                    error=exc,
-                )
-                _emit_span(
-                    span_name=resolved_span_name,
-                    attributes=attrs,
-                    start_time_ns=start_ns,
-                    error=exc,
-                    parent_context=parent_context,
-                )
-                raise
-
-            resolved_span_name, attrs = build_model_call_span_data(
-                span_name=REPLICATE_PREDICTION_CREATE_SPAN_NAME,
-                ref=args[0] if args else None,
-                input_value=call_kwargs.get(INPUT_KEY),
-                kwargs=event_kwargs,
-                prediction=prediction,
-            )
-            _emit_span(
-                span_name=resolved_span_name,
-                attributes=attrs,
-                start_time_ns=start_ns,
-                parent_context=parent_context,
-            )
-            _set_prediction_reported_model(prediction, respan_params)
-            return prediction
-
-        return async_wrapper
-
-    @functools.wraps(original)
-    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        if not _ENABLED:
-            return original(self, *args, **kwargs)
-        call_kwargs, respan_params = _pop_respan_params(kwargs)
-        event_kwargs = {**call_kwargs, RESPAN_PARAMS_KEY: respan_params}
-        parent_context = _current_otel_parent()
-        start_ns = time.time_ns()
-        try:
-            with _suppress_nested_spans():
-                prediction = original(self, *args, **call_kwargs)
-        except BaseException as exc:
-            resolved_span_name, attrs = build_model_call_span_data(
-                span_name=REPLICATE_PREDICTION_CREATE_SPAN_NAME,
-                ref=args[0] if args else None,
-                input_value=call_kwargs.get(INPUT_KEY),
-                kwargs=event_kwargs,
-                error=exc,
-            )
-            _emit_span(
-                span_name=resolved_span_name,
-                attributes=attrs,
-                start_time_ns=start_ns,
-                error=exc,
-                parent_context=parent_context,
-            )
-            raise
-
-        resolved_span_name, attrs = build_model_call_span_data(
-            span_name=REPLICATE_PREDICTION_CREATE_SPAN_NAME,
-            ref=args[0] if args else None,
-            input_value=call_kwargs.get(INPUT_KEY),
-            kwargs=event_kwargs,
-            prediction=prediction,
-        )
-        _emit_span(
-            span_name=resolved_span_name,
-            attributes=attrs,
-            start_time_ns=start_ns,
-            parent_context=parent_context,
-        )
-        _set_prediction_reported_model(prediction, respan_params)
-        return prediction
-
-    return wrapper
-
-
-def _wrap_prediction_wait(original: Any, *, is_async: bool = False) -> Any:
-    if is_async:
-
-        @functools.wraps(original)
-        async def async_wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-            if not _ENABLED:
-                return await original(self, *args, **kwargs)
-            parent_context = _current_otel_parent()
-            start_ns = time.time_ns()
-            try:
-                with _suppress_nested_spans():
-                    result = await original(self, *args, **kwargs)
-            except BaseException as exc:
-                resolved_span_name, attrs = build_operation_span_data(
-                    span_name=REPLICATE_PREDICTION_WAIT_SPAN_NAME,
-                    input_value=prediction_summary(self),
-                    error=exc,
-                )
-                _emit_span(
-                    span_name=resolved_span_name,
-                    attributes=attrs,
-                    start_time_ns=start_ns,
-                    error=exc,
-                    parent_context=parent_context,
-                )
-                raise
-
-            resolved_span_name, attrs = build_operation_span_data(
-                span_name=REPLICATE_PREDICTION_WAIT_SPAN_NAME,
-                input_value=prediction_summary(self),
-                output=prediction_summary(self),
-            )
-            _emit_span(
-                span_name=resolved_span_name,
-                attributes=attrs,
-                start_time_ns=start_ns,
-                parent_context=parent_context,
-            )
-            return result
-
-        return async_wrapper
-
-    @functools.wraps(original)
-    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        if not _ENABLED:
-            return original(self, *args, **kwargs)
-        parent_context = _current_otel_parent()
-        start_ns = time.time_ns()
-        try:
-            with _suppress_nested_spans():
-                result = original(self, *args, **kwargs)
-        except BaseException as exc:
-            resolved_span_name, attrs = build_operation_span_data(
-                span_name=REPLICATE_PREDICTION_WAIT_SPAN_NAME,
-                input_value=prediction_summary(self),
-                error=exc,
-            )
-            _emit_span(
-                span_name=resolved_span_name,
-                attributes=attrs,
-                start_time_ns=start_ns,
-                error=exc,
-                parent_context=parent_context,
-            )
-            raise
-
-        resolved_span_name, attrs = build_operation_span_data(
-            span_name=REPLICATE_PREDICTION_WAIT_SPAN_NAME,
-            input_value=prediction_summary(self),
-            output=prediction_summary(self),
-        )
-        _emit_span(
-            span_name=resolved_span_name,
-            attributes=attrs,
-            start_time_ns=start_ns,
-            parent_context=parent_context,
-        )
-        return result
-
-    return wrapper
-
-
-def _wrap_prediction_stream(original: Any, *, is_async: bool = False) -> Any:
-    if is_async:
-
-        @functools.wraps(original)
-        def async_wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-            if not _ENABLED:
-                return original(self, *args, **kwargs)
-            parent_context = _current_otel_parent()
-            start_ns = time.time_ns()
-            try:
-                with _suppress_nested_spans():
-                    iterator = original(self, *args, **kwargs)
-            except BaseException as exc:
-                resolved_span_name, attrs = build_model_call_span_data(
-                    span_name=REPLICATE_STREAM_SPAN_NAME,
-                    prediction=self,
-                    error=exc,
-                    stream=True,
-                )
-                _emit_span(
-                    span_name=resolved_span_name,
-                    attributes=attrs,
-                    start_time_ns=start_ns,
-                    error=exc,
-                    parent_context=parent_context,
-                )
-                raise
-
-            def emit_once(chunks: list[Any], error: BaseException | None) -> None:
-                resolved_span_name, attrs = build_model_call_span_data(
-                    span_name=REPLICATE_STREAM_SPAN_NAME,
-                    prediction=self,
-                    output=chunks,
-                    error=error,
-                    stream=True,
-                )
-                _emit_span(
-                    span_name=resolved_span_name,
-                    attributes=attrs,
-                    start_time_ns=start_ns,
-                    error=error,
-                    parent_context=parent_context,
-                )
-
-            return _AsyncIteratorProxy(iterator=iterator, emit_once=emit_once)
-
-        return async_wrapper
-
-    @functools.wraps(original)
-    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        if not _ENABLED:
-            return original(self, *args, **kwargs)
-        parent_context = _current_otel_parent()
-        start_ns = time.time_ns()
-        try:
-            with _suppress_nested_spans():
-                iterator = original(self, *args, **kwargs)
-        except BaseException as exc:
-            resolved_span_name, attrs = build_model_call_span_data(
-                span_name=REPLICATE_STREAM_SPAN_NAME,
-                prediction=self,
-                error=exc,
-                stream=True,
-            )
-            _emit_span(
-                span_name=resolved_span_name,
-                attributes=attrs,
-                start_time_ns=start_ns,
-                error=exc,
-                parent_context=parent_context,
-            )
-            raise
-
-        def emit_once(chunks: list[Any], error: BaseException | None) -> None:
-            resolved_span_name, attrs = build_model_call_span_data(
-                span_name=REPLICATE_STREAM_SPAN_NAME,
-                prediction=self,
-                output=chunks,
-                error=error,
-                stream=True,
-            )
-            _emit_span(
-                span_name=resolved_span_name,
-                attributes=attrs,
-                start_time_ns=start_ns,
-                error=error,
-                parent_context=parent_context,
-            )
-
-        return _SyncIteratorProxy(iterator=iterator, emit_once=emit_once)
-
-    return wrapper
-
-
-def _wrap_operation(original: Any, *, span_name: str, is_async: bool = False) -> Any:
-    if is_async:
-
-        @functools.wraps(original)
-        async def async_wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-            if not _ENABLED:
-                return await original(self, *args, **kwargs)
-            parent_context = _current_otel_parent()
-            start_ns = time.time_ns()
-            input_value = {"args": args, "kwargs": kwargs}
-            try:
-                with _suppress_nested_spans():
-                    result = await original(self, *args, **kwargs)
-            except BaseException as exc:
-                resolved_span_name, attrs = build_operation_span_data(
-                    span_name=span_name,
-                    input_value=input_value,
-                    error=exc,
-                )
-                _emit_span(
-                    span_name=resolved_span_name,
-                    attributes=attrs,
-                    start_time_ns=start_ns,
-                    error=exc,
-                    parent_context=parent_context,
-                )
-                raise
-
-            resolved_span_name, attrs = build_operation_span_data(
-                span_name=span_name,
-                input_value=input_value,
-                output=result,
-            )
-            _emit_span(
-                span_name=resolved_span_name,
-                attributes=attrs,
-                start_time_ns=start_ns,
-                parent_context=parent_context,
-            )
-            return result
-
-        return async_wrapper
-
-    @functools.wraps(original)
-    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        if not _ENABLED:
-            return original(self, *args, **kwargs)
-        parent_context = _current_otel_parent()
-        start_ns = time.time_ns()
-        input_value = {"args": args, "kwargs": kwargs}
-        try:
-            with _suppress_nested_spans():
-                result = original(self, *args, **kwargs)
-        except BaseException as exc:
-            resolved_span_name, attrs = build_operation_span_data(
-                span_name=span_name,
-                input_value=input_value,
-                error=exc,
-            )
-            _emit_span(
-                span_name=resolved_span_name,
-                attributes=attrs,
-                start_time_ns=start_ns,
-                error=exc,
-                parent_context=parent_context,
-            )
-            raise
-
-        resolved_span_name, attrs = build_operation_span_data(
-            span_name=span_name,
-            input_value=input_value,
-            output=result,
-        )
-        _emit_span(
-            span_name=resolved_span_name,
-            attributes=attrs,
-            start_time_ns=start_ns,
-            parent_context=parent_context,
-        )
-        return result
-
-    return wrapper
-
-
-def _module_run_wrapper(module: Any, *, method_name: str) -> Callable[..., Any]:
-    def wrapper(ref: Any, input: Any = None, *args: Any, **kwargs: Any) -> Any:
-        client = module.default_client
-        method = getattr(client, method_name)
-        return method(ref, input, *args, **kwargs)
-
-    return wrapper
-
-
-def _module_async_run_wrapper(module: Any, *, method_name: str) -> Callable[..., Any]:
-    async def wrapper(ref: Any, input: Any = None, *args: Any, **kwargs: Any) -> Any:
-        client = module.default_client
-        method = getattr(client, method_name)
-        return await method(ref, input, *args, **kwargs)
-
-    return wrapper
-
-
-def _module_stream_wrapper(module: Any, *, method_name: str) -> Callable[..., Any]:
-    def wrapper(ref: Any, *, input: Any = None, **kwargs: Any) -> Any:
-        client = module.default_client
-        method = getattr(client, method_name)
-        return method(ref, input=input, **kwargs)
-
-    return wrapper
-
-
-def _module_async_stream_wrapper(
-    module: Any, *, method_name: str
-) -> Callable[..., Any]:
-    async def wrapper(ref: Any, input: Any = None, **kwargs: Any) -> Any:
-        client = module.default_client
-        method = getattr(client, method_name)
-        return await method(ref, input=input, **kwargs)
-
-    return wrapper
+                delattr(owner, name)
+    _PATCHES.clear()
 
 
 class ReplicateInstrumentor:
-    """Respan instrumentor for the Replicate Python SDK."""
+    name = "replicate"
 
-    name = REPLICATE_INSTRUMENTATION_NAME
-
-    def __init__(self) -> None:
+    def __init__(self, *, tracer_provider=None, capture_content=True):
+        self.provider = tracer_provider
+        self.capture = capture_content
         self._is_instrumented = False
 
-    @staticmethod
-    def _is_respan_tracing_enabled() -> bool:
-        tracer = getattr(RespanTracer, "_instance", None)
-        if tracer is None:
-            return True
-        return bool(getattr(tracer, "is_enabled", True))
-
-    @staticmethod
-    def _patch_attr(owner: Any, attr_name: str, replacement: Any) -> None:
-        original = getattr(owner, attr_name)
-        setattr(owner, attr_name, replacement)
-        _PATCHES.append(_Patch(owner, attr_name, original, replacement))
-
-    def _activate_once(self) -> None:
-        if self._is_instrumented:
-            return
-
-        if not self._is_respan_tracing_enabled():
-            logger.info(
-                "Replicate instrumentation skipped because Respan tracing is disabled"
-            )
-            return
-
-        try:
-            replicate_module = importlib.import_module("replicate")
-            client_module = importlib.import_module("replicate.client")
-            prediction_module = importlib.import_module("replicate.prediction")
-        except ImportError as exc:
-            logger.warning(
-                "Failed to activate Replicate instrumentation - missing dependency: %s",
-                exc,
-            )
-            return
-
-        Client = client_module.Client
-        Predictions = prediction_module.Predictions
-        Prediction = prediction_module.Prediction
-
-        self._patch_attr(
-            Client,
-            "run",
-            _wrap_sync_run(
-                Client.run,
-                span_name=REPLICATE_RUN_SPAN_NAME,
-            ),
-        )
-        self._patch_attr(
-            Client,
-            "async_run",
-            _wrap_async_run(
-                Client.async_run,
-                span_name=f"{ASYNC_PREFIX}{REPLICATE_RUN_SPAN_NAME}",
-            ),
-        )
-        self._patch_attr(
-            Client,
-            "stream",
-            _wrap_sync_run(
-                Client.stream,
-                span_name=REPLICATE_STREAM_SPAN_NAME,
-                stream=True,
-            ),
-        )
-        self._patch_attr(
-            Client,
-            "async_stream",
-            _wrap_async_run(
-                Client.async_stream,
-                span_name=f"{ASYNC_PREFIX}{REPLICATE_STREAM_SPAN_NAME}",
-                stream=True,
-            ),
-        )
-
-        self._patch_attr(
-            Predictions,
-            "create",
-            _wrap_prediction_create(Predictions.create),
-        )
-        self._patch_attr(
-            Predictions,
-            "async_create",
-            _wrap_prediction_create(Predictions.async_create, is_async=True),
-        )
-        for method_name in ("list", "get", "cancel"):
-            self._patch_attr(
-                Predictions,
-                method_name,
-                _wrap_operation(
-                    getattr(Predictions, method_name),
-                    span_name=f"replicate.predictions.{method_name}",
-                ),
-            )
-        for method_name in ("async_list", "async_get", "async_cancel"):
-            self._patch_attr(
-                Predictions,
-                method_name,
-                _wrap_operation(
-                    getattr(Predictions, method_name),
-                    span_name=f"replicate.predictions.{method_name}",
-                    is_async=True,
-                ),
-            )
-
-        self._patch_attr(
-            Prediction,
-            "wait",
-            _wrap_prediction_wait(Prediction.wait),
-        )
-        self._patch_attr(
-            Prediction,
-            "async_wait",
-            _wrap_prediction_wait(Prediction.async_wait, is_async=True),
-        )
-        self._patch_attr(
-            Prediction,
-            "stream",
-            _wrap_prediction_stream(Prediction.stream),
-        )
-        self._patch_attr(
-            Prediction,
-            "async_stream",
-            _wrap_prediction_stream(Prediction.async_stream, is_async=True),
-        )
-
-        self._patch_attr(
-            replicate_module,
-            "run",
-            _module_run_wrapper(replicate_module, method_name="run"),
-        )
-        self._patch_attr(
-            replicate_module,
-            "async_run",
-            _module_async_run_wrapper(replicate_module, method_name="async_run"),
-        )
-        self._patch_attr(
-            replicate_module,
-            "stream",
-            _module_stream_wrapper(replicate_module, method_name="stream"),
-        )
-        self._patch_attr(
-            replicate_module,
-            "async_stream",
-            _module_async_stream_wrapper(replicate_module, method_name="async_stream"),
-        )
-
-        self._is_instrumented = True
-
-    def activate(self) -> None:
-        """Monkey-patch the Replicate SDK with shared transactional ownership."""
-        global _ENABLED, _REFCOUNT
-
-        if self._is_instrumented:
-            return
+    def activate(self):
+        global _MANAGER
         with _LOCK:
             if self._is_instrumented:
                 return
-            if _REFCOUNT:
-                _REFCOUNT += 1
-                self._is_instrumented = True
-                return
-            try:
-                self._activate_once()
-            except Exception:
-                for patch in reversed(_PATCHES):
-                    if getattr(patch.owner, patch.name, None) is patch.replacement:
-                        setattr(patch.owner, patch.name, patch.original)
-                _PATCHES.clear()
-                raise
-            if not self._is_instrumented:
-                return
-            _ENABLED = True
-            _REFCOUNT = 1
-        logger.info("Replicate instrumentation activated")
+            if _MANAGER and (
+                _MANAGER.provider is not self.provider
+                or _MANAGER.capture != self.capture
+            ):
+                raise ValueError(
+                    "Incompatible shared Replicate instrumentation configuration"
+                )
+            if not _MANAGER:
+                try:
+                    import replicate
+                    from replicate.deployment import DeploymentsPredictions
+                    from replicate.model import ModelsPredictions
+                    from replicate.prediction import Prediction, Predictions
 
-    def deactivate(self) -> None:
-        """Restore patched Replicate SDK methods."""
-        global _ENABLED, _REFCOUNT
+                    register_native_types()
+                    manager = _Manager(self.provider, self.capture)
+                    manager.refresh()
+                    for owner, namespace, names in [
+                        (
+                            replicate.Client,
+                            "",
+                            ("run", "async_run", "stream", "async_stream"),
+                        ),
+                        (
+                            Predictions,
+                            "predictions",
+                            (
+                                "create",
+                                "async_create",
+                                "get",
+                                "async_get",
+                                "list",
+                                "async_list",
+                                "cancel",
+                                "async_cancel",
+                            ),
+                        ),
+                        (
+                            ModelsPredictions,
+                            "models.predictions",
+                            ("create", "async_create"),
+                        ),
+                        (
+                            DeploymentsPredictions,
+                            "deployments.predictions",
+                            ("create", "async_create"),
+                        ),
+                        (
+                            Prediction,
+                            "prediction",
+                            (
+                                "wait",
+                                "async_wait",
+                                "reload",
+                                "async_reload",
+                                "cancel",
+                                "async_cancel",
+                                "stream",
+                                "async_stream",
+                            ),
+                        ),
+                    ]:
+                        for name in names:
+                            original = getattr(owner, name, None)
+                            if original is not None:
+                                _patch(
+                                    owner,
+                                    name,
+                                    _wrap(
+                                        original,
+                                        "replicate."
+                                        + (namespace + "." if namespace else "")
+                                        + name,
+                                        coroutine=name.startswith("async_")
+                                        and name not in ("async_stream",)
+                                        or name == "async_stream"
+                                        and owner is replicate.Client,
+                                    ),
+                                )
+                    for name in ("run", "async_run", "stream", "async_stream"):
+                        _patch(
+                            replicate,
+                            name,
+                            _wrap(
+                                getattr(replicate, name),
+                                "replicate." + name,
+                                method=False,
+                                coroutine=name.startswith("async_"),
+                            ),
+                        )
+                    from replicate.stream import EventSource
 
+                    original_init = EventSource.__init__
+
+                    @functools.wraps(original_init)
+                    def event_init(instance, client, response, **kwargs):
+                        original_init(instance, client, response, **kwargs)
+                        state = _CURRENT.get()
+                        if state:
+                            state.safe(_http_result, state, response)
+
+                    _patch(EventSource, "__init__", event_init)
+                    for name in ("_request", "_async_request"):
+                        _patch(
+                            replicate.Client,
+                            name,
+                            _http(
+                                getattr(replicate.Client, name),
+                                name.startswith("_async"),
+                            ),
+                        )
+                    _MANAGER = manager
+                except BaseException:
+                    _restore()
+                    if "manager" in locals():
+                        manager.close()
+                    raise
+            _OWNERS.add(self)
+            self._is_instrumented = True
+
+    def deactivate(self):
+        global _MANAGER
         with _LOCK:
             if not self._is_instrumented:
                 return
             self._is_instrumented = False
-            _REFCOUNT = max(0, _REFCOUNT - 1)
-            if _REFCOUNT:
-                return
-            _ENABLED = False
-            for patch in reversed(_PATCHES):
-                try:
-                    if getattr(patch.owner, patch.name, None) is patch.replacement:
-                        setattr(patch.owner, patch.name, patch.original)
-                except Exception:  # noqa: BLE001 - foreign-safe best-effort restore.
-                    logger.debug("Failed to restore Replicate SDK attr %s", patch.name)
-            _PATCHES.clear()
-        logger.info("Replicate instrumentation deactivated")
+            _OWNERS.discard(self)
+            if not _OWNERS:
+                manager = _MANAGER
+                _MANAGER = None
+                if manager:
+                    manager.close()
+                _restore()

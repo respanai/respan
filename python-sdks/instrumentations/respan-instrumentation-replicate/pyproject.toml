@@ -12,9 +12,9 @@ packages = [
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
 respan-tracing = "^2.17.0"
-respan-sdk = ">=2.6.1"
+respan-sdk = ">=2.6.26"
 replicate = ">=1.0.0"
-opentelemetry-semantic-conventions-ai = ">=0.4.1"
+opentelemetry-semantic-conventions-ai = ">=0.5.1,<0.6"
 
 [tool.poetry.plugins."respan.instrumentations"]
 replicate = "respan_instrumentation_replicate:ReplicateInstrumentor"

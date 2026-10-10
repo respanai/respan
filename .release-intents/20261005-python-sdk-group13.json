@@ -1,0 +1,9 @@
+{
+  "summary": "Support current Python Hugging Face, Ollama, Together, and Replicate SDKs with native payload, streaming, privacy, and lifecycle repairs.",
+  "packages": {
+    "respan-instrumentation-huggingface": "minor",
+    "respan-instrumentation-ollama": "minor",
+    "respan-instrumentation-together": "minor",
+    "respan-instrumentation-replicate": "minor"
+  }
+}

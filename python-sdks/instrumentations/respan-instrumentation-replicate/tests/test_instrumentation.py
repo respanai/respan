@@ -1,305 +1,584 @@
+"""Actual released SDK values, HTTP/SSE parsers and native provider behavior."""
+
 import asyncio
-import sys
-from types import ModuleType, SimpleNamespace
+import json
 
 import pytest
-from opentelemetry.semconv_ai import LLMRequestTypeValues, SpanAttributes
-from respan_instrumentation_replicate import ReplicateInstrumentor, _instrumentation
-from respan_instrumentation_replicate._constants import (
-    OFF_CONTRACT_ALIASES,
-    RESPAN_PARAMS_KEY,
-    RESPAN_PARAMS_MODEL_KEY,
-)
-from respan_instrumentation_replicate._translator import (
-    build_model_call_span_data,
-    model_from_ref_or_prediction,
-    output_to_text,
-)
-from respan_sdk.constants.llm_logging import LOG_TYPE_TEXT
-from respan_sdk.constants.span_attributes import (
-    RESPAN_LOG_TYPE,
-    RESPAN_METADATA,
-    RESPAN_TRACE_GROUP_ID,
-)
-from respan_tracing.core.tracer import RespanTracer
+from _native import Native
+from opentelemetry import context, trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.sdk.trace.sampling import ALWAYS_OFF
+from opentelemetry.semconv_ai import SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY
+from replicate.exceptions import ModelError, ReplicateError
+from replicate.helpers import FileOutput
+from respan_instrumentation_replicate import ReplicateInstrumentor
+from respan_instrumentation_replicate import _instrumentation as adapter
+from respan_instrumentation_replicate._serialization import json_string, native_value
+from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+
+INPUT = "traceloop.entity.input"
+OUTPUT = "traceloop.entity.output"
 
 
-@pytest.fixture(autouse=True)
-def reset_tracer(monkeypatch):
-    RespanTracer.reset_instance()
-    monkeypatch.setattr(_instrumentation, "_REFCOUNT", 0)
-    monkeypatch.setattr(_instrumentation, "_ENABLED", False)
-    monkeypatch.setattr(_instrumentation, "_PATCHES", [])
-    yield
-    RespanTracer.reset_instance()
+@pytest.fixture
+def pipeline():
+    p = TracerProvider()
+    m = InMemorySpanExporter()
+    p.add_span_processor(SimpleSpanProcessor(m))
+    owners = []
+
+    def owner(**kwargs):
+        i = ReplicateInstrumentor(tracer_provider=p, **kwargs)
+        i.activate()
+        owners.append(i)
+        return i
+
+    yield p, m, owner
+    for i in reversed(owners):
+        i.deactivate()
+    p.shutdown()
 
 
-def test_build_model_call_span_data_uses_canonical_attrs_only():
-    span_name, attrs = build_model_call_span_data(
-        span_name="replicate.run",
-        ref="meta/meta-llama-3-8b-instruct",
-        input_value={"prompt": "Say hi"},
-        output=["hello", " world"],
-        kwargs={
-            RESPAN_PARAMS_KEY: {
-                "workflow_name": "replicate_unit.workflow",
-                "metadata": {"example": "unit"},
-            }
-        },
-        stream=True,
+def run(native, **kwargs):
+    return native.client.run("owner/model", input={"prompt": "native"}, **kwargs)
+
+
+def test_full_native_output_zero_usage_source_http_and_parent(pipeline):
+    p, m, owner = pipeline
+    owner()
+    n = Native(
+        {"object": "embedding", "embedding": [0.0] * 5001, "zero": 0, "flag": False}
     )
-
-    assert span_name == "replicate.run"
-    assert attrs[RESPAN_LOG_TYPE] == LOG_TYPE_TEXT
-    assert attrs[SpanAttributes.LLM_SYSTEM] == "replicate"
-    assert attrs[SpanAttributes.LLM_REQUEST_TYPE] == LLMRequestTypeValues.CHAT.value
-    assert attrs[SpanAttributes.LLM_REQUEST_MODEL] == "meta/meta-llama-3-8b-instruct"
-    assert attrs[f"{SpanAttributes.LLM_PROMPTS}.0.role"] == "user"
-    assert attrs[f"{SpanAttributes.LLM_PROMPTS}.0.content"] == "Say hi"
-    assert attrs[f"{SpanAttributes.LLM_COMPLETIONS}.0.content"] == "hello world"
-    assert attrs[SpanAttributes.LLM_IS_STREAMING] is True
-    assert attrs[RESPAN_TRACE_GROUP_ID] == "replicate_unit.workflow"
-    assert attrs[f"{RESPAN_METADATA}.example"] == "unit"
-
-    for alias in OFF_CONTRACT_ALIASES:
-        assert alias not in attrs
-
-
-def test_respan_params_model_overrides_reported_model_without_alias():
-    _, attrs = build_model_call_span_data(
-        span_name="replicate.run",
-        ref="owner/replicate-model",
-        input_value={"prompt": "Say hi"},
-        output=["hello"],
-        kwargs={
-            RESPAN_PARAMS_KEY: {
-                RESPAN_PARAMS_MODEL_KEY: "gpt-4o-mini",
-            }
-        },
-    )
-
-    assert attrs[SpanAttributes.LLM_REQUEST_MODEL] == "gpt-4o-mini"
-    assert "model" not in attrs
-
-
-def test_output_to_text_handles_prediction_and_file_output_like_values():
-    prediction = SimpleNamespace(output=["a", "b"], status="succeeded")
-    assert output_to_text(prediction) == "ab"
-
-    FileOutput = type("FileOutput", (), {})
-    file_output = FileOutput()
-    file_output.url = "https://delivery.replicate.com/file"
-    assert output_to_text(file_output) == "https://delivery.replicate.com/file"
-
-
-def test_model_from_prediction_does_not_duplicate_prefixed_version():
-    prediction = SimpleNamespace(
-        model="owner/model",
-        version="owner/model:version-id",
+    with p.get_tracer("app").start_as_current_span("parent") as parent:
+        result = run(n)
+        assert len(result["embedding"]) == 5001
+    s = m.get_finished_spans()[0]
+    assert s.parent.span_id == parent.context.span_id
+    assert (
+        len(json.loads(s.attributes[OUTPUT])) == 5001
+        and s.attributes["gen_ai.usage.input_tokens"] == 0
     )
     assert (
-        model_from_ref_or_prediction(prediction=prediction) == "owner/model:version-id"
+        "llm.usage.total_tokens" not in s.attributes
+        and s.attributes["http.response.status_code"] == 201
     )
+    assert s.attributes["respan.entity.log_type"] == "embedding"
+    n.close()
 
 
-def _install_fake_replicate_modules(monkeypatch):
-    emitted_spans = []
+@pytest.mark.parametrize("value", [False, 0, [], {}, "", {"items": [0] * 5001}])
+def test_actual_false_zero_empty_and_complete_native_payloads(pipeline, value):
+    _, m, owner = pipeline
+    owner()
+    n = Native(value)
+    result = run(n)
+    assert result == value
+    assert json.loads(m.get_finished_spans()[0].attributes[OUTPUT]) == value
+    n.close()
 
-    class Prediction:
-        def __init__(self, output=None):
-            self.id = "pred_unit"
-            self.model = "owner/model"
-            self.version = "version"
-            self.status = "succeeded"
-            self.input = {"prompt": "hello"}
-            self.output = output or ["done"]
-            self.logs = None
-            self.error = None
-            self.metrics = {"predict_time": 0.1}
 
-        def dict(self):
-            return dict(self.__dict__)
-
-        def wait(self):
-            return None
-
-        async def async_wait(self):
-            return None
-
-        def stream(self):
-            return iter(["a", "b"])
-
-        async def async_stream(self):
-            for chunk in ["a", "b"]:
-                yield chunk
-
-    class Predictions:
-        def __init__(self, client=None):
-            self._client = client
-
-        def create(self, version=None, input=None, **params):
-            return Prediction(output=["created"])
-
-        async def async_create(self, version=None, input=None, **params):
-            return Prediction(output=["created"])
-
-        def list(self, cursor=...):
-            return [Prediction(output=["listed"])]
-
-        async def async_list(self, cursor=...):
-            return [Prediction(output=["listed"])]
-
-        def get(self, id):
-            return Prediction(output=["got"])
-
-        async def async_get(self, id):
-            return Prediction(output=["got"])
-
-        def cancel(self, id):
-            prediction = Prediction(output=[])
-            prediction.status = "canceled"
-            return prediction
-
-        async def async_cancel(self, id):
-            prediction = Prediction(output=[])
-            prediction.status = "canceled"
-            return prediction
-
-    class Client:
-        def __init__(self):
-            self.predictions = Predictions(client=self)
-
-        def run(self, ref, input=None, **params):
-            return ["hello", " world"]
-
-        async def async_run(self, ref, input=None, **params):
-            return ["hello", " async"]
-
-        def stream(self, ref, *, input=None, **params):
-            return iter(["s", "t"])
-
-        async def async_stream(self, ref, input=None, **params):
-            async def iterator():
-                for chunk in ["s", "t"]:
-                    yield chunk
-
-            return iterator()
-
-    replicate_module = ModuleType("replicate")
-    client_module = ModuleType("replicate.client")
-    prediction_module = ModuleType("replicate.prediction")
-
-    default_client = Client()
-    replicate_module.default_client = default_client
-    replicate_module.run = default_client.run
-    replicate_module.async_run = default_client.async_run
-    replicate_module.stream = default_client.stream
-    replicate_module.async_stream = default_client.async_stream
-    client_module.Client = Client
-    prediction_module.Prediction = Prediction
-    prediction_module.Predictions = Predictions
-
-    monkeypatch.setitem(sys.modules, "replicate", replicate_module)
-    monkeypatch.setitem(sys.modules, "replicate.client", client_module)
-    monkeypatch.setitem(sys.modules, "replicate.prediction", prediction_module)
-
-    def fake_inject_span(span):
-        emitted_spans.append(span)
-        return True
-
-    monkeypatch.setattr(_instrumentation, "inject_span", fake_inject_span)
-    return SimpleNamespace(
-        module=replicate_module,
-        client_class=Client,
-        prediction_class=Prediction,
-        emitted_spans=emitted_spans,
+def test_sse_all_native_events_and_lazy_close_before_and_after_read(pipeline):
+    _, m, owner = pipeline
+    owner()
+    n = Native(chunks=250)
+    iterator = n.client.stream("owner/model", input={"prompt": "native"})
+    assert not n.calls and not m.get_finished_spans()
+    events = list(iterator)
+    assert len(events) == 251
+    s = m.get_finished_spans()[0]
+    frames = json.loads(s.attributes[OUTPUT])
+    assert len(frames) == 251 and frames[-2]["data"] == "chunk-249"
+    assert s.attributes["gen_ai.completion.0.content"] == "".join(
+        event.data for event in events if event.event.value == "output"
     )
+    assert s.attributes["gen_ai.completion.0.role"] == "assistant"
+    n = Native()
+    iterator = n.client.stream("owner/model", input={"prompt": "native"})
+    source = iterator.source
+    iterator.close()
+    assert source.gi_frame is None
+    assert OUTPUT not in m.get_finished_spans()[-1].attributes
+    n = Native()
+    iterator = n.client.stream("owner/model", input={"prompt": "native"})
+    event = next(iterator)
+    assert event.data == "chunk-0"
+    source = iterator.source
+    iterator.close()
+    assert source.gi_frame is None
+    assert len(json.loads(m.get_finished_spans()[-1].attributes[OUTPUT])) == 1
 
 
-def test_instrumentor_patches_run_and_stream(monkeypatch):
-    fake = _install_fake_replicate_modules(monkeypatch)
-
-    instrumentor = ReplicateInstrumentor()
-    instrumentor.activate()
-
-    client = fake.client_class()
-    assert client.run("owner/model", input={"prompt": "hi"}) == ["hello", " world"]
-    assert client.run(
-        "owner/model",
-        input={"prompt": "hi"},
-        respan_params={"model": "gpt-4o-mini"},
-    ) == ["hello", " world"]
-    assert "".join(client.stream("owner/model", input={"prompt": "hi"})) == "st"
-
-    assert len(fake.emitted_spans) == 3
-    assert fake.emitted_spans[0].name == "replicate.run"
+@pytest.mark.asyncio
+async def test_native_async_run_client_stream_prediction_stream_and_aclose(pipeline):
+    _, m, owner = pipeline
+    owner()
+    n = Native("native")
     assert (
-        fake.emitted_spans[0].attributes[f"{SpanAttributes.LLM_COMPLETIONS}.0.content"]
-        == "hello world"
+        await n.client.async_run("owner/model", input={"prompt": "native"}) == "native"
     )
-    assert (
-        fake.emitted_spans[1].attributes[SpanAttributes.LLM_REQUEST_MODEL]
-        == "gpt-4o-mini"
+    iterator = await n.client.async_stream("owner/model", input={"prompt": "native"})
+    events = [e async for e in iterator]
+    assert len(events) == 251
+    prediction = await n.client.predictions.async_create(
+        model="owner/model", input={"prompt": "native"}, stream=True
     )
-    assert fake.emitted_spans[2].name == "replicate.stream"
-    assert fake.emitted_spans[2].attributes[SpanAttributes.LLM_IS_STREAMING] is True
+    iterator = prediction.async_stream()
+    source = iterator.source
+    await iterator.aclose()
+    assert source.ag_frame is None
+    iterator = prediction.async_stream()
+    events = [e async for e in iterator]
+    assert len(events) == 251
+    assert len(json.loads(m.get_finished_spans()[-1].attributes[OUTPUT])) == 251
+    await n.client._async_client.aclose()
+    n.close()
 
-    instrumentor.deactivate()
-    assert client.run.__func__ is fake.client_class.run
+
+def test_native_prediction_and_file_return_identity_resources_and_management(pipeline):
+    _, m, owner = pipeline
+    owner()
+    n = Native("https://replicate.delivery/controlled/output/file")
+    output = run(n, use_file_output=True)
+    assert type(output) is FileOutput and output.read() == b"native"
+    s = m.get_finished_spans()[0]
+    assert json.loads(s.attributes[OUTPUT]) == {"url": output.url}
+    prediction = n.client.models.predictions.create(
+        model="owner/model", input={"prompt": "native"}
+    )
+    assert prediction.wait() is None
+    assert prediction.reload() is None
+    assert prediction.cancel() is None
+    page = n.client.predictions.list()
+    assert page.results[0].id == "controlled"
+    for s in m.get_finished_spans()[1:]:
+        if s.name.endswith((".wait", ".reload", ".cancel")):
+            assert OUTPUT not in s.attributes
+    assert "__orig_class__" not in json.loads(
+        m.get_finished_spans()[-1].attributes[OUTPUT]
+    )
+    n.close()
 
 
-def test_instrumentor_patches_async_run_and_prediction_create(monkeypatch):
-    fake = _install_fake_replicate_modules(monkeypatch)
+@pytest.mark.parametrize("error_kind", ["api", "model"])
+def test_actual_errors_no_synthesized_result_or_guessed_http_status(
+    pipeline, error_kind
+):
+    _, m, owner = pipeline
+    owner()
+    n = Native(status="failed") if error_kind == "model" else Native(http_status=429)
+    with pytest.raises(ModelError if error_kind == "model" else ReplicateError):
+        run(n)
+    s = m.get_finished_spans()[0]
+    assert s.status.status_code.name == "ERROR" and OUTPUT not in s.attributes
+    assert s.attributes["error.type"] == (
+        "ModelError" if error_kind == "model" else "ReplicateError"
+    )
+    assert s.attributes["http.response.status_code"] == (
+        201 if error_kind == "model" else 429
+    )
+    n.close()
 
-    instrumentor = ReplicateInstrumentor()
-    instrumentor.activate()
 
-    async def run_calls():
-        client = fake.client_class()
-        assert await client.async_run("owner/model", input={"prompt": "hi"}) == [
-            "hello",
-            " async",
-        ]
-        prediction = await client.predictions.async_create(
-            version="version",
-            input={"prompt": "hi"},
-            respan_params={"model": "gpt-4o-mini"},
+@pytest.mark.parametrize(
+    "gate",
+    [
+        "constructor",
+        "canonical",
+        "legacy",
+        "env",
+        "active_parent",
+        "preimported",
+        "late_stream",
+    ],
+)
+def test_irreversible_privacy_without_owned_payloads_or_diagnostics(
+    pipeline, monkeypatch, gate
+):
+    p, m, owner = pipeline
+    owner(capture_content=gate != "constructor")
+    n = Native("PRIVATE result")
+    token = None
+    if gate == "env":
+        monkeypatch.setenv("RESPAN_TRACE_CONTENT", "false")
+    if gate in ("canonical", "legacy"):
+        token = context.attach(
+            context.set_value(
+                ENABLE_CONTENT_TRACING_KEY if gate == "canonical" else "trace_content",
+                False,
+            )
         )
-        await prediction.async_wait()
+    with p.get_tracer("app").start_as_current_span("parent") as parent:
+        if gate == "active_parent":
+            parent.set_attribute("trace_content", False)
+        if gate in ("preimported", "late_stream"):
+            iterator = n.client.stream("owner/model", input={"prompt": "PRIVATE input"})
+            if gate == "late_stream":
+                next(iterator)
+            from opentelemetry.context import detach as alias
 
-    asyncio.run(run_calls())
+            t = context.attach(context.set_value(ENABLE_CONTENT_TRACING_KEY, False))
+            alias(t)
+            list(iterator)
+        else:
+            assert (
+                n.client.run("owner/model", input={"prompt": "PRIVATE input"})
+                == "PRIVATE result"
+            )
+    if token:
+        context.detach(token)
+    leaves = [s for s in m.get_finished_spans() if s.name.startswith("replicate")]
+    assert len(leaves) == 1
+    for s in leaves:
+        assert (
+            INPUT not in s.attributes
+            and OUTPUT not in s.attributes
+            and "PRIVATE" not in str(s.attributes)
+        )
+        assert not s.events and not s.status.description
+    n.close()
 
-    names = [span.name for span in fake.emitted_spans]
-    assert names == [
-        "async_replicate.run",
-        "replicate.predictions.create",
-        "replicate.prediction.wait",
-    ]
-    assert (
-        fake.emitted_spans[1].attributes[SpanAttributes.LLM_REQUEST_MODEL]
-        == "gpt-4o-mini"
+
+@pytest.mark.parametrize(
+    "suppression",
+    [
+        context._SUPPRESS_INSTRUMENTATION_KEY,
+        SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY,
+    ],
+)
+def test_real_suppression_omits_leaf(pipeline, suppression):
+    _, m, owner = pipeline
+    owner()
+    t = context.attach(context.set_value(suppression, True))
+    n = Native("native")
+    try:
+        assert run(n) == "native"
+    finally:
+        context.detach(t)
+    assert not m.get_finished_spans()
+    n.close()
+
+
+def test_sampling_before_telemetry_conversion(monkeypatch):
+    p = TracerProvider(sampler=ALWAYS_OFF)
+    m = InMemorySpanExporter()
+    p.add_span_processor(SimpleSpanProcessor(m))
+    i = ReplicateInstrumentor(tracer_provider=p)
+    i.activate()
+    monkeypatch.setattr(
+        adapter,
+        "native_value",
+        lambda *a: (_ for _ in ()).throw(AssertionError("telemetry extraction")),
     )
-    wait_attrs = fake.emitted_spans[2].attributes
-    assert wait_attrs[RESPAN_LOG_TYPE] == "task"
-    assert SpanAttributes.LLM_REQUEST_MODEL not in wait_attrs
-    assert SpanAttributes.LLM_SYSTEM not in wait_attrs
+    n = Native("native")
+    assert run(n) == "native"
+    i.deactivate()
+    assert not m.get_finished_spans()
+    n.close()
+    p.shutdown()
 
 
-def test_activate_skips_when_respan_tracing_is_disabled(monkeypatch, caplog):
-    fake = _install_fake_replicate_modules(monkeypatch)
-    RespanTracer(is_enabled=False)
-
-    instrumentor = ReplicateInstrumentor()
-    with caplog.at_level("INFO"):
-        instrumentor.activate()
-
-    assert instrumentor._is_instrumented is False
-    assert (
-        "Replicate instrumentation skipped because Respan tracing is disabled"
-        in caplog.text
+@pytest.mark.parametrize("hook", ["observe_result", "observe_prediction", "finish"])
+def test_observer_faults_preserve_native_outcome_and_restore_context(
+    pipeline, monkeypatch, hook
+):
+    _, _m, owner = pipeline
+    owner()
+    before = context.get_current()
+    monkeypatch.setattr(
+        adapter._Call,
+        hook,
+        lambda *a: (_ for _ in ()).throw(RuntimeError("observer fault")),
     )
-    assert fake.client_class().run("owner/model", input={"prompt": "hi"}) == [
-        "hello",
-        " world",
+    n = Native("native")
+    assert run(n) == "native"
+    assert context.get_current() is before
+    n.close()
+
+
+def test_shared_lifecycle_conflict_and_foreign_owned_restore(pipeline):
+    _, _m, owner = pipeline
+    import replicate
+
+    original = replicate.Client.run
+    first = owner()
+    second = owner()
+    first.activate()
+    first.deactivate()
+    n = Native("native")
+    assert run(n) == "native"
+    with pytest.raises(ValueError):
+        owner(capture_content=False)
+    ours = replicate.Client.run
+
+    def foreign(*a, **k):
+        return ours(*a, **k)
+
+    replicate.Client.run = foreign
+    second.deactivate()
+    assert replicate.Client.run is foreign and run(n) == "native"
+    replicate.Client.run = original
+    n.close()
+
+
+def test_unknown_conversion_hooks_and_quoted_schema_redaction():
+    class Hostile:
+        def model_dump(self):
+            raise AssertionError("unknown model_dump")
+
+        def __str__(self):
+            raise AssertionError("unknown str")
+
+    assert native_value(Hostile()) == {"type": "Hostile"}
+    value = {
+        "type": "object",
+        "properties": {"api_key": {"type": "string", "default": "PRIVATE"}},
+        "arguments": '{"api_key":"PRIVATE "quoted" secret"}',
+        "vector": [0] * 5001,
+        "flag": False,
+    }
+    encoded = json_string(value)
+    assert "PRIVATE" not in encoded and len(json.loads(encoded)["vector"]) == 5001
+    assert "api_key" in json.loads(encoded)["properties"]
+
+
+def test_native_polling_wait_updates_same_prediction_without_invented_return(pipeline):
+    _, m, owner = pipeline
+    owner()
+    n = Native("native")
+    n.statuses = ["starting", "processing", "succeeded"]
+    prediction = n.client.predictions.create(
+        model="owner/model", input={"prompt": "native"}, wait=False
+    )
+    identity = id(prediction)
+    assert prediction.status == "starting"
+    assert prediction.wait() is None
+    assert (
+        id(prediction) == identity
+        and prediction.status == "succeeded"
+        and prediction.output == "native"
+    )
+    assert (
+        len(m.get_finished_spans()) == 2
+        and OUTPUT not in m.get_finished_spans()[-1].attributes
+    )
+    n.close()
+
+
+def test_native_sse_close_releases_http_response_and_foreign_binding(pipeline):
+    _, m, owner = pipeline
+    owner()
+    n = Native()
+    iterator = n.client.stream("owner/model", input={"prompt": "native"})
+    next(iterator)
+    response = n.responses[-1]
+    assert not response.is_closed
+    iterator.close()
+    assert response.is_closed
+    assert m.get_finished_spans()[-1].attributes["http.response.status_code"] == 200
+    n.close()
+
+
+def test_native_namespace_deployment_and_module_bound_methods(pipeline, monkeypatch):
+    _, m, owner = pipeline
+    owner()
+    n = Native("native")
+    prediction = n.client.deployments.predictions.create(
+        deployment="owner/deployment", input={"prompt": "native"}
+    )
+    assert prediction.id == "controlled"
+    import replicate
+
+    monkeypatch.setattr(replicate.default_client, "_Client__client", n.client._client)
+    assert replicate.run("owner/model", input={"prompt": "native"}) == "native"
+    assert [s.name for s in m.get_finished_spans()] == [
+        "replicate.deployments.predictions.create",
+        "replicate.run",
     ]
-    assert fake.emitted_spans == []
+    n.close()
+
+
+def test_native_throw_identity_and_consumed_partial_data(pipeline):
+    _, m, owner = pipeline
+    owner()
+    n = Native()
+    iterator = n.client.stream("owner/model", input={"prompt": "native"})
+    next(iterator)
+    error = ValueError("native caller throw")
+    try:
+        iterator.throw(error)
+    except ValueError as received:
+        assert received is error
+    else:
+        raise AssertionError("native exception absent")
+    assert len(json.loads(m.get_finished_spans()[-1].attributes[OUTPUT])) == 1
+    assert n.responses[-1].is_closed
+    n.close()
+
+
+def test_two_pending_native_siblings_survive_exporter_suppression(pipeline):
+    p, m, owner = pipeline
+    owner()
+    n = Native()
+    with p.get_tracer("app").start_as_current_span("parent"):
+        first = n.client.stream("owner/model", input={"prompt": "first"})
+        second = n.client.stream("owner/model", input={"prompt": "second"})
+        assert len(list(first)) == 251 and len(list(second)) == 251
+    leaves = [s for s in m.get_finished_spans() if s.name.startswith("replicate")]
+    assert len(leaves) == 2 and all(
+        INPUT in s.attributes and OUTPUT in s.attributes for s in leaves
+    )
+    n.close()
+
+
+def test_unknown_local_and_finished_veto_ancestors(pipeline):
+    p, m, owner = pipeline
+    unknown = p.get_tracer("app").start_span("unknown")
+    owner()
+    t = context.attach(trace.set_span_in_context(unknown))
+    n = Native("native")
+    try:
+        assert run(n) == "native"
+    finally:
+        context.detach(t)
+        unknown.end()
+    assert INPUT not in m.get_finished_spans()[0].attributes
+    known = p.get_tracer("app").start_span("known")
+    known.set_attribute("trace_content", False)
+    known.end()
+    t = context.attach(trace.set_span_in_context(known))
+    try:
+        assert run(n) == "native"
+    finally:
+        context.detach(t)
+    assert INPUT not in m.get_finished_spans()[-1].attributes
+    n.close()
+
+
+def test_true_remote_parent_preserved_and_unknown_carriers_bounded(pipeline):
+    _p, m, owner = pipeline
+    owner()
+    remote = trace.NonRecordingSpan(
+        trace.SpanContext(
+            trace_id=123, span_id=456, is_remote=True, trace_flags=trace.TraceFlags(1)
+        )
+    )
+    token = context.attach(trace.set_span_in_context(remote))
+    n = Native("native")
+    try:
+        assert run(n) == "native"
+    finally:
+        context.detach(token)
+    leaf = m.get_finished_spans()[0]
+    assert leaf.parent.is_remote and INPUT in leaf.attributes
+    policy = adapter._MANAGER.policy
+    for i in range(5000):
+        policy.enroll(
+            trace.NonRecordingSpan(
+                trace.SpanContext(
+                    trace_id=123,
+                    span_id=1000 + i,
+                    is_remote=False,
+                    trace_flags=trace.TraceFlags(1),
+                )
+            )
+        )
+    assert len(policy.closed) <= 4096 and not any(k[1] >= 1000 for k in policy.active)
+    n.close()
+
+
+def test_abandoned_generator_span_is_bodyless_without_draining(pipeline):
+    import gc
+
+    _, m, owner = pipeline
+    owner()
+    n = Native()
+    iterator = n.client.stream("owner/model", input={"prompt": "native"})
+    assert not n.calls
+    del iterator
+    gc.collect()
+    assert (
+        len(m.get_finished_spans()) == 1
+        and OUTPUT not in m.get_finished_spans()[0].attributes
+        and m.get_finished_spans()[0].attributes["respan.entity.log_type"] == "text"
+        and INPUT not in m.get_finished_spans()[0].attributes
+    )
+
+
+@pytest.mark.asyncio
+async def test_abandoned_async_generator_is_bodyless(pipeline):
+    import gc
+
+    _, m, owner = pipeline
+    owner()
+    n = Native()
+    iterator = await n.client.async_stream("owner/model", input={"prompt": "native"})
+    assert not n.calls
+    del iterator
+    gc.collect()
+    await asyncio.sleep(0)
+    assert (
+        len(m.get_finished_spans()) == 1
+        and OUTPUT not in m.get_finished_spans()[0].attributes
+        and m.get_finished_spans()[0].attributes["respan.entity.log_type"] == "text"
+    )
+
+
+def test_scrub_and_finish_fault_cannot_replace_native_outcome(pipeline, monkeypatch):
+    _p, m, owner = pipeline
+    owner()
+    n = Native("native")
+    before = context.get_current()
+
+    def fail(*args):
+        raise RuntimeError("observer fault")
+
+    monkeypatch.setattr(adapter._Call, "scrub", fail)
+    monkeypatch.setattr(adapter._Call, "observe_result", fail)
+    assert run(n) == "native"
+    assert context.get_current() is before
+    assert (
+        len(m.get_finished_spans()) == 1
+        and OUTPUT not in m.get_finished_spans()[0].attributes
+    )
+    n.close()
+
+
+def test_complete_embedding_result_extras_preserved_separately(pipeline):
+    _, m, owner = pipeline
+    owner()
+    value = {
+        "object": "embedding",
+        "embedding": [0] * 5001,
+        "extra": {"false": False, "zero": 0, "empty": []},
+    }
+    n = Native(value)
+    assert run(n) == value
+    s = m.get_finished_spans()[0]
+    assert len(json.loads(s.attributes[OUTPUT])) == 5001
+    assert json.loads(s.attributes["respan.metadata.replicate.result"]) == value
+    n.close()
+
+
+@pytest.mark.parametrize(
+    "fragments",
+    [
+        ['Authorization: Bearer "controlled-private"'],
+        ["Authorization: Be", 'arer "controlled-private"'],
+        ["api_key=", "controlled-private"],
+    ],
+)
+def test_native_sse_quoted_and_fragmented_credentials_preserve_events(
+    pipeline, fragments
+):
+    _, m, owner = pipeline
+    owner()
+    n = Native(chunks=len(fragments), output_chunks=fragments)
+    events = list(n.client.stream("owner/model", input={"prompt": "controlled"}))
+    assert [event.data for event in events[:-1]] == fragments
+    attrs = dict(m.get_finished_spans()[0].attributes)
+    assert "controlled-private" not in json.dumps(attrs)
+    assert attrs["gen_ai.completion.0.role"] == "assistant"
+    assert len(json.loads(attrs[OUTPUT])) == len(fragments) + 1
+    n.close()

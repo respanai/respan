@@ -1,449 +1,192 @@
-"""Translate Together SDK requests and responses into Respan span fields."""
+"""Complete builtin and exact installed Together model values without hooks."""
 
 from __future__ import annotations
 
-import json
-import math
-from itertools import islice
-from typing import Any
+import importlib
 
-from respan_instrumentation_together._constants import (
-    ARGUMENTS_KEY,
-    B64_JSON_KEY,
-    CHOICES_KEY,
-    CONTENT_KEY,
-    DATA_KEY,
-    DELTA_KEY,
-    DESCRIPTION_KEY,
-    DOCUMENT_KEY,
-    DOCUMENTS_KEY,
-    EMBEDDING_KEY,
-    FINISH_REASON_KEY,
-    FUNCTION_CALL_KEY,
-    FUNCTION_KEY,
-    FUNCTION_TOOL_TYPE,
-    ID_KEY,
-    INDEX_KEY,
-    INPUT_KEY,
-    MESSAGE_KEY,
-    MESSAGES_KEY,
-    MODEL_KEY,
-    NAME_KEY,
-    PARAMETERS_KEY,
-    PROMPT_KEY,
-    QUERY_KEY,
-    RELEVANCE_SCORE_KEY,
-    RESULTS_KEY,
-    ROLE_KEY,
-    TEXT_KEY,
-    TOOL_CALL_ID_KEY,
-    TOOL_CALLS_KEY,
-    TYPE_KEY,
-    URL_KEY,
-    USAGE_KEY,
-)
 from respan_instrumentation_together._serialization import (
-    json_dumps,
     safe_text,
+    safe_type_name,
     to_jsonable,
 )
 
 
-def safe_json(value: Any) -> str:
-    """JSON-encode a value with the instrumentation capture policy."""
-    return json_dumps(value)
+def _known_model(value):
+    cls = type(value)
+    module = type.__dict__["__dict__"].__get__(cls).get("__module__", "")
+    name = type.__dict__["__name__"].__get__(cls)
+    if type(module) is not str or not module.startswith("together.types."):
+        return False
+    return getattr(importlib.import_module(module), name, None) is cls
 
 
-def to_json_attr(value: Any) -> str:
-    if isinstance(value, str):
-        return safe_text(value)
-    return safe_json(value=value)
-
-
-def field(value: Any, name: str, default: Any = None) -> Any:
-    if isinstance(value, dict):
-        return value.get(name, default)
-    try:
-        return getattr(value, name, default)
-    except BaseException:  # noqa: BLE001
-        return default
-
-
-def _is_omitted(value: Any) -> bool:
-    value_type = type(value)
-    return value_type.__module__.startswith("together.") and value_type.__name__ in {
-        "Omit",
-        "NotGiven",
-    }
-
-
-def dump_value(value: Any) -> Any:
-    if _is_omitted(value):
-        return None
+def native_value(value, seen=None):
+    kind = type(value)
+    types = importlib.import_module("together._types")
+    if any(kind is getattr(types, name, None) for name in ("Omit", "NotGiven")):
+        return _OMITTED
+    if kind is str:
+        return value
+    active = seen if seen is not None else set()
+    if kind in {dict, list, tuple} or _known_model(value):
+        identity = id(value)
+        if identity in active:
+            return "<cycle>"
+        active.add(identity)
+        try:
+            if kind in {list, tuple}:
+                result = [native_value(item, active) for item in value]
+                return [item for item in result if item is not _OMITTED]
+            if kind is dict:
+                state = value
+            else:
+                state = dict(object.__getattribute__(value, "__dict__"))
+                extra = (
+                    object.__getattribute__(value, "__pydantic_extra__")
+                    if hasattr(type(value), "model_fields")
+                    else None
+                )
+                if type(extra) is dict:
+                    state.update(extra)
+                try:
+                    fields = object.__getattribute__(value, "__pydantic_fields_set__")
+                except AttributeError:
+                    fields = object.__getattribute__(value, "__fields_set__")
+                if type(fields) is set:
+                    state = {
+                        key: item
+                        for key, item in state.items()
+                        if key in fields or (type(extra) is dict and key in extra)
+                    }
+            result = {}
+            for key, item in state.items():
+                converted = native_value(item, active)
+                if converted is not _OMITTED:
+                    name = key if type(key) is str else "<" + safe_type_name(key) + ">"
+                    result[name] = converted
+            return result
+        finally:
+            active.remove(identity)
     return to_jsonable(value)
 
 
-def sequence_value(value: Any) -> list[Any]:
-    if value is None or _is_omitted(value):
-        return []
-    if isinstance(value, list):
-        return value
-    if isinstance(value, tuple):
-        return list(value)
-    if isinstance(value, (str, bytes, dict)):
-        return [value]
-    try:
-        return list(islice(iter(value), 50))
-    except (TypeError, RuntimeError):
-        return [value]
+_OMITTED = object()
 
 
-def normalize_message(message: Any) -> dict[str, Any]:
-    normalized: dict[str, Any] = {}
-    role = field(message, ROLE_KEY)
-    content = field(message, CONTENT_KEY)
-    if role is not None:
-        normalized[ROLE_KEY] = safe_text(role, max_bytes=256)
-    if content is not None:
-        normalized[CONTENT_KEY] = dump_value(content)
-
-    tool_calls = normalize_tool_calls(field(message, TOOL_CALLS_KEY))
-    if tool_calls:
-        normalized[TOOL_CALLS_KEY] = tool_calls
-
-    function_call = normalize_function_call(field(message, FUNCTION_CALL_KEY))
-    if function_call:
-        normalized[FUNCTION_CALL_KEY] = function_call
-
-    tool_call_id = field(message, TOOL_CALL_ID_KEY)
-    if tool_call_id:
-        normalized[TOOL_CALL_ID_KEY] = safe_text(tool_call_id, max_bytes=256)
-
-    return normalized
+def responses(value):
+    values = value if type(value) is list else [value]
+    return [native_value(item) for item in values]
 
 
-def normalize_messages(messages: Any) -> list[dict[str, Any]]:
-    return [normalize_message(message) for message in sequence_value(messages)]
-
-
-def normalize_function_call(function_call: Any) -> dict[str, Any]:
-    if function_call is None or _is_omitted(function_call):
-        return {}
-    name = field(function_call, NAME_KEY)
-    arguments = field(function_call, ARGUMENTS_KEY)
-    result: dict[str, Any] = {}
-    if name:
-        result[NAME_KEY] = safe_text(name, max_bytes=256)
-    if arguments is not None:
-        result[ARGUMENTS_KEY] = (
-            arguments if isinstance(arguments, str) else safe_json(arguments)
-        )
-    return result
-
-
-def _normalize_tool_call(tool_call: Any) -> dict[str, Any]:
-    function = field(tool_call, FUNCTION_KEY, {}) or {}
-    normalized_function = normalize_function_call(function)
-    if not normalized_function.get(NAME_KEY):
-        return {}
-
-    normalized: dict[str, Any] = {
-        TYPE_KEY: field(tool_call, TYPE_KEY, FUNCTION_TOOL_TYPE) or FUNCTION_TOOL_TYPE,
-        FUNCTION_KEY: normalized_function,
-    }
-    call_id = field(tool_call, ID_KEY)
-    if call_id:
-        normalized[ID_KEY] = safe_text(call_id, max_bytes=256)
-    return normalized
-
-
-def normalize_tool_calls(tool_calls: Any) -> list[dict[str, Any]]:
-    normalized_calls: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for tool_call in sequence_value(tool_calls):
-        normalized = _normalize_tool_call(tool_call)
-        if not normalized:
-            continue
-        signature = safe_json(normalized)
-        if signature in seen:
-            continue
-        seen.add(signature)
-        normalized_calls.append(normalized)
-    return normalized_calls
-
-
-def normalize_tools(tools: Any) -> list[dict[str, Any]]:
-    normalized_tools: list[dict[str, Any]] = []
-    for tool in sequence_value(tools):
-        tool_type = field(tool, TYPE_KEY, FUNCTION_TOOL_TYPE) or FUNCTION_TOOL_TYPE
-        function = field(tool, FUNCTION_KEY)
-        if function is None:
-            function = tool
-        function_name = field(function, NAME_KEY)
-        if not function_name:
-            continue
-        normalized_function: dict[str, Any] = {
-            NAME_KEY: safe_text(function_name, max_bytes=256)
-        }
-        description = field(function, DESCRIPTION_KEY)
-        if description is not None:
-            normalized_function[DESCRIPTION_KEY] = safe_text(description)
-        parameters = field(function, PARAMETERS_KEY)
-        if parameters is not None:
-            normalized_function[PARAMETERS_KEY] = dump_value(parameters)
-        normalized_tools.append(
-            {
-                TYPE_KEY: safe_text(tool_type, max_bytes=64),
-                FUNCTION_KEY: normalized_function,
-            }
-        )
-    return normalized_tools
-
-
-def chat_input_messages(request_kwargs: dict[str, Any]) -> list[dict[str, Any]]:
-    return normalize_messages(request_kwargs.get(MESSAGES_KEY))
-
-
-def chat_input(request_kwargs: dict[str, Any]) -> str:
-    return safe_json(chat_input_messages(request_kwargs))
-
-
-def text_completion_input(request_kwargs: dict[str, Any]) -> str:
-    prompt = request_kwargs.get(PROMPT_KEY)
-    return prompt if isinstance(prompt, str) else to_json_attr(prompt)
-
-
-def _first_choice(response: Any) -> Any:
-    choices = field(response, CHOICES_KEY, []) or []
-    return choices[0] if choices else None
-
-
-def _choice_message(choice: Any) -> Any:
-    if choice is None:
-        return None
-    return field(choice, MESSAGE_KEY)
-
-
-def _choice_text(choice: Any) -> str:
-    text = field(choice, TEXT_KEY)
-    if isinstance(text, str):
-        return text
-    message = _choice_message(choice)
-    content = field(message, CONTENT_KEY)
-    if isinstance(content, str):
-        return content
-    return ""
-
-
-def chat_output(response_or_chunks: Any) -> str:
-    if isinstance(response_or_chunks, list):
-        parts: list[str] = []
-        for chunk in response_or_chunks:
-            for choice in field(chunk, CHOICES_KEY, []) or []:
-                delta = field(choice, DELTA_KEY)
-                content = field(delta, CONTENT_KEY)
-                if isinstance(content, str):
-                    parts.append(content)
-        return "".join(parts)
-    return _choice_text(_first_choice(response_or_chunks))
-
-
-def text_completion_output(response_or_chunks: Any) -> str:
-    if isinstance(response_or_chunks, list):
-        parts: list[str] = []
-        for chunk in response_or_chunks:
-            for choice in field(chunk, CHOICES_KEY, []) or []:
-                text = field(choice, TEXT_KEY)
-                if isinstance(text, str):
-                    parts.append(text)
-                    continue
-                delta = field(choice, DELTA_KEY)
-                content = field(delta, CONTENT_KEY)
-                if isinstance(content, str):
-                    parts.append(content)
-            token = field(chunk, "token")
-            token_text = field(token, TEXT_KEY)
-            if isinstance(token_text, str) and not parts:
-                parts.append(token_text)
-        return "".join(parts)
-    return _choice_text(_first_choice(response_or_chunks))
-
-
-def extract_tool_calls(response_or_chunks: Any) -> list[dict[str, Any]]:
-    raw_calls: list[Any] = []
-    chunks = (
-        response_or_chunks
-        if isinstance(response_or_chunks, list)
-        else [response_or_chunks]
-    )
-    for response in chunks:
-        choice = _first_choice(response)
-        message = _choice_message(choice)
-        raw_calls.extend(sequence_value(field(message, TOOL_CALLS_KEY)))
-        function_call = field(message, FUNCTION_CALL_KEY)
-        if function_call is not None:
-            raw_calls.append(
-                {
-                    TYPE_KEY: FUNCTION_TOOL_TYPE,
-                    FUNCTION_KEY: function_call,
-                }
-            )
-        for chunk_choice in field(response, CHOICES_KEY, []) or []:
-            delta = field(chunk_choice, DELTA_KEY)
-            raw_calls.extend(sequence_value(field(delta, TOOL_CALLS_KEY)))
-            delta_function_call = field(delta, FUNCTION_CALL_KEY)
-            if delta_function_call is not None:
-                raw_calls.append(
-                    {
-                        TYPE_KEY: FUNCTION_TOOL_TYPE,
-                        FUNCTION_KEY: delta_function_call,
-                    }
-                )
-    return normalize_tool_calls(raw_calls)
-
-
-def finish_reason(response_or_chunks: Any) -> str | None:
-    chunks = (
-        response_or_chunks
-        if isinstance(response_or_chunks, list)
-        else [response_or_chunks]
-    )
-    for response in reversed(chunks):
-        for choice in reversed(field(response, CHOICES_KEY, []) or []):
-            reason = field(choice, FINISH_REASON_KEY)
-            if isinstance(reason, str):
-                return reason
-    return None
-
-
-def extract_usage(response_or_chunks: Any) -> dict[str, int]:
-    chunks = (
-        response_or_chunks
-        if isinstance(response_or_chunks, list)
-        else [response_or_chunks]
-    )
-    for response in reversed(chunks):
-        usage = field(response, USAGE_KEY)
-        if usage is None:
-            continue
-        result: dict[str, int] = {}
-        for source_name, target_name in (
-            ("prompt_tokens", "prompt_tokens"),
-            ("completion_tokens", "completion_tokens"),
-            ("total_tokens", "total_tokens"),
-        ):
-            token_count = field(usage, source_name)
-            if isinstance(token_count, int):
-                result[target_name] = token_count
-        if result:
-            return result
+def usage(values):
+    for value in reversed(values):
+        native = value.get("usage") if type(value) is dict else None
+        if type(native) is dict:
+            return {key: item for key, item in native.items() if type(item) is int}
     return {}
 
 
-def embedding_input(request_kwargs: dict[str, Any]) -> str:
-    return to_json_attr(request_kwargs.get(INPUT_KEY))
-
-
-def embedding_output(response: Any) -> str:
-    """Retain complete numeric vectors as required by the span contract."""
-    entries: list[dict[str, Any]] = []
-    data = field(response, DATA_KEY, [])
-    try:
-        iterator = iter(data)
-    except TypeError:
-        iterator = iter(())
-    for item in iterator:
-        raw_embedding = field(item, EMBEDDING_KEY)
-        if not isinstance(raw_embedding, (list, tuple)):
+def completions(values, operation):
+    result = {}
+    for response in values:
+        if type(response) is not dict:
             continue
-        vector: list[int | float] = []
-        valid = True
-        for value in raw_embedding:
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                valid = False
-                break
-            if isinstance(value, float) and not math.isfinite(value):
-                valid = False
-                break
-            vector.append(value)
-        if not valid:
+        for offset, choice in enumerate(response.get("choices") or []):
+            if type(choice) is not dict:
+                continue
+            index = choice.get("index", offset)
+            if type(index) is not int:
+                index = offset
+            message = choice.get("message") or choice.get("delta")
+            if type(message) is not dict:
+                message = (
+                    {"content": choice["text"]}
+                    if "text" in choice and choice["text"] is not None
+                    else {}
+                )
+            target = result.setdefault(index, {})
+            if type(message.get("role")) is str:
+                target["role"] = message["role"]
+            content = message.get("content")
+            if type(content) is str:
+                target["content"] = target.get("content", "") + content
+            for key in ("tool_calls", "function_call"):
+                calls = message.get(key)
+                if not calls:
+                    continue
+                if key == "function_call":
+                    calls = [{"type": "function", "function": calls}]
+                if type(calls) is not list:
+                    continue
+                stored = target.setdefault("tool_calls", {})
+                for call_offset, call in enumerate(calls):
+                    if type(call) is not dict:
+                        continue
+                    call_index = call.get("index", call_offset)
+                    if type(call_index) is not int:
+                        call_index = call_offset
+                    merged = stored.setdefault(call_index, {"function": {}})
+                    for field in ("id", "type"):
+                        if field in call and call[field] is not None:
+                            merged[field] = call[field]
+                    function = call.get("function")
+                    if type(function) is dict:
+                        for field in ("name", "arguments"):
+                            item = function.get(field)
+                            if type(item) is str:
+                                merged["function"][field] = (
+                                    merged["function"].get(field, "") + item
+                                )
+                            elif item is not None:
+                                merged["function"][field] = item
+            if choice.get("finish_reason") is not None:
+                target["finish_reason"] = choice["finish_reason"]
+    for target in result.values():
+        if "tool_calls" in target:
+            target["tool_calls"] = list(target["tool_calls"].values())
+    return result
+
+
+def redact_stream_fragments(values):
+    # Preserve complete merged argument/text projections, and redact every raw
+    # fragment when a credential straddles native SSE chunk boundaries.
+    groups = {}
+    for response in values:
+        if type(response) is not dict:
             continue
-        entry: dict[str, Any] = {EMBEDDING_KEY: vector}
-        index = field(item, INDEX_KEY)
-        if isinstance(index, int) and not isinstance(index, bool):
-            entry[INDEX_KEY] = index
-        entries.append(entry)
-    return json.dumps(
-        {DATA_KEY: entries},
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
-
-
-def rerank_input(request_kwargs: dict[str, Any]) -> str:
-    return safe_json(
-        {
-            QUERY_KEY: dump_value(request_kwargs.get(QUERY_KEY)),
-            DOCUMENTS_KEY: dump_value(request_kwargs.get(DOCUMENTS_KEY)),
-        }
-    )
-
-
-def rerank_output(response: Any) -> str:
-    results: list[dict[str, Any]] = []
-    for result in field(response, RESULTS_KEY, []) or []:
-        normalized: dict[str, Any] = {}
-        index = field(result, INDEX_KEY)
-        if index is not None:
-            normalized[INDEX_KEY] = index
-        score = field(result, RELEVANCE_SCORE_KEY)
-        if score is not None:
-            normalized[RELEVANCE_SCORE_KEY] = score
-        document = field(result, DOCUMENT_KEY)
-        document_text = field(document, TEXT_KEY)
-        if document_text is not None:
-            normalized[DOCUMENT_KEY] = {TEXT_KEY: document_text}
-        results.append(normalized)
-    return safe_json(results)
-
-
-def image_input(request_kwargs: dict[str, Any]) -> str:
-    return safe_json(
-        {
-            PROMPT_KEY: dump_value(request_kwargs.get(PROMPT_KEY)),
-            "image_url": dump_value(request_kwargs.get("image_url")),
-            "reference_images": dump_value(request_kwargs.get("reference_images")),
-        }
-    )
-
-
-def image_output(response: Any) -> str:
-    images: list[dict[str, Any]] = []
-    for item in field(response, DATA_KEY, []) or []:
-        image_type = field(item, TYPE_KEY)
-        normalized: dict[str, Any] = {
-            INDEX_KEY: field(item, INDEX_KEY),
-            TYPE_KEY: image_type,
-        }
-        if image_type == URL_KEY:
-            normalized[URL_KEY] = field(item, URL_KEY)
-        elif image_type == B64_JSON_KEY:
-            value = field(item, B64_JSON_KEY)
-            normalized[B64_JSON_KEY] = {
-                "present": bool(value),
-                "length": len(value) if isinstance(value, str) else 0,
-            }
-        images.append(
-            {key: value for key, value in normalized.items() if value is not None}
-        )
-    return safe_json({"image_count": len(images), "images": images})
-
-
-def request_model(request_kwargs: dict[str, Any], response: Any = None) -> str | None:
-    model = request_kwargs.get(MODEL_KEY)
-    if isinstance(model, str) and model:
-        return model
-    response_model = field(response, MODEL_KEY)
-    return safe_text(response_model, max_bytes=512) if response_model else None
+        for offset, choice in enumerate(response.get("choices") or []):
+            if type(choice) is not dict:
+                continue
+            candidate = choice.get("index", offset)
+            if type(candidate) is not int:
+                candidate = offset
+            delta = choice.get("delta")
+            if type(delta) is not dict:
+                continue
+            for key in ("content", "reasoning", "reasoning_content"):
+                if type(delta.get(key)) is str:
+                    groups.setdefault((candidate, key), []).append(
+                        (delta, key, delta[key])
+                    )
+            for offset, call in enumerate(delta.get("tool_calls") or []):
+                if type(call) is not dict:
+                    continue
+                index = call.get("index", offset)
+                if type(index) is not int:
+                    index = offset
+                function = call.get("function")
+                if type(function) is dict and type(function.get("arguments")) is str:
+                    groups.setdefault((candidate, "tool", index), []).append(
+                        (function, "arguments", function["arguments"])
+                    )
+            function = delta.get("function_call")
+            if type(function) is dict and type(function.get("arguments")) is str:
+                groups.setdefault((candidate, "function"), []).append(
+                    (function, "arguments", function["arguments"])
+                )
+    for pieces in groups.values():
+        text = "".join(item[2] for item in pieces)
+        if safe_text(text) != text:
+            for target, key, _ in pieces:
+                target[key] = "[REDACTED]"
+    return values

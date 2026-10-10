@@ -1,279 +1,220 @@
-"""Bounded, privacy-safe serialization for Replicate SDK values."""
+"""Complete builtin native payloads without unknown conversion hooks."""
 
 from __future__ import annotations
 
 import json
 import math
 import re
-from collections.abc import Mapping, Sequence
-from datetime import date, datetime
-from enum import Enum
-from itertools import islice
-from numbers import Integral, Real
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
 
-MAX_ATTRIBUTE_BYTES = 16_000
-MAX_DEPTH = 8
-MAX_ITEMS = 50
-MAX_STRING_BYTES = 4_000
 REDACTED = "[REDACTED]"
-
-_SENSITIVE_SUFFIXES = (
-    "apikey",
-    "authorization",
-    "credential",
-    "password",
-    "secret",
-    "sessiontoken",
-    "token",
+_SENSITIVE = re.compile(
+    r"(?:apikey|authorization|password|secret|sessiontoken|accesstoken|refreshtoken|token|credentials?|privatekey|cookie)$"
 )
-_SECRET_ASSIGNMENT = re.compile(
-    r"(?i)([\"']?(?:api[_-]?key|authorization|password|secret|session[_-]?token|token)[\"']?)"
-    r"(\s*[:=]\s*)([\"']?)([^\s,;}\"']+)([\"']?)"
+_ASSIGNMENT = re.compile(
+    r"""(?ix)(["']?(?:api[_-]?key|authorization|password|secret|session[_-]?token|access[_-]?token|refresh[_-]?token|credentials?|private[_-]?key|token)["']?)(\s*[:=]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}]+)"""
 )
-_BEARER = re.compile(r"(?i)\bbearer\s+[a-z0-9._~+/=-]+")
-_ADDRESS = re.compile(r"(?i)\b0x[0-9a-f]{6,}\b")
+_AUTH = re.compile(
+    r"""(?i)\b(?:bearer|basic)\s+(?!\[REDACTED\])(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[a-z0-9._~+/=-]+)"""
+)
+_URL = re.compile(
+    r"(?i)\b(https?://)([^\s/?#@\"\']+@)?([^\s/?#\"\']+)([^\s?#\"\']*)(?:\?[^\s#\"\']*)?(?:#[^\s\"\']*)?"
+)
 
 
-def _truncate_utf8(value: str, limit: int = MAX_STRING_BYTES) -> str:
-    encoded = value.encode("utf-8")
-    if len(encoded) <= limit:
-        return value
-    suffix = "...[truncated]"
-    budget = max(0, limit - len(suffix.encode("utf-8")))
-    return encoded[:budget].decode("utf-8", errors="ignore") + suffix
+def _type(value: Any) -> str:
+    return type.__getattribute__(type(value), "__name__")
 
 
-def sanitize_url(value: str) -> str:
-    try:
-        parsed = urlsplit(value)
-    except ValueError:
-        return "<redacted-endpoint>"
-    if not parsed.scheme or not parsed.netloc:
-        return value
-    hostname = parsed.hostname
-    if not hostname:
-        return "<redacted-endpoint>"
-    netloc = (
-        f"[{hostname}]"
-        if ":" in hostname and not hostname.startswith("[")
-        else hostname
+def sensitive_key(key: Any) -> bool:
+    return type(key) is str and bool(
+        _SENSITIVE.search(re.sub(r"[^a-z0-9]", "", key.lower()))
     )
-    try:
-        port = parsed.port
-    except ValueError:
-        return "<redacted-endpoint>"
-    if port is not None:
-        netloc = f"{netloc}:{port}"
-    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
 
 
 def safe_text(value: Any, *, default: str = "") -> str:
-    if isinstance(value, str):
-        if "://" in value:
-            value = sanitize_url(value)
-        value = _BEARER.sub(REDACTED, value)
-        value = _SECRET_ASSIGNMENT.sub(
-            lambda match: (
-                f"{match.group(1)}{match.group(2)}{match.group(3)}"
-                f"{REDACTED}{match.group(5)}"
-            ),
-            value,
+    if type(value) is str:
+        if value.lstrip().startswith(("{", "[")):
+            try:
+                parsed = json.loads(value)
+            except ValueError:
+                parsed = None
+            if type(parsed) in (dict, list):
+                converted = to_jsonable(parsed)
+                return (
+                    value
+                    if converted == parsed
+                    else json.dumps(
+                        converted,
+                        allow_nan=False,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                )
+
+        def assignment(match):
+            raw = match[3]
+            replacement = (
+                json.dumps(REDACTED)
+                if raw.startswith('"')
+                else ("'" + REDACTED + "'" if raw.startswith("'") else REDACTED)
+            )
+            return match[1] + match[2] + replacement
+
+        return _ASSIGNMENT.sub(
+            assignment,
+            _AUTH.sub(REDACTED, _URL.sub(lambda m: m[1] + m[3] + m[4], value)),
         )
-        return _truncate_utf8(_ADDRESS.sub("0x<redacted>", value))
     if value is None:
         return default
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, Integral):
-        return str(int(value))
-    if isinstance(value, Real) and math.isfinite(float(value)):
-        return str(float(value))
-    return f"<{type(value).__name__}>"
+    if type(value) in (bool, int):
+        return str(value).lower()
+    if type(value) is float and math.isfinite(value):
+        return str(value)
+    return "<" + _type(value) + ">"
 
 
-def exception_message(exc: BaseException) -> str:
-    try:
-        arguments = exc.args
-    except Exception:  # noqa: BLE001
-        arguments = ()
-    for argument in arguments:
-        if isinstance(argument, str | bool | int | float):
-            return safe_text(argument)
-    return type(exc).__name__
-
-
-def exception_status(exc: BaseException, *, default: int = 500) -> int:
-    for candidate in (exc, _safe_attr(exc, "response")):
-        for name in ("status_code", "status"):
-            value = _safe_attr(candidate, name)
-            if isinstance(value, int) and 400 <= value <= 599:
-                return value
-    return default
-
-
-def _safe_attr(value: Any, name: str) -> Any:
-    try:
-        return getattr(value, name, None)
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def sensitive_key(value: Any) -> bool:
-    if not isinstance(value, str):
-        return False
-    normalized = re.sub(r"[^a-z0-9]", "", value.lower())
-    return any(normalized.endswith(suffix) for suffix in _SENSITIVE_SUFFIXES)
-
-
-def _key(value: Any) -> str:
-    if isinstance(value, Enum):
-        value = value.value
-    return safe_text(value)[:256]
-
-
-def json_value(value: Any, *, depth: int = 0, seen: set[int] | None = None) -> Any:
-    if value is None or isinstance(value, bool):
+def to_jsonable(
+    value: Any,
+    *,
+    depth: int = 0,
+    seen: set[int] | None = None,
+    schema: bool = False,
+    property_map: bool = False,
+    secret_property: bool = False,
+) -> Any:
+    if value is None or type(value) in (bool, int):
         return value
-    if isinstance(value, str):
+    if type(value) is float:
+        return value if math.isfinite(value) else None
+    if type(value) is str:
         return safe_text(value)
-    if isinstance(value, Integral):
-        return int(value)
-    if isinstance(value, Real):
-        number = float(value)
-        return number if math.isfinite(number) else None
-    if isinstance(value, datetime | date):
-        return value.isoformat()
-    if isinstance(value, bytes | bytearray | memoryview):
-        return {"length": len(value), "type": type(value).__name__}
-    if isinstance(value, Enum):
-        return json_value(value.value, depth=depth + 1, seen=seen)
-    if depth >= MAX_DEPTH:
-        return {"truncated": "max_depth", "type": type(value).__name__}
-
-    active = seen if seen is not None else set()
-    identity = id(value)
-    if identity in active:
+    if type(value) in (bytes, bytearray, memoryview):
+        return {"length": len(value), "type": _type(value)}
+    active = set() if seen is None else seen
+    if id(value) in active:
         return "<cycle>"
-    active.add(identity)
+    active.add(id(value))
     try:
-        if isinstance(value, Mapping):
-            result: dict[str, Any] = {}
-            items = list(islice(value.items(), MAX_ITEMS + 1))
-            for key, item in items[:MAX_ITEMS]:
-                key_text = _key(key)
-                result[key_text] = (
-                    REDACTED
-                    if sensitive_key(key)
-                    else json_value(item, depth=depth + 1, seen=active)
-                )
-            if len(items) > MAX_ITEMS:
-                result["__truncated_items__"] = True
+        if type(value) is dict:
+            is_schema = schema or (
+                type(value.get("properties")) is dict and value.get("type") == "object"
+            )
+            result = {}
+            for key, item in value.items():
+                text = safe_text(key)
+                secret = sensitive_key(key)
+                if (
+                    key == "token"
+                    and type(item) is dict
+                    and type(item.get("text")) is str
+                    and set(item).issubset({"id", "text", "special", "logprob"})
+                ):
+                    secret = False
+                if (secret and not property_map) or (
+                    secret_property
+                    and key in ("default", "const", "enum", "examples", "example")
+                ):
+                    result[text] = REDACTED
+                else:
+                    result[text] = to_jsonable(
+                        item,
+                        depth=depth + 1,
+                        seen=active,
+                        schema=is_schema,
+                        property_map=is_schema
+                        and key in ("properties", "$defs", "definitions"),
+                        secret_property=property_map and secret,
+                    )
             return result
-        if isinstance(value, Sequence) and not isinstance(
-            value, str | bytes | bytearray
-        ):
-            items = list(islice(iter(value), MAX_ITEMS + 1))
-            converted = [
-                json_value(item, depth=depth + 1, seen=active)
-                for item in items[:MAX_ITEMS]
+        if type(value) in (list, tuple):
+            return [
+                to_jsonable(v, depth=depth + 1, seen=active, schema=schema)
+                for v in value
             ]
-            if len(items) > MAX_ITEMS:
-                return {"items": converted, "truncated": True}
-            return converted
-        for method_name in ("model_dump", "to_dict", "dict"):
-            method = _safe_attr(value, method_name)
-            if not callable(method):
-                continue
-            try:
-                converted = method()
-            except Exception:  # noqa: BLE001,S112
-                continue
-            if isinstance(converted, Mapping):
-                return json_value(converted, depth=depth + 1, seen=active)
-        return {"type": type(value).__name__}
-    except Exception:  # noqa: BLE001
-        return {"type": type(value).__name__, "unserializable": True}
+        return {"type": _type(value)}
     finally:
-        active.discard(identity)
+        active.remove(id(value))
 
 
-def json_string(value: Any) -> str:
+def json_dumps(value: Any, *, max_bytes: int | None = None) -> str:
     encoded = json.dumps(
-        json_value(value),
+        to_jsonable(value),
         allow_nan=False,
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
     )
-    size = len(encoded.encode("utf-8"))
-    if size <= MAX_ATTRIBUTE_BYTES:
+    if max_bytes is None or len(encoded.encode("utf-8")) <= max_bytes:
         return encoded
-    low, high, result = 0, len(encoded), ""
-    while low <= high:
-        midpoint = (low + high) // 2
-        candidate = json.dumps(
-            {"original_bytes": size, "preview": encoded[:midpoint], "truncated": True},
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        if len(candidate.encode("utf-8")) <= MAX_ATTRIBUTE_BYTES:
-            result = candidate
-            low = midpoint + 1
-        else:
-            high = midpoint - 1
-    return result
-
-
-def prediction_summary(value: Any) -> Any:
-    """Return allow-listed stable prediction/page fields."""
-    mapping = value if isinstance(value, Mapping) else None
-    if mapping is None:
-        for method_name in ("model_dump", "dict"):
-            method = _safe_attr(value, method_name)
-            if not callable(method):
-                continue
-            try:
-                converted = method()
-            except Exception:  # noqa: BLE001,S112
-                continue
-            if isinstance(converted, Mapping):
-                mapping = converted
-                break
-    if mapping is None:
-        results = _safe_attr(value, "results")
-        if results is not None:
-            return {"results": prediction_summary(results)}
-        return json_value(value)
-
-    allowed = (
-        "id",
-        "model",
-        "version",
-        "status",
-        "input",
-        "output",
-        "error",
-        "logs",
-        "metrics",
-        "created_at",
-        "started_at",
-        "completed_at",
-        "urls",
+    # Only callers explicitly requesting a cap receive a valid JSON summary.
+    return json.dumps(
+        {"original_bytes": len(encoded.encode("utf-8")), "truncated": True},
+        separators=(",", ":"),
     )
-    summary = {
-        key: mapping[key]
-        for key in allowed
-        if key in mapping and mapping[key] is not None
-    }
-    if "results" in mapping:
-        summary["results"] = [
-            prediction_summary(item)
-            for item in list(islice(iter(mapping["results"]), MAX_ITEMS))
-        ]
-    for key in ("next", "previous"):
-        if key in mapping:
-            summary[key] = mapping[key]
-    return json_value(summary)
+
+
+# Only exact released native types are traversed; never invoke customer dump hooks.
+_NATIVE_TYPES = set()
+_EVENT_TYPES = set()
+
+
+def register_native_types():
+    import importlib
+
+    for module_name, class_name in [
+        ("prediction", "Prediction"),
+        ("model", "Model"),
+        ("version", "Version"),
+        ("deployment", "Deployment"),
+        ("pagination", "Page"),
+        ("stream", "ServerSentEvent"),
+        ("helpers", "FileOutput"),
+    ]:
+        module = importlib.import_module("replicate." + module_name)
+        _NATIVE_TYPES.add(getattr(module, class_name))
+    from replicate.stream import ServerSentEvent
+
+    _EVENT_TYPES.add(ServerSentEvent.EventType)
+
+
+def native_value(value, seen=None):
+    from datetime import date, datetime
+
+    active = set() if seen is None else seen
+    if value is None or type(value) in (str, int, float, bool):
+        return value
+    if type(value) in (date, datetime):
+        return value.isoformat()
+    if id(value) in active:
+        return "<cycle>"
+    active.add(id(value))
+    try:
+        if type(value) in _EVENT_TYPES:
+            return object.__getattribute__(value, "_value_")
+        if type(value) in _NATIVE_TYPES:
+            fields = object.__getattribute__(value, "__dict__")
+            return {
+                k: native_value(v, active)
+                for k, v in fields.items()
+                if type(k) is str and not k.startswith("_") and k != "client"
+            }
+        if type(value) is dict:
+            return {
+                k: native_value(v, active)
+                for k, v in value.items()
+                if type(k) in (str, int, bool, float)
+            }
+        if type(value) in (list, tuple):
+            return [native_value(v, active) for v in value]
+        return {"type": _type(value)}
+    finally:
+        active.remove(id(value))
+
+
+def json_string(value):
+    return json_dumps(native_value(value))
+
+
+def prediction_summary(value):
+    return to_jsonable(native_value(value))
