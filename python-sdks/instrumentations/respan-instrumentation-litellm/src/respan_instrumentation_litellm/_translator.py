@@ -1,465 +1,432 @@
-"""Translate LiteLLM callback payloads into canonical Respan span attributes."""
+"""Canonical translation of observed LiteLLM request and provider fields."""
 
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from typing import Any
 
-from opentelemetry.semconv._incubating.attributes import (
-    gen_ai_attributes as GenAIAttributes,
-)
-from opentelemetry.semconv_ai import LLMRequestTypeValues
+from opentelemetry.semconv._incubating.attributes import gen_ai_attributes as GenAI
 from opentelemetry.semconv_ai import SpanAttributes
-
-from respan_instrumentation_litellm._constants import (
-    API_BASE_KEY,
-    ARGUMENTS_KEY,
-    ASSISTANT_ROLE,
-    CACHE_HIT_KEY,
-    CHOICES_KEY,
-    COMPLETION_TOKENS_KEY,
-    CONTENT_KEY,
-    COST_KEY,
-    DELTA_KEY,
-    FUNCTION_KEY,
-    FUNCTIONS_KEY,
-    FUNCTION_TOOL_TYPE,
-    ID_KEY,
-    LITELLM_CHAT_SPAN_NAME,
-    LITELLM_PARAMS_KEY,
-    MESSAGE_KEY,
-    MESSAGES_KEY,
-    METADATA_KEY,
-    MODEL_KEY,
-    NAME_KEY,
-    OPENAI_MODEL_PREFIXES,
-    PROMPT_TOKENS_KEY,
-    PROVIDER_MODEL_PREFIXES,
-    RESPONSE_KEY,
-    RESPAN_PARAMS_KEY,
-    ROLE_KEY,
-    STANDARD_LOGGING_OBJECT_KEY,
-    STREAM_KEY,
-    TEXT_KEY,
-    TOOL_CALLS_KEY,
-    TOOLS_KEY,
-    TOTAL_TOKENS_KEY,
-    TYPE_KEY,
-    USAGE_KEY,
-    USER_ROLE,
-)
-from respan_sdk.constants.llm_logging import LOG_TYPE_CHAT
-from respan_sdk.constants.llm_logging import LogMethodChoices
+from respan_sdk.constants.llm_logging import LOG_TYPE_CHAT, LOG_TYPE_EMBEDDING
 from respan_sdk.constants.span_attributes import (
-    RESPAN_LOG_METHOD,
     RESPAN_LOG_TYPE,
     RESPAN_METADATA,
     RESPAN_SPAN_ATTRIBUTES_MAP,
-    RESPAN_TRACE_GROUP_ID,
 )
-from respan_sdk.utils.serialization import serialize_value
+
+from ._serialization import json_string, redact_text
 
 
-def safe_json(value: Any) -> str:
-    """Serialize arbitrary LiteLLM values into an OTEL-safe JSON string."""
+def get(value, key, default=None):
     try:
-        return json.dumps(
-            serialize_value(value=value), default=str, separators=(",", ":")
+        return (
+            value.get(key, default)
+            if isinstance(value, Mapping)
+            else getattr(value, key, default)
         )
-    except Exception:
-        return json.dumps(str(value), separators=(",", ":"))
+    except Exception:  # noqa: BLE001 - telemetry cannot replace native behavior
+        return default
 
 
-def _to_mapping(value: Any) -> Mapping[str, Any] | None:
+def plain(value, depth=0):
+    if depth > 64:
+        return {"type": type(value).__name__, "recursive": True}
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
     if isinstance(value, Mapping):
-        return value
-
-    for method_name in ("model_dump", "to_dict", "dict"):
-        method = getattr(value, method_name, None)
-        if callable(method):
-            try:
-                converted = method()
-            except Exception:
-                continue
-            if isinstance(converted, Mapping):
-                return converted
-
-    value_dict = getattr(value, "__dict__", None)
-    if isinstance(value_dict, Mapping):
-        return value_dict
-    return None
-
-
-def _get(value: Any, key: str, default: Any = None) -> Any:
-    mapping = _to_mapping(value)
-    if mapping is not None:
-        return mapping.get(key, default)
-    return getattr(value, key, default)
-
-
-def _standard_logging_object(kwargs: Mapping[str, Any]) -> Mapping[str, Any]:
-    standard_logging_object = kwargs.get(STANDARD_LOGGING_OBJECT_KEY)
-    mapping = _to_mapping(standard_logging_object)
-    return mapping or {}
-
-
-def _request_messages(kwargs: Mapping[str, Any]) -> list[Any]:
-    messages = kwargs.get(MESSAGES_KEY)
-    if messages is None:
-        messages = _standard_logging_object(kwargs).get(MESSAGES_KEY)
-    if messages is None:
-        return []
-    if isinstance(messages, list):
-        return messages
-    if isinstance(messages, tuple):
-        return list(messages)
-    if isinstance(messages, Mapping):
-        return [messages]
-    return [{ROLE_KEY: USER_ROLE, CONTENT_KEY: messages}]
-
-
-def _content_to_string(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    return safe_json(value=value)
-
-
-def _message_role(message: Any) -> str:
-    role = _get(message, ROLE_KEY)
-    if role is None:
-        return USER_ROLE
-    return str(role)
-
-
-def _message_content(message: Any) -> str:
-    return _content_to_string(_get(message, CONTENT_KEY))
-
-
-def _normalized_tool_call(tool_call: Any) -> dict[str, Any] | None:
-    function = _get(tool_call, FUNCTION_KEY)
-    function_name = _get(function, NAME_KEY)
-    if not function_name:
-        return None
-
-    arguments = _get(function, ARGUMENTS_KEY, {})
-    normalized = {
-        TYPE_KEY: str(_get(tool_call, TYPE_KEY, FUNCTION_TOOL_TYPE)),
-        FUNCTION_KEY: {
-            NAME_KEY: str(function_name),
-            ARGUMENTS_KEY: (
-                arguments if isinstance(arguments, str) else safe_json(value=arguments)
-            ),
-        },
-    }
-    tool_call_id = _get(tool_call, ID_KEY)
-    if tool_call_id:
-        normalized[ID_KEY] = str(tool_call_id)
-    return normalized
-
-
-def _normalized_tool_calls(value: Any) -> list[dict[str, Any]]:
-    if not value:
-        return []
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
-        value = [value]
-
-    normalized = []
-    for item in value:
-        tool_call = _normalized_tool_call(tool_call=item)
-        if tool_call is not None:
-            normalized.append(tool_call)
-    return normalized
-
-
-def _normalized_tool_definition(tool: Any) -> dict[str, Any] | None:
-    function = _get(tool, FUNCTION_KEY)
-    if function is None:
-        function = tool
-    function_name = _get(function, NAME_KEY)
-    if not function_name:
-        return None
-
-    tool_type = _get(tool, TYPE_KEY, FUNCTION_TOOL_TYPE)
-    function_mapping = _to_mapping(function)
-    if function_mapping is None:
-        function_mapping = {NAME_KEY: str(function_name)}
-    else:
-        function_mapping = {
-            str(key): serialize_value(value=value)
-            for key, value in function_mapping.items()
-            if value is not None
+        return {
+            str(k): plain(v, depth + 1)
+            for k, v in value.items()
+            if isinstance(k, str) or type(k) is int
         }
-        function_mapping[NAME_KEY] = str(function_name)
-
-    return {
-        TYPE_KEY: str(tool_type),
-        FUNCTION_KEY: function_mapping,
-    }
-
-
-def _tool_definitions(kwargs: Mapping[str, Any]) -> list[dict[str, Any]]:
-    tools = kwargs.get(TOOLS_KEY)
-    if tools is None and kwargs.get(FUNCTIONS_KEY) is not None:
-        tools = [
-            {TYPE_KEY: FUNCTION_TOOL_TYPE, FUNCTION_KEY: function}
-            for function in kwargs.get(FUNCTIONS_KEY) or []
-        ]
-
-    if not tools:
-        return []
-    if not isinstance(tools, Sequence) or isinstance(tools, (str, bytes, bytearray)):
-        tools = [tools]
-
-    normalized = []
-    for item in tools:
-        tool = _normalized_tool_definition(tool=item)
-        if tool is not None:
-            normalized.append(tool)
-    return normalized
+    if isinstance(value, list | tuple):
+        return [plain(v, depth + 1) for v in value]
+    if type(value).__module__.startswith(("litellm.", "openai.")):
+        fields = get(type(value), "model_fields", {})
+        if isinstance(fields, Mapping):
+            return {k: plain(get(value, k), depth + 1) for k in fields}
+    return {"type": type(value).__name__}
 
 
-def _first_choice(response_obj: Any) -> Any:
-    choices = _get(response_obj, CHOICES_KEY, [])
-    if choices is None and isinstance(response_obj, Mapping):
-        choices = response_obj.get(CHOICES_KEY, [])
-    if choices:
-        return choices[0]
-    return None
+def safe_json(value, *, schema=False):
+    return json_string(plain(value), schema=schema) or "null"
 
 
-def _choice_message(choice: Any) -> Any:
-    if choice is None:
-        return None
-    message = _get(choice, MESSAGE_KEY)
-    if message is not None:
-        return message
-    return _get(choice, DELTA_KEY)
+def calls(values):
+    result = []
+    for call in values or ():
+        function = get(call, "function")
+        name = get(function, "name") if function is not None else get(call, "name")
+        arguments = (
+            get(function, "arguments")
+            if function is not None
+            else get(call, "arguments")
+        )
+        item = {
+            "type": get(call, "type", "function"),
+            "function": {
+                "name": name,
+                "arguments": redact_text(arguments)
+                if isinstance(arguments, str)
+                else safe_json(arguments),
+            },
+        }
+        identifier = (
+            get(call, "id")
+            if function is not None
+            else get(call, "call_id", get(call, "id"))
+        )
+        if isinstance(identifier, str):
+            item["id"] = identifier
+        result.append(item)
+    return result
 
 
-def _response_text(response_obj: Any, kwargs: Mapping[str, Any]) -> str:
-    choice = _first_choice(response_obj=response_obj)
-    message = _choice_message(choice=choice)
-    content = _get(message, CONTENT_KEY)
-    if content is not None:
-        return _content_to_string(content)
-
-    choice_text = _get(choice, TEXT_KEY)
-    if choice_text is not None:
-        return _content_to_string(choice_text)
-
-    standard_response = _standard_logging_object(kwargs).get(RESPONSE_KEY)
-    if standard_response is not None:
-        return _content_to_string(standard_response)
-
-    response_text = _get(response_obj, CONTENT_KEY)
-    if response_text is not None:
-        return _content_to_string(response_text)
-
-    return ""
+def message(value):
+    if get(value, "type") == "function_call":
+        return {"role": "assistant", "tool_calls": calls([value])}
+    if get(value, "type") == "function_call_output":
+        return {
+            "role": "tool",
+            "tool_call_id": get(value, "call_id"),
+            "content": plain(get(value, "output")),
+        }
+    item = {"role": get(value, "role", "assistant")}
+    if (content := get(value, "content")) is not None:
+        item["content"] = plain(content)
+    if tool_calls := get(value, "tool_calls"):
+        item["tool_calls"] = calls(tool_calls)
+    if isinstance(identifier := get(value, "tool_call_id"), str):
+        item["tool_call_id"] = identifier
+    return item
 
 
-def _response_tool_calls(response_obj: Any) -> list[dict[str, Any]]:
-    choice = _first_choice(response_obj=response_obj)
-    message = _choice_message(choice=choice)
-    return _normalized_tool_calls(value=_get(message, TOOL_CALLS_KEY))
+def set_messages(attrs, prefix, messages):
+    # Preserve every message in entity I/O. Bound only indexed projections so
+    # OTel's default128-attribute budget cannot evict identity/usage/run fields.
+    for index, item in enumerate(messages[:8]):
+        base = f"{prefix}.{index}"
+        attrs[f"{base}.role"] = item["role"]
+        if "content" in item:
+            attrs[f"{base}.content"] = (
+                redact_text(item["content"])
+                if isinstance(item["content"], str)
+                else safe_json(item["content"])
+            )
+        if item.get("tool_calls"):
+            attrs[f"{base}.tool_calls"] = safe_json(item["tool_calls"])
+        if item.get("tool_call_id"):
+            attrs[f"{base}.tool_call_id"] = item["tool_call_id"]
 
 
-def _usage_mapping(response_obj: Any, kwargs: Mapping[str, Any]) -> Mapping[str, Any]:
-    usage = _get(response_obj, USAGE_KEY)
-    mapping = _to_mapping(usage)
-    if mapping is not None:
-        return mapping
-
-    standard_logging_object = _standard_logging_object(kwargs)
-    if standard_logging_object:
-        return standard_logging_object
-    return {}
-
-
-def _int_value(mapping: Mapping[str, Any], key: str) -> int | None:
-    value = mapping.get(key)
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    return None
+_COUNTERS = (
+    "prompt_tokens",
+    "completion_tokens",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+)
+_DETAILS = (
+    "prompt_tokens_details",
+    "input_tokens_details",
+    "completion_tokens_details",
+    "output_tokens_details",
+)
 
 
-def _model_name(response_obj: Any, kwargs: Mapping[str, Any]) -> str | None:
-    model = (
-        kwargs.get(MODEL_KEY)
-        or _get(response_obj, MODEL_KEY)
-        or _standard_logging_object(kwargs).get(MODEL_KEY)
+def usage_fields(source):
+    result = {}
+    fields = get(source, "model_fields_set")
+    for key in _COUNTERS:
+        if isinstance(fields, set) and key not in fields:
+            continue
+        value = get(source, key)
+        if type(value) is int and value >= 0:
+            result[key] = value
+    for key in _DETAILS:
+        detail = get(source, key)
+        values = {
+            name: v
+            for name in (
+                "cached_tokens",
+                "cache_write_tokens",
+                "cache_creation_tokens",
+                "reasoning_tokens",
+            )
+            if type(v := get(detail, name)) is int and v >= 0
+        }
+        if values:
+            result[key] = values
+    return result
+
+
+def _raw_counters(text, *, detail=False):
+    result = {}
+    names = (
+        (
+            "cached_tokens",
+            "cache_write_tokens",
+            "cache_creation_tokens",
+            "reasoning_tokens",
+        )
+        if detail
+        else _COUNTERS
     )
-    return str(model) if model else None
-
-
-def _provider_name(model_name: str | None, kwargs: Mapping[str, Any]) -> str:
-    litellm_params = kwargs.get(LITELLM_PARAMS_KEY)
-    provider = _get(litellm_params, "custom_llm_provider")
-    if provider:
-        provider_name = str(provider).lower()
-        return "google" if provider_name == "gemini" else provider_name
-
-    if not model_name:
-        return "litellm"
-
-    model_prefix = model_name.split("/", maxsplit=1)[0].lower()
-    if model_prefix in PROVIDER_MODEL_PREFIXES:
-        return "google" if model_prefix == "gemini" else model_prefix
-
-    if model_name.lower().startswith(OPENAI_MODEL_PREFIXES):
-        return "openai"
-
-    return "litellm"
-
-
-def _respan_params(kwargs: Mapping[str, Any]) -> Mapping[str, Any]:
-    metadata = kwargs.get(METADATA_KEY)
-    litellm_params = kwargs.get(LITELLM_PARAMS_KEY)
-    litellm_metadata = _get(litellm_params, METADATA_KEY, {})
-
-    for candidate in (litellm_metadata, metadata):
-        mapping = _to_mapping(candidate)
-        if mapping is None:
+    decoder = json.JSONDecoder()
+    level = 0
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if character == '"':
+            start = index
+            index += 1
+            while index < len(text):
+                if text[index] == "\\":
+                    index += 2
+                elif text[index] == '"':
+                    index += 1
+                    break
+                else:
+                    index += 1
+            key = text[start + 1 : index - 1]
+            remaining = text[index:].lstrip()
+            if level == 1 and remaining.startswith(":"):
+                raw = remaining[1:].lstrip()
+                if key in names and raw and raw[0] in "-0123456789":
+                    try:
+                        value, _ = decoder.raw_decode(raw)
+                        if type(value) is int and value >= 0:
+                            result[key] = value
+                    except (ValueError, TypeError):
+                        pass
+                elif not detail and key in _DETAILS and raw.startswith("{"):
+                    values = _raw_counters(raw, detail=True)
+                    if values:
+                        result[key] = values
             continue
-        params = mapping.get(RESPAN_PARAMS_KEY)
-        params_mapping = _to_mapping(params)
-        if params_mapping is not None:
-            return params_mapping
+        if character in "{[":
+            level += 1
+        elif character in "}]":
+            level -= 1
+            if level == 0:
+                break
+        index += 1
+    return result
+
+
+def raw_usage(value):
+    """Decode only known actual counters; other provider values stay undecoded."""
+    if not isinstance(value, str):
+        return usage_fields(get(value, "usage"))
+    level = 0
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character == '"':
+            start = index
+            index += 1
+            while index < len(value):
+                if value[index] == "\\":
+                    index += 2
+                elif value[index] == '"':
+                    index += 1
+                    break
+                else:
+                    index += 1
+            if level == 1 and value[start:index] == '"usage"':
+                remaining = value[index:].lstrip()
+                if remaining.startswith(":"):
+                    raw = remaining[1:].lstrip()
+                    return _raw_counters(raw) if raw.startswith("{") else {}
+            continue
+        if character in "{[":
+            level += 1
+        elif character in "}]":
+            level -= 1
+        index += 1
     return {}
 
 
-def _apply_respan_params(attributes: dict[str, Any], kwargs: Mapping[str, Any]) -> str:
-    params = _respan_params(kwargs=kwargs)
-    span_name = str(params.get("span_name") or LITELLM_CHAT_SPAN_NAME)
+def add_usage(attrs, usage):
+    def count(*keys):
+        return next(
+            (
+                get(usage, key)
+                for key in keys
+                if type(get(usage, key)) is int and get(usage, key) >= 0
+            ),
+            None,
+        )
 
-    workflow_name = params.get("workflow_name")
-    if workflow_name and "trace_group_identifier" not in params:
-        attributes.setdefault(RESPAN_TRACE_GROUP_ID, str(workflow_name))
-
-    for key, value in params.items():
-        if key in {
-            "parent_span_id",
-            "span_id",
-            "span_name",
-            "trace_id",
-            "trace_name",
-            "workflow_name",
-        }:
-            continue
-        attr_key = RESPAN_SPAN_ATTRIBUTES_MAP.get(str(key))
-        if attr_key is None:
-            continue
-        if attr_key == RESPAN_METADATA and isinstance(value, Mapping):
-            for metadata_key, metadata_value in value.items():
-                attributes[f"{RESPAN_METADATA}.{metadata_key}"] = (
-                    metadata_value
-                    if isinstance(metadata_value, str)
-                    else str(metadata_value)
-                )
-        else:
-            attributes[attr_key] = value
-
-    return span_name
+    read = count("cache_read_tokens", "cache_read_input_tokens")
+    write = count("cache_write_tokens", "cache_creation_input_tokens")
+    reasoning = count("reasoning_tokens")
+    for detail in ("prompt_tokens_details", "input_tokens_details"):
+        data = get(usage, detail)
+        if read is None:
+            read = get(data, "cached_tokens")
+        if write is None:
+            write = get(data, "cache_write_tokens", get(data, "cache_creation_tokens"))
+    for detail in ("completion_tokens_details", "output_tokens_details"):
+        if reasoning is None:
+            reasoning = get(get(usage, detail), "reasoning_tokens")
+    for value, keys in (
+        (
+            count("input_tokens", "prompt_tokens"),
+            (GenAI.GEN_AI_USAGE_INPUT_TOKENS, SpanAttributes.LLM_USAGE_PROMPT_TOKENS),
+        ),
+        (
+            count("output_tokens", "completion_tokens"),
+            (
+                GenAI.GEN_AI_USAGE_OUTPUT_TOKENS,
+                SpanAttributes.LLM_USAGE_COMPLETION_TOKENS,
+            ),
+        ),
+        (count("total_tokens"), (SpanAttributes.LLM_USAGE_TOTAL_TOKENS,)),
+        (
+            read,
+            (
+                SpanAttributes.GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
+                SpanAttributes.LLM_USAGE_CACHE_READ_INPUT_TOKENS,
+            ),
+        ),
+        (
+            write,
+            (
+                SpanAttributes.GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
+                SpanAttributes.LLM_USAGE_CACHE_CREATION_INPUT_TOKENS,
+            ),
+        ),
+        (
+            reasoning,
+            (
+                SpanAttributes.GEN_AI_USAGE_REASONING_TOKENS,
+                SpanAttributes.LLM_USAGE_REASONING_TOKENS,
+            ),
+        ),
+    ):
+        if type(value) is int and value >= 0:
+            for key in keys:
+                attrs[key] = value
 
 
 def build_litellm_span_data(
     *,
     kwargs: Mapping[str, Any],
     response_obj: Any,
-    error: Exception | None = None,
-    include_content: bool = True,
-) -> tuple[str, dict[str, Any]]:
-    """Build canonical span name and attributes from a LiteLLM callback event."""
-    model_name = _model_name(response_obj=response_obj, kwargs=kwargs)
-    attributes: dict[str, Any] = {
-        RESPAN_LOG_METHOD: LogMethodChoices.TRACING_INTEGRATION.value,
-        RESPAN_LOG_TYPE: LOG_TYPE_CHAT,
-        SpanAttributes.LLM_SYSTEM: _provider_name(model_name=model_name, kwargs=kwargs),
-        SpanAttributes.LLM_REQUEST_TYPE: LLMRequestTypeValues.CHAT.value,
-        SpanAttributes.TRACELOOP_ENTITY_NAME: LITELLM_CHAT_SPAN_NAME,
-        SpanAttributes.TRACELOOP_ENTITY_PATH: LITELLM_CHAT_SPAN_NAME,
+    error: BaseException | None = None,
+    include_content=True,
+    usage=None,
+):
+    kind = (
+        "embedding"
+        if "embedding" in str(kwargs.get("call_type", "")).lower()
+        else "chat"
+    )
+    attrs = {
+        RESPAN_LOG_TYPE: LOG_TYPE_EMBEDDING if kind == "embedding" else LOG_TYPE_CHAT,
+        SpanAttributes.LLM_REQUEST_TYPE: kind,
+        SpanAttributes.TRACELOOP_ENTITY_NAME: f"litellm.{kind}",
+        SpanAttributes.TRACELOOP_ENTITY_PATH: "",
     }
-    span_name = _apply_respan_params(attributes=attributes, kwargs=kwargs)
-    attributes[SpanAttributes.TRACELOOP_ENTITY_NAME] = span_name
-    attributes[SpanAttributes.TRACELOOP_ENTITY_PATH] = span_name
-
-    if model_name:
-        attributes[SpanAttributes.LLM_REQUEST_MODEL] = model_name
-    if kwargs.get(STREAM_KEY):
-        attributes[SpanAttributes.LLM_IS_STREAMING] = True
-
-    if include_content:
-        messages = _request_messages(kwargs=kwargs)
-        attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safe_json(value=messages)
-        attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = (
-            str(error) if error is not None else _response_text(response_obj, kwargs)
-        )
-
-        for message_index, message in enumerate(messages):
-            prompt_prefix = f"{SpanAttributes.LLM_PROMPTS}.{message_index}"
-            attributes[f"{prompt_prefix}.role"] = _message_role(message=message)
-            attributes[f"{prompt_prefix}.content"] = _message_content(message=message)
-            tool_calls = _normalized_tool_calls(value=_get(message, TOOL_CALLS_KEY))
-            if tool_calls:
-                attributes[f"{prompt_prefix}.tool_calls"] = safe_json(value=tool_calls)
-
-        completion_text = (
-            str(error)
-            if error is not None
-            else _response_text(
-                response_obj=response_obj,
-                kwargs=kwargs,
-            )
-        )
-        if completion_text:
-            attributes[f"{SpanAttributes.LLM_COMPLETIONS}.0.role"] = ASSISTANT_ROLE
-            attributes[f"{SpanAttributes.LLM_COMPLETIONS}.0.content"] = completion_text
-
-        response_tool_calls = _response_tool_calls(response_obj=response_obj)
-        if response_tool_calls:
-            attributes[f"{SpanAttributes.LLM_COMPLETIONS}.0.role"] = ASSISTANT_ROLE
-            attributes[f"{SpanAttributes.LLM_COMPLETIONS}.0.tool_calls"] = safe_json(
-                value=response_tool_calls
-            )
-
-        tools = _tool_definitions(kwargs=kwargs)
-        if tools:
-            attributes[SpanAttributes.LLM_REQUEST_FUNCTIONS] = safe_json(value=tools)
-
-    usage = _usage_mapping(response_obj=response_obj, kwargs=kwargs)
-    prompt_tokens = _int_value(mapping=usage, key=PROMPT_TOKENS_KEY)
-    completion_tokens = _int_value(mapping=usage, key=COMPLETION_TOKENS_KEY)
-    total_tokens = _int_value(mapping=usage, key=TOTAL_TOKENS_KEY)
-    if total_tokens is None and (
-        prompt_tokens is not None or completion_tokens is not None
+    params = get(kwargs, "litellm_params", {})
+    optional = get(kwargs, "optional_params", {})
+    if isinstance(model := get(kwargs, "model"), str):
+        attrs[SpanAttributes.LLM_REQUEST_MODEL] = redact_text(model)
+    if isinstance(model := get(response_obj, "model"), str):
+        attrs[GenAI.GEN_AI_RESPONSE_MODEL] = redact_text(model)
+    if isinstance(
+        provider := get(
+            params, "custom_llm_provider", get(kwargs, "custom_llm_provider")
+        ),
+        str,
     ):
-        total_tokens = (prompt_tokens or 0) + (completion_tokens or 0)
-
-    if prompt_tokens is not None:
-        attributes[GenAIAttributes.GEN_AI_USAGE_INPUT_TOKENS] = prompt_tokens
-        attributes[SpanAttributes.LLM_USAGE_PROMPT_TOKENS] = prompt_tokens
-    if completion_tokens is not None:
-        attributes[GenAIAttributes.GEN_AI_USAGE_OUTPUT_TOKENS] = completion_tokens
-        attributes[SpanAttributes.LLM_USAGE_COMPLETION_TOKENS] = completion_tokens
-    if total_tokens is not None:
-        attributes[SpanAttributes.LLM_USAGE_TOTAL_TOKENS] = total_tokens
-
-    standard_logging_object = _standard_logging_object(kwargs)
-    cost = standard_logging_object.get(COST_KEY, kwargs.get(COST_KEY))
-    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
-        attributes[f"{RESPAN_METADATA}.response_cost"] = str(cost)
-    cache_hit = standard_logging_object.get(CACHE_HIT_KEY, kwargs.get(CACHE_HIT_KEY))
-    if isinstance(cache_hit, bool):
-        attributes[f"{RESPAN_METADATA}.cache_hit"] = str(cache_hit).lower()
-    api_base = kwargs.get(API_BASE_KEY) or standard_logging_object.get(API_BASE_KEY)
-    if api_base:
-        attributes[f"{RESPAN_METADATA}.api_base"] = str(api_base)
-
-    return span_name, attributes
+        attrs[SpanAttributes.LLM_SYSTEM] = provider
+        attrs[GenAI.GEN_AI_PROVIDER_NAME] = provider
+    if type(stream := get(kwargs, "stream", get(optional, "stream"))) is bool:
+        attrs[SpanAttributes.GEN_AI_IS_STREAMING] = stream
+    for source, target in [
+        ("temperature", SpanAttributes.LLM_REQUEST_TEMPERATURE),
+        ("top_p", SpanAttributes.LLM_REQUEST_TOP_P),
+        ("max_tokens", SpanAttributes.LLM_REQUEST_MAX_TOKENS),
+    ]:
+        if type(value := get(kwargs, source, get(optional, source))) in (int, float):
+            attrs[target] = value
+    metadata = get(kwargs, "metadata", get(params, "metadata", {}))
+    attribution = get(metadata, "respan_params", {})
+    for key, target in RESPAN_SPAN_ATTRIBUTES_MAP.items():
+        value = get(attribution, key)
+        if value is None or target in (RESPAN_METADATA, RESPAN_LOG_TYPE):
+            continue
+        if isinstance(value, str | int | bool | float):
+            attrs[target] = redact_text(value) if isinstance(value, str) else value
+    span_name = get(attribution, "span_name", f"litellm.{kind}")
+    if not isinstance(span_name, str):
+        span_name = f"litellm.{kind}"
+    attrs[SpanAttributes.TRACELOOP_ENTITY_NAME] = redact_text(span_name)
+    if include_content:
+        if kind == "embedding":
+            if (inputs := get(kwargs, "input", get(kwargs, "messages"))) is not None:
+                attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safe_json(inputs)
+            if isinstance(data := get(response_obj, "data"), list | tuple):
+                vectors = [
+                    plain(get(item, "embedding"))
+                    for item in data
+                    if get(item, "embedding") is not None
+                ]
+                if vectors:
+                    attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safe_json(vectors)
+        else:
+            inputs = get(kwargs, "messages", get(kwargs, "input"))
+            messages = (
+                [message(item) for item in inputs]
+                if isinstance(inputs, list | tuple)
+                else [{"role": "user", "content": plain(inputs)}]
+                if inputs is not None
+                else []
+            )
+            if messages:
+                attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safe_json(messages)
+                set_messages(attrs, SpanAttributes.LLM_PROMPTS, messages)
+            outputs = [
+                message(get(choice, "message"))
+                for choice in get(response_obj, "choices", ()) or ()
+                if get(choice, "message") is not None
+            ]
+            response_output = get(response_obj, "output")
+            if isinstance(response_output, list | tuple):
+                outputs = []
+                current_calls = []
+                for item in response_output:
+                    if get(item, "type") == "function_call":
+                        current_calls.extend(calls([item]))
+                    elif get(item, "type") == "message":
+                        outputs.append(message(item))
+                if current_calls:
+                    outputs.append({"role": "assistant", "tool_calls": current_calls})
+            if outputs:
+                attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safe_json(outputs)
+                set_messages(attrs, SpanAttributes.LLM_COMPLETIONS, outputs)
+            tools = get(kwargs, "tools", get(optional, "tools"))
+            if (
+                tools is None
+                and (functions := get(kwargs, "functions", get(optional, "functions")))
+                is not None
+            ):
+                tools = [{"type": "function", "function": plain(f)} for f in functions]
+            if tools is not None:
+                attrs[SpanAttributes.LLM_REQUEST_FUNCTIONS] = safe_json(
+                    tools, schema=True
+                )
+        if get(attribution, "metadata") is not None:
+            attrs[RESPAN_METADATA] = safe_json(get(attribution, "metadata"))
+    add_usage(
+        attrs, usage if usage is not None else usage_fields(get(response_obj, "usage"))
+    )
+    return redact_text(span_name), attrs

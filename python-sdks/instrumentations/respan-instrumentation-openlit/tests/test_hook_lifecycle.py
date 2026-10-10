@@ -113,6 +113,8 @@ def test_concurrent_same_instance_activation_is_idempotent(monkeypatch) -> None:
     class Provider:
         _active_span_processor = Active()
 
+    stable_provider = Provider()
+
     init_calls = 0
 
     def init(**kwargs) -> None:
@@ -150,7 +152,7 @@ def test_concurrent_same_instance_activation_is_idempotent(monkeypatch) -> None:
         lifecycle, "install_openai_embedding_hooks", lambda **kwargs: []
     )
     monkeypatch.setattr(lifecycle, "remove_openai_embedding_hooks", lambda hooks: None)
-    monkeypatch.setattr(lifecycle.trace, "get_tracer_provider", lambda: Provider())
+    monkeypatch.setattr(lifecycle.trace, "get_tracer_provider", lambda: stable_provider)
     for name, value in (
         ("_REFCOUNT", 0),
         ("_PROCESSOR", None),
@@ -191,6 +193,8 @@ def test_active_configuration_mismatch_is_rejected(monkeypatch) -> None:
     class Provider:
         _active_span_processor = Active()
 
+    stable_provider = Provider()
+
     original_import_module = lifecycle.importlib.import_module
     monkeypatch.setattr(
         lifecycle.importlib,
@@ -221,7 +225,7 @@ def test_active_configuration_mismatch_is_rejected(monkeypatch) -> None:
         lifecycle, "install_openai_embedding_hooks", lambda **kwargs: []
     )
     monkeypatch.setattr(lifecycle, "remove_openai_embedding_hooks", lambda hooks: None)
-    monkeypatch.setattr(lifecycle.trace, "get_tracer_provider", lambda: Provider())
+    monkeypatch.setattr(lifecycle.trace, "get_tracer_provider", lambda: stable_provider)
     for name, value in (
         ("_REFCOUNT", 0),
         ("_PROCESSOR", None),

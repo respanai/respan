@@ -1,0 +1,9 @@
+{
+  "summary": "Support current OpenLIT, Portkey, LiteLLM and native/OpenAI-compatible OpenRouter Python SDKs with source-only canonical fields and privacy-safe native lifecycle coverage",
+  "packages": {
+    "respan-instrumentation-openlit": "minor",
+    "respan-instrumentation-portkey": "minor",
+    "respan-instrumentation-litellm": "minor",
+    "respan-instrumentation-openrouter": "minor"
+  }
+}

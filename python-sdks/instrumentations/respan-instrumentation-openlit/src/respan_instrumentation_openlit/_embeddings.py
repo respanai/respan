@@ -13,6 +13,8 @@ from typing import Any
 
 from opentelemetry.semconv_ai import SpanAttributes
 
+from ._policy import allowed
+
 logger = logging.getLogger(__name__)
 
 _OPENAI_EMBEDDING_MODULES = (
@@ -73,9 +75,9 @@ def _enrich_embedding_span(
     span: Any,
     capture_content: bool,
 ) -> None:
-    if not capture_content or span is None:
-        return
     try:
+        if not allowed(span, capture_content):
+            return
         vectors = _embedding_vectors(response)
         if vectors:
             span.set_attribute(
@@ -117,6 +119,8 @@ def install_openai_embedding_hooks(
                 **kwargs: Any,
             ) -> Any:
                 result = __original(*args, **kwargs)
+                if not process_embedding_response._respan_active:
+                    return result
                 response = kwargs.get("response", args[0] if args else result)
                 span = kwargs.get("span")
                 _enrich_embedding_span(
@@ -126,6 +130,7 @@ def install_openai_embedding_hooks(
                 )
                 return result
 
+            process_embedding_response._respan_active = True
             module.process_embedding_response = process_embedding_response
             hooks.append((module, original, process_embedding_response))
     except Exception:
@@ -138,5 +143,6 @@ def remove_openai_embedding_hooks(hooks: list[EmbeddingHook]) -> None:
     """Restore only hook functions still owned by this adapter."""
 
     for module, original, replacement in reversed(hooks):
+        replacement._respan_active = False
         if getattr(module, "process_embedding_response", None) is replacement:
             module.process_embedding_response = original

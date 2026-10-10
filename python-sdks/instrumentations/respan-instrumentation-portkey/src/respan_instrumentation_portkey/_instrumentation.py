@@ -1,213 +1,193 @@
-"""Lifecycle for Portkey's OpenInference adapter and Respan contract layer."""
+"""Reference-counted ownership of Portkey's native OpenInference delegation."""
 
 from __future__ import annotations
 
 import importlib
-import logging
+import inspect
 import threading
 from typing import Any
 
 from opentelemetry import trace
-from respan_instrumentation_openinference import OpenInferenceInstrumentor
-from respan_instrumentation_openinference._translator import OpenInferenceTranslator
 from respan_tracing.core.tracer import RespanTracer
 
-from respan_instrumentation_portkey._constants import (
-    OPENINFERENCE_PORTKEY_MODULE,
-    PORTKEY_INSTRUMENTATION_NAME,
-)
-from respan_instrumentation_portkey._processor import PortkeySpanContractProcessor
-from respan_instrumentation_portkey._streaming import (
-    StreamHooks,
-    install_stream_hooks,
-    remove_stream_hooks,
-)
-
-logger = logging.getLogger(__name__)
+from respan_instrumentation_portkey._streaming import Runtime
 
 _LOCK = threading.RLock()
-_REFCOUNT = 0
-_CONFIG: dict[str, Any] | None = None
-_DELEGATE: OpenInferenceInstrumentor | None = None
-_PROCESSOR: PortkeySpanContractProcessor | None = None
-_PROVIDER: Any = None
-_STREAM_HOOKS: StreamHooks | None = None
+_SHARED = None
+_NATIVE_SPECS = [
+    ("chat_complete", "Completions", "_original_completions_create"),
+    ("chat_complete", "AsyncCompletions", "_original_async_completions_create"),
+    ("generation", "Completions", "_original_prompt_completions_create"),
+    ("generation", "AsyncCompletions", "_original_async_prompt_completions_create"),
+]
+_MISSING = object()
 
 
-def _load_openinference_portkey_class() -> type:
-    return importlib.import_module(OPENINFERENCE_PORTKEY_MODULE).PortkeyInstrumentor
+def _load_openinference_portkey_class():
+    return importlib.import_module(
+        "openinference.instrumentation.portkey"
+    ).PortkeyInstrumentor
 
 
-def _processors(provider: Any) -> tuple[Any, ...] | None:
-    active = getattr(provider, "_active_span_processor", None)
-    current = getattr(active, "_span_processors", None) if active else None
-    return tuple(current) if current is not None else None
-
-
-def _set_processors(provider: Any, processors: tuple[Any, ...]) -> bool:
-    active = getattr(provider, "_active_span_processor", None)
-    if active is None or getattr(active, "_span_processors", None) is None:
-        return False
-    active._span_processors = processors
-    return True
-
-
-def _register_after_translator(provider: Any, processor: Any) -> None:
-    processors = _processors(provider)
-    if processors is None:
-        if hasattr(provider, "add_span_processor"):
-            provider.add_span_processor(processor)
-        return
-    remaining = tuple(item for item in processors if item is not processor)
-    for index, item in enumerate(remaining):
-        if isinstance(item, OpenInferenceTranslator):
-            _set_processors(
-                provider,
-                (*remaining[: index + 1], processor, *remaining[index + 1 :]),
-            )
-            return
-    _set_processors(provider, (*remaining, processor))
-
-
-def _unregister(provider: Any, processor: Any) -> None:
-    processors = _processors(provider)
-    if processors is not None:
-        _set_processors(
-            provider, tuple(item for item in processors if item is not processor)
+def _native_methods():
+    result = []
+    for module, name, attribute in _NATIVE_SPECS:
+        cls = getattr(
+            importlib.import_module("portkey_ai.api_resources.apis." + module), name
         )
+        result.append((cls, attribute, inspect.getattr_static(cls, "create")))
+    return result
 
 
-def _same_config(left: dict[str, Any], right: dict[str, Any]) -> bool:
-    if left.keys() != right.keys():
-        return False
-    for key, value in left.items():
-        if value is right[key]:
-            continue
-        try:
-            if value == right[key]:
+def _restore_native(
+    delegate, before, installed, owned, fields_before, fields_installed
+):
+    if not owned:
+        return
+    # Upstream uninstrument assigns blindly. Hand it the current foreign method
+    # where ownership was replaced so its native teardown preserves that owner.
+    current_fields = {name: getattr(delegate, name, _MISSING) for name in fields_before}
+    temporary = {}
+    for (cls, attribute, original), (_, _, wrapper) in zip(
+        before, installed, strict=True
+    ):
+        current = inspect.getattr_static(cls, "create")
+        temporary[attribute] = original if current is wrapper else current
+        setattr(delegate, attribute, temporary[attribute])
+    try:
+        if delegate.is_instrumented_by_opentelemetry:
+            delegate.uninstrument()
+        else:
+            delegate._uninstrument()
+    finally:
+        for (cls, attribute, original), (_, _, wrapper) in zip(
+            before, installed, strict=True
+        ):
+            if inspect.getattr_static(cls, "create") is wrapper:
+                cls.create = original
+        for attribute, original in fields_before.items():
+            expected = temporary.get(
+                attribute, fields_installed.get(attribute, _MISSING)
+            )
+            if getattr(delegate, attribute, _MISSING) is not expected:
                 continue
-        except Exception:  # noqa: BLE001
-            return False
-        return False
-    return True
-
-
-def _tracing_enabled() -> bool:
-    tracer = getattr(RespanTracer, "_instance", None)
-    return tracer is None or bool(getattr(tracer, "is_enabled", True))
+            if current_fields[attribute] is not fields_installed.get(
+                attribute, _MISSING
+            ):
+                original = current_fields[attribute]
+            if original is _MISSING:
+                try:
+                    delattr(delegate, attribute)
+                except AttributeError:
+                    pass
+            else:
+                setattr(delegate, attribute, original)
+        delegate._is_instrumented_by_opentelemetry = False
 
 
 class PortkeyInstrumentor:
-    """Activate one shared Portkey runtime per process."""
+    """Keep upstream chat/prompt instrumentation; add canonical SDK inference data."""
 
-    name = PORTKEY_INSTRUMENTATION_NAME
+    name = "portkey"
 
-    def __init__(self, **instrumentor_kwargs: Any) -> None:
-        self._instrumentor_kwargs = dict(instrumentor_kwargs)
-        self._delegate: OpenInferenceInstrumentor | None = None
-        self._contract_processor: PortkeySpanContractProcessor | None = None
+    def __init__(
+        self, *, capture_content=True, tracer_provider=None, **instrumentor_kwargs: Any
+    ):
+        self.capture_content = bool(capture_content)
+        self.provider = tracer_provider
+        self.kwargs = dict(instrumentor_kwargs)
         self._is_instrumented = False
+        self._delegate = None
 
-    def activate(self) -> None:
-        global _CONFIG, _DELEGATE, _PROCESSOR, _PROVIDER, _REFCOUNT, _STREAM_HOOKS
-
+    def activate(self):
+        global _SHARED
         if self._is_instrumented:
             return
-        if not _tracing_enabled():
-            logger.info(
-                "Portkey instrumentation skipped because Respan tracing is disabled"
-            )
+        current = getattr(RespanTracer, "_instance", None)
+        if current is not None and not current.is_enabled:
             return
+        provider = self.provider or trace.get_tracer_provider()
+        config = (provider, self.capture_content, self.kwargs)
         with _LOCK:
             if self._is_instrumented:
                 return
-            if _REFCOUNT:
-                if _CONFIG is None or not _same_config(
-                    _CONFIG, self._instrumentor_kwargs
-                ):
-                    logger.warning(
-                        "Portkey instrumentation is already active with different settings"
-                    )
-                    return
-                _REFCOUNT += 1
-                self._delegate = _DELEGATE
-                self._contract_processor = _PROCESSOR
+            if _SHARED is not None:
+                if _SHARED["config"] != config:
+                    raise ValueError("Portkey owners must share provider and settings")
+                _SHARED["count"] += 1
+                self._delegate = _SHARED["delegate"]
                 self._is_instrumented = True
                 return
+            delegate = _load_openinference_portkey_class()()
+            owned = not delegate.is_instrumented_by_opentelemetry
+            before = _native_methods()
+            fields_before = {a: getattr(delegate, a, _MISSING) for _, a, _ in before}
+            fields_before["_tracer"] = getattr(delegate, "_tracer", _MISSING)
+            runtime = Runtime(provider, self.capture_content, self.kwargs.get("config"))
+            runtime.native_owned = owned
+            installed = before
+            fields_installed = fields_before
             try:
-                instrumentor_class = _load_openinference_portkey_class()
-            except ImportError as exc:
-                logger.warning(
-                    "Failed to activate Portkey instrumentation - missing dependency: %s",
-                    exc,
-                )
-                return
-
-            provider = trace.get_tracer_provider()
-            delegate = OpenInferenceInstrumentor(
-                instrumentor_class, **self._instrumentor_kwargs
-            )
-            processor = PortkeySpanContractProcessor()
-            hooks: StreamHooks | None = None
-            registered = False
-            try:
-                delegate.activate()
-                _register_after_translator(provider, processor)
-                registered = True
-                hooks = install_stream_hooks(provider)
-            except Exception:
-                remove_stream_hooks(hooks)
-                if registered:
-                    _unregister(provider, processor)
                 try:
-                    delegate.deactivate()
-                except Exception:
-                    logger.exception("Failed to roll back Portkey instrumentation")
-                logger.exception("Failed to activate Portkey instrumentation")
-                return
-
-            _CONFIG = dict(self._instrumentor_kwargs)
-            _DELEGATE = delegate
-            _PROCESSOR = processor
-            _PROVIDER = provider
-            _REFCOUNT = 1
-            _STREAM_HOOKS = hooks
+                    if owned:
+                        delegate.instrument(tracer_provider=provider, **self.kwargs)
+                finally:
+                    installed = _native_methods()
+                    fields_installed = {
+                        name: getattr(delegate, name, _MISSING)
+                        for name in fields_before
+                    }
+                if runtime.config is None:
+                    runtime.config = delegate._tracer._self_config
+                runtime.install()
+            except BaseException:
+                runtime.close()
+                _restore_native(
+                    delegate, before, installed, owned, fields_before, fields_installed
+                )
+                raise
+            _SHARED = {
+                "config": config,
+                "count": 1,
+                "delegate": delegate,
+                "runtime": runtime,
+                "before": before,
+                "installed": installed,
+                "owned": owned,
+                "fields_before": fields_before,
+                "fields_installed": fields_installed,
+            }
             self._delegate = delegate
-            self._contract_processor = processor
             self._is_instrumented = True
-            logger.info("Portkey instrumentation activated")
 
-    def deactivate(self) -> None:
-        global _CONFIG, _DELEGATE, _PROCESSOR, _PROVIDER, _REFCOUNT, _STREAM_HOOKS
-
-        if not self._is_instrumented:
-            return
+    def deactivate(self):
+        global _SHARED
         with _LOCK:
             if not self._is_instrumented:
                 return
             self._is_instrumented = False
             self._delegate = None
-            self._contract_processor = None
-            _REFCOUNT = max(0, _REFCOUNT - 1)
-            if _REFCOUNT:
+            if _SHARED is None:
                 return
-            remove_stream_hooks(_STREAM_HOOKS)
-            if _PROCESSOR is not None and _PROVIDER is not None:
-                _unregister(_PROVIDER, _PROCESSOR)
-            if _DELEGATE is not None:
-                try:
-                    _DELEGATE.deactivate()
-                except Exception:
-                    logger.exception("Failed to deactivate Portkey instrumentation")
-            _CONFIG = None
-            _DELEGATE = None
-            _PROCESSOR = None
-            _PROVIDER = None
-            _STREAM_HOOKS = None
-            logger.info("Portkey instrumentation deactivated")
+            _SHARED["count"] -= 1
+            if _SHARED["count"]:
+                return
+            shared = _SHARED
+            _SHARED = None
+            try:
+                shared["runtime"].close()
+            finally:
+                _restore_native(
+                    shared["delegate"],
+                    shared["before"],
+                    shared["installed"],
+                    shared["owned"],
+                    shared["fields_before"],
+                    shared["fields_installed"],
+                )
 
-    def instrument(self) -> None:
+    def instrument(self):
         self.activate()
 
-    def uninstrument(self) -> None:
+    def uninstrument(self):
         self.deactivate()

@@ -34,6 +34,10 @@ from respan_instrumentation_openlit._openai_hooks import (
 )
 from respan_instrumentation_openlit._processor import OpenLITSpanProcessor
 
+from ._config import restore as restore_native_config
+from ._config import snapshot as snapshot_native_config
+from ._guard import install_context_guard, install_provider_guard, remove_provider_guard
+
 logger = logging.getLogger(__name__)
 
 _LOCK = threading.RLock()
@@ -46,6 +50,8 @@ _REQUEST_HOOKS: list[RequestHook] = []
 _STREAM_USAGE_HOOKS: list[ChunkHook] = []
 _OPENAI_PATCHES: list[OpenAIPatch] = []
 _CONFIG: tuple[Any, ...] | None = None
+_TRACER_HOOK = None
+_NATIVE_CONFIG = None
 
 _DEFAULT_DISABLED_TRANSPORT_INSTRUMENTORS = (
     "httpx",
@@ -183,7 +189,7 @@ class OpenLITInstrumentor:
         """Activate OpenLIT without adding a second exporter or wrapper span."""
         global _CONFIG, _EMBEDDING_HOOKS, _OPENAI_PATCHES, _OWNED_INSTRUMENTORS
         global _PROCESSOR, _PROVIDER, _REFCOUNT, _REQUEST_HOOKS
-        global _STREAM_USAGE_HOOKS
+        global _STREAM_USAGE_HOOKS, _TRACER_HOOK, _NATIVE_CONFIG
 
         if not _is_respan_tracing_enabled():
             return
@@ -216,6 +222,10 @@ class OpenLITInstrumentor:
                 raise RuntimeError(
                     "OpenLIT is already active with a different adapter configuration"
                 )
+            if _REFCOUNT and _PROVIDER is not trace.get_tracer_provider():
+                raise RuntimeError(
+                    "OpenLIT is already active with a different tracing provider"
+                )
             if _REFCOUNT == 0:
                 instrumentors = _instrumentors()
                 openai_before = snapshot_openai_resource_methods()
@@ -230,8 +240,18 @@ class OpenLITInstrumentor:
                 embedding_hooks: list[EmbeddingHook] = []
                 processor: OpenLITSpanProcessor | None = None
                 provider: Any = None
+                tracer_hook = None
+                native_before = snapshot_native_config()
                 owned_instrumentors: list[Any] = []
                 try:
+                    provider = trace.get_tracer_provider()
+                    processor = OpenLITSpanProcessor(
+                        capture_content=self._capture_content
+                    )
+                    _PROCESSOR = processor
+                    tracer_hook = install_provider_guard(provider, processor)
+                    processor._detach_hook = install_context_guard(processor)
+                    _register_first(provider, processor)
                     request_hooks = install_openai_request_hooks(
                         capture_content=self._capture_content,
                         max_content_length=self._max_content_length,
@@ -273,11 +293,6 @@ class OpenLITInstrumentor:
                         capture_content=self._capture_content,
                         max_content_length=self._max_content_length,
                     )
-                    provider = trace.get_tracer_provider()
-                    processor = OpenLITSpanProcessor(
-                        capture_content=self._capture_content
-                    )
-                    _register_first(provider, processor)
                 except Exception:  # noqa: BLE001 - transactional third-party install.
                     if not owned_instrumentors:
                         try:
@@ -300,6 +315,11 @@ class OpenLITInstrumentor:
                     _uninstrument_owned(owned_instrumentors)
                     restore_openai_patches(openai_patches)
                     remove_openai_request_hooks(request_hooks)
+                    if processor is not None:
+                        processor.shutdown()
+                    _PROCESSOR = None
+                    remove_provider_guard(tracer_hook)
+                    restore_native_config(native_before, snapshot_native_config())
                     raise RuntimeError("Failed to activate OpenLIT instrumentation")
 
                 _REQUEST_HOOKS = request_hooks
@@ -308,6 +328,8 @@ class OpenLITInstrumentor:
                 _EMBEDDING_HOOKS = embedding_hooks
                 _OWNED_INSTRUMENTORS = owned_instrumentors
                 _PROVIDER = provider
+                _TRACER_HOOK = tracer_hook
+                _NATIVE_CONFIG = (native_before, snapshot_native_config())
                 _PROCESSOR = processor
                 _CONFIG = config
 
@@ -318,7 +340,7 @@ class OpenLITInstrumentor:
         """Remove Respan normalization and only OpenLIT hooks owned by this adapter."""
         global _CONFIG, _EMBEDDING_HOOKS, _OPENAI_PATCHES, _OWNED_INSTRUMENTORS
         global _PROCESSOR, _PROVIDER, _REFCOUNT, _REQUEST_HOOKS
-        global _STREAM_USAGE_HOOKS
+        global _STREAM_USAGE_HOOKS, _TRACER_HOOK, _NATIVE_CONFIG
 
         with _LOCK:
             if not self._is_instrumented:
@@ -328,7 +350,7 @@ class OpenLITInstrumentor:
             if _REFCOUNT:
                 return
             if _PROCESSOR is not None and _PROVIDER is not None:
-                _unregister(_PROVIDER, _PROCESSOR)
+                _PROCESSOR.retire(_PROVIDER)
             remove_openai_embedding_hooks(_EMBEDDING_HOOKS)
             _EMBEDDING_HOOKS = []
             remove_openai_stream_usage_hooks(_STREAM_USAGE_HOOKS)
@@ -339,6 +361,11 @@ class OpenLITInstrumentor:
             _OPENAI_PATCHES = []
             remove_openai_request_hooks(_REQUEST_HOOKS)
             _REQUEST_HOOKS = []
+            if _NATIVE_CONFIG is not None:
+                restore_native_config(*_NATIVE_CONFIG)
+            _NATIVE_CONFIG = None
+            remove_provider_guard(_TRACER_HOOK)
+            _TRACER_HOOK = None
             _PROCESSOR = None
             _PROVIDER = None
             _CONFIG = None

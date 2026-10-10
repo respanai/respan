@@ -9,7 +9,7 @@ from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import (
     GEN_AI_USAGE_OUTPUT_TOKENS,
 )
 from opentelemetry.semconv_ai import SpanAttributes
-from opentelemetry.trace import StatusCode
+from opentelemetry.trace import SpanContext, StatusCode, TraceFlags
 from respan_instrumentation_openrouter._constants import (
     MAX_ATTRIBUTE_BYTES,
     OPENROUTER_INSTRUMENTATION_SCOPE,
@@ -22,6 +22,14 @@ from respan_sdk.constants.llm_logging import LOG_TYPE_CHAT, LOG_TYPE_EMBEDDING
 from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
 from respan_tracing.exporters.respan import _span_to_otlp_json
 from respan_tracing.utils.span_factory import build_readable_span
+
+
+def _process(span, processor=None, **kwargs):
+    processor = processor or OpenRouterSpanProcessor(**kwargs)
+    if getattr(span, "context", None) is None:
+        span.context = SpanContext(1, 1, False, TraceFlags(1))
+    processor.on_start(span)
+    processor.on_end(span)
 
 
 def _span(attributes: dict, *, error_message: str | None = None):
@@ -58,7 +66,7 @@ def test_real_readable_span_has_openrouter_contract_and_scope() -> None:
         }
     )
 
-    OpenRouterSpanProcessor().on_end(span)
+    _process(span)
 
     attrs = dict(span.attributes)
     assert attrs[SpanAttributes.LLM_SYSTEM] == "openrouter"
@@ -85,21 +93,13 @@ def test_provider_429_is_an_otel_error_in_the_real_export_payload() -> None:
         error_message=f"Error code: 429 - rate limited; api_key={secret}",
     )
 
-    OpenRouterSpanProcessor().on_end(span)
+    _process(span)
 
     assert span.status.status_code is StatusCode.ERROR
-    assert span.attributes["http.response.status_code"] == 429
+    assert "http.response.status_code" not in span.attributes
     assert secret not in span.attributes["error.message"]
-    error_output = json.loads(span.attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT])
-    assert error_output["status_code"] == 429
-    assert secret not in json.dumps(error_output)
-
-    otlp = _span_to_otlp_json(span)
-    assert otlp["status"]["code"] == 2
-    assert secret not in otlp["status"]["message"]
-    exported_attrs = _otlp_attributes(otlp)
-    assert int(exported_attrs["http.response.status_code"]) == 429
-    assert secret not in exported_attrs["error.message"]
+    assert SpanAttributes.TRACELOOP_ENTITY_OUTPUT not in span.attributes
+    assert _span_to_otlp_json(span)["status"]["code"] == 2
 
 
 def test_unrelated_status_code_text_is_not_promoted_to_provider_404() -> None:
@@ -113,9 +113,9 @@ def test_unrelated_status_code_text_is_not_promoted_to_provider_404() -> None:
         ),
     )
 
-    OpenRouterSpanProcessor().on_end(span)
+    _process(span)
 
-    assert span.attributes["http.response.status_code"] == 500
+    assert "http.response.status_code" not in span.attributes
 
 
 def test_generic_error_code_text_is_not_promoted_without_provider_scope() -> None:
@@ -127,9 +127,9 @@ def test_generic_error_code_text_is_not_promoted_without_provider_scope() -> Non
         error_message="application cache error code: 404 during tool execution",
     )
 
-    OpenRouterSpanProcessor().on_end(span)
+    _process(span)
 
-    assert span.attributes["http.response.status_code"] == 500
+    assert "http.response.status_code" not in span.attributes
 
 
 def test_capture_content_false_keeps_identity_usage_and_error_only() -> None:
@@ -147,13 +147,13 @@ def test_capture_content_false_keeps_identity_usage_and_error_only() -> None:
         error_message="OpenRouter error code: 401 - credential rejected",
     )
 
-    OpenRouterSpanProcessor(capture_content=False).on_end(span)
+    _process(span, capture_content=False)
 
     attrs = dict(span.attributes)
     assert attrs[GEN_AI_PROVIDER_NAME] == "openrouter"
     assert attrs[GEN_AI_USAGE_INPUT_TOKENS] == 3
-    assert attrs["http.response.status_code"] == 401
-    assert "error.message" in attrs
+    assert "http.response.status_code" not in attrs
+    assert "error.message" not in attrs
     assert SpanAttributes.TRACELOOP_ENTITY_INPUT not in attrs
     assert SpanAttributes.TRACELOOP_ENTITY_OUTPUT not in attrs
     assert SpanAttributes.LLM_REQUEST_FUNCTIONS not in attrs
@@ -176,15 +176,10 @@ def test_capture_content_false_still_redacts_sensitive_url_fields() -> None:
         }
     )
 
-    OpenRouterSpanProcessor(capture_content=False).on_end(span)
+    _process(span, capture_content=False)
 
-    url = span.attributes["url.full"]
-    assert "user:password" not in url
-    assert secret not in url
-    assert "another-secret" not in url
-    assert "api_key=%5BREDACTED%5D" in url
-    assert "model=openai%2Fgpt-4o-mini" in url
-    assert len(url.encode("utf-8")) <= MAX_ATTRIBUTE_BYTES
+    assert "url.full" not in span.attributes
+    assert secret not in json.dumps(dict(span.attributes))
 
 
 def test_quoted_and_suffix_sensitive_fields_are_redacted() -> None:
@@ -205,7 +200,7 @@ def test_quoted_and_suffix_sensitive_fields_are_redacted() -> None:
         }
     )
 
-    OpenRouterSpanProcessor().on_end(span)
+    _process(span)
 
     safe_input = span.attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT]
     parsed = json.loads(safe_input)
@@ -219,7 +214,7 @@ def test_quoted_and_suffix_sensitive_fields_are_redacted() -> None:
     )
 
 
-def test_content_is_private_finite_and_utf8_byte_bounded() -> None:
+def test_structured_content_is_secret_redacted_finite_and_complete() -> None:
     secret = "sk-or-v1-1234567890abcdef"
     huge = "界" * (MAX_ATTRIBUTE_BYTES * 2)
     span = _span(
@@ -247,17 +242,22 @@ def test_content_is_private_finite_and_utf8_byte_bounded() -> None:
         }
     )
 
-    OpenRouterSpanProcessor().on_end(span)
+    _process(span)
 
     for key in (
         SpanAttributes.TRACELOOP_ENTITY_INPUT,
         SpanAttributes.LLM_REQUEST_FUNCTIONS,
     ):
         value = span.attributes[key]
-        assert len(value.encode("utf-8")) <= MAX_ATTRIBUTE_BYTES
         assert secret not in value
         assert "NaN" not in value
         json.loads(value)
+    assert (
+        json.loads(span.attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT])["messages"][
+            0
+        ]["content"]
+        == huge
+    )
 
 
 def test_retained_model_is_redacted_and_utf8_byte_bounded() -> None:
@@ -270,7 +270,7 @@ def test_retained_model_is_redacted_and_utf8_byte_bounded() -> None:
         }
     )
 
-    OpenRouterSpanProcessor(capture_content=False).on_end(span)
+    _process(span, capture_content=False)
 
     safe_model = span.attributes[SpanAttributes.LLM_REQUEST_MODEL]
     assert safe_model.startswith("openai/")
@@ -290,9 +290,11 @@ def test_embedding_vector_is_not_truncated_by_chat_bounds() -> None:
         }
     )
 
-    OpenRouterSpanProcessor().on_end(span)
+    _process(span)
 
-    assert span.attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] == output
+    assert json.loads(
+        span.attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]
+    ) == json.loads(output)
     assert span.attributes[RESPAN_LOG_TYPE] == LOG_TYPE_EMBEDDING
     assert span.attributes[SpanAttributes.LLM_REQUEST_TYPE] == "embedding"
     assert span.attributes[SpanAttributes.TRACELOOP_ENTITY_NAME] == (
@@ -319,7 +321,7 @@ def test_hostile_readable_span_status_properties_do_not_break_export() -> None:
     )
     span._status = HostileStatus()
 
-    OpenRouterSpanProcessor().on_end(span)
+    _process(span)
 
     assert span.attributes[GEN_AI_PROVIDER_NAME] == "openrouter"
     assert span.attributes[SpanAttributes.TRACELOOP_ENTITY_NAME] == "openrouter.chat"
@@ -343,7 +345,7 @@ def test_stream_flag_uses_current_and_traceloop_conventions() -> None:
         error_message=None,
         status_code=200,
     ):
-        OpenRouterSpanProcessor().on_end(span)
+        _process(span)
 
     assert span.attributes[GEN_AI_REQUEST_STREAM] is True
     assert span.attributes[SpanAttributes.LLM_IS_STREAMING] is True

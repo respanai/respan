@@ -38,6 +38,13 @@ _SECRET_PATTERNS = (
     re.compile(r"(?i)\bbearer\s+[a-z0-9._~+/=-]+"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
 )
+_QUOTED_DOUBLE = re.compile(
+    r'''(?i)(["']?[a-z0-9_-]*(?:api[_-]?key|authorization|password|secret|session[_-]?token|token)["']?\s*[:=]\s*")((?:\\.|[^"\\])*)"'''
+)
+_QUOTED_SINGLE = re.compile(
+    r"""(?i)(["']?[a-z0-9_-]*(?:api[_-]?key|authorization|password|secret|session[_-]?token|token)["']?\s*[:=]\s*')((?:\\.|[^'\\])*)'"""
+)
+
 _CREDENTIAL_URI = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)([^/@\s]+)@")
 _MEMORY_ADDRESS = re.compile(r"(?i)\b0x[0-9a-f]{6,}\b")
 _SECRET_ASSIGNMENT = re.compile(
@@ -47,8 +54,9 @@ _SECRET_ASSIGNMENT = re.compile(
 )
 
 
-def _redact_text(value: str) -> str:
-    redacted = value
+def _redact_text(value: str, *, complete: bool = False) -> str:
+    redacted = _QUOTED_DOUBLE.sub(lambda m: f'{m.group(1)}{REDACTED}"', value)
+    redacted = _QUOTED_SINGLE.sub(lambda m: f"{m.group(1)}{REDACTED}'", redacted)
     redacted = _CREDENTIAL_URI.sub(
         lambda match: f"{match.group(1)}{REDACTED}@", redacted
     )
@@ -58,7 +66,7 @@ def _redact_text(value: str) -> str:
     redacted = _SECRET_ASSIGNMENT.sub(
         lambda match: f"{match.group(1)}{match.group(2)}{REDACTED}", redacted
     )
-    if len(redacted) <= MAX_STRING_CHARS:
+    if complete or len(redacted) <= MAX_STRING_CHARS:
         return redacted
     return f"{redacted[:MAX_STRING_CHARS]}...[truncated]"
 
@@ -82,11 +90,11 @@ def _is_sensitive_key(key: Any) -> bool:
     )
 
 
-def safe_text(value: Any, *, default: str = "", limit: int = 512) -> str:
+def safe_text(value: Any, *, default: str = "", limit: int | None = 512) -> str:
     """Return bounded scalar text without arbitrary ``str``/``repr`` calls."""
 
     if isinstance(value, str):
-        return _redact_text(value)[:limit]
+        return _redact_text(value, complete=limit is None)[:limit]
     if value is None:
         return default
     if isinstance(value, bool):
@@ -140,24 +148,68 @@ def _public_dataclass_fields(value: Any) -> Mapping[str, Any] | None:
     return result
 
 
+def requires_complete_payload(value: Any, _seen=None) -> bool:
+    _seen = set() if _seen is None else _seen
+    if id(value) in _seen:
+        return False
+    _seen.add(id(value))
+    if isinstance(value, (list, tuple)):
+        return any(requires_complete_payload(v, _seen) for v in value) or (
+            len(value) > MAX_COLLECTION_ITEMS
+            and all(
+                type(v) in (int, float)
+                and (not isinstance(v, float) or math.isfinite(v))
+                for v in value
+            )
+        )
+    if isinstance(value, dict):
+        if len(value) > MAX_COLLECTION_ITEMS and all(
+            ((type(k) is int and k >= 0) or (type(k) is str and k.isdecimal()))
+            and type(v) in (int, float)
+            and (not isinstance(v, float) or math.isfinite(v))
+            for k, v in value.items()
+        ):
+            return True
+        return any(requires_complete_payload(v, _seen) for v in value.values()) or any(
+            k in value
+            for k in (
+                "tool_calls",
+                "function",
+                "parameters",
+                "tool_call_id",
+                "arguments",
+                "dense",
+                "sparse",
+                "vector",
+                "embedding",
+            )
+        )
+    return False
+
+
 def json_value(
     value: Any,
     *,
     _depth: int = 0,
     _seen: set[int] | None = None,
     _max_items: int = MAX_COLLECTION_ITEMS,
+    complete: bool = False,
+    schema: bool = False,
+    _property_map: bool = False,
+    _sensitive_property: bool = False,
 ) -> Any:
     """Convert to finite JSON data without custom string or dump hooks."""
 
+    complete = complete or requires_complete_payload(value)
     if value is None or isinstance(value, bool | int):
         return value
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     if isinstance(value, str):
-        return _redact_text(value)
+        return _redact_text(value, complete=complete)
     if isinstance(value, bytes | bytearray | memoryview):
         return f"<{type(value).__name__}:{len(value)} bytes>"
-    if _depth >= MAX_DEPTH:
+    if _depth >= MAX_DEPTH and not complete:
         return f"<{type(value).__name__}:max-depth>"
 
     seen = _seen if _seen is not None else set()
@@ -182,18 +234,43 @@ def json_value(
             try:
                 iterator = mapping.items()
                 for index, (key, item) in enumerate(iterator):
-                    if index >= _max_items:
+                    if not complete and index >= _max_items:
                         result["__truncated_items__"] = True
                         break
                     key_text = _safe_key(key)
+                    sensitive_property = (
+                        _is_sensitive_key(key) if _property_map else _sensitive_property
+                    )
+                    redacted_default = (
+                        schema
+                        and _sensitive_property
+                        and key_text
+                        in {"default", "example", "examples", "const", "enum"}
+                    )
+                    property_schema = (
+                        schema and _property_map and isinstance(item, (dict, bool))
+                    )
                     result[key_text] = (
-                        REDACTED
-                        if _is_sensitive_key(key)
+                        (
+                            [REDACTED for _ in item]
+                            if isinstance(item, list)
+                            else REDACTED
+                        )
+                        if redacted_default
+                        or (_is_sensitive_key(key) and not property_schema)
                         else json_value(
                             item,
                             _depth=_depth + 1,
                             _seen=seen,
                             _max_items=_max_items,
+                            complete=complete,
+                            schema=schema
+                            and key_text
+                            not in {"default", "example", "examples", "const", "enum"},
+                            _property_map=schema
+                            and not _property_map
+                            and key_text == "properties",
+                            _sensitive_property=sensitive_property,
                         )
                     )
             except Exception:  # noqa: BLE001 - mappings can have hostile iterators.
@@ -202,7 +279,11 @@ def json_value(
 
         if sequence is not None:
             try:
-                items = list(islice(iter(sequence), _max_items + 1))
+                items = (
+                    list(sequence)
+                    if complete
+                    else list(islice(iter(sequence), _max_items + 1))
+                )
             except Exception:  # noqa: BLE001 - sequences can have hostile iterators.
                 return f"<{type(value).__name__}:unserializable>"
             result = [
@@ -211,10 +292,13 @@ def json_value(
                     _depth=_depth + 1,
                     _seen=seen,
                     _max_items=_max_items,
+                    complete=complete,
+                    schema=schema,
+                    _sensitive_property=_sensitive_property,
                 )
-                for item in items[:_max_items]
+                for item in (items if complete else items[:_max_items])
             ]
-            if len(items) > _max_items:
+            if not complete and len(items) > _max_items:
                 result.append("<truncated:more items>")
             return result
 
@@ -230,12 +314,17 @@ def json_string(
     *,
     max_bytes: int = MAX_ATTRIBUTE_BYTES,
     max_collection_items: int = MAX_COLLECTION_ITEMS,
+    complete: bool = False,
+    schema: bool = False,
 ) -> str:
     """Return redacted valid JSON capped by an exact UTF-8 byte budget."""
 
     max_bytes = max(128, min(int(max_bytes), MAX_ATTRIBUTE_BYTES))
     max_collection_items = max(1, min(int(max_collection_items), 8_192))
-    normalized = json_value(value, _max_items=max_collection_items)
+    complete = complete or requires_complete_payload(value)
+    normalized = json_value(
+        value, _max_items=max_collection_items, complete=complete, schema=schema
+    )
     encoded = json.dumps(
         normalized,
         allow_nan=False,
@@ -244,7 +333,7 @@ def json_string(
         sort_keys=True,
     )
     encoded_bytes = len(encoded.encode("utf-8"))
-    if encoded_bytes <= max_bytes:
+    if complete or encoded_bytes <= max_bytes:
         return encoded
 
     preview = encoded[: max_bytes // 2]
@@ -267,14 +356,14 @@ def json_string(
 def input_messages(value: Any) -> list[dict[str, Any]]:
     """Normalize common OpenAI message inputs to finite GenAI messages."""
 
-    normalized = json_value(value)
+    normalized = json_value(value, complete=True)
     raw_messages = normalized if isinstance(normalized, list) else [normalized]
     messages: list[dict[str, Any]] = []
-    for item in raw_messages[:MAX_COLLECTION_ITEMS]:
+    for item in raw_messages:
         if isinstance(item, Mapping):
             role = safe_text(item.get("role"), default="user", limit=64)
             if isinstance(item.get("parts"), list):
-                parts = item["parts"][:MAX_COLLECTION_ITEMS]
+                parts = item["parts"]
             else:
                 content = item.get("content")
                 parts = [{"type": "text", "content": content}]
@@ -282,6 +371,9 @@ def input_messages(value: Any) -> list[dict[str, Any]]:
             tool_calls = item.get("tool_calls")
             if tool_calls:
                 message["tool_calls"] = tool_calls
+            for key in ("tool_call_id", "id"):
+                if item.get(key) is not None:
+                    message[key] = item[key]
             messages.append(message)
         else:
             messages.append(
@@ -293,10 +385,10 @@ def input_messages(value: Any) -> list[dict[str, Any]]:
 def tool_definitions(value: Any) -> list[dict[str, Any]]:
     """Normalize OpenAI function tools to the OTel GenAI definition shape."""
 
-    normalized = json_value(value)
+    normalized = json_value(value, complete=True, schema=True)
     raw_tools = normalized if isinstance(normalized, list) else [normalized]
     definitions: list[dict[str, Any]] = []
-    for item in raw_tools[:MAX_COLLECTION_ITEMS]:
+    for item in raw_tools:
         if not isinstance(item, Mapping):
             continue
         function = item.get("function")
@@ -306,7 +398,7 @@ def tool_definitions(value: Any) -> list[dict[str, Any]]:
             continue
         definition: dict[str, Any] = {
             "type": safe_text(item.get("type"), default="function", limit=64),
-            "name": safe_text(name, default="unknown", limit=256),
+            "name": safe_text(name, default="unknown", limit=None),
         }
         for key in ("description", "parameters"):
             if source.get(key) is not None:

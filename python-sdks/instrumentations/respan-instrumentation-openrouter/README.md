@@ -1,92 +1,71 @@
 # Respan OpenRouter instrumentation
 
-Trace OpenRouter calls made through the OpenAI-compatible Python client with Respan.
-
-OpenRouter's Python usage is OpenAI-compatible, so this package delegates SDK
-patching to `respan-instrumentation-openai` and adds a package-local processor
-that normalizes those spans as OpenRouter spans before export.
-
-The processor emits `gen_ai.system=openrouter` and
-`gen_ai.provider.name=openrouter`, canonical request tool definitions and
-current-turn completion tool calls, modern and legacy usage fields, precise
-OTEL error status, and both current and Traceloop streaming flags. It removes
-legacy tool aliases rather than duplicating the canonical fields.
+Trace OpenRouter's native Python SDK and OpenAI-compatible calls through the normal OTel pipeline.
 
 ## Install
 
 ```bash
-pip install respan-ai respan-instrumentation-openrouter openai
+pip install 'respan-instrumentation-openrouter[native]'
 ```
 
-Version `0.1.0` is validated with OpenAI Python `>=3.0.0,<4.0.0` and the
-`respan-instrumentation-openai` `>=1.2.1,<2.0.0` delegate surface. These bounds
-are intentional because OpenRouter's stream bridge integrates with that
-delegate's current lifecycle hooks.
+The native extra installs `openrouter>=1.3.22,<2`. Existing OpenAI-compatible installations can omit the extra. Both paths use released Respan packages; the adapter does not require source checkouts of its dependencies.
 
-## Environment
+| Dependency | Supported lower bound | Current validation |
+| --- | --- | --- |
+| OpenRouter native SDK | 1.3.22 | 1.3.22 |
+| OpenAI-compatible SDK | 3.0.0 | 3.24.0 |
+| Respan OpenAI delegate | 1.2.1 | 1.2.3 |
+| Respan tracing / SDK | 2.17.0 / 2.6.26 | 2.20.1 / 2.7.6 |
+| OTel semantic conventions | 0.66b0 | 0.66b0 |
+| AI semantic conventions | 0.5.1 | 0.5.1 |
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `RESPAN_API_KEY` | Yes | Respan API key for trace export. |
-| `RESPAN_BASE_URL` | No | Defaults to `https://api.respan.ai/api`. |
-| `OPENROUTER_API_KEY` | Yes | OpenRouter API key for direct OpenRouter calls. |
-| `OPENROUTER_BASE_URL` | No | Defaults to `https://openrouter.ai/api/v1`. |
-| `OPENROUTER_MODEL` | No | Defaults to `openai/gpt-4o-mini`. |
+The explicit OTel semantic-conventions floor supplies the modern streaming and reasoning keys. OTel API and SDK resolve together with that floor. Python 3.11–3.13 is supported.
 
-The examples can also run through a Respan gateway configuration by providing
-`OPENROUTER_USE_RESPAN_GATEWAY=true`, `RESPAN_GATEWAY_API_KEY`,
-`RESPAN_GATEWAY_BASE_URL`, and `RESPAN_MODEL`. Without direct OpenRouter or
-explicit gateway configuration, the example set uses a local OpenAI-compatible
-mock so instrumentation and Respan export can still be verified.
-
-## Usage
+## Native SDK usage
 
 ```python
 import os
-
-from openai import OpenAI
-from respan import Respan, workflow
+from openrouter import OpenRouter
 from respan_instrumentation_openrouter import OpenRouterInstrumentor
+from respan_tracing import RespanTelemetry, workflow
 
-respan = Respan(
+telemetry = RespanTelemetry(
     api_key=os.environ["RESPAN_API_KEY"],
-    base_url=os.getenv("RESPAN_BASE_URL", "https://api.respan.ai/api"),
-    instrumentations=[OpenRouterInstrumentor()],
+    is_auto_instrument=False,
 )
+instrumentor = OpenRouterInstrumentor()
+instrumentor.activate()
 
-client = OpenAI(
-    api_key=os.environ["OPENROUTER_API_KEY"],
-    base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-)
+with OpenRouter(api_key=os.environ["OPENROUTER_API_KEY"]) as client:
 
+    @workflow(name="openrouter_chat")
+    def run(prompt: str) -> str:
+        result = client.chat.send(
+            model="openai/gpt-4.1-mini",
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return result.choices[0].message.content or ""
 
-@workflow(name="openrouter_chat_example")
-def run_chat() -> str:
-    response = client.chat.completions.create(
-        model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
-        messages=[
-            {
-                "role": "user",
-                "content": "Reply with one concise sentence about observability.",
-            }
-        ],
-    )
-    return response.choices[0].message.content or ""
+    print(run("Explain one benefit of tracing."))
 
-
-try:
-    print(run_chat())
-finally:
-    respan.flush()
-    respan.shutdown()
+telemetry.flush()
+instrumentor.deactivate()
+telemetry.tracer.tracer_provider.shutdown()
 ```
 
-`OpenRouterInstrumentor(normalize_all_openai_spans=True)` is the default because
-the package is intended for OpenRouter-specific OpenAI-compatible clients. Set
-`normalize_all_openai_spans=False` if the same process also emits regular OpenAI
-spans and only spans with OpenRouter URL markers should be rewritten.
+## Coverage
 
-Set `capture_content=False` to retain provider, model, usage, stream, lifecycle,
-and error data while removing prompt, completion, tool-definition, and tool-call
-content. Captured chat content is secret-redacted and bounded by UTF-8 bytes;
-embedding vectors remain intact under the shared span contract.
+- Native `chat.send` / `send_async`, stable and beta `responses.send` / `send_async`, and `embeddings.generate` / `generate_async`.
+- OpenAI-compatible chat and Responses `create` / `parse`, text completions, embeddings, and synchronous/asynchronous streaming.
+- Native request DTOs, routing options and server-tool schemas continue through the original SDK methods. Complete request tool definitions and current-turn function calls are captured; historical tool calls remain in input context.
+- Embedding float arrays and encoded values are retained in full. Input/output, source integer usage, cache and reasoning counters, response IDs, and streaming flags use canonical fields. SDK-coerced boolean counts and missing totals are not invented.
+- Recording spans begin at the SDK call. Stream exhaustion, explicit close, exceptions and context-manager exit finish once under the call-time parent. Iterator `send` / `throw` and `asend` / `athrow` delegate to native implementations. Always close an abandoned stream. Cancellation keeps the native exception and records OTel error/type without an invented HTTP status.
+- Shared instances, independent OpenAI owners, partial activation rollback and foreign wrapper restoration are supported. No backend or generic delegate source changes are needed.
+
+`normalize_all_openai_spans=True` preserves the existing default for applications dedicated to OpenRouter. Use `False` in mixed-provider processes: only the exact `openrouter.ai` host and its subdomains are observed as OpenRouter, while the existing OpenAI delegate handles other hosts.
+
+`capture_content=False`, `TRACELOOP_TRACE_CONTENT=0/false/no/off`, and Respan's content context opt-out remove payload and diagnostic content. Start-time and ancestor restrictions remain in effect if content is later enabled; a final veto is checked before context detachment. Standard OTel and LLM suppression and sampling remain effective. Complete entity input/output retains every message and choice; indexed prompt/completion fields cover the first eight of each to preserve common attributes within the OTel field limit. Known DTOs and built-in structures are serialized; arbitrary clients, iterables and object representations are not inspected.
+
+HTTP error status is emitted only from a real provider response/exception. Application errors and cancellation carry OTel error status and type without a fabricated HTTP status or error-as-completion payload. Secrets are redacted in captured content and diagnostics.
+
+Native audio/image/video/rerank/admin endpoints and the separate `openrouter-agent-sdk` are outside this coverage. Controlled examples validate instrumentation and native SDK parsing; they do not claim live model quality, native server-tool execution or Gateway routing support. Backend storage/projection acceptance remains a separate validation gate.

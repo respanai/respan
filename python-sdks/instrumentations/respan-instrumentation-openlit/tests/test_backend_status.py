@@ -20,8 +20,10 @@ def test_otel_error_sets_backend_visible_status_and_message() -> None:
         Status(StatusCode.ERROR, "openlit provider failed"),
     )
     translate_openlit_span(span, capture_content=False)
-    assert span._attributes["status_code"] == 500
-    assert span._attributes["error.message"] == "OpenLIT operation failed"
+    assert "status_code" not in span._attributes
+    assert "error.message" not in span._attributes
+    assert span._status.status_code is StatusCode.ERROR
+    assert span._status.description is None
     assert SpanAttributes.TRACELOOP_ENTITY_OUTPUT not in span._attributes
 
 
@@ -34,8 +36,11 @@ def test_upstream_http_status_is_preserved() -> None:
         Status(StatusCode.ERROR, "rate limited"),
     )
     translate_openlit_span(span, capture_content=False)
-    assert span._attributes["status_code"] == 429
-    assert span._attributes["error.message"] == "OpenLIT operation failed"
+    assert "status_code" not in span._attributes
+    assert span._attributes["http.response.status_code"] == 429
+    assert "error.message" not in span._attributes
+    assert span._status.status_code is StatusCode.ERROR
+    assert span._status.description is None
     assert SpanAttributes.TRACELOOP_ENTITY_OUTPUT not in span._attributes
 
 
@@ -45,5 +50,5 @@ def test_success_sets_backend_visible_200() -> None:
         Status(StatusCode.OK),
     )
     translate_openlit_span(span, capture_content=False)
-    assert span._attributes["status_code"] == 200
+    assert "status_code" not in span._attributes
     assert "error.message" not in span._attributes

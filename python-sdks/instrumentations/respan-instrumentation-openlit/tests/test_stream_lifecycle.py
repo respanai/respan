@@ -124,7 +124,8 @@ def test_async_stream_cancellation_closes_source_and_ends_exactly_once() -> None
         assert source.close_calls == 1
         assert source._span.end_calls == 1
         assert source._span.status.is_ok is False
-        assert source._span.attributes["error.message"] == "CancelledError"
+        assert "error.message" not in source._span.attributes
+        assert source._span.status.description == "CancelledError"
 
         await proxy.close()
         assert source.close_calls == 1
@@ -139,7 +140,8 @@ def test_sync_stream_failures_finish_once_and_preserve_provider_error() -> None:
     with pytest.raises(ProviderFailure):
         next(proxy)
     assert iteration._span.end_calls == 1
-    assert iteration._span.attributes["error.message"] == "ProviderFailure"
+    assert "error.message" not in iteration._span.attributes
+    assert iteration._span.status.description == "ProviderFailure"
 
     entering = FailingSyncStream("enter")
     with pytest.raises(EnterFailure):
@@ -151,7 +153,8 @@ def test_sync_stream_failures_finish_once_and_preserve_provider_error() -> None:
     with pytest.raises(ExitFailure):
         _SyncStreamProxy(exiting, capture_content=True).__exit__(None, None, None)
     assert exiting._span.end_calls == 1
-    assert exiting._span.attributes["error.message"] == "ExitFailure"
+    assert "error.message" not in exiting._span.attributes
+    assert exiting._span.status.description == "ExitFailure"
 
     closing = FailingSyncStream("close")
     with pytest.raises(CloseFailure):
@@ -166,7 +169,8 @@ def test_async_stream_failures_finish_once_and_preserve_provider_error() -> None
         with pytest.raises(ProviderFailure):
             await proxy.__anext__()
         assert iteration._span.end_calls == 1
-        assert iteration._span.attributes["error.message"] == "ProviderFailure"
+        assert "error.message" not in iteration._span.attributes
+        assert iteration._span.status.description == "ProviderFailure"
 
         entering = FailingAsyncStream("enter")
         with pytest.raises(EnterFailure):
@@ -180,7 +184,8 @@ def test_async_stream_failures_finish_once_and_preserve_provider_error() -> None
                 None, None, None
             )
         assert exiting._span.end_calls == 1
-        assert exiting._span.attributes["error.message"] == "ExitFailure"
+        assert "error.message" not in exiting._span.attributes
+        assert exiting._span.status.description == "ExitFailure"
 
         closing = FailingAsyncStream("close")
         with pytest.raises(CloseFailure):

@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "respan-instrumentation-openrouter"
 version = "0.1.0"
-description = "Respan instrumentation plugin for OpenRouter's OpenAI-compatible Python usage"
+description = "Respan instrumentation plugin for OpenRouter native and OpenAI-compatible Python SDKs"
 authors = ["Respan <team@respan.ai>"]
 license = "Apache 2.0"
 readme = "README.md"
@@ -15,7 +15,12 @@ respan-tracing = "^2.17.0"
 respan-sdk = ">=2.6.26"
 respan-instrumentation-openai = ">=1.2.1,<2.0.0"
 openai = ">=3.0.0,<4.0.0"
-opentelemetry-semantic-conventions-ai = ">=0.4.1"
+opentelemetry-semantic-conventions-ai = ">=0.5.1"
+opentelemetry-semantic-conventions = ">=0.66b0"
+openrouter = { version = ">=1.3.22,<2.0.0", optional = true }
+
+[tool.poetry.extras]
+native = ["openrouter"]
 
 [tool.poetry.plugins."respan.instrumentations"]
 openrouter = "respan_instrumentation_openrouter:OpenRouterInstrumentor"

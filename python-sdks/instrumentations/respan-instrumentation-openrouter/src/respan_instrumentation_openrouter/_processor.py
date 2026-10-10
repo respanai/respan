@@ -17,16 +17,20 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor
 from opentelemetry.sdk.util.instrumentation import InstrumentationScope
+from opentelemetry.semconv._incubating.attributes.error_attributes import ERROR_MESSAGE
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import (
+    GEN_AI_OUTPUT_MESSAGES,
     GEN_AI_PROVIDER_NAME,
     GEN_AI_REQUEST_STREAM,
+    GEN_AI_RESPONSE_ID,
+    GEN_AI_TOOL_DEFINITIONS,
     GEN_AI_USAGE_INPUT_TOKENS,
     GEN_AI_USAGE_OUTPUT_TOKENS,
 )
+from opentelemetry.semconv.attributes.http_attributes import HTTP_RESPONSE_STATUS_CODE
 from opentelemetry.semconv_ai import LLMRequestTypeValues
 from opentelemetry.semconv_ai import SpanAttributes as TLSpanAttributes
 from opentelemetry.trace import SpanContext, Status, StatusCode
-from respan_sdk.constants import ERROR_MESSAGE_ATTR
 from respan_sdk.constants.llm_logging import (
     LOG_TYPE_CHAT,
     LOG_TYPE_EMBEDDING,
@@ -44,7 +48,6 @@ from respan_instrumentation_openrouter._constants import (
     MAX_COLLECTION_ITEMS,
     MAX_ERROR_BYTES,
     OPENAI_INSTRUMENTATION_SCOPE_FRAGMENT,
-    OPENROUTER_HOST_MARKERS,
     OPENROUTER_INSTRUMENTATION_SCOPE,
     OPENROUTER_SYSTEM_NAME,
     OPENROUTER_URL_ATTRIBUTE_KEYS,
@@ -58,26 +61,16 @@ GEN_AI_COMPLETION_PREFIX = f"{TLSpanAttributes.LLM_COMPLETIONS}."
 GEN_AI_TOOL_CALLS_SUFFIX = ".tool_calls"
 GEN_AI_TOOL_CALLS_INDEX_FRAGMENT = ".tool_calls."
 GEN_AI_COMPLETION_TOOL_CALLS_ATTR = f"{TLSpanAttributes.LLM_COMPLETIONS}.0.tool_calls"
-GEN_AI_OUTPUT_MESSAGES_ATTR = getattr(
-    TLSpanAttributes,
-    "GEN_AI_OUTPUT_MESSAGES",
-    "gen_ai.output.messages",
-)
-GEN_AI_TOOL_DEFINITIONS_ATTR = getattr(
-    TLSpanAttributes,
-    "GEN_AI_TOOL_DEFINITIONS",
-    "gen_ai.tool.definitions",
-)
-
 _PROVIDER_CONTROLLED_IDENTITY_KEYS = (
     TLSpanAttributes.LLM_REQUEST_MODEL,
     TLSpanAttributes.LLM_RESPONSE_MODEL,
-    "gen_ai.response.id",
+    GEN_AI_RESPONSE_ID,
     TLSpanAttributes.LLM_OPENAI_RESPONSE_SYSTEM_FINGERPRINT,
 )
 
 _OFF_CONTRACT_ALIAS_ATTRIBUTES = frozenset(
     {
+        "status_code",
         "completion_tokens",
         "has_tool_calls",
         "model",
@@ -96,30 +89,7 @@ _OFF_CONTRACT_ALIAS_ATTRIBUTES = frozenset(
 
 _OPENAI_OMIT_VALUE_PREFIX = "<openai.Omit object"
 
-_PROVIDER_ERROR_MARKER = r"(?:openrouter|openai|provider|api(?:[_ -]?key)?)"
-_HTTP_STATUS_PATTERNS = (
-    re.compile(
-        rf"\b{_PROVIDER_ERROR_MARKER}\b[^\r\n]{{0,64}}"
-        r"\berror\s+code\s*[:=]\s*([1-5]\d{2})\b",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\berror\s+code\s*[:=]\s*([1-5]\d{2})\b"
-        rf"[^\r\n]{{0,64}}\b{_PROVIDER_ERROR_MARKER}\b",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\b(?:openrouter|openai|provider|api)\b[^\r\n]{0,64}"
-        r"\bHTTP\s+([1-5]\d{2})\b",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\bHTTP\s+([1-5]\d{2})\b[^\r\n]{0,64}"
-        r"\b(?:openrouter|openai|provider|api)\b",
-        re.IGNORECASE,
-    ),
-)
-_BEARER_SECRET = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
+_BEARER_SECRET = re.compile(r"(?i)\bBearer\s+(?:\[REDACTED\]|[^\s,;\"'{}\[\]\\]+)")
 _OPENAI_STYLE_SECRET = re.compile(r"\bsk-(?:or-v1-)?[A-Za-z0-9_-]{8,}\b")
 _SECRET_FIELD_PATTERN = (
     r"(?:api[_-]?key|authorization|access[_-]?token|refresh[_-]?token|"
@@ -128,8 +98,8 @@ _SECRET_FIELD_PATTERN = (
 )
 _KEY_VALUE_SECRET = re.compile(
     rf"(?P<prefix>['\"]?{_SECRET_FIELD_PATTERN}['\"]?\s*[:=]\s*)"
-    rf"(?:(?P<quote>['\"])(?P<quoted>[^'\"]*)(?P=quote)|"
-    rf"(?P<bare>[^\s,;&?#}}\]]+))",
+    rf"(?:(?P<quote>['\"])(?P<quoted>(?:\\.|(?!(?P=quote)|\\).)*)(?P=quote)|"
+    rf"(?P<bare>\[REDACTED\]|[^\s,;&?#}}\]\[\"']+))",
     re.IGNORECASE,
 )
 
@@ -141,7 +111,7 @@ class OpenRouterEmissionContext:
     kind: str
     stream: bool
     error_message: str | None
-    status_code: int
+    status_code: int | None
 
 
 _CURRENT_EMISSION: ContextVar[OpenRouterEmissionContext | None] = ContextVar(
@@ -160,7 +130,9 @@ def openrouter_emission_context(
 ):
     """Expose delegate-only request/error facts to the synchronous processor."""
 
-    resolved_status = _resolve_http_status(error_message, status_code)
+    resolved_status = (
+        status_code if type(status_code) is int and 100 <= status_code <= 599 else None
+    )
     token = _CURRENT_EMISSION.set(
         OpenRouterEmissionContext(
             kind=kind,
@@ -205,8 +177,9 @@ def _has_openrouter_url_marker(attrs: dict[str, Any]) -> bool:
         value = attrs.get(key)
         if not isinstance(value, str):
             continue
-        normalized_value = value[:2_048].lower()
-        if any(marker in normalized_value for marker in OPENROUTER_HOST_MARKERS):
+        parsed = urlsplit(value if "://" in value else "//" + value)
+        host = parsed.hostname
+        if host == "openrouter.ai" or (host and host.endswith(".openrouter.ai")):
             return True
     return False
 
@@ -231,10 +204,6 @@ def _json_string(value: Any) -> str | None:
 def _parse_json_if_string(value: Any) -> Any:
     if not isinstance(value, str):
         return value
-    if len(value) > MAX_ATTRIBUTE_BYTES:
-        return value
-    if len(value.encode("utf-8")) > MAX_ATTRIBUTE_BYTES:
-        return value
     try:
         return json.loads(value)
     except (TypeError, json.JSONDecodeError):
@@ -246,29 +215,6 @@ def _is_openai_omit(value: Any) -> bool:
         return True
     value_type = type(value)
     return value_type.__name__ == "Omit" and value_type.__module__.startswith("openai")
-
-
-def _http_status_code(message: str | None) -> int | None:
-    if not message:
-        return None
-    message = _truncate_utf8(message, limit=MAX_ERROR_BYTES)
-    for pattern in _HTTP_STATUS_PATTERNS:
-        match = pattern.search(message)
-        if match is not None:
-            return int(match.group(1))
-    return None
-
-
-def _resolve_http_status(message: str | None, explicit_status: Any) -> int:
-    if type(explicit_status) is int:
-        resolved_explicit = explicit_status
-    elif type(explicit_status) is str and re.fullmatch(r"[1-5]\d{2}", explicit_status):
-        resolved_explicit = int(explicit_status)
-    else:
-        resolved_explicit = None
-    if resolved_explicit is not None and 400 <= resolved_explicit <= 599:
-        return resolved_explicit
-    return _http_status_code(message) or 500
 
 
 def _truncate_utf8(value: str, *, limit: int) -> str:
@@ -365,106 +311,26 @@ def _redact_url(value: str) -> str:
     )
 
 
-def _safe_json_value(
-    value: Any,
-    *,
-    depth: int = 0,
-    budget: list[int] | None = None,
-) -> Any:
-    """Create a bounded JSON value while retaining useful message/tool shape."""
-
-    if budget is None:
-        budget = [MAX_COLLECTION_ITEMS * 4]
-    if budget[0] <= 0:
-        return "[truncated-items]"
-    budget[0] -= 1
-    if depth > 8:
-        return "[max-depth]"
-    if value is None or isinstance(value, (bool, int)):
-        return value
-    if isinstance(value, float):
-        return value if math.isfinite(value) else "[non-finite]"
-    if isinstance(value, str):
-        return _redact_text(value)
-    if isinstance(value, dict):
-        result: dict[str, Any] = {}
-        for index, (key, item) in enumerate(value.items()):
-            if index >= MAX_COLLECTION_ITEMS:
-                result["__truncated_items__"] = len(value) - MAX_COLLECTION_ITEMS
-                break
-            key_text = key if isinstance(key, str) else f"<{type(key).__name__}>"
-            key_text = _redact_text(key_text, limit=256)
-            result[key_text] = (
-                "[REDACTED]"
-                if _is_sensitive_key(key_text)
-                else _safe_json_value(item, depth=depth + 1, budget=budget)
-            )
-        return result
-    if isinstance(value, (list, tuple)):
-        items = [
-            _safe_json_value(item, depth=depth + 1, budget=budget)
-            for item in value[:MAX_COLLECTION_ITEMS]
-        ]
-        if len(value) > MAX_COLLECTION_ITEMS:
-            return {
-                "count": len(value),
-                "items": items,
-                "truncated": True,
-            }
-        return items
-    return {"type": type(value).__name__}
-
-
-def _bounded_json_string(value: Any) -> str | None:
-    if isinstance(value, str):
-        if len(value) > MAX_ATTRIBUTE_BYTES or len(value.encode("utf-8")) > (
-            MAX_ATTRIBUTE_BYTES
-        ):
-            parsed = _redact_text(value)
-        else:
-            try:
-                parsed = json.loads(value)
-            except (TypeError, json.JSONDecodeError):
-                parsed = _redact_text(value)
-    else:
-        parsed = value
-    if parsed is None:
+def _safe_json_value(value: Any, *, depth: int = 0, budget: Any = None) -> Any:
+    if depth > 40:
         return None
-    sanitized = _safe_json_value(parsed)
-    text = json.dumps(
-        sanitized,
-        allow_nan=False,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    if len(text.encode("utf-8")) <= MAX_ATTRIBUTE_BYTES:
-        return text
-    preview = _redact_text(text, limit=max(0, MAX_ATTRIBUTE_BYTES - 160))
-    bounded = json.dumps(
-        {
-            "original_bytes": len(text.encode("utf-8")),
-            "preview": preview,
-            "truncated": True,
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    while len(bounded.encode("utf-8")) > MAX_ATTRIBUTE_BYTES and preview:
-        overflow = len(bounded.encode("utf-8")) - MAX_ATTRIBUTE_BYTES
-        preview = _truncate_utf8(
-            preview,
-            limit=max(0, len(preview.encode("utf-8")) - overflow - 16),
-        )
-        bounded = json.dumps(
-            {
-                "original_bytes": len(text.encode("utf-8")),
-                "preview": preview,
-                "truncated": True,
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-    return bounded
+    if value is None or type(value) in (bool, int):
+        return value
+    if type(value) is float:
+        return value if math.isfinite(value) else None
+    if isinstance(value, str):
+        return _redact_text(value, limit=len(value.encode("utf-8")) + 100)
+    if type(value) is dict:
+        return {
+            key: "[REDACTED]"
+            if _is_sensitive_key(key)
+            else _safe_json_value(item, depth=depth + 1)
+            for key, item in value.items()
+            if isinstance(key, str)
+        }
+    if type(value) in (list, tuple):
+        return [_safe_json_value(item, depth=depth + 1) for item in value]
+    return None
 
 
 @lru_cache(maxsize=1)
@@ -521,7 +387,7 @@ def _tool_calls_content(value: Any) -> str | None:
         elif isinstance(arguments, str):
             descriptions.append(f"{name}({arguments})")
         else:
-            safe_arguments = _bounded_json_string(arguments) or "{}"
+            safe_arguments = _json_string(arguments) or "{}"
             descriptions.append(f"{name}({safe_arguments})")
 
     if not descriptions:
@@ -605,7 +471,7 @@ def _tool_call_from_output_part(part: dict[str, Any]) -> dict[str, Any] | None:
         return None
     arguments = part.get("arguments")
     if not isinstance(arguments, str):
-        arguments = _bounded_json_string(arguments if arguments is not None else {})
+        arguments = _json_string(arguments if arguments is not None else {})
         if arguments is None:
             arguments = "{}"
     tool_call: dict[str, Any] = {
@@ -619,7 +485,7 @@ def _tool_call_from_output_part(part: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _normalize_gen_ai_output_messages(attrs: dict[str, Any]) -> None:
-    output_messages = _parse_json_if_string(attrs.get(GEN_AI_OUTPUT_MESSAGES_ATTR))
+    output_messages = _parse_json_if_string(attrs.get(GEN_AI_OUTPUT_MESSAGES))
     if not isinstance(output_messages, list):
         return
 
@@ -663,7 +529,7 @@ def _normalize_structured_contract_attrs(attrs: dict[str, Any]) -> None:
     if tools_value is None:
         tools_value = attrs.get(RESPAN_SPAN_TOOLS)
     if tools_value is None:
-        tools_value = attrs.get(GEN_AI_TOOL_DEFINITIONS_ATTR)
+        tools_value = attrs.get(GEN_AI_TOOL_DEFINITIONS)
     tools_json = _json_string(_canonical_tool_definitions(tools_value))
     if tools_json:
         attrs[TLSpanAttributes.LLM_REQUEST_FUNCTIONS] = tools_json
@@ -742,65 +608,35 @@ def _normalize_error(
         return
 
     safe_message = _redact_text(message, limit=MAX_ERROR_BYTES)
-    emitted_status = emission.status_code if emission is not None else None
-    status_code = _resolve_http_status(message, emitted_status)
-    attrs[ERROR_MESSAGE_ATTR] = safe_message
-    attrs["http.response.status_code"] = status_code
-    attrs.setdefault(
-        TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT,
-        json.dumps(
-            {
-                "error": "OpenRouterError",
-                "message": safe_message,
-                "status": "error",
-                "status_code": status_code,
-            },
-            separators=(",", ":"),
-        ),
-    )
-    # ReadableSpan exposes status as read-only but stores it in this mutable
-    # field. Downstream processors/exporters must observe an OTEL error.
+    attrs[ERROR_MESSAGE] = safe_message
+    if (
+        emission is not None
+        and type(emission.status_code) is int
+        and 100 <= emission.status_code <= 599
+    ):
+        attrs[HTTP_RESPONSE_STATUS_CODE] = emission.status_code
     if hasattr(span, "_status"):
-        span._status = Status(StatusCode.ERROR, safe_message)
+        span._status = Status(StatusCode.ERROR)
 
 
 def _drop_content(attrs: dict[str, Any]) -> None:
-    content_keys = {
-        TLSpanAttributes.TRACELOOP_ENTITY_INPUT,
-        TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT,
-        TLSpanAttributes.LLM_REQUEST_FUNCTIONS,
-        GEN_AI_OUTPUT_MESSAGES_ATTR,
-        GEN_AI_TOOL_DEFINITIONS_ATTR,
+    keep = {
+        TLSpanAttributes.LLM_SYSTEM,
+        GEN_AI_PROVIDER_NAME,
+        TLSpanAttributes.LLM_REQUEST_MODEL,
+        TLSpanAttributes.LLM_RESPONSE_MODEL,
+        GEN_AI_RESPONSE_ID,
+        TLSpanAttributes.LLM_REQUEST_TYPE,
+        TLSpanAttributes.GEN_AI_IS_STREAMING,
+        GEN_AI_REQUEST_STREAM,
+        RESPAN_LOG_TYPE,
+        TLSpanAttributes.TRACELOOP_ENTITY_NAME,
+        TLSpanAttributes.TRACELOOP_ENTITY_PATH,
+        HTTP_RESPONSE_STATUS_CODE,
     }
     for key in tuple(attrs):
-        if key in content_keys or key.startswith(
-            (GEN_AI_PROMPT_PREFIX, GEN_AI_COMPLETION_PREFIX)
-        ):
+        if key not in keep and not key.startswith(("gen_ai.usage.", "llm.usage.")):
             attrs.pop(key, None)
-
-
-def _bound_content(attrs: dict[str, Any]) -> None:
-    request_type = attrs.get(TLSpanAttributes.LLM_REQUEST_TYPE)
-    json_keys = {
-        TLSpanAttributes.TRACELOOP_ENTITY_INPUT,
-        TLSpanAttributes.LLM_REQUEST_FUNCTIONS,
-        GEN_AI_OUTPUT_MESSAGES_ATTR,
-        GEN_AI_TOOL_DEFINITIONS_ATTR,
-    }
-    if request_type != LLMRequestTypeValues.EMBEDDING.value:
-        json_keys.add(TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT)
-
-    for key in tuple(attrs):
-        value = attrs.get(key)
-        if value is None:
-            continue
-        if key in json_keys or key.endswith(GEN_AI_TOOL_CALLS_SUFFIX):
-            bounded = _bounded_json_string(value)
-            if bounded is not None:
-                attrs[key] = bounded
-        elif key.startswith((GEN_AI_PROMPT_PREFIX, GEN_AI_COMPLETION_PREFIX)):
-            if isinstance(value, str):
-                attrs[key] = _redact_text(value)
 
 
 def _canonical_operation_kind(
@@ -890,9 +726,12 @@ class OpenRouterSpanProcessor(SpanProcessor):
     ) -> None:
         self._normalize_all_openai_spans = normalize_all_openai_spans
         self._capture_content = capture_content
+        from respan_instrumentation_openrouter._policy import Policy
+
+        self._policy = Policy(capture_content)
 
     def on_start(self, span: Any, parent_context: Any = None) -> None:
-        pass
+        self._policy.start(span, parent_context)
 
     def _is_openrouter_span(self, span: ReadableSpan, attrs: dict[str, Any]) -> bool:
         system = attrs.get(TLSpanAttributes.LLM_SYSTEM)
@@ -903,6 +742,12 @@ class OpenRouterSpanProcessor(SpanProcessor):
         return self._normalize_all_openai_spans or _has_openrouter_url_marker(attrs)
 
     def on_end(self, span: ReadableSpan) -> None:
+        allowed = self._policy.finish(span)
+        if (
+            getattr(getattr(span, "instrumentation_scope", None), "name", None)
+            == "respan.instrumentation.openrouter"
+        ):
+            return
         original_attrs = getattr(span, "_attributes", None)
         if original_attrs is None:
             return
@@ -931,8 +776,23 @@ class OpenRouterSpanProcessor(SpanProcessor):
             if key in _OFF_CONTRACT_ALIAS_ATTRIBUTES or _is_openai_omit(value):
                 attrs.pop(key, None)
 
-        if self._capture_content:
-            _bound_content(attrs)
+        if self._capture_content and allowed:
+            for key, value in list(attrs.items()):
+                is_content = key in {
+                    TLSpanAttributes.TRACELOOP_ENTITY_INPUT,
+                    TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+                    TLSpanAttributes.LLM_REQUEST_FUNCTIONS,
+                    GEN_AI_OUTPUT_MESSAGES,
+                    GEN_AI_TOOL_DEFINITIONS,
+                } or key.startswith((GEN_AI_PROMPT_PREFIX, GEN_AI_COMPLETION_PREFIX))
+                if is_content and isinstance(value, str):
+                    parsed = _parse_json_if_string(value)
+                    attrs[key] = (
+                        _json_string(parsed)
+                        if parsed is not value
+                        else _redact_text(value, limit=len(value.encode("utf-8")) + 100)
+                    )
+
         else:
             _drop_content(attrs)
 

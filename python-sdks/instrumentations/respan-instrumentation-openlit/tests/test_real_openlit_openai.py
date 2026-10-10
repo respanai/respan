@@ -60,6 +60,8 @@ def _chat_response(
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
+            "prompt_tokens_details": {"cached_tokens": 0},
+            "completion_tokens_details": {"reasoning_tokens": 0},
         }
     return response
 
@@ -595,12 +597,14 @@ def test_real_current_openlit_openai_export_contract_and_privacy(
     assert definitions == [
         {
             "type": "function",
-            "name": _TOOL_NAME,
-            "description": "Look up weather for a city",
-            "parameters": {
-                "type": "object",
-                "properties": {"city": {"type": "string"}},
-                "required": ["city"],
+            "function": {
+                "name": _TOOL_NAME,
+                "description": "Look up weather for a city",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
             },
         }
     ]
@@ -610,7 +614,7 @@ def test_real_current_openlit_openai_export_contract_and_privacy(
             "type": "function",
             "function": {
                 "name": _TOOL_NAME,
-                "arguments": {"city": "Tokyo"},
+                "arguments": '{"city": "Tokyo"}',
             },
         }
     ]
@@ -704,8 +708,10 @@ def test_real_current_openlit_openai_export_contract_and_privacy(
     error_attrs = dict(error_span.attributes)
     assert error_span.status.status_code is StatusCode.ERROR
     assert error_attrs["http.response.status_code"] == 429
-    assert error_attrs["status_code"] == 429
-    assert "deterministic rate limit" in error_attrs["error.message"]
+    assert "status_code" not in error_attrs
+    assert "error.message" not in error_attrs
+    assert "deterministic rate limit" in error_span.status.description
+    assert SpanAttributes.TRACELOOP_ENTITY_OUTPUT not in error_attrs
     assert (
         json.loads(error_attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT])[0]["parts"][0][
             "content"

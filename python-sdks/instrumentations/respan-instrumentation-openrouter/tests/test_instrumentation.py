@@ -7,6 +7,7 @@ from typing import ClassVar
 
 import pytest
 from opentelemetry.semconv_ai import SpanAttributes
+from opentelemetry.trace import SpanContext, TraceFlags
 from respan_instrumentation_openrouter import OpenRouterInstrumentor, _instrumentation
 from respan_instrumentation_openrouter._constants import OPENROUTER_SYSTEM_NAME
 from respan_instrumentation_openrouter._processor import OpenRouterSpanProcessor
@@ -61,6 +62,14 @@ def reset_fakes(monkeypatch):
     while (owner := _instrumentation._ACTIVE_BRIDGE_OWNER) is not None:
         owner.deactivate()
     RespanTracer.reset_instance()
+
+
+def _process(span, processor=None, **kwargs):
+    processor = processor or OpenRouterSpanProcessor(**kwargs)
+    if getattr(span, "context", None) is None:
+        span.context = SpanContext(1, 1, False, TraceFlags(1))
+    processor.on_start(span)
+    processor.on_end(span)
 
 
 def test_name_is_openrouter() -> None:
@@ -223,7 +232,7 @@ def test_deactivate_does_not_overwrite_foreign_delegate_change(monkeypatch) -> N
     instrumentor.activate()
 
     assert instrumentor._runtime is not None
-    original = instrumentor._runtime.delegate_kind_entries["chat"]
+    original = _instrumentation.openai_instrumentation._KINDS["chat"]
     aggregate = _instrumentation.openai_instrumentation._KINDS["chat"][1]
 
     def foreign_emit(**_kwargs):
@@ -346,7 +355,7 @@ def test_processor_rewrites_openai_span_to_openrouter_contract() -> None:
         },
     )
 
-    OpenRouterSpanProcessor().on_end(span)
+    _process(span)
 
     assert span._attributes[SpanAttributes.LLM_SYSTEM] == OPENROUTER_SYSTEM_NAME
     assert span._attributes[SpanAttributes.LLM_REQUEST_TYPE] == "chat"
@@ -362,7 +371,7 @@ def test_processor_can_require_openrouter_url_marker() -> None:
     )
     processor = OpenRouterSpanProcessor(normalize_all_openai_spans=False)
 
-    processor.on_end(span_without_marker)
+    _process(span_without_marker, processor=processor)
 
     assert span_without_marker._attributes[SpanAttributes.LLM_SYSTEM] == "openai"
 
@@ -376,7 +385,7 @@ def test_processor_can_require_openrouter_url_marker() -> None:
         },
     )
 
-    processor.on_end(span_with_marker)
+    _process(span_with_marker, processor=processor)
 
     assert span_with_marker._attributes[SpanAttributes.LLM_SYSTEM] == "openrouter"
 
@@ -415,7 +424,7 @@ def test_processor_normalizes_tool_attrs_and_removes_off_contract_aliases() -> N
         },
     )
 
-    OpenRouterSpanProcessor().on_end(span)
+    _process(span)
 
     attrs = span._attributes
     assert json.loads(attrs[SpanAttributes.LLM_REQUEST_FUNCTIONS]) == [
@@ -479,7 +488,7 @@ def test_processor_promotes_new_gen_ai_output_messages_to_canonical_fields() -> 
         },
     )
 
-    OpenRouterSpanProcessor().on_end(span)
+    _process(span)
 
     attrs = span._attributes
     assert attrs[f"{SpanAttributes.LLM_COMPLETIONS}.0.role"] == "assistant"
@@ -512,7 +521,7 @@ def test_processor_ignores_non_openai_spans() -> None:
         _attributes={SpanAttributes.LLM_SYSTEM: "anthropic", "model": "claude"},
     )
 
-    OpenRouterSpanProcessor().on_end(span)
+    _process(span)
 
     assert span._attributes == {
         SpanAttributes.LLM_SYSTEM: "anthropic",

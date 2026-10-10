@@ -6,13 +6,37 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from openlit.semcov import SemanticConvention
+from opentelemetry import trace
 from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor
+from opentelemetry.sdk.util import BoundedList
+from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import (
+    GEN_AI_AGENT_NAME,
+    GEN_AI_INPUT_MESSAGES,
+    GEN_AI_OPERATION_NAME,
+    GEN_AI_OUTPUT_MESSAGES,
+    GEN_AI_PROVIDER_NAME,
+    GEN_AI_SYSTEM_INSTRUCTIONS,
+    GEN_AI_TOOL_CALL_ID,
+    GEN_AI_TOOL_NAME,
+    GEN_AI_USAGE_INPUT_TOKENS,
+    GEN_AI_USAGE_OUTPUT_TOKENS,
+)
+from opentelemetry.semconv.attributes.db_attributes import (
+    DB_OPERATION_NAME,
+    DB_QUERY_TEXT,
+    DB_SYSTEM_NAME,
+)
+from opentelemetry.semconv.attributes.error_attributes import ERROR_TYPE
 from opentelemetry.semconv_ai import LLMRequestTypeValues
 from opentelemetry.semconv_ai import SpanAttributes as TLSpanAttributes
 from opentelemetry.trace import Status, StatusCode
-from respan_sdk.constants import ERROR_MESSAGE_ATTR
 from respan_sdk.constants.llm_logging import LogMethodChoices
-from respan_sdk.constants.span_attributes import RESPAN_LOG_METHOD, RESPAN_LOG_TYPE
+from respan_sdk.constants.span_attributes import (
+    RESPAN_LOG_METHOD,
+    RESPAN_LOG_TYPE,
+    RESPAN_METADATA,
+)
 
 from respan_instrumentation_openlit._constants import (
     OFF_CONTRACT_ALIASES,
@@ -22,6 +46,10 @@ from respan_instrumentation_openlit._constants import (
     OPENLIT_REQUEST_PROVIDER,
     OPENLIT_RESPONSE_TOOL_CALLS,
     OPENLIT_SCOPE_PREFIX,
+    OPENLIT_SOURCE_INPUT,
+    OPENLIT_SOURCE_OUTPUT,
+    OPENLIT_SOURCE_TOOLS,
+    OPENLIT_SOURCE_USAGE,
     OPENLIT_TOOL_ARGS,
     OPENLIT_TOOL_INPUT,
     OPENLIT_TOOL_OUTPUT,
@@ -33,7 +61,6 @@ from respan_instrumentation_openlit._constants import (
 )
 from respan_instrumentation_openlit._serialization import (
     MAX_ATTRIBUTE_BYTES,
-    MAX_COLLECTION_ITEMS,
     MAX_STRING_CHARS,
     safe_text,
     safe_url,
@@ -45,90 +72,35 @@ from respan_instrumentation_openlit._serialization import (
     json_value as _bounded_json_value,
 )
 
-try:
-    from opentelemetry.semconv._incubating.attributes import gen_ai_attributes
-except ImportError:  # pragma: no cover - supported OTel releases provide this module
-    gen_ai_attributes = None
-
-
-def _otel_key(name: str, fallback: str) -> str:
-    if gen_ai_attributes is None:
-        return fallback
-    value = getattr(gen_ai_attributes, name, fallback)
-    return str(getattr(value, "value", value))
-
-
-GEN_AI_OPERATION_NAME = _otel_key("GEN_AI_OPERATION_NAME", "gen_ai.operation.name")
-GEN_AI_PROVIDER_NAME = _otel_key("GEN_AI_PROVIDER_NAME", "gen_ai.provider.name")
-GEN_AI_INPUT_MESSAGES = _otel_key("GEN_AI_INPUT_MESSAGES", "gen_ai.input.messages")
-GEN_AI_OUTPUT_MESSAGES = _otel_key("GEN_AI_OUTPUT_MESSAGES", "gen_ai.output.messages")
-GEN_AI_SYSTEM_INSTRUCTIONS = _otel_key(
-    "GEN_AI_SYSTEM_INSTRUCTIONS", "gen_ai.system_instructions"
-)
-GEN_AI_TOOL_DEFINITIONS = _otel_key(
-    "GEN_AI_TOOL_DEFINITIONS", "gen_ai.tool.definitions"
-)
-GEN_AI_TOOL_NAME = _otel_key("GEN_AI_TOOL_NAME", "gen_ai.tool.name")
-GEN_AI_TOOL_CALL_ARGUMENTS = _otel_key(
-    "GEN_AI_TOOL_CALL_ARGUMENTS", "gen_ai.tool.call.arguments"
-)
-GEN_AI_TOOL_CALL_RESULT = _otel_key(
-    "GEN_AI_TOOL_CALL_RESULT", "gen_ai.tool.call.result"
-)
-GEN_AI_AGENT_NAME = _otel_key("GEN_AI_AGENT_NAME", "gen_ai.agent.name")
-GEN_AI_WORKFLOW_NAME = "gen_ai.workflow.name"
-GEN_AI_USAGE_INPUT_TOKENS = _otel_key(
-    "GEN_AI_USAGE_INPUT_TOKENS", "gen_ai.usage.input_tokens"
-)
-GEN_AI_USAGE_OUTPUT_TOKENS = _otel_key(
-    "GEN_AI_USAGE_OUTPUT_TOKENS", "gen_ai.usage.output_tokens"
-)
-GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS = _otel_key(
-    "GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS",
-    "gen_ai.usage.cache_read.input_tokens",
-)
-GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS = _otel_key(
-    "GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS",
-    "gen_ai.usage.cache_creation.input_tokens",
-)
-DB_SYSTEM_NAME = "db.system.name"
-DB_OPERATION_NAME = "db.operation.name"
-DB_QUERY_TEXT = "db.query.text"
+from ._policy import content_allowed
 
 _PROMPT_PREFIX = f"{TLSpanAttributes.LLM_PROMPTS}."
 _COMPLETION_PREFIX = f"{TLSpanAttributes.LLM_COMPLETIONS}."
-_MODERN_INPUT_USAGE = getattr(
-    TLSpanAttributes, "LLM_USAGE_INPUT_TOKENS", GEN_AI_USAGE_INPUT_TOKENS
-)
-_MODERN_OUTPUT_USAGE = getattr(
-    TLSpanAttributes, "LLM_USAGE_OUTPUT_TOKENS", GEN_AI_USAGE_OUTPUT_TOKENS
-)
-_CACHE_READ_USAGE = getattr(
-    TLSpanAttributes,
-    "LLM_USAGE_CACHE_READ_INPUT_TOKENS",
-    "llm.usage.cache_read_input_tokens",
-)
 
 
-def _json_value(value: Any) -> Any:
+def _json_value(value: Any, *, complete: bool = False, schema: bool = False) -> Any:
     if isinstance(value, str):
-        if len(value.encode("utf-8")) <= MAX_ATTRIBUTE_BYTES:
+        if value.lstrip().startswith(("{", "[", '"')) and (
+            complete or len(value.encode("utf-8")) <= MAX_ATTRIBUTE_BYTES
+        ):
             try:
-                return _bounded_json_value(json.loads(value))
+                return _bounded_json_value(
+                    json.loads(value), complete=complete, schema=schema
+                )
             except (json.JSONDecodeError, TypeError):
                 pass
-        return safe_text(value, limit=MAX_STRING_CHARS)
-    return _bounded_json_value(value)
+        return safe_text(value, limit=None if complete else MAX_STRING_CHARS)
+    return _bounded_json_value(value, complete=complete, schema=schema)
 
 
-def _json_string(value: Any) -> str:
-    return _bounded_json_string(_json_value(value))
+def _json_string(value: Any, *, complete: bool = False, schema: bool = False) -> str:
+    return _bounded_json_string(value, complete=complete, schema=schema)
 
 
 def _sequence(value: Any) -> list[Any]:
-    parsed = _json_value(value)
+    parsed = _json_value(value, complete=True)
     if isinstance(parsed, list):
-        return parsed[:MAX_COLLECTION_ITEMS]
+        return parsed
     if parsed is None:
         return []
     return [parsed]
@@ -172,19 +144,15 @@ def _message_content(message: Mapping[str, Any]) -> Any:
 
 
 def _message_tool_calls(message: Mapping[str, Any]) -> list[dict[str, Any]]:
-    direct = _json_value(message.get("tool_calls"))
+    direct = _json_value(message.get("tool_calls"), complete=True)
     if isinstance(direct, list):
-        return [
-            dict(item)
-            for item in direct[:MAX_COLLECTION_ITEMS]
-            if isinstance(item, Mapping)
-        ]
+        return [dict(item) for item in direct if isinstance(item, Mapping)]
 
     calls: list[dict[str, Any]] = []
     parts = message.get("parts")
     if not isinstance(parts, Sequence) or isinstance(parts, str | bytes):
         return calls
-    for part in parts[:MAX_COLLECTION_ITEMS]:
+    for part in parts:
         if not isinstance(part, Mapping) or part.get("type") not in {
             "tool_call",
             "function_call",
@@ -196,7 +164,7 @@ def _message_tool_calls(message: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "type": "function",
                 "function": {
                     "name": part.get("name"),
-                    "arguments": part.get("arguments") or part.get("args") or "{}",
+                    "arguments": part.get("arguments", part.get("args")),
                 },
             }
         )
@@ -209,9 +177,12 @@ def _set_message_attributes(
     messages: list[Any],
     target_prefix: str,
 ) -> None:
-    for index, raw_message in enumerate(messages[:MAX_COLLECTION_ITEMS]):
+    for index, raw_message in enumerate(messages):
         if isinstance(raw_message, str):
-            message: Mapping[str, Any] = {"role": "user", "content": raw_message}
+            message: Mapping[str, Any] = {
+                "role": "assistant" if target_prefix == _COMPLETION_PREFIX else "user",
+                "content": raw_message,
+            }
         elif isinstance(raw_message, Mapping):
             message = raw_message
         else:
@@ -226,13 +197,43 @@ def _set_message_attributes(
         content = _message_content(message)
         if content is not None:
             attrs[f"{target_prefix}{index}.content"] = (
-                safe_text(content, limit=MAX_STRING_CHARS)
+                safe_text(
+                    content,
+                    limit=None if message.get("tool_call_id") else MAX_STRING_CHARS,
+                )
                 if isinstance(content, str)
-                else _json_string(content)
+                else _json_string(content, complete=bool(message.get("tool_call_id")))
+            )
+        if message.get("tool_call_id") is not None:
+            attrs[f"{target_prefix}{index}.tool_call_id"] = safe_text(
+                message["tool_call_id"], limit=None
             )
         tool_calls = _message_tool_calls(message)
         if tool_calls:
-            attrs[f"{target_prefix}{index}.tool_calls"] = _json_string(tool_calls)
+            for call in tool_calls:
+                function = call.get("function")
+                if (
+                    isinstance(function, dict)
+                    and function.get("arguments") is not None
+                    and not isinstance(function["arguments"], str)
+                ):
+                    function["arguments"] = _json_string(
+                        function["arguments"], complete=True
+                    )
+            attrs[f"{target_prefix}{index}.tool_calls"] = _json_string(
+                tool_calls, complete=True
+            )
+
+
+def _canonical_definition(value):
+    if not isinstance(value, dict) or isinstance(value.get("function"), dict):
+        return value
+    if value.get("type") != "function" or not value.get("name"):
+        return value
+    return {
+        "type": "function",
+        "function": {k: v for k, v in value.items() if k != "type"},
+    }
 
 
 def _scope_name(span: ReadableSpan) -> str:
@@ -279,7 +280,7 @@ def _entity_name(span: ReadableSpan, attrs: Mapping[str, Any], log_type: str) ->
     elif log_type == "agent":
         candidates = (attrs.get(GEN_AI_AGENT_NAME),)
     elif log_type == "workflow":
-        candidates = (attrs.get(GEN_AI_WORKFLOW_NAME),)
+        candidates = (attrs.get(SemanticConvention.GEN_AI_WORKFLOW_NAME),)
     elif log_type == "task" and attrs.get(DB_SYSTEM_NAME):
         candidates = (
             ".".join(
@@ -304,46 +305,45 @@ def _entity_name(span: ReadableSpan, attrs: Mapping[str, Any], log_type: str) ->
     )
 
 
-def _set_usage(attrs: dict[str, Any]) -> None:
-    input_tokens = attrs.get(GEN_AI_USAGE_INPUT_TOKENS)
-    output_tokens = attrs.get(GEN_AI_USAGE_OUTPUT_TOKENS)
-    total_tokens = attrs.pop(OPENLIT_USAGE_TOTAL_TOKENS, None)
-    cache_read_tokens = attrs.get(GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS)
+def _set_usage(attrs):
+    pairs = (
+        (GEN_AI_USAGE_INPUT_TOKENS, TLSpanAttributes.LLM_USAGE_PROMPT_TOKENS),
+        (GEN_AI_USAGE_OUTPUT_TOKENS, TLSpanAttributes.LLM_USAGE_COMPLETION_TOKENS),
+        (
+            SemanticConvention.GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
+            TLSpanAttributes.LLM_USAGE_CACHE_READ_INPUT_TOKENS,
+        ),
+        (
+            SemanticConvention.GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
+            TLSpanAttributes.LLM_USAGE_CACHE_CREATION_INPUT_TOKENS,
+        ),
+    )
+    for source, target in pairs:
+        value = attrs.get(source)
+        if type(value) is int and value >= 0:
+            attrs[target] = value
+        elif value is not None:
+            attrs.pop(source, None)
+    total = attrs.pop(
+        OPENLIT_USAGE_TOTAL_TOKENS, attrs.get(TLSpanAttributes.LLM_USAGE_TOTAL_TOKENS)
+    )
+    if total is None:
+        i, o = (
+            attrs.get(GEN_AI_USAGE_INPUT_TOKENS),
+            attrs.get(GEN_AI_USAGE_OUTPUT_TOKENS),
+        )
+        if type(i) is int and i >= 0 and type(o) is int and o >= 0:
+            total = i + o
+    if type(total) is int and total >= 0:
+        attrs[TLSpanAttributes.LLM_USAGE_TOTAL_TOKENS] = total
+    else:
+        attrs.pop(TLSpanAttributes.LLM_USAGE_TOTAL_TOKENS, None)
 
-    if input_tokens is not None:
-        attrs[TLSpanAttributes.LLM_USAGE_PROMPT_TOKENS] = input_tokens
-        attrs[_MODERN_INPUT_USAGE] = input_tokens
-    if output_tokens is not None:
-        attrs[TLSpanAttributes.LLM_USAGE_COMPLETION_TOKENS] = output_tokens
-        attrs[_MODERN_OUTPUT_USAGE] = output_tokens
-    if total_tokens is None and input_tokens is not None and output_tokens is not None:
-        try:
-            total_tokens = int(input_tokens) + int(output_tokens)
-        except (TypeError, ValueError):
-            total_tokens = None
-    if total_tokens is not None:
-        attrs[TLSpanAttributes.LLM_USAGE_TOTAL_TOKENS] = total_tokens
-    if cache_read_tokens is not None:
-        attrs[_CACHE_READ_USAGE] = cache_read_tokens
 
-
-def _clear_synthetic_usage(attrs: dict[str, Any]) -> None:
-    for key in (
-        GEN_AI_USAGE_INPUT_TOKENS,
-        GEN_AI_USAGE_OUTPUT_TOKENS,
-        GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
-        GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
-        "gen_ai.usage.cache_creation_input_tokens",
-        "gen_ai.usage.cache_read_input_tokens",
-        OPENLIT_USAGE_TOTAL_TOKENS,
-        TLSpanAttributes.LLM_USAGE_PROMPT_TOKENS,
-        TLSpanAttributes.LLM_USAGE_COMPLETION_TOKENS,
-        TLSpanAttributes.LLM_USAGE_TOTAL_TOKENS,
-        _MODERN_INPUT_USAGE,
-        _MODERN_OUTPUT_USAGE,
-        _CACHE_READ_USAGE,
-    ):
-        attrs.pop(key, None)
+def _clear_synthetic_usage(attrs):
+    for key in list(attrs):
+        if key.startswith(("gen_ai.usage.", "llm.usage.")):
+            attrs.pop(key, None)
 
 
 def _strip_content(attrs: dict[str, Any]) -> None:
@@ -351,9 +351,9 @@ def _strip_content(attrs: dict[str, Any]) -> None:
         GEN_AI_INPUT_MESSAGES,
         GEN_AI_OUTPUT_MESSAGES,
         GEN_AI_SYSTEM_INSTRUCTIONS,
-        GEN_AI_TOOL_DEFINITIONS,
-        GEN_AI_TOOL_CALL_ARGUMENTS,
-        GEN_AI_TOOL_CALL_RESULT,
+        SemanticConvention.GEN_AI_TOOL_DEFINITIONS,
+        SemanticConvention.GEN_AI_TOOL_CALL_ARGUMENTS,
+        SemanticConvention.GEN_AI_TOOL_CALL_RESULT,
         "gen_ai.prompt",
         "gen_ai.completion",
         "gen_ai.retrieval.query.text",
@@ -415,70 +415,21 @@ def _sanitize_url_attributes(attrs: dict[str, Any]) -> None:
             attrs.pop(key, None)
 
 
-def _backend_status_code(attrs: Mapping[str, Any], *, is_error: bool) -> int:
-    for key in (
-        "status_code",
-        "http.response.status_code",
-        "http.status_code",
-        "gen_ai.response.status_code",
-    ):
-        value = attrs.get(key)
-        try:
-            if value is not None:
-                code = int(value)
-                return code if not is_error or code >= 400 else 500
-        except (TypeError, ValueError):
-            continue
-    return 500 if is_error else 200
-
-
-def _set_backend_status(
-    span: ReadableSpan, attrs: dict[str, Any], *, capture_content: bool
-) -> None:
+def _sanitize_error(span, attrs, capture_content):
     status = getattr(span, "status", None)
-    otel_error = getattr(status, "status_code", None) is StatusCode.ERROR
-    code = _backend_status_code(attrs, is_error=otel_error)
-    is_error = otel_error or code >= 400
-    if is_error and code < 400:
-        code = 500
-    attrs["status_code"] = code
-    if not is_error:
-        return
-
-    message = attrs.get(ERROR_MESSAGE_ATTR) or getattr(status, "description", None)
-    if not message:
-        for event in getattr(span, "events", ()) or ():
-            event_attrs = getattr(event, "attributes", None) or {}
-            message = event_attrs.get("exception.message")
-            if message:
-                break
-    message = (
-        safe_text(message, default="OpenLIT operation failed", limit=1_024)
-        if capture_content
-        else "OpenLIT operation failed"
-    )
-    attrs[ERROR_MESSAGE_ATTR] = message
-    sanitized_status = Status(StatusCode.ERROR, message)
-    if hasattr(span, "_status"):
-        span._status = sanitized_status
-    else:
-        try:
-            span.status = sanitized_status
-        except AttributeError:
-            pass
-    if capture_content:
-        attrs.setdefault(
-            TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT,
-            _json_string(
-                {
-                    "status": "error",
-                    "error": safe_text(
-                        attrs.get("error.type"), default="OpenLITError", limit=256
-                    ),
-                    "message": message,
-                }
-            ),
+    if getattr(status, "status_code", None) is StatusCode.ERROR:
+        attrs.pop(TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT, None)
+        for key in list(attrs):
+            if key.startswith(_COMPLETION_PREFIX):
+                attrs.pop(key, None)
+        description = (
+            safe_text(getattr(status, "description", None), limit=1024)
+            if capture_content
+            else None
         )
+        span._status = Status(StatusCode.ERROR, description)
+    attrs.pop("status_code", None)
+    attrs.pop("error.message", None)
 
 
 def _remove_openlit_events(span: ReadableSpan) -> None:
@@ -515,7 +466,7 @@ def translate_openlit_span(span: ReadableSpan, *, capture_content: bool) -> bool
         OPENLIT_REQUEST_PROVIDER, None
     )
     if provider is not None:
-        attrs[TLSpanAttributes.LLM_SYSTEM] = safe_text(provider, limit=128)
+        attrs[TLSpanAttributes.LLM_SYSTEM] = safe_text(provider, limit=128).lower()
 
     if _is_truthy(attrs.get("gen_ai.request.stream")):
         attrs[TLSpanAttributes.LLM_IS_STREAMING] = True
@@ -530,6 +481,32 @@ def translate_openlit_span(span: ReadableSpan, *, capture_content: bool) -> bool
     if provider_usage is False:
         _clear_synthetic_usage(attrs)
     else:
+        _set_usage(attrs)
+
+    source_input = attrs.pop(OPENLIT_SOURCE_INPUT, None)
+    if source_input is not None:
+        attrs[GEN_AI_INPUT_MESSAGES] = source_input
+    source_tools = attrs.pop(OPENLIT_SOURCE_TOOLS, None)
+    if source_tools is not None:
+        attrs[SemanticConvention.GEN_AI_TOOL_DEFINITIONS] = source_tools
+    source_output = attrs.pop(OPENLIT_SOURCE_OUTPUT, None)
+    if source_output is not None:
+        attrs[GEN_AI_OUTPUT_MESSAGES] = source_output
+    source_usage = attrs.pop(OPENLIT_SOURCE_USAGE, None)
+    if source_usage is not None:
+        actual = _json_value(source_usage)
+        _clear_synthetic_usage(attrs)
+        for source, target in {
+            "input": GEN_AI_USAGE_INPUT_TOKENS,
+            "output": GEN_AI_USAGE_OUTPUT_TOKENS,
+            "total": TLSpanAttributes.LLM_USAGE_TOTAL_TOKENS,
+            "cache_read": TLSpanAttributes.LLM_USAGE_CACHE_READ_INPUT_TOKENS,
+            "cache_creation": TLSpanAttributes.LLM_USAGE_CACHE_CREATION_INPUT_TOKENS,
+            "reasoning": TLSpanAttributes.LLM_USAGE_REASONING_TOKENS,
+        }.items():
+            value = actual.get(source) if isinstance(actual, dict) else None
+            if type(value) is int and value >= 0:
+                attrs[target] = value
         _set_usage(attrs)
 
     if capture_content:
@@ -566,34 +543,51 @@ def translate_openlit_span(span: ReadableSpan, *, capture_content: bool) -> bool
                 attrs, messages=output_messages, target_prefix=_COMPLETION_PREFIX
             )
 
-        tool_definitions = _json_value(attrs.get(GEN_AI_TOOL_DEFINITIONS))
+        tool_definitions = _json_value(
+            attrs.get(SemanticConvention.GEN_AI_TOOL_DEFINITIONS),
+            complete=True,
+            schema=True,
+        )
         if tool_definitions:
             attrs[TLSpanAttributes.LLM_REQUEST_FUNCTIONS] = _json_string(
-                tool_definitions
+                [_canonical_definition(d) for d in tool_definitions]
+                if isinstance(tool_definitions, list)
+                else tool_definitions,
+                complete=True,
+                schema=True,
             )
-        response_tool_calls = _json_value(attrs.pop(OPENLIT_RESPONSE_TOOL_CALLS, None))
-        if response_tool_calls:
+        response_tool_calls = _json_value(
+            attrs.pop(OPENLIT_RESPONSE_TOOL_CALLS, None), complete=True
+        )
+        if response_tool_calls and source_output is None:
             attrs[f"{_COMPLETION_PREFIX}0.tool_calls"] = _json_string(
-                response_tool_calls
+                response_tool_calls, complete=True
             )
 
         if log_type == "tool":
-            tool_input = attrs.get(GEN_AI_TOOL_CALL_ARGUMENTS)
+            tool_input = attrs.get(SemanticConvention.GEN_AI_TOOL_CALL_ARGUMENTS)
             if tool_input is None:
                 tool_input = attrs.get(OPENLIT_TOOL_ARGS, attrs.get(OPENLIT_TOOL_INPUT))
             tool_output = attrs.get(
-                GEN_AI_TOOL_CALL_RESULT, attrs.get(OPENLIT_TOOL_OUTPUT)
+                SemanticConvention.GEN_AI_TOOL_CALL_RESULT,
+                attrs.get(OPENLIT_TOOL_OUTPUT),
             )
             if tool_input is not None:
                 attrs[TLSpanAttributes.TRACELOOP_ENTITY_INPUT] = _json_string(
-                    _json_value(tool_input)
+                    {
+                        "name": entity_name,
+                        "arguments": _json_value(tool_input, complete=True),
+                    },
+                    complete=True,
                 )
             if tool_output is not None:
                 attrs[TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT] = _json_string(
-                    _json_value(tool_output)
+                    _json_value(tool_output, complete=True), complete=True
                 )
             for key in list(attrs):
-                if key.startswith("gen_ai.tool."):
+                if key.startswith("gen_ai.tool.") and not (
+                    log_type == "tool" and key == GEN_AI_TOOL_CALL_ID
+                ):
                     attrs.pop(key, None)
         elif log_type == "workflow":
             workflow_input = attrs.get(OPENLIT_WORKFLOW_INPUT)
@@ -612,36 +606,266 @@ def translate_openlit_span(span: ReadableSpan, *, capture_content: bool) -> bool
             )
     else:
         _strip_content(attrs)
+        attrs = _private_attributes(attrs)
 
     for key in list(attrs):
-        if key.startswith("gen_ai.tool."):
+        if key.startswith("gen_ai.tool.") and not (
+            log_type == "tool" and key == GEN_AI_TOOL_CALL_ID
+        ):
             attrs.pop(key, None)
 
-    _set_backend_status(span, attrs, capture_content=capture_content)
+    _sanitize_error(span, attrs, capture_content)
     _remove_openlit_events(span)
     _sanitize_url_attributes(attrs)
     for key in OFF_CONTRACT_ALIASES:
         attrs.pop(key, None)
     _strip_openlit_vendor_attributes(attrs)
+    for key, value in list(attrs.items()):
+        if isinstance(value, str):
+            attrs[key] = safe_text(value, limit=None)
     span._attributes = attrs
     return True
 
 
+def _private_attributes(attrs):
+    structural = {
+        RESPAN_LOG_TYPE,
+        RESPAN_LOG_METHOD,
+        TLSpanAttributes.TRACELOOP_ENTITY_NAME,
+        TLSpanAttributes.TRACELOOP_ENTITY_PATH,
+        TLSpanAttributes.LLM_REQUEST_TYPE,
+        TLSpanAttributes.LLM_SYSTEM,
+        TLSpanAttributes.LLM_REQUEST_MODEL,
+        TLSpanAttributes.LLM_RESPONSE_MODEL,
+        TLSpanAttributes.LLM_IS_STREAMING,
+        GEN_AI_OPERATION_NAME,
+        GEN_AI_PROVIDER_NAME,
+        GEN_AI_TOOL_CALL_ID,
+        ERROR_TYPE,
+        DB_SYSTEM_NAME,
+        DB_OPERATION_NAME,
+        "server.address",
+        "server.port",
+        GEN_AI_USAGE_INPUT_TOKENS,
+        GEN_AI_USAGE_OUTPUT_TOKENS,
+        TLSpanAttributes.LLM_USAGE_PROMPT_TOKENS,
+        TLSpanAttributes.LLM_USAGE_COMPLETION_TOKENS,
+        TLSpanAttributes.LLM_USAGE_TOTAL_TOKENS,
+        TLSpanAttributes.LLM_USAGE_CACHE_READ_INPUT_TOKENS,
+        TLSpanAttributes.LLM_USAGE_CACHE_CREATION_INPUT_TOKENS,
+        TLSpanAttributes.LLM_USAGE_REASONING_TOKENS,
+        "http.response.status_code",
+    }
+    kept = {
+        k: v
+        for k, v in attrs.items()
+        if k in structural
+        or k.startswith(("respan.threads.", "respan.trace.", "respan.customer_params."))
+    }
+    markers = {
+        "run_id",
+        "example_run_id",
+        "framework",
+        "example",
+        "scenario",
+        "example_set",
+        "workflow_name",
+    }
+    try:
+        metadata = _json_value(attrs.get(RESPAN_METADATA))
+    except Exception:  # noqa: BLE001 - content stays excluded if serialization fails.
+        metadata = None
+    if isinstance(metadata, dict):
+        metadata = {k: v for k, v in metadata.items() if k in markers}
+        if metadata:
+            kept[RESPAN_METADATA] = _json_string(metadata)
+    for key, value in attrs.items():
+        if (
+            key.startswith(RESPAN_METADATA + ".")
+            and key[len(RESPAN_METADATA) + 1 :] in markers
+        ):
+            kept[key] = value
+    return kept
+
+
+def _span_key(span):
+    c = span.get_span_context()
+    return c.trace_id, c.span_id
+
+
 class OpenLITSpanProcessor(SpanProcessor):
-    """First-in-pipeline processor that normalizes OpenLIT native spans."""
+    """Owned native spans retain their initial capture bound and observed vetoes."""
 
-    def __init__(self, *, capture_content: bool = True) -> None:
+    def __init__(self, *, capture_content=True):
         self.capture_content = capture_content
+        self.active = True
+        self._spans = {}
+        self._capture = {}
+        self._parents = {}
+        self._closed = {}
+        self._closing_provider = None
+        self._detach_hook = None
+        import threading
 
-    def on_start(self, span: Any, parent_context: Any = None) -> None:
-        del span, parent_context
+        self._lock = threading.RLock()
 
-    def on_end(self, span: ReadableSpan) -> None:
-        translate_openlit_span(span, capture_content=self.capture_content)
+    def on_start(self, span, parent_context=None):
+        if not self.active:
+            return
+        span._respan_openlit_processor = self
+        sid = _span_key(span)
+        parent_span = trace.get_current_span(parent_context)
+        parent = (
+            _span_key(parent_span) if parent_span.get_span_context().is_valid else None
+        )
+        with self._lock:
+            if (
+                parent is not None
+                and parent not in self._capture
+                and parent not in self._closed
+            ):
+                self._spans[parent] = parent_span
+                self._capture[parent] = content_allowed(
+                    self.capture_content, parent_context
+                )
+                ancestor = getattr(parent_span, "parent", None)
+                self._parents[parent] = (
+                    (ancestor.trace_id, ancestor.span_id)
+                    if ancestor is not None and ancestor.is_valid
+                    else None
+                )
+            permitted = content_allowed(
+                self.capture_content, parent_context
+            ) and self._capture.get(parent, self._closed.get(parent, True))
+            self._spans[sid] = span
+            self._capture[sid] = permitted
+            self._parents[sid] = parent
+            if not permitted:
+                self.veto(span)
 
-    def shutdown(self) -> None:
-        return None
+    def observe_detach(self, span):
+        sid = _span_key(span)
+        with self._lock:
+            if sid not in self._spans and sid in self._parents.values():
+                self._spans[sid] = span
+                self._capture[sid] = True
+                ancestor = getattr(span, "parent", None)
+                self._parents[sid] = (
+                    (ancestor.trace_id, ancestor.span_id)
+                    if ancestor is not None and ancestor.is_valid
+                    else None
+                )
+            if sid in self._spans and (
+                not content_allowed(self.capture_content)
+                or not self._ancestors_allowed(sid)
+            ):
+                self.veto(span)
 
-    def force_flush(self, timeout_millis: int = 30_000) -> bool:
-        del timeout_millis
+    @staticmethod
+    def _clear_live_content(current):
+        if current.is_recording() and _is_openlit_span(
+            current, current.attributes or {}
+        ):
+            kept = _private_attributes(dict(current.attributes or {}))
+            current._attributes.clear()
+            current._attributes.update(kept)
+            current._events = BoundedList(0)
+            if current.status.status_code is StatusCode.ERROR:
+                current._status = Status(StatusCode.ERROR)
+
+    def veto(self, span):
+        sid = _span_key(span)
+        with self._lock:
+            seen = set()
+            while sid and sid not in seen:
+                seen.add(sid)
+                if sid in self._spans:
+                    self._capture[sid] = False
+                if sid in self._closed:
+                    self._closed[sid] = False
+                current = self._spans.get(sid)
+                if current is not None:
+                    self._clear_live_content(current)
+                sid = self._parents.get(sid)
+            for key, current in self._spans.items():
+                if not self._ancestors_allowed(key):
+                    self._capture[key] = False
+                    self._clear_live_content(current)
+
+    def _ancestors_allowed(self, sid):
+        seen = set()
+        while sid and sid not in seen:
+            seen.add(sid)
+            if not self._capture.get(sid, self._closed.get(sid, True)):
+                return False
+            sid = self._parents.get(sid)
+        return True
+
+    def allowed(self, span):
+        if not getattr(span, "is_recording", lambda: False)():
+            return False
+        with self._lock:
+            if not content_allowed(self.capture_content) or not self._ancestors_allowed(
+                _span_key(span)
+            ):
+                self.veto(span)
+            sid = _span_key(span)
+            return self.active and self._capture.get(sid, False)
+
+    def on_end(self, span):
+        sid = _span_key(span)
+        with self._lock:
+            if sid not in self._spans:
+                return
+            if not content_allowed(self.capture_content) or not self._ancestors_allowed(
+                _span_key(span)
+            ):
+                self.veto(span)
+            capture = self._capture.pop(sid, False)
+            self._closed[sid] = capture
+            self._spans.pop(sid, None)
+            if len(self._closed) > 4096:
+                old = next(iter(self._closed))
+                self._closed.pop(old, None)
+                self._parents.pop(old, None)
+        try:
+            translate_openlit_span(span, capture_content=capture)
+        except Exception:  # noqa: BLE001 - telemetry must preserve native outcomes.
+            if _is_openlit_span(span, span.attributes or {}):
+                span._attributes = _private_attributes(dict(span.attributes or {}))
+                span._events = ()
+                if span.status.status_code is StatusCode.ERROR:
+                    span._status = Status(StatusCode.ERROR)
+
+        self._finish_retirement()
+
+    def retire(self, provider):
+        self.active = False
+        self._closing_provider = provider
+        self._finish_retirement()
+
+    def _finish_retirement(self):
+        if self._closing_provider is not None and not any(
+            _is_openlit_span(s, getattr(s, "attributes", {}) or {})
+            for s in self._spans.values()
+        ):
+            from ._instrumentation import _unregister
+
+            _unregister(self._closing_provider, self)
+            self._closing_provider = None
+            self.shutdown()
+
+    def shutdown(self):
+        from ._guard import remove_context_guard
+
+        remove_context_guard(self._detach_hook)
+        self._detach_hook = None
+        self.active = False
+        with self._lock:
+            self._spans.clear()
+            self._capture.clear()
+            self._parents.clear()
+            self._closed.clear()
+
+    def force_flush(self, timeout_millis=30000):
         return True

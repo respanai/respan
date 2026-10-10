@@ -94,7 +94,10 @@ def test_tool_span_uses_entity_input_and_output() -> None:
     attrs = span._attributes
     assert attrs[RESPAN_LOG_TYPE] == "tool"
     assert attrs[SpanAttributes.TRACELOOP_ENTITY_NAME] == "weather"
-    assert json.loads(attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT]) == {"city": "Paris"}
+    assert json.loads(attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT]) == {
+        "name": "weather",
+        "arguments": {"city": "Paris"},
+    }
     assert json.loads(attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]) == {
         "temperature": 18
     }
@@ -153,10 +156,10 @@ def test_capture_content_false_strips_all_content_and_exception_events() -> None
     translate_openlit_span(span, capture_content=False)
 
     assert secret not in json.dumps(span._attributes)
-    assert span._attributes["error.message"] == "OpenLIT operation failed"
+    assert "error.message" not in span._attributes
     assert span.events == ()
     assert secret not in (span.status.description or "")
-    assert span.status.description == "OpenLIT operation failed"
+    assert span.status.description is None
 
 
 def test_url_attributes_remove_credentials_query_and_fragment_in_both_modes() -> None:
@@ -177,6 +180,10 @@ def test_url_attributes_remove_credentials_query_and_fragment_in_both_modes() ->
 
         translate_openlit_span(span, capture_content=capture_content)
 
+        if not capture_content:
+            assert "url.full" not in span._attributes
+            assert "client.base_url" not in span._attributes
+            continue
         assert span._attributes["url.full"] == ("https://host.example/v1/models")
         assert span._attributes["client.base_url"] == "https://api.example/v1"
         assert span._attributes["server.address"] == "host.example"

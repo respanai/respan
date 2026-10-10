@@ -51,7 +51,7 @@ def test_openlit_vendor_attributes_are_stripped_after_canonical_mapping() -> Non
     assert attrs["server.address"] == "api.openai.com"
     assert attrs["http.response.status_code"] == 202
     assert attrs["openai.response.system_fingerprint"] == "fp_test"
-    assert attrs["status_code"] == 202
+    assert "status_code" not in attrs
     assert not any(key.startswith("openlit.") for key in attrs)
     assert all(
         not key.startswith("gen_ai.") or key in STANDARD_GEN_AI_ATTRIBUTES

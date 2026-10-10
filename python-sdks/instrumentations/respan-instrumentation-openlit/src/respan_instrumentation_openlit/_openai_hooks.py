@@ -9,26 +9,34 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import logging
 import sys
 from collections.abc import Callable, Mapping
+from contextvars import ContextVar
 from functools import wraps
 from types import TracebackType
 from typing import Any, Self
 
+from openlit.semcov import SemanticConvention
 from opentelemetry import trace
 from opentelemetry.semconv.attributes.http_attributes import (
     HTTP_RESPONSE_STATUS_CODE,
 )
 from opentelemetry.semconv_ai import SpanAttributes
 from opentelemetry.trace import Status, StatusCode
-from respan_sdk.constants import ERROR_MESSAGE_ATTR
 from wrapt import FunctionWrapper
 
-from respan_instrumentation_openlit._constants import OPENLIT_PROVIDER_USAGE
+from respan_instrumentation_openlit._constants import (
+    OPENLIT_PROVIDER_USAGE,
+    OPENLIT_RAW_USAGE_OBSERVED,
+    OPENLIT_SOURCE_INPUT,
+    OPENLIT_SOURCE_OUTPUT,
+    OPENLIT_SOURCE_TOOLS,
+    OPENLIT_SOURCE_USAGE,
+)
 from respan_instrumentation_openlit._processor import (
     GEN_AI_INPUT_MESSAGES,
     GEN_AI_OUTPUT_MESSAGES,
-    GEN_AI_TOOL_DEFINITIONS,
 )
 from respan_instrumentation_openlit._serialization import (
     input_messages,
@@ -36,6 +44,11 @@ from respan_instrumentation_openlit._serialization import (
     safe_text,
     tool_definitions,
 )
+
+from ._policy import allowed
+
+logger = logging.getLogger(__name__)
+_RAW_SPAN = ContextVar("respan_openlit_raw_span", default=None)
 
 RequestHook = tuple[Any, str, Callable[..., Any], Callable[..., Any]]
 ChunkHook = tuple[Any, str, Callable[..., Any], Callable[..., Any]]
@@ -182,7 +195,7 @@ def _safe_get(value: Any, name: str, default: Any = None) -> Any:
         if isinstance(value, Mapping):
             return value.get(name, default)
         return getattr(value, name, default)
-    except Exception:  # noqa: BLE001 - SDK/user objects may expose descriptors.
+    except Exception:  # noqa: BLE001 - telemetry must preserve native outcomes.  # noqa: BLE001 - SDK/user objects may expose descriptors.
         return default
 
 
@@ -223,7 +236,7 @@ def _set_request_attributes(
     max_content_length: int,
     is_embedding: bool,
 ) -> None:
-    if not capture_content:
+    if not allowed(span, capture_content):
         return
     request_input = kwargs.get("messages")
     if request_input is None:
@@ -238,19 +251,157 @@ def _set_request_attributes(
             span.set_attribute(
                 GEN_AI_INPUT_MESSAGES,
                 json_string(
-                    input_messages(request_input), max_bytes=max_content_length
+                    input_messages(request_input),
+                    max_bytes=max_content_length,
+                    complete=True,
                 ),
+            )
+            span.set_attribute(
+                OPENLIT_SOURCE_INPUT, span.attributes[GEN_AI_INPUT_MESSAGES]
             )
     tools = kwargs.get("tools")
     if tools:
         span.set_attribute(
-            GEN_AI_TOOL_DEFINITIONS,
-            json_string(tool_definitions(tools), max_bytes=max_content_length),
+            SemanticConvention.GEN_AI_TOOL_DEFINITIONS,
+            json_string(
+                tool_definitions(tools),
+                max_bytes=max_content_length,
+                complete=True,
+                schema=True,
+            ),
+        )
+        span.set_attribute(
+            OPENLIT_SOURCE_TOOLS,
+            span.attributes[SemanticConvention.GEN_AI_TOOL_DEFINITIONS],
         )
 
 
-def _mark_response(span: Any, response: Any) -> None:
-    span.set_attribute(OPENLIT_PROVIDER_USAGE, _has_provider_usage(response))
+def _valid_count(value):
+    return value if type(value) is int and value >= 0 else None
+
+
+def _source_usage(response):
+    usage = _safe_get(response, "usage")
+    if usage is None:
+        return {}
+    actual = {}
+    fields = {
+        "input": ("prompt_tokens", "input_tokens"),
+        "output": ("completion_tokens", "output_tokens"),
+        "total": ("total_tokens",),
+    }
+    for target, names in fields.items():
+        for name in names:
+            value = _valid_count(_safe_get(usage, name))
+            if value is not None:
+                actual[target] = value
+                break
+    for details_name in (
+        "prompt_tokens_details",
+        "input_tokens_details",
+        "input_token_details",
+    ):
+        details = _safe_get(usage, details_name)
+        for target, names in {
+            "cache_read": ("cached_tokens", "cache_read_tokens"),
+            "cache_creation": ("cache_write_tokens", "cache_creation_tokens"),
+        }.items():
+            for name in names:
+                value = _valid_count(_safe_get(details, name))
+                if value is not None:
+                    actual[target] = value
+                    break
+    for details_name in (
+        "completion_tokens_details",
+        "output_tokens_details",
+        "output_token_details",
+    ):
+        value = _valid_count(
+            _safe_get(_safe_get(usage, details_name), "reasoning_tokens")
+        )
+        if value is not None:
+            actual["reasoning"] = value
+    return actual
+
+
+def _response_messages(response):
+    choices = _safe_get(response, "choices")
+    if isinstance(choices, list):
+        messages = []
+        for choice in choices:
+            message = _safe_get(choice, "message")
+            if message is None:
+                continue
+            result = {
+                k: _safe_get(message, k)
+                for k in ("role", "content")
+                if _safe_get(message, k) is not None
+            }
+            calls = _safe_get(message, "tool_calls")
+            if isinstance(calls, list):
+                result["tool_calls"] = [
+                    {
+                        "id": _safe_get(c, "id"),
+                        "type": "function",
+                        "function": {
+                            "name": _safe_get(_safe_get(c, "function"), "name"),
+                            "arguments": _safe_get(
+                                _safe_get(c, "function"), "arguments"
+                            ),
+                        },
+                    }
+                    for c in calls
+                ]
+            messages.append(result)
+        return messages
+    output = _safe_get(response, "output")
+    if not isinstance(output, list):
+        return None
+    messages = []
+    calls = []
+    for item in output:
+        kind = _safe_get(item, "type")
+        if kind == "message":
+            parts = _safe_get(item, "content")
+            if isinstance(parts, list):
+                text = "".join(
+                    _safe_get(part, "text", "")
+                    for part in parts
+                    if _safe_get(part, "type") == "output_text"
+                    and isinstance(_safe_get(part, "text"), str)
+                )
+                messages.append(
+                    {"role": _safe_get(item, "role", "assistant"), "content": text}
+                )
+        elif kind == "function_call":
+            calls.append(
+                {
+                    "id": _safe_get(item, "call_id"),
+                    "type": "function",
+                    "function": {
+                        "name": _safe_get(item, "name"),
+                        "arguments": _safe_get(item, "arguments"),
+                    },
+                }
+            )
+    if calls:
+        messages.append({"role": "assistant", "tool_calls": calls})
+    return messages
+
+
+def _mark_response(span, response):
+    if not span.attributes.get(OPENLIT_RAW_USAGE_OBSERVED):
+        span.set_attribute(OPENLIT_PROVIDER_USAGE, _has_provider_usage(response))
+        span.set_attribute(
+            OPENLIT_SOURCE_USAGE, json_string(_source_usage(response), complete=True)
+        )
+    if allowed(span):
+        messages = _response_messages(response)
+        if messages is not None:
+            span.set_attribute(
+                OPENLIT_SOURCE_OUTPUT,
+                json_string(messages, complete=True),
+            )
 
 
 def _mark_error(span: Any, error: BaseException) -> None:
@@ -258,68 +409,161 @@ def _mark_error(span: Any, error: BaseException) -> None:
     if status_code is not None:
         span.set_attribute(HTTP_RESPONSE_STATUS_CODE, status_code)
     span.set_attribute(OPENLIT_PROVIDER_USAGE, False)
+    span.set_attribute(OPENLIT_SOURCE_USAGE, "{}")
 
 
-def _sync_wrapper(
-    original: Callable[..., Any],
-    *,
-    capture_content: bool,
-    max_content_length: int,
-    is_embedding: bool,
-) -> Callable[..., Any]:
+def _observe_request(span, kwargs, capture_content, max_content_length, is_embedding):
+    if span is None:
+        return
+    try:
+        _set_request_attributes(
+            span,
+            kwargs,
+            capture_content=capture_content,
+            max_content_length=max_content_length,
+            is_embedding=is_embedding,
+        )
+    except Exception:  # noqa: BLE001 - telemetry must preserve native outcomes.
+        from ._instrumentation import _PROCESSOR
+
+        if _PROCESSOR is not None:
+            _PROCESSOR.veto(span)
+
+
+def _observe_end(span, response=None, error=None):
+    if span is None:
+        return
+    try:
+        allowed(span)
+        if error is not None:
+            _mark_error(span, error)
+        else:
+            _mark_response(span, response)
+    except Exception as exc:  # noqa: BLE001 - preserve provider outcomes.
+        logger.debug("OpenLIT observer skipped: %s", type(exc).__name__)
+
+
+def _sync_wrapper(original, *, capture_content, max_content_length, is_embedding):
     @wraps(original)
-    def wrapped(*args: Any, **kwargs: Any) -> Any:
-        span = _openlit_span()
-        if span is not None:
-            _set_request_attributes(
-                span,
-                kwargs,
-                capture_content=capture_content,
-                max_content_length=max_content_length,
-                is_embedding=is_embedding,
-            )
+    def wrapped(*args, **kwargs):
+        span = _openlit_span() if wrapped._respan_active else None
+        _observe_request(
+            span, kwargs, capture_content, max_content_length, is_embedding
+        )
         try:
             result = original(*args, **kwargs)
-        except Exception as exc:
-            if span is not None:
-                _mark_error(span, exc)
+        except BaseException as exc:
+            _observe_end(span, error=exc)
             raise
-        if span is not None:
-            _mark_response(span, result)
+        _observe_end(span, response=result)
         return result
 
+    wrapped._respan_active = True
     return wrapped
 
 
-def _async_wrapper(
-    original: Callable[..., Any],
-    *,
-    capture_content: bool,
-    max_content_length: int,
-    is_embedding: bool,
-) -> Callable[..., Any]:
+def _async_wrapper(original, *, capture_content, max_content_length, is_embedding):
     @wraps(original)
-    async def wrapped(*args: Any, **kwargs: Any) -> Any:
-        span = _openlit_span()
-        if span is not None:
-            _set_request_attributes(
-                span,
-                kwargs,
-                capture_content=capture_content,
-                max_content_length=max_content_length,
-                is_embedding=is_embedding,
-            )
+    async def wrapped(*args, **kwargs):
+        span = _openlit_span() if wrapped._respan_active else None
+        _observe_request(
+            span, kwargs, capture_content, max_content_length, is_embedding
+        )
         try:
             result = await original(*args, **kwargs)
-        except Exception as exc:
-            if span is not None:
-                _mark_error(span, exc)
+        except BaseException as exc:
+            _observe_end(span, error=exc)
             raise
-        if span is not None:
-            _mark_response(span, result)
+        _observe_end(span, response=result)
         return result
 
+    wrapped._respan_active = True
     return wrapped
+
+
+def _observe_raw_usage(body, span):
+    if span is None or not span.is_recording() or not isinstance(body, dict):
+        return
+    span.set_attribute(OPENLIT_RAW_USAGE_OBSERVED, True)
+    actual = _source_usage(
+        body.get("response") if isinstance(body.get("response"), dict) else body
+    )
+    existing = span.attributes.get(OPENLIT_SOURCE_USAGE)
+    if existing is None:
+        span.set_attribute(OPENLIT_SOURCE_USAGE, "{}")
+    if actual or existing is None:
+        span.set_attribute(OPENLIT_SOURCE_USAGE, json_string(actual, complete=True))
+    span.set_attribute(
+        OPENLIT_PROVIDER_USAGE, bool(actual) or bool(existing and existing != "{}")
+    )
+
+
+def _install_raw_usage_hooks(hooks):
+    for module_name, class_name, asynchronous in [
+        ("openai._response", "APIResponse", False),
+        ("openai._response", "AsyncAPIResponse", True),
+        ("openai._legacy_response", "LegacyAPIResponse", False),
+    ]:
+        owner = getattr(importlib.import_module(module_name), class_name)
+        original = owner.parse
+        if asynchronous:
+
+            def factory(original):
+                @wraps(original)
+                async def parse(instance, *args, **kwargs):
+                    span = _openlit_span() if parse._respan_active else None
+                    result = await original(instance, *args, **kwargs)
+                    _observe_http_usage(instance, span)
+                    return result
+
+                parse._respan_active = True
+                return parse
+        else:
+
+            def factory(original):
+                @wraps(original)
+                def parse(instance, *args, **kwargs):
+                    span = _openlit_span() if parse._respan_active else None
+                    result = original(instance, *args, **kwargs)
+                    _observe_http_usage(instance, span)
+                    return result
+
+                parse._respan_active = True
+                return parse
+
+        replacement = factory(original)
+        owner.parse = replacement
+        hooks.append((owner, "parse", original, replacement))
+    owner = importlib.import_module("openai._streaming").ServerSentEvent
+    original = owner.json
+
+    @wraps(original)
+    def event_json(instance, *args, **kwargs):
+        result = original(instance, *args, **kwargs)
+        if event_json._respan_active:
+            try:
+                _observe_raw_usage(result, _RAW_SPAN.get())
+            except Exception as exc:  # noqa: BLE001 - native SSE values/errors are preserved.
+                logger.debug("OpenLIT raw SSE usage skipped: %s", type(exc).__name__)
+        return result
+
+    event_json._respan_active = True
+    owner.json = event_json
+    hooks.append((owner, "json", original, event_json))
+
+
+def _observe_http_usage(instance, span):
+    if span is None or not span.is_recording():
+        return
+    try:
+        response = instance.http_response
+        if (
+            "json" in response.headers.get("content-type", "")
+            and response.is_stream_consumed
+        ):
+            _observe_raw_usage(response.json(), span)
+    except Exception as exc:  # noqa: BLE001 - source observation never changes parsing.
+        logger.debug("OpenLIT raw HTTP usage skipped: %s", type(exc).__name__)
 
 
 def install_openai_request_hooks(
@@ -361,6 +605,7 @@ def install_openai_request_hooks(
             )
             setattr(owner, method_name, replacement)
             hooks.append((owner, method_name, original, replacement))
+        _install_raw_usage_hooks(hooks)
     except Exception:
         remove_openai_request_hooks(hooks)
         raise
@@ -371,6 +616,7 @@ def remove_openai_request_hooks(hooks: list[RequestHook]) -> None:
     """Restore only OpenAI methods which still contain this adapter's hook."""
 
     for owner, method_name, original, replacement in reversed(hooks):
+        replacement._respan_active = False
         current = vars(owner).get(method_name)
         if current is replacement:
             setattr(owner, method_name, original)
@@ -383,6 +629,14 @@ def remove_openai_request_hooks(hooks: list[RequestHook]) -> None:
                 current.__wrapped__ = original
                 break
             current = wrapped
+
+
+def _checkpoint(span, configured=True):
+    try:
+        return allowed(span, configured)
+    except Exception as exc:  # noqa: BLE001 - policy observers preserve native outcomes.
+        logger.debug("OpenLIT checkpoint skipped: %s", type(exc).__name__)
+        return False
 
 
 def _finish_early_stream(
@@ -398,7 +652,8 @@ def _finish_early_stream(
     is_recording = _safe_get(span, "is_recording")
     if span is None or not callable(is_recording) or not is_recording():
         return
-    if capture_content:
+    permitted = _checkpoint(span, capture_content)
+    if error is None and permitted:
         partial_text = _safe_get(scope, "_llmresponse")
         if isinstance(partial_text, str) and partial_text:
             span.set_attribute(
@@ -416,7 +671,6 @@ def _finish_early_stream(
                                     ),
                                 }
                             ],
-                            "finish_reason": "cancelled",
                         }
                     ],
                     max_bytes=max_content_length,
@@ -426,7 +680,6 @@ def _finish_early_stream(
         span.set_status(Status(StatusCode.OK))
     else:
         message = safe_text(type(error).__name__, default="stream cancelled")
-        span.set_attribute(ERROR_MESSAGE_ATTR, message)
         status_code = _http_status_code(error)
         if status_code is not None:
             span.set_attribute(HTTP_RESPONSE_STATUS_CODE, status_code)
@@ -455,7 +708,14 @@ class _SyncStreamProxy:
         if self._finished:
             raise StopIteration
         try:
-            return next(self._wrapped)
+            _checkpoint(_safe_get(self._wrapped, "_span"), self._capture_content)
+            token = _RAW_SPAN.set(_safe_get(self._wrapped, "_span"))
+            try:
+                result = next(self._wrapped)
+            finally:
+                _RAW_SPAN.reset(token)
+            _checkpoint(_safe_get(self._wrapped, "_span"), self._capture_content)
+            return result
         except StopIteration:
             self._finished = True
             raise
@@ -550,7 +810,14 @@ class _AsyncStreamProxy:
         if self._finished:
             raise StopAsyncIteration
         try:
-            return await self._wrapped.__anext__()
+            _checkpoint(_safe_get(self._wrapped, "_span"), self._capture_content)
+            token = _RAW_SPAN.set(_safe_get(self._wrapped, "_span"))
+            try:
+                result = await self._wrapped.__anext__()
+            finally:
+                _RAW_SPAN.reset(token)
+            _checkpoint(_safe_get(self._wrapped, "_span"), self._capture_content)
+            return result
         except StopAsyncIteration:
             self._finished = True
             raise
@@ -645,6 +912,9 @@ def _sync_stream_factory(
     def factory(*factory_args: Any, **factory_kwargs: Any) -> Callable[..., Any]:
         upstream_wrapper = original(*factory_args, **factory_kwargs)
         capture_content = _factory_capture_content(factory_args, factory_kwargs)
+        processor = (
+            _safe_get(factory_args[3], "processor") if len(factory_args) > 3 else None
+        )
 
         @wraps(upstream_wrapper)
         def wrapper(
@@ -653,6 +923,8 @@ def _sync_stream_factory(
             args: tuple[Any, ...],
             kwargs: dict[str, Any],
         ) -> Any:
+            if processor is not None and not processor.active:
+                return wrapped(*args, **kwargs)
             result = upstream_wrapper(wrapped, instance, args, kwargs)
             if kwargs.get("stream") and _safe_get(result, "_span") is not None:
                 return _SyncStreamProxy(
@@ -674,6 +946,9 @@ def _async_stream_factory(
     def factory(*factory_args: Any, **factory_kwargs: Any) -> Callable[..., Any]:
         upstream_wrapper = original(*factory_args, **factory_kwargs)
         capture_content = _factory_capture_content(factory_args, factory_kwargs)
+        processor = (
+            _safe_get(factory_args[3], "processor") if len(factory_args) > 3 else None
+        )
 
         @wraps(upstream_wrapper)
         async def wrapper(
@@ -682,6 +957,8 @@ def _async_stream_factory(
             args: tuple[Any, ...],
             kwargs: dict[str, Any],
         ) -> Any:
+            if processor is not None and not processor.active:
+                return await wrapped(*args, **kwargs)
             result = await upstream_wrapper(wrapped, instance, args, kwargs)
             if kwargs.get("stream") and _safe_get(result, "_span") is not None:
                 return _AsyncStreamProxy(
@@ -762,7 +1039,21 @@ def install_openai_stream_usage_hooks() -> list[ChunkHook]:
                     if _has_provider_usage(response):
                         span = getattr(scope, "_span", None)
                         if span is not None:
-                            span.set_attribute(OPENLIT_PROVIDER_USAGE, True)
+                            try:
+                                _checkpoint(span)
+                                if not span.attributes.get(OPENLIT_RAW_USAGE_OBSERVED):
+                                    span.set_attribute(OPENLIT_PROVIDER_USAGE, True)
+                                    span.set_attribute(
+                                        OPENLIT_SOURCE_USAGE,
+                                        json_string(
+                                            _source_usage(response), complete=True
+                                        ),
+                                    )
+                            except Exception as exc:  # noqa: BLE001 - preserve chunk identity/error.
+                                logger.debug(
+                                    "OpenLIT chunk observation skipped: %s",
+                                    type(exc).__name__,
+                                )
                     return result
 
                 setattr(module, name, process_chunk)

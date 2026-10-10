@@ -13,6 +13,11 @@ OPENLIT_TOOL_ARGS = "gen_ai.tool.args"
 OPENLIT_WORKFLOW_INPUT = "gen_ai.workflow.input"
 OPENLIT_WORKFLOW_OUTPUT = "gen_ai.workflow.output"
 OPENLIT_PROVIDER_USAGE = "openlit.respan.provider_usage"
+OPENLIT_SOURCE_USAGE = "openlit.respan.source_usage"
+OPENLIT_SOURCE_OUTPUT = "openlit.respan.source_output"
+OPENLIT_SOURCE_INPUT = "openlit.respan.source_input"
+OPENLIT_SOURCE_TOOLS = "openlit.respan.source_tools"
+OPENLIT_RAW_USAGE_OBSERVED = "openlit.respan.raw_usage_observed"
 
 OPENLIT_OPERATION_LOG_TYPES = {
     "chat": "chat",
