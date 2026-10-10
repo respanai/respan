@@ -1,0 +1,9 @@
+{
+  "summary": "Support current Chroma, Elasticsearch, LanceDB, and Marqo Python APIs with complete sampled content and native lifecycle handling",
+  "packages": {
+    "respan-instrumentation-chroma": "minor",
+    "respan-instrumentation-elasticsearch": "minor",
+    "respan-instrumentation-lancedb": "minor",
+    "respan-instrumentation-marqo": "minor"
+  }
+}

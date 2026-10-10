@@ -12,10 +12,10 @@ packages = [
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
 respan-tracing = "^2.17.0"
-respan-sdk = ">=2.6.1"
+respan-sdk = ">=2.6.26"
 elasticsearch = ">=8.13.0,<10.0.0"
 elastic-transport = ">=8.13.0,<10.0.0"
-opentelemetry-semantic-conventions-ai = ">=0.4.1"
+opentelemetry-semantic-conventions-ai = ">=0.5.1,<0.6"
 wrapt = ">=1.16.0"
 
 [tool.poetry.plugins."respan.instrumentations"]

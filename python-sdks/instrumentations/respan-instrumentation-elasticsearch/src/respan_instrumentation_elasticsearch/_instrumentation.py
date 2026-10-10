@@ -1,472 +1,737 @@
-"""Native sync/async Elasticsearch transport instrumentation for Respan."""
+"""Augment the official native Elasticsearch tracer without changing API results."""
 
+# ruff: noqa: BLE001 -- all telemetry faults fail closed.
 from __future__ import annotations
 
+import contextvars
+import functools
 import importlib
 import json
 import logging
-import re
-from collections.abc import Callable, Mapping, Sequence
-from contextlib import nullcontext
-from typing import Any
+import threading
+import types
+import weakref
+from contextlib import contextmanager
 
-from opentelemetry import trace
-from opentelemetry.instrumentation.utils import unwrap
-from opentelemetry.semconv_ai import SpanAttributes
-from opentelemetry.trace import SpanKind, Status, StatusCode
-from respan_instrumentation_elasticsearch._constants import (
-    ELASTICSEARCH_INSTRUMENTATION_NAME,
-    ELASTICSEARCH_METHOD,
-    ELASTICSEARCH_STATUS_CODE,
-    ELASTICSEARCH_TARGET,
-    ELASTIC_TRANSPORT_MODULE,
-    ELASTIC_TRANSPORT_TARGETS,
-    MAX_ATTRIBUTE_CHARS,
-    MAX_COLLECTION_ITEMS,
-    MAX_SERIALIZATION_DEPTH,
-    TASK_LOG_TYPE,
+import elastic_transport
+from elastic_transport.client_utils import DEFAULT
+from elasticsearch._otel import OpenTelemetry
+from opentelemetry import context, trace
+from opentelemetry.sdk.util import BoundedList
+from opentelemetry.semconv._incubating.attributes.db_attributes import (
+    DB_COLLECTION_NAME,
+    DB_OPERATION_NAME,
+    DB_QUERY_TEXT,
+    DB_RESPONSE_STATUS_CODE,
+    DB_SYSTEM_NAME,
 )
-from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
+from opentelemetry.semconv._incubating.attributes.error_attributes import (
+    ERROR_MESSAGE,
+    ERROR_TYPE,
+)
+from opentelemetry.semconv._incubating.attributes.http_attributes import (
+    HTTP_REQUEST_METHOD,
+    HTTP_RESPONSE_STATUS_CODE,
+)
+from opentelemetry.semconv._incubating.attributes.server_attributes import (
+    SERVER_ADDRESS,
+    SERVER_PORT,
+)
+from opentelemetry.semconv_ai import SpanAttributes
+from opentelemetry.trace import Status, StatusCode
+from respan_sdk.constants.llm_logging import LOG_TYPE_TASK
+from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE, RESPAN_METADATA
 from respan_tracing.core.tracer import RespanTracer
-from wrapt import wrap_function_wrapper
+
+from ._native import OMIT, namespace, status, storage, value
+from ._policy import (
+    CREATING_CALL,
+    AncestorPolicy,
+    content_allowed,
+    span_key,
+    suppressed,
+)
+from ._serialization import (
+    json_dumps,
+    safe_exception_message,
+    safe_text,
+    safe_type_name,
+)
 
 logger = logging.getLogger(__name__)
-
-_DOCUMENT_ID_RE = re.compile(r"(?P<prefix>/(?:_doc|_update|_source)/)[^/?]+")
-_TASK_ID_RE = re.compile(r"(?P<prefix>/_tasks/)[^/?]+")
-
-
-def _to_jsonable(value: Any, *, depth: int = 0) -> Any:
-    if depth > MAX_SERIALIZATION_DEPTH:
-        return repr(value)
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, bytes):
-        try:
-            return value.decode("utf-8")
-        except UnicodeDecodeError:
-            return {"type": "bytes", "length": len(value)}
-    if isinstance(value, Mapping):
-        items = list(value.items())
-        payload = {
-            str(key): _to_jsonable(item, depth=depth + 1)
-            for key, item in items[:MAX_COLLECTION_ITEMS]
-        }
-        if len(items) > MAX_COLLECTION_ITEMS:
-            payload["_respan_truncated_items"] = len(items) - MAX_COLLECTION_ITEMS
-        return payload
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        items = list(value)
-        payload = [
-            _to_jsonable(item, depth=depth + 1) for item in items[:MAX_COLLECTION_ITEMS]
-        ]
-        if len(items) > MAX_COLLECTION_ITEMS:
-            payload.append(
-                {"_respan_truncated_items": len(items) - MAX_COLLECTION_ITEMS}
-            )
-        return payload
-    model_dump = getattr(value, "model_dump", None)
-    if callable(model_dump):
-        try:
-            return _to_jsonable(model_dump(mode="json"), depth=depth + 1)
-        except TypeError:
-            return _to_jsonable(model_dump(), depth=depth + 1)
-        except Exception:
-            return repr(value)
-    body = getattr(value, "body", None)
-    if body is not None and body is not value:
-        return _to_jsonable(body, depth=depth + 1)
-    return repr(value)
+_LOCK = threading.RLock()
+_ACTIVE = contextvars.ContextVar("respan_elasticsearch_call", default=None)
+_PATCHES = []
+_POLICIES = weakref.WeakKeyDictionary()
+_PENDING = weakref.WeakSet()
+_CONFIG = None
+_OWNERS = 0
 
 
-def _json_dumps(value: Any, *, max_chars: int = MAX_ATTRIBUTE_CHARS) -> str:
-    serialized = json.dumps(
-        _to_jsonable(value),
-        default=str,
-        ensure_ascii=False,
-        sort_keys=True,
-    )
-    if len(serialized) <= max_chars:
-        return serialized
-    return json.dumps(
-        {
-            "truncated": True,
-            "original_characters": len(serialized),
-            "preview": serialized[:max_chars],
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-    )
+def _attempt(fn, default=None):
+    try:
+        return fn()
+    except BaseException:
+        logger.debug("Elasticsearch telemetry operation failed")
+        return default
 
 
-def _request_parts(
-    args: tuple[Any, ...], kwargs: dict[str, Any]
-) -> tuple[str, str, Any]:
-    method = kwargs.get("method")
-    target = kwargs.get("target")
-    if method is None and args:
-        method = args[0]
-    if target is None and len(args) > 1:
-        target = args[1]
-    return str(method or "REQUEST").upper(), str(target or "/"), kwargs.get("body")
+def _restore_context(ambient):
+    if context.get_current() is ambient:
+        return
+    _attempt(lambda: context._RUNTIME_CONTEXT.attach(ambient))
+    if context.get_current() is not ambient:
+        for candidate in storage(context._RUNTIME_CONTEXT).values():
+            if type(candidate) is contextvars.ContextVar:
+                candidate.set(ambient)
+                break
 
 
-def _sanitize_target(target: str) -> str:
-    sanitized = target.split("?", 1)[0]
-    sanitized = _DOCUMENT_ID_RE.sub(
-        lambda match: f"{match.group('prefix')}:id", sanitized
-    )
-    sanitized = _TASK_ID_RE.sub(lambda match: f"{match.group('prefix')}:id", sanitized)
-    return sanitized
+def _enabled():
+    current = RespanTracer._instance
+    return current is None or storage(current).get("is_enabled", True) is not False
 
 
-def _operation_name(method: str, target: str) -> str:
-    path = target.split("?", 1)[0]
-    segments = [segment for segment in path.split("/") if segment]
-    segment_set = set(segments)
-
-    if "_search" in segment_set or "_msearch" in segment_set:
-        return "search"
-    if "_bulk" in segment_set:
-        return "bulk"
-    if "_update_by_query" in segment_set:
-        return "update_by_query"
-    if "_delete_by_query" in segment_set:
-        return "delete_by_query"
-    if "_update" in segment_set:
-        return "update"
-    if "_doc" in segment_set or "_source" in segment_set:
-        return {
-            "GET": "get",
-            "HEAD": "exists",
-            "DELETE": "delete",
-        }.get(method, "index")
-    if "_cluster" in segment_set:
-        suffix = segments[segments.index("_cluster") + 1 :]
-        return "cluster_" + (suffix[0] if suffix else "request")
-    if "_indices" in segment_set:
-        return "indices_request"
-    if "_refresh" in segment_set:
-        return "refresh"
-    if "_count" in segment_set:
-        return "count"
-    if "_cat" in segment_set:
-        suffix = segments[segments.index("_cat") + 1 :]
-        return "cat_" + (suffix[0] if suffix else "request")
-    if not segments:
-        return "info"
-    return "request"
+def _provider():
+    provider = _CONFIG[0] if _CONFIG is not None else None
+    provider = provider if provider is not None else trace.get_tracer_provider()
+    # ProxyTracerProvider resolves lazily, after application configuration.
+    if type(provider) is trace.ProxyTracerProvider:
+        provider = trace._TRACER_PROVIDER
+    return provider
 
 
-def _response_body(response: Any) -> Any:
-    return getattr(response, "body", response)
-
-
-def _status_code(value: Any, default: int = 200) -> int:
-    meta = getattr(value, "meta", None)
-    status = getattr(meta, "status", None)
-    if isinstance(status, int):
-        return status
-    if isinstance(value, Mapping):
-        raw_status = value.get("status") or value.get("status_code")
-        if isinstance(raw_status, int):
-            return raw_status
-    return default
-
-
-def _error_status_code(exc: BaseException) -> int:
-    status = _status_code(exc, default=500)
-    return status if status >= 400 else 500
-
-
-def _error_message(body: Any, fallback: str) -> str:
-    if isinstance(body, Mapping):
-        error = body.get("error")
-        if isinstance(error, Mapping):
-            return str(error.get("reason") or error.get("type") or fallback)
-        if error is not None:
-            return str(error)
-    return fallback
-
-
-def _active_elasticsearch_span() -> Any | None:
-    """Return the official client span so it can be normalized in place."""
-    span = trace.get_current_span()
-    is_recording = getattr(span, "is_recording", None)
-    if callable(is_recording) and not is_recording():
+def _policy(provider):
+    if provider is None or not hasattr(provider, "add_span_processor"):
         return None
-    scope = getattr(span, "instrumentation_scope", None) or getattr(
-        span, "instrumentation_info", None
-    )
-    scope_name = str(getattr(scope, "name", "") or "")
-    if scope_name.startswith(("elasticsearch", "elastic_transport")):
-        return span
-    return None
+    found = _POLICIES.get(provider)
+    if found is None:
+        found = AncestorPolicy(_CONFIG[1])
+        _POLICIES[provider] = found
+        provider.add_span_processor(found)
+        processor = provider._active_span_processor
+        entries = processor._span_processors
+        processor._span_processors = (found,) + tuple(
+            p for p in entries if p is not found
+        )
+    return found
+
+
+def _remove_policies():
+    for provider, observer in list(_POLICIES.items()):
+        observer.enabled = False
+        processor = provider._active_span_processor
+        _attempt(
+            lambda processor=processor, observer=observer: setattr(
+                processor,
+                "_span_processors",
+                tuple(p for p in processor._span_processors if p is not observer),
+            )
+        )
+        observer.clear()
+    _POLICIES.clear()
+
+
+def _observe(call, fn):
+    ambient = context.get_current()
+    try:
+        return fn()
+    except BaseException:
+        call.failed = True
+        _attempt(call.scrub)
+        return None
+    finally:
+        if not call.finished and call.span is not None:
+            _attempt(lambda: call.allowed(honor_suppression=False))
+        _restore_context(ambient)
+
+
+class _Call:
+    def __init__(self, name):
+        self.span = None
+        self.creation_name = name
+        self.policy = None
+        self.finished = False
+        self.failed = False
+        self.request = None
+        self.native_configuration = None
+        self.output = OMIT
+        self.response_meta = None
+        self.error_value = None
+        self.cleanups = []
+        self.base = {
+            RESPAN_LOG_TYPE: LOG_TYPE_TASK,
+            DB_SYSTEM_NAME: "elasticsearch",
+            SpanAttributes.TRACELOOP_ENTITY_NAME: name,
+            SpanAttributes.TRACELOOP_ENTITY_PATH: name
+            if trace.get_current_span().get_span_context().is_valid
+            else "",
+        }
+        self.allowed_initially = content_allowed(_CONFIG[1])
+        _PENDING.add(self)
+
+    def recording(self):
+        return self.span is not None and _attempt(self.span.is_recording, False)
+
+    def allowed(self, *, honor_suppression=True):
+        allowed = (
+            self.allowed_initially
+            and not self.failed
+            and self.recording()
+            and self.policy is not None
+            and self.policy.observe(self.span, honor_suppression=honor_suppression)
+        )
+        if not allowed:
+            if self.policy is not None:
+                self.policy._deny_chain(span_key(self.span))
+            self.scrub()
+        return allowed
+
+    def scrub(self, readable=None):
+        self.request = None
+        self.native_configuration = None
+        self.output = OMIT
+        self.response_meta = None
+        self.error_value = None
+        structural = set(self.base) | {
+            DB_OPERATION_NAME,
+            HTTP_REQUEST_METHOD,
+            HTTP_RESPONSE_STATUS_CODE,
+            DB_RESPONSE_STATUS_CODE,
+            SERVER_ADDRESS,
+            SERVER_PORT,
+            ERROR_TYPE,
+        }
+        if self.span is not None:
+            attributes = getattr(self.span, "_attributes", None)
+            if attributes is not None:
+                for key in list(attributes):
+                    if key not in structural:
+                        _attempt(lambda key=key: attributes.pop(key, None))
+            if hasattr(self.span, "_events"):
+                self.span._events = BoundedList(0)
+            if self.recording():
+                self.span._status = Status(self.span.status.status_code)
+        if readable is not None:
+            readable._attributes = types.MappingProxyType(
+                {
+                    key: item
+                    for key, item in (readable.attributes or {}).items()
+                    if key in structural
+                }
+            )
+            readable._events = ()
+            readable._status = Status(readable.status.status_code)
+
+    def set(self, key, item):
+        self.span.set_attribute(key, item)
+
+    def request_values(self, original, args, kwargs, *, transport=False):
+        if not self.allowed():
+            return
+        if transport:
+            method = kwargs.get("method", args[0] if args else None)
+            target = kwargs.get("target", args[1] if len(args) > 1 else None)
+            if self.request is None:
+                self.request = {"method": value(method), "target": value(target)}
+            self.request["transport"] = value(
+                {k: v for k, v in kwargs.items() if k != "otel_span"}
+            )
+        else:
+            # The released native signature is stable across 8.13 and 9.5.
+            self.request = {
+                "method": value(args[0] if args else kwargs.get("method")),
+                "target": value(args[1] if len(args) > 1 else kwargs.get("path")),
+            }
+            for key, item in kwargs.items():
+                if key != "otel_span" and item is not DEFAULT:
+                    self.request[key] = value(item)
+            if self.native_configuration is not None:
+                self.request["native"] = self.native_configuration
+            attrs = self.span.attributes or {}
+            index = attrs.get(
+                "db.operation.parameter.index",
+                attrs.get("db.elasticsearch.path_parts.index"),
+            )
+            if type(index) is str:
+                self.set(DB_COLLECTION_NAME, safe_text(index))
+            parts = kwargs.get("path_parts")
+            if type(parts) is dict and type(parts.get("index")) is str:
+                self.set(DB_COLLECTION_NAME, safe_text(parts["index"]))
+            operation = kwargs.get("endpoint_id")
+            if type(operation) is str:
+                self.set(DB_OPERATION_NAME, operation)
+        hook = _CONFIG[3] if _CONFIG is not None else None
+        if hook is not None and not transport:
+            hook(
+                self.span,
+                self.request.get("method"),
+                self.request.get("target"),
+                kwargs,
+            )
+
+    def response(self, response, *, transport=False):
+        actual_status = status(response)
+        if type(actual_status) is int:
+            self.set(HTTP_RESPONSE_STATUS_CODE, actual_status)
+            self.set(DB_RESPONSE_STATUS_CODE, str(actual_status))
+        if self.allowed():
+            if not transport or self.output is OMIT:
+                self.output = value(response)
+                from ._native import meta
+
+                self.response_meta = value(meta(response))
+            hook = _CONFIG[4] if _CONFIG is not None else None
+            if hook is not None and not transport:
+                from ._native import body
+
+                hook(self.span, body(response))
+
+    def error(self, error):
+        if not self.recording():
+            return
+        self.output = OMIT
+        self.span.set_status(Status(StatusCode.ERROR))
+        self.set(ERROR_TYPE, safe_type_name(error))
+        actual_status = status(error)
+        if type(actual_status) is int:
+            self.set(HTTP_RESPONSE_STATUS_CODE, actual_status)
+            self.set(DB_RESPONSE_STATUS_CODE, str(actual_status))
+        if self.allowed():
+            # Exact released native classes and exact builtin exceptions only.
+            cls = type(error)
+            module = namespace(cls).get("__module__", "")
+            native = type(module) is str and module.startswith(
+                ("elastic_transport", "elasticsearch")
+            )
+            installed = (
+                _attempt(
+                    lambda: getattr(
+                        importlib.import_module(module), safe_type_name(error)
+                    )
+                )
+                if native
+                else None
+            )
+            if (native and installed is cls) or any(
+                cls is k for k in (ValueError, TypeError, RuntimeError, OSError)
+            ):
+                state = BaseException.__dict__["__dict__"].__get__(error)
+                message = state.get("message")
+                message = (
+                    safe_text(message)
+                    if type(message) is str
+                    else safe_exception_message(error)
+                )
+                if message is not None:
+                    self.set(ERROR_MESSAGE, message)
+
+    def finish(self):
+        if self.finished:
+            return
+        if self.recording():
+            _observe(self, self._finish_attributes)
+        self.finished = True
+        if self.span is not None:
+            _attempt(self.span.end)
+        for undo in reversed(self.cleanups):
+            _attempt(undo)
+        self.cleanups.clear()
+        self.request = None
+        self.output = OMIT
+        self.response_meta = None
+        if self.policy is not None:
+            self.policy.calls.pop(span_key(self.span), None)
+        _PENDING.discard(self)
+
+    def _finish_attributes(self):
+        # Normalize actual legacy SDK fields into their upstream semantic names.
+        attrs = getattr(self.span, "_attributes", None)
+        if attrs is not None:
+            for old, new in (
+                ("db.system", DB_SYSTEM_NAME),
+                ("db.operation", DB_OPERATION_NAME),
+                ("db.statement", DB_QUERY_TEXT),
+            ):
+                if old in attrs:
+                    self.set(new, attrs.pop(old))
+        for key, item in self.base.items():
+            self.set(key, item)
+        if not self.allowed(honor_suppression=False):
+            return
+        if attrs is not None:
+            for key, item in list(attrs.items()):
+                if type(item) is str:
+                    self.set(key, safe_text(item))
+        if self.response_meta is not None:
+            self.set(
+                f"{RESPAN_METADATA}.elasticsearch.response",
+                json_dumps(self.response_meta),
+            )
+        if self.request is not None:
+            self.set(SpanAttributes.TRACELOOP_ENTITY_INPUT, self.dumps(self.request))
+        if self.output is not OMIT:
+            self.set(SpanAttributes.TRACELOOP_ENTITY_OUTPUT, self.dumps(self.output))
+
+    def dumps(self, item):
+        result = json_dumps(item)
+        limit = _CONFIG[2] if _CONFIG is not None else None
+        if limit is not None and len(result) > limit:
+            return json_dumps(
+                {
+                    "truncated": True,
+                    "original_characters": len(result),
+                    "preview": result[:limit],
+                }
+            )
+        return result
+
+
+def _protect_setter(call):
+    span = call.span
+    if span is None or not call.recording():
+        return
+    for key in (
+        f"{RESPAN_METADATA}.run_id",
+        f"{RESPAN_METADATA}.scenario",
+        f"{RESPAN_METADATA}.example_set",
+    ):
+        item = (span.attributes or {}).get(key)
+        if type(item) is str:
+            call.base[key] = safe_text(item)
+    marker = (span.attributes or {}).get(RESPAN_METADATA)
+    if type(marker) is str:
+        decoded = _attempt(lambda: json.loads(marker), {})
+        if type(decoded) is dict:
+            keep = {
+                key: item
+                for key, item in decoded.items()
+                if type(key) is str
+                and key in {"run_id", "scenario", "example_set"}
+                and type(item) is str
+            }
+            if keep:
+                call.base[RESPAN_METADATA] = json_dumps(keep)
+    state = storage(span)
+    present = "set_attribute" in state
+    prior = state.get("set_attribute")
+    original = span.set_attribute
+
+    def setter(key, item):
+        try:
+            return original(key, item)
+        except BaseException:
+            call.failed = True
+            _attempt(call.scrub)
+            return None
+
+    def undo():
+        if storage(span).get("set_attribute") is setter:
+            if present:
+                span.set_attribute = prior
+            else:
+                delattr(span, "set_attribute")
+
+    call.cleanups.append(undo)
+    span.set_attribute = setter
+
+
+@contextmanager
+def _scope(name, native_tracer=None):
+    ambient = context.get_current()
+    call = _Call(name)
+    active = _ACTIVE.set(call)
+    token = None
+    try:
+        if _enabled() and not suppressed():
+
+            def startup():
+                provider = _provider()
+                call.policy = _policy(provider)
+                tracer = (
+                    provider.get_tracer("elasticsearch-api")
+                    if provider is not None
+                    else native_tracer
+                )
+                if tracer is None:
+                    return
+                creating = CREATING_CALL.set(call)
+                try:
+                    call.span = tracer.start_span(name)
+                finally:
+                    CREATING_CALL.reset(creating)
+                _protect_setter(call)
+
+            _observe(call, startup)
+        if call.span is None or call.failed:
+            if call.span is not None:
+                _attempt(call.scrub)
+                _attempt(call.span.end)
+            call.span = trace.NonRecordingSpan(trace.INVALID_SPAN_CONTEXT)
+        token = _attempt(lambda: context.attach(trace.set_span_in_context(call.span)))
+        if token is None:
+            call.failed = True
+            call.scrub()
+            _restore_context(ambient)
+        try:
+            yield call.span
+        except BaseException as exc:
+            _observe(call, functools.partial(call.error, exc))
+            raise
+        finally:
+            if call.recording():
+                _observe(call, lambda: call.allowed(honor_suppression=False))
+            if token is not None:
+                _attempt(lambda: context.detach(token))
+            _restore_context(ambient)
+            call.finish()
+    finally:
+        _ACTIVE.reset(active)
+        _restore_context(ambient)
+
+
+class _TracerShim:
+    def __init__(self, tracer):
+        self.tracer = tracer
+
+    def start_as_current_span(self, name, *args, **kwargs):
+        return _scope(name, self.tracer)
+
+
+def _helper_wrapper(original):
+    @functools.wraps(original)
+    @contextmanager
+    def wrapped(instance, *args, **kwargs):
+        state = storage(instance)
+        if _CONFIG is None or type(instance) is not OpenTelemetry:
+            with original(instance, *args, **kwargs) as span:
+                yield span
+            return
+        if not _enabled() or suppressed() or state.get("enabled") is not True:
+            active = _ACTIVE.set(False)
+            try:
+                yield elastic_transport.OpenTelemetrySpan(None)
+            finally:
+                _ACTIVE.reset(active)
+            return
+        clone = OpenTelemetry(
+            enabled=True,
+            tracer=_TracerShim(state.get("tracer")),
+            body_strategy=state.get("body_strategy"),
+        )
+        with original(clone, *args, **kwargs) as span:
+            call = _ACTIVE.get()
+            if call is not None and call is not False and call.recording():
+
+                def capture_configuration():
+                    if call.allowed():
+                        call.native_configuration = value(
+                            {"arguments": args, "parameters": kwargs}
+                        )
+
+                _observe(call, capture_configuration)
+            yield span
+
+    return wrapped
+
+
+def _use_span_wrapper(original):
+    @functools.wraps(original)
+    @contextmanager
+    def wrapped(instance, span):
+        if _CONFIG is None or type(instance) is not OpenTelemetry:
+            with original(instance, span):
+                yield
+            return
+        state = storage(instance)
+        native = (
+            storage(span).get("otel_span")
+            if type(span) is elastic_transport.OpenTelemetrySpan
+            else None
+        )
+        ambient = context.get_current()
+        token = None
+        try:
+            if state.get("enabled") and native is not None and not suppressed():
+                token = _attempt(
+                    lambda: context.attach(trace.set_span_in_context(native))
+                )
+            yield
+        finally:
+            if token is not None:
+                _attempt(lambda: context.detach(token))
+            _restore_context(ambient)
+
+    return wrapped
+
+
+def _api_wrapper(original, asynchronous, transport=False):
+    def before(args, kwargs):
+        call = _ACTIVE.get()
+        if call is not None and call is not False and call.recording():
+            _observe(
+                call,
+                lambda: call.request_values(
+                    original, args, kwargs, transport=transport
+                ),
+            )
+        return call
+
+    if asynchronous:
+
+        @functools.wraps(original)
+        async def wrapped(instance, *args, **kwargs):
+            call = before(args, kwargs)
+            if call is None and transport and _CONFIG is not None:
+                with _scope("elasticsearch.transport"):
+                    return await wrapped(instance, *args, **kwargs)
+            try:
+                response = await original(instance, *args, **kwargs)
+            except BaseException as exc:
+                if call is not None and call is not False:
+                    _observe(call, functools.partial(call.error, exc))
+                raise
+            if call is not None and call is not False and call.recording():
+                _observe(call, lambda: call.response(response, transport=transport))
+            return response
+    else:
+
+        @functools.wraps(original)
+        def wrapped(instance, *args, **kwargs):
+            call = before(args, kwargs)
+            if call is None and transport and _CONFIG is not None:
+                with _scope("elasticsearch.transport"):
+                    return wrapped(instance, *args, **kwargs)
+            try:
+                response = original(instance, *args, **kwargs)
+            except BaseException as exc:
+                if call is not None and call is not False:
+                    _observe(call, functools.partial(call.error, exc))
+                raise
+            if call is not None and call is not False and call.recording():
+                _observe(call, lambda: call.response(response, transport=transport))
+            return response
+
+    return wrapped
+
+
+def _restore():
+    for owner, name, original, wrapper in reversed(_PATCHES):
+        if namespace(owner).get(name) is wrapper:
+            _attempt(
+                lambda owner=owner, name=name, original=original: setattr(
+                    owner, name, original
+                )
+            )
+    _PATCHES.clear()
+    _remove_policies()
 
 
 class ElasticsearchInstrumentor:
-    """Trace all official Elasticsearch sync and async transport requests."""
+    """Add canonical Respan TASK capture to native SDK sync/async spans."""
 
-    name = ELASTICSEARCH_INSTRUMENTATION_NAME
-    _patches_applied = False
-    _activation_count = 0
-    _patched_targets: list[tuple[str, str]] = []
+    name = "elasticsearch"
 
     def __init__(
         self,
         *,
-        capture_content: bool = True,
-        max_attribute_chars: int = MAX_ATTRIBUTE_CHARS,
-        request_hook: Callable[[Any, str, str, dict[str, Any]], None] | None = None,
-        response_hook: Callable[[Any, Any], None] | None = None,
-    ) -> None:
-        self._capture_content = capture_content
-        self._max_attribute_chars = max(512, int(max_attribute_chars))
-        self._request_hook = request_hook
-        self._response_hook = response_hook
+        capture_content=True,
+        max_attribute_chars=None,
+        request_hook=None,
+        response_hook=None,
+        tracer_provider=None,
+    ):
+        if max_attribute_chars is not None and (
+            type(max_attribute_chars) is not int or max_attribute_chars <= 0
+        ):
+            raise ValueError("max_attribute_chars must be a positive integer or None")
+        self.config = (
+            tracer_provider,
+            capture_content is True,
+            max_attribute_chars,
+            request_hook,
+            response_hook,
+        )
         self._is_instrumented = False
 
-    @staticmethod
-    def _is_respan_tracing_enabled() -> bool:
-        tracer = getattr(RespanTracer, "_instance", None)
-        if tracer is None:
-            return True
-        return bool(getattr(tracer, "is_enabled", True))
-
-    def _set_request_attributes(
-        self,
-        span: Any,
-        *,
-        method: str,
-        target: str,
-        body: Any,
-        kwargs: dict[str, Any],
-    ) -> str:
-        operation = _operation_name(method, target)
-        entity_name = f"elasticsearch.{operation}"
-        sanitized_target = _sanitize_target(target)
-
-        span.set_attribute(RESPAN_LOG_TYPE, TASK_LOG_TYPE)
-        span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_NAME, entity_name)
-        span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_PATH, entity_name)
-        span.set_attribute(ELASTICSEARCH_METHOD, method)
-        span.set_attribute(ELASTICSEARCH_TARGET, sanitized_target)
-
-        input_payload: dict[str, Any] = {
-            "operation": operation,
-            "method": method,
-            "target": target if self._capture_content else sanitized_target,
-            "content_captured": self._capture_content,
-        }
-        if self._capture_content:
-            if body is not None:
-                input_payload["body"] = body
-            for key in ("params", "request_timeout", "max_retries"):
-                value = kwargs.get(key)
-                if value is not None:
-                    input_payload[key] = value
-        span.set_attribute(
-            SpanAttributes.TRACELOOP_ENTITY_INPUT,
-            _json_dumps(input_payload, max_chars=self._max_attribute_chars),
-        )
-        return operation
-
-    def _set_response_attributes(self, span: Any, response: Any) -> None:
-        body = _response_body(response)
-        status_code = _status_code(response)
-        span.set_attribute(ELASTICSEARCH_STATUS_CODE, status_code)
-        span.set_attribute("status_code", status_code)
-        output = (
-            {"status_code": status_code, "body": body}
-            if self._capture_content
-            else {"status_code": status_code, "content_captured": False}
-        )
-        span.set_attribute(
-            SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
-            _json_dumps(output, max_chars=self._max_attribute_chars),
-        )
-        if status_code >= 400:
-            message = (
-                _error_message(body, f"Elasticsearch returned HTTP {status_code}")
-                if self._capture_content
-                else f"Elasticsearch returned HTTP {status_code}"
+    def activate(self, *, tracer_provider=None):
+        global _CONFIG, _OWNERS
+        with _LOCK:
+            if self._is_instrumented:
+                return
+            config = (
+                self.config
+                if tracer_provider is None
+                else (tracer_provider, *self.config[1:])
             )
-            span.set_attribute("error.message", message)
-            span.set_status(Status(StatusCode.ERROR, message))
-
-    def _set_error_attributes(self, span: Any, exc: BaseException) -> None:
-        status_code = _error_status_code(exc)
-        message = str(exc) if self._capture_content else type(exc).__name__
-        if self._capture_content:
-            span.record_exception(exc)
-        span.set_status(Status(StatusCode.ERROR, message))
-        span.set_attribute(ELASTICSEARCH_STATUS_CODE, status_code)
-        span.set_attribute("status_code", status_code)
-        span.set_attribute("error.message", message)
-        span.set_attribute(
-            SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
-            _json_dumps(
-                {
-                    "error": type(exc).__name__,
-                    "message": message,
-                    "status_code": status_code,
-                    "content_captured": self._capture_content,
-                },
-                max_chars=self._max_attribute_chars,
-            ),
-        )
-
-    def _trace_sync(
-        self,
-        wrapped: Callable[..., Any],
-        args: tuple[Any, ...],
-        kwargs: dict[str, Any],
-    ) -> Any:
-        method, target, body = _request_parts(args, kwargs)
-        operation = _operation_name(method, target)
-        active_span = _active_elasticsearch_span()
-        span_context = (
-            nullcontext(active_span)
-            if active_span is not None
-            else trace.get_tracer(__name__).start_as_current_span(
-                f"elasticsearch.{operation}", kind=SpanKind.CLIENT
-            )
-        )
-        with span_context as span:
-            self._set_request_attributes(
-                span, method=method, target=target, body=body, kwargs=kwargs
-            )
-            if self._request_hook is not None:
-                self._request_hook(span, method, target, kwargs)
+            if _OWNERS:
+                if any(a is not b for a, b in zip(config, _CONFIG)):
+                    raise ValueError(
+                        "Elasticsearch instrumentation configuration conflict"
+                    )
+                _OWNERS += 1
+                self._is_instrumented = True
+                return
+            _CONFIG = config
             try:
-                response = wrapped(*args, **kwargs)
-            except Exception as exc:
-                self._set_error_attributes(span, exc)
+                _policy(_provider())
+                targets = [
+                    (OpenTelemetry, "span", _helper_wrapper),
+                    (OpenTelemetry, "helpers_span", _helper_wrapper),
+                    (OpenTelemetry, "use_span", _use_span_wrapper),
+                ]
+                for module, asynchronous in (
+                    ("elasticsearch._sync.client._base", False),
+                    ("elasticsearch._async.client._base", True),
+                ):
+                    cls = importlib.import_module(module).BaseClient
+                    targets.append(
+                        (
+                            cls,
+                            "_perform_request",
+                            lambda fn, asynchronous=asynchronous: _api_wrapper(
+                                fn, asynchronous
+                            ),
+                        )
+                    )
+                for cls, asynchronous in (
+                    (elastic_transport.Transport, False),
+                    (elastic_transport.AsyncTransport, True),
+                ):
+                    targets.append(
+                        (
+                            cls,
+                            "perform_request",
+                            lambda fn, asynchronous=asynchronous: _api_wrapper(
+                                fn, asynchronous, True
+                            ),
+                        )
+                    )
+                for owner, name, factory in targets:
+                    original = namespace(owner).get(name)
+                    if original is None:
+                        continue
+                    wrapper = factory(original)
+                    _PATCHES.append((owner, name, original, wrapper))
+                    setattr(owner, name, wrapper)
+            except BaseException:
+                _restore()
+                _CONFIG = None
                 raise
-            self._set_response_attributes(span, response)
-            if self._response_hook is not None:
-                self._response_hook(span, _response_body(response))
-            return response
-
-    async def _trace_async(
-        self,
-        wrapped: Callable[..., Any],
-        args: tuple[Any, ...],
-        kwargs: dict[str, Any],
-    ) -> Any:
-        method, target, body = _request_parts(args, kwargs)
-        operation = _operation_name(method, target)
-        active_span = _active_elasticsearch_span()
-        span_context = (
-            nullcontext(active_span)
-            if active_span is not None
-            else trace.get_tracer(__name__).start_as_current_span(
-                f"elasticsearch.{operation}", kind=SpanKind.CLIENT
-            )
-        )
-        with span_context as span:
-            self._set_request_attributes(
-                span, method=method, target=target, body=body, kwargs=kwargs
-            )
-            if self._request_hook is not None:
-                self._request_hook(span, method, target, kwargs)
-            try:
-                response = await wrapped(*args, **kwargs)
-            except Exception as exc:
-                self._set_error_attributes(span, exc)
-                raise
-            self._set_response_attributes(span, response)
-            if self._response_hook is not None:
-                self._response_hook(span, _response_body(response))
-            return response
-
-    def _patch_transport(self, target: str, *, asynchronous: bool) -> bool:
-        module = importlib.import_module(ELASTIC_TRANSPORT_MODULE)
-        class_name, method_name = target.split(".", 1)
-        target_class = getattr(module, class_name, None)
-        if target_class is None or not hasattr(target_class, method_name):
-            return False
-
-        if asynchronous:
-
-            async def traced(
-                wrapped: Callable[..., Any],
-                instance: Any,
-                args: tuple[Any, ...],
-                kwargs: dict[str, Any],
-            ) -> Any:
-                return await self._trace_async(wrapped, args, kwargs)
-
-        else:
-
-            def traced(
-                wrapped: Callable[..., Any],
-                instance: Any,
-                args: tuple[Any, ...],
-                kwargs: dict[str, Any],
-            ) -> Any:
-                return self._trace_sync(wrapped, args, kwargs)
-
-        wrap_function_wrapper(ELASTIC_TRANSPORT_MODULE, target, traced)
-        type(self)._patched_targets.append((ELASTIC_TRANSPORT_MODULE, target))
-        return True
-
-    def activate(self) -> None:
-        """Patch sync and async Elasticsearch transport methods."""
-        cls = type(self)
-        if self._is_instrumented:
-            return
-        if not self._is_respan_tracing_enabled():
-            logger.info(
-                "Elasticsearch instrumentation skipped because Respan tracing is disabled"
-            )
-            return
-        if cls._patches_applied:
-            cls._activation_count += 1
+            _OWNERS = 1
             self._is_instrumented = True
-            return
-        try:
-            patched = False
-            for target, asynchronous in ELASTIC_TRANSPORT_TARGETS:
-                patched = (
-                    self._patch_transport(target, asynchronous=asynchronous) or patched
-                )
-        except ImportError as exc:
-            logger.warning(
-                "Failed to activate Elasticsearch instrumentation - missing dependency: %s",
-                exc,
-            )
-            return
-        except Exception:
-            logger.exception("Failed to activate Elasticsearch instrumentation")
-            self.deactivate()
-            return
-        if not patched:
-            return
-        cls._patches_applied = True
-        cls._activation_count = 1
-        self._is_instrumented = True
-        logger.info("Elasticsearch instrumentation activated")
 
-    def deactivate(self) -> None:
-        """Restore original transport methods."""
-        cls = type(self)
-        if not self._is_instrumented:
-            if cls._patches_applied or not cls._patched_targets:
+    def deactivate(self):
+        global _CONFIG, _OWNERS
+        with _LOCK:
+            if not self._is_instrumented:
                 return
-        else:
             self._is_instrumented = False
-            cls._activation_count = max(cls._activation_count - 1, 0)
-            if cls._activation_count:
+            _OWNERS -= 1
+            if _OWNERS:
                 return
-        for module_path, target in reversed(cls._patched_targets):
-            try:
-                unwrap(module_path, target)
-            except Exception:
-                logger.debug(
-                    "Failed to unwrap %s.%s", module_path, target, exc_info=True
-                )
-        cls._patched_targets.clear()
-        cls._patches_applied = False
-        cls._activation_count = 0
-        logger.info("Elasticsearch instrumentation deactivated")
+            for call in list(_PENDING):
+                call.failed = True
+                _attempt(call.scrub)
+            _restore()
+            _CONFIG = None
