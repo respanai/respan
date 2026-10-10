@@ -1,601 +1,666 @@
-from __future__ import annotations
+"""Released Writer SDK/native OTel contract and lifecycle regression tests."""
 
-import asyncio
+import gc
 import json
-import sys
-import time
-from types import ModuleType, SimpleNamespace
-from typing import Any
+import weakref
 
 import pytest
-from opentelemetry import context as context_api
-from opentelemetry import trace
-from opentelemetry.semconv._incubating.attributes import (
-    gen_ai_attributes as GenAIAttributes,
-)
-from opentelemetry.semconv_ai import SpanAttributes as TLSpanAttributes
+from opentelemetry import context, trace
+from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.sdk.trace.sampling import ALWAYS_OFF
+from opentelemetry.semconv_ai import SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY
+from opentelemetry.semconv_ai import SpanAttributes as S
 from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
-from respan_instrumentation_writer import (
-    WriterInstrumentor,
-    _instrumentation,
-    _otel_emitter,
+from pydantic import BaseModel
+from respan_instrumentation_writer import WriterInstrumentor
+from respan_instrumentation_writer import _instrumentation as adapter
+from respan_instrumentation_writer._serialization import json_dumps, safe_text
+from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+from respan_tracing.utils.span_factory import _PROPAGATED_ATTRIBUTES
+from writerai import APIError, AsyncStream, RateLimitError, Stream
+
+from tests._native import NativeRuntime, invoke
+
+IN = S.TRACELOOP_ENTITY_INPUT
+OUT = S.TRACELOOP_ENTITY_OUTPUT
+OPS = (
+    "chat",
+    "completion",
+    "graph",
+    "application",
+    "vision",
+    "translation",
+    "web_search",
+    "parse_pdf",
 )
-from respan_instrumentation_writer._constants import (
-    WRITER_PARSE_PDF_TOOL_NAME,
-    WRITER_WEB_SEARCH_TOOL_NAME,
-)
-from respan_instrumentation_writer._translator import (
-    build_application_generate_attrs,
-    build_completion_attrs,
-    build_graph_question_attrs,
-    build_tool_attrs,
-    build_translation_attrs,
-    build_vision_attrs,
-)
-from respan_sdk.constants.llm_logging import LOG_TYPE_CHAT, LOG_TYPE_TEXT, LOG_TYPE_TOOL
-from respan_sdk.constants.span_attributes import (
-    RESPAN_INTERNAL_SPAN_NAME_DETAIL,
-    RESPAN_INTERNAL_SPAN_NAME_KIND,
-    RESPAN_LOG_TYPE,
-)
-from respan_tracing.core.tracer import RespanTracer
-from respan_tracing.exporters.respan import _export_span_name
-
-OFF_CONTRACT_ALIASES = {
-    "model",
-    "prompt_tokens",
-    "completion_tokens",
-    "total_request_tokens",
-    "tools",
-    "tool_calls",
-    "span_tools",
-    "has_tool_calls",
-    "parallel_tool_calls",
-    "respan.span.tools",
-    "respan.span.tool_calls",
-    "respan.span.handoffs",
-}
 
 
-@pytest.fixture(autouse=True)
-def reset_state() -> None:
-    RespanTracer.reset_instance()
-    _instrumentation._activation_count = 0
-    _instrumentation._activation_installing = False
-    _instrumentation._installed_methods.clear()
-    yield
-    RespanTracer.reset_instance()
-    for name in list(vars(_instrumentation)):
-        if name.startswith("_original_"):
-            setattr(_instrumentation, name, None)
-    _instrumentation._activation_count = 0
-    _instrumentation._activation_installing = False
-    _instrumentation._installed_methods.clear()
-    for module_name in list(sys.modules):
-        if module_name == "writerai" or module_name.startswith("writerai."):
-            sys.modules.pop(module_name, None)
+@pytest.fixture
+def setup():
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    instrumentor = WriterInstrumentor(tracer_provider=provider)
+    instrumentor.activate()
+    yield instrumentor, provider, exporter
+    instrumentor.deactivate()
+    provider.shutdown()
 
 
-@pytest.fixture()
-def captured_spans(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
-    spans: list[dict[str, Any]] = []
-    monkeypatch.setattr(
-        _instrumentation,
-        "emit_writer_span",
-        lambda **kwargs: spans.append(kwargs),
-    )
-    return spans
-
-
-def _chat_response(model: str = "palmyra-x5") -> SimpleNamespace:
-    return SimpleNamespace(
-        model=model,
-        choices=[
-            SimpleNamespace(
-                index=0,
-                message=SimpleNamespace(
-                    role="assistant",
-                    content="Use the forecast tool.",
-                    tool_calls=[
-                        SimpleNamespace(
-                            id="call_1",
-                            type="function",
-                            function=SimpleNamespace(
-                                name="get_weather",
-                                arguments='{"city":"Tokyo"}',
-                            ),
-                        )
-                    ],
-                ),
-            )
-        ],
-        usage=SimpleNamespace(
-            prompt_tokens=12,
-            completion_tokens=8,
-            total_tokens=20,
-            prompt_token_details=SimpleNamespace(cached_tokens=3),
-        ),
-    )
-
-
-def _chat_stream_chunks() -> list[SimpleNamespace]:
+def owned(exporter):
     return [
-        SimpleNamespace(
-            model="palmyra-x5",
-            choices=[
-                SimpleNamespace(
-                    index=0,
-                    delta=SimpleNamespace(role="assistant", content="Hello "),
-                )
-            ],
-        ),
-        SimpleNamespace(
-            model="palmyra-x5",
-            choices=[SimpleNamespace(index=0, delta=SimpleNamespace(content="stream"))],
-            usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5),
-        ),
+        s
+        for s in exporter.get_finished_spans()
+        if s.instrumentation_scope.name == "writer"
     ]
 
 
-def _install_fake_writer_modules(monkeypatch: pytest.MonkeyPatch) -> Any:
-    class ChatResource:
-        def chat(self, **kwargs: Any) -> Any:
-            if kwargs.get("stream") is True:
-                return iter(_chat_stream_chunks())
-            return _chat_response(model=kwargs.get("model", "palmyra-x5"))
-
-    class AsyncChatResource:
-        async def chat(self, **kwargs: Any) -> Any:
-            return _chat_response(model=kwargs.get("model", "palmyra-x5"))
-
-    class CompletionsResource:
-        def create(self, **kwargs: Any) -> Any:
-            if kwargs.get("stream") is True:
-                return iter(
-                    [SimpleNamespace(value="alpha "), SimpleNamespace(value="beta")]
-                )
-            return SimpleNamespace(
-                model=kwargs.get("model"),
-                choices=[SimpleNamespace(text="Generated completion")],
-            )
-
-    class AsyncCompletionsResource:
-        async def create(self, **kwargs: Any) -> Any:
-            return SimpleNamespace(
-                model=kwargs.get("model"),
-                choices=[SimpleNamespace(text="Generated completion")],
-            )
-
-    class GraphsResource:
-        def question(self, **kwargs: Any) -> Any:
-            return SimpleNamespace(
-                answer="Graph answer", question=kwargs.get("question")
-            )
-
-    class AsyncGraphsResource:
-        async def question(self, **kwargs: Any) -> Any:
-            return SimpleNamespace(
-                answer="Graph answer", question=kwargs.get("question")
-            )
-
-    class ApplicationsResource:
-        def generate_content(self, application_id: str, **kwargs: Any) -> Any:
-            if kwargs.get("stream") is True:
-                return iter(
-                    [
-                        SimpleNamespace(suggestion="Application "),
-                        SimpleNamespace(suggestion="stream"),
-                    ]
-                )
-            return SimpleNamespace(title="Summary", suggestion="Application answer")
-
-    class AsyncApplicationsResource:
-        async def generate_content(self, application_id: str, **kwargs: Any) -> Any:
-            return SimpleNamespace(title="Summary", suggestion="Application answer")
-
-    class VisionResource:
-        def analyze(self, **kwargs: Any) -> Any:
-            return SimpleNamespace(data="Vision answer")
-
-    class AsyncVisionResource:
-        async def analyze(self, **kwargs: Any) -> Any:
-            return SimpleNamespace(data="Vision answer")
-
-    class TranslationResource:
-        def translate(self, **kwargs: Any) -> Any:
-            return SimpleNamespace(data="Bonjour")
-
-    class AsyncTranslationResource:
-        async def translate(self, **kwargs: Any) -> Any:
-            return SimpleNamespace(data="Bonjour")
-
-    class ToolsResource:
-        def web_search(self, **kwargs: Any) -> Any:
-            return SimpleNamespace(
-                query=kwargs.get("query"), answer="Search answer", sources=[]
-            )
-
-        def parse_pdf(self, file_id: str, **kwargs: Any) -> Any:
-            return SimpleNamespace(content="PDF text")
-
-    class AsyncToolsResource:
-        async def web_search(self, **kwargs: Any) -> Any:
-            return SimpleNamespace(
-                query=kwargs.get("query"), answer="Search answer", sources=[]
-            )
-
-        async def parse_pdf(self, file_id: str, **kwargs: Any) -> Any:
-            return SimpleNamespace(content="PDF text")
-
-    module_specs = {
-        "writerai.resources.chat": {
-            "ChatResource": ChatResource,
-            "AsyncChatResource": AsyncChatResource,
-        },
-        "writerai.resources.completions": {
-            "CompletionsResource": CompletionsResource,
-            "AsyncCompletionsResource": AsyncCompletionsResource,
-        },
-        "writerai.resources.graphs": {
-            "GraphsResource": GraphsResource,
-            "AsyncGraphsResource": AsyncGraphsResource,
-        },
-        "writerai.resources.applications.applications": {
-            "ApplicationsResource": ApplicationsResource,
-            "AsyncApplicationsResource": AsyncApplicationsResource,
-        },
-        "writerai.resources.vision": {
-            "VisionResource": VisionResource,
-            "AsyncVisionResource": AsyncVisionResource,
-        },
-        "writerai.resources.translation": {
-            "TranslationResource": TranslationResource,
-            "AsyncTranslationResource": AsyncTranslationResource,
-        },
-        "writerai.resources.tools": {
-            "ToolsResource": ToolsResource,
-            "AsyncToolsResource": AsyncToolsResource,
-        },
-    }
-
-    package_names = [
-        "writerai",
-        "writerai.resources",
-        "writerai.resources.applications",
-    ]
-    for package_name in package_names:
-        monkeypatch.setitem(sys.modules, package_name, ModuleType(package_name))
-
-    for module_name, attrs in module_specs.items():
-        module = ModuleType(module_name)
-        for attr_name, attr_value in attrs.items():
-            setattr(module, attr_name, attr_value)
-        monkeypatch.setitem(sys.modules, module_name, module)
-
-    return SimpleNamespace(
-        ChatResource=ChatResource,
-        AsyncChatResource=AsyncChatResource,
-        CompletionsResource=CompletionsResource,
-        ApplicationsResource=ApplicationsResource,
-        ToolsResource=ToolsResource,
-    )
-
-
-def _chat_request_kwargs() -> dict[str, Any]:
-    return {
-        "model": "palmyra-x5",
-        "messages": [{"role": "user", "content": "Use a tool."}],
-        "tools": [
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_weather",
-                    "description": "Get weather.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"city": {"type": "string"}},
-                    },
-                },
-            }
-        ],
-    }
-
-
-def test_sync_chat_emits_canonical_attrs_without_aliases(
-    monkeypatch: pytest.MonkeyPatch,
-    captured_spans: list[dict[str, Any]],
-) -> None:
-    fake = _install_fake_writer_modules(monkeypatch)
-    instrumentor = WriterInstrumentor()
-    instrumentor.activate()
-
-    response = fake.ChatResource().chat(**_chat_request_kwargs())
-
-    assert response.choices[0].message.content == "Use the forecast tool."
-    assert len(captured_spans) == 1
-    attrs = captured_spans[0]["attrs"]
-    assert captured_spans[0]["name"] == "writer.chat"
-    assert attrs[RESPAN_LOG_TYPE] == LOG_TYPE_CHAT
-    assert attrs[TLSpanAttributes.LLM_SYSTEM] == "writer"
-    assert attrs[GenAIAttributes.GEN_AI_PROVIDER_NAME] == "writer"
-    assert attrs[TLSpanAttributes.LLM_REQUEST_TYPE] == "chat"
-    assert attrs[TLSpanAttributes.LLM_REQUEST_MODEL] == "palmyra-x5"
-    assert attrs[f"{TLSpanAttributes.LLM_PROMPTS}.0.role"] == "user"
-    assert attrs[f"{TLSpanAttributes.LLM_PROMPTS}.0.content"] == "Use a tool."
-    assert attrs[f"{TLSpanAttributes.LLM_COMPLETIONS}.0.role"] == "assistant"
+@pytest.mark.parametrize("operation", OPS)
+def test_native_sync_resource_full_payload_and_callbacks(setup, operation):
+    _, _, exporter = setup
+    runtime = NativeRuntime()
+    with runtime.client() as client:
+        result = invoke(client, operation)
+        assert type(result).__module__.startswith("writerai.types.")
+    spans = owned(exporter)
+    assert len(spans) == runtime.response_callbacks == len(runtime.requests) == 1
+    attrs = spans[0].attributes
     assert (
-        attrs[f"{TLSpanAttributes.LLM_COMPLETIONS}.0.content"]
-        == "Use the forecast tool."
+        json.loads(attrs[OUT])[0][
+            "native_extra" if operation != "chat" else "feedback"
+        ]["zero"]
+        == 0
     )
-    assert (
-        json.loads(attrs[TLSpanAttributes.LLM_REQUEST_FUNCTIONS])[0]["function"]["name"]
-        == "get_weather"
-    )
-    assert (
-        json.loads(attrs[f"{TLSpanAttributes.LLM_COMPLETIONS}.0.tool_calls"])[0]["id"]
-        == "call_1"
-    )
-    assert attrs[GenAIAttributes.GEN_AI_USAGE_INPUT_TOKENS] == 12
-    assert attrs[GenAIAttributes.GEN_AI_USAGE_OUTPUT_TOKENS] == 8
-    assert attrs[TLSpanAttributes.LLM_USAGE_PROMPT_TOKENS] == 12
-    assert attrs[TLSpanAttributes.LLM_USAGE_COMPLETION_TOKENS] == 8
-    assert attrs[TLSpanAttributes.LLM_USAGE_TOTAL_TOKENS] == 20
-    assert attrs[TLSpanAttributes.LLM_USAGE_CACHE_READ_INPUT_TOKENS] == 3
-    assert TLSpanAttributes.TRACELOOP_SPAN_KIND not in attrs
-    assert not OFF_CONTRACT_ALIASES.intersection(attrs)
-
-    instrumentor.deactivate()
-
-
-def test_streaming_chat_emits_after_consumption(
-    monkeypatch: pytest.MonkeyPatch,
-    captured_spans: list[dict[str, Any]],
-) -> None:
-    fake = _install_fake_writer_modules(monkeypatch)
-    WriterInstrumentor().activate()
-
-    stream = fake.ChatResource().chat(**_chat_request_kwargs(), stream=True)
-    assert [chunk.choices[0].delta.content for chunk in stream] == ["Hello ", "stream"]
-
-    attrs = captured_spans[0]["attrs"]
-    assert attrs[f"{TLSpanAttributes.LLM_COMPLETIONS}.0.content"] == "Hello stream"
-    assert attrs[TLSpanAttributes.LLM_USAGE_TOTAL_TOKENS] == 5
-    assert attrs[TLSpanAttributes.LLM_IS_STREAMING] is True
-    assert not OFF_CONTRACT_ALIASES.intersection(attrs)
-
-
-def test_async_chat_is_patched(
-    monkeypatch: pytest.MonkeyPatch,
-    captured_spans: list[dict[str, Any]],
-) -> None:
-    fake = _install_fake_writer_modules(monkeypatch)
-    WriterInstrumentor().activate()
-
-    async def run() -> None:
-        response = await fake.AsyncChatResource().chat(**_chat_request_kwargs())
-        assert response.model == "palmyra-x5"
-
-    asyncio.run(run())
-
-    assert len(captured_spans) == 1
-    assert captured_spans[0]["attrs"][TLSpanAttributes.LLM_REQUEST_TYPE] == "chat"
-
-
-def test_completion_mapper_uses_text_log_type_without_aliases() -> None:
-    attrs = build_completion_attrs(
-        request_kwargs={"model": "palmyra-x5", "prompt": "Write a headline."},
-        response_or_chunks=SimpleNamespace(
-            model="palmyra-x5",
-            choices=[SimpleNamespace(text="Tracing works")],
-        ),
-    )
-
-    assert attrs[RESPAN_LOG_TYPE] == LOG_TYPE_TEXT
-    assert attrs[TLSpanAttributes.LLM_REQUEST_TYPE] == "chat"
-    assert attrs[TLSpanAttributes.LLM_REQUEST_MODEL] == "palmyra-x5"
-    assert attrs[f"{TLSpanAttributes.LLM_PROMPTS}.0.content"] == "Write a headline."
-    assert attrs[f"{TLSpanAttributes.LLM_COMPLETIONS}.0.content"] == "Tracing works"
-    assert not OFF_CONTRACT_ALIASES.intersection(attrs)
-
-
-def test_other_writer_text_operations_map_to_canonical_attrs() -> None:
-    graph_attrs = build_graph_question_attrs(
-        request_kwargs={"graph_ids": ["graph_1"], "question": "What changed?"},
-        response_or_chunks=SimpleNamespace(answer="The docs changed."),
-    )
-    app_attrs = build_application_generate_attrs(
-        request_kwargs={
-            "application_id": "app_1",
-            "inputs": [{"id": "topic", "value": "AI"}],
-        },
-        response_or_chunks=SimpleNamespace(suggestion="Application output"),
-    )
-    vision_attrs = build_vision_attrs(
-        request_kwargs={
-            "model": "palmyra-vision",
-            "prompt": "Describe {{image}}",
-            "variables": [],
-        },
-        response=SimpleNamespace(data="Vision output"),
-    )
-    translation_attrs = build_translation_attrs(
-        request_kwargs={
-            "model": "palmyra-translate",
-            "text": "Hello",
-            "source_language_code": "en",
-            "target_language_code": "fr",
-            "formality": False,
-            "length_control": False,
-            "mask_profanity": False,
-        },
-        response=SimpleNamespace(data="Bonjour"),
-    )
-
-    for attrs in (graph_attrs, app_attrs, vision_attrs, translation_attrs):
-        assert attrs[RESPAN_LOG_TYPE] == LOG_TYPE_TEXT
-        assert attrs[TLSpanAttributes.LLM_REQUEST_TYPE] == "chat"
-        assert not OFF_CONTRACT_ALIASES.intersection(attrs)
-
-    assert (
-        graph_attrs[f"{TLSpanAttributes.LLM_COMPLETIONS}.0.content"]
-        == "The docs changed."
-    )
-    assert graph_attrs[TLSpanAttributes.LLM_REQUEST_MODEL] == "writer-graph"
-    assert (
-        app_attrs[f"{TLSpanAttributes.LLM_COMPLETIONS}.0.content"]
-        == "Application output"
-    )
-    assert app_attrs[TLSpanAttributes.LLM_REQUEST_MODEL] == "writer-application"
-    assert vision_attrs[TLSpanAttributes.LLM_REQUEST_MODEL] == "palmyra-vision"
-    assert translation_attrs[TLSpanAttributes.LLM_REQUEST_MODEL] == "palmyra-translate"
-
-
-def test_direct_writer_tools_emit_tool_spans_without_llm_tool_attrs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    web_attrs = build_tool_attrs(
-        tool_name=WRITER_WEB_SEARCH_TOOL_NAME,
-        request_kwargs={"query": "Respan tracing", "include_answer": True},
-        response=SimpleNamespace(
-            query="Respan tracing", answer="Search output", sources=[]
-        ),
-    )
-    pdf_attrs = build_tool_attrs(
-        tool_name=WRITER_PARSE_PDF_TOOL_NAME,
-        request_kwargs={"file_id": "file_1", "format": "markdown"},
-        response=SimpleNamespace(content="PDF output"),
-    )
-
-    for attrs, legacy_name, semantic_detail in (
-        (web_attrs, WRITER_WEB_SEARCH_TOOL_NAME, "web_search"),
-        (pdf_attrs, WRITER_PARSE_PDF_TOOL_NAME, "parse_pdf"),
-    ):
-        assert attrs[RESPAN_LOG_TYPE] == LOG_TYPE_TOOL
-        assert attrs[RESPAN_INTERNAL_SPAN_NAME_KIND] == LOG_TYPE_TOOL
-        assert attrs[RESPAN_INTERNAL_SPAN_NAME_DETAIL] == semantic_detail
-        assert attrs[TLSpanAttributes.TRACELOOP_ENTITY_INPUT]
-        assert attrs[TLSpanAttributes.TRACELOOP_ENTITY_OUTPUT]
-        assert "gen_ai.tool.name" not in attrs
-        assert "gen_ai.tool.call.arguments" not in attrs
-        assert not OFF_CONTRACT_ALIASES.intersection(attrs)
-
-        span = SimpleNamespace(name=legacy_name, attributes=attrs)
-        assert _export_span_name(span) == f"tool.{semantic_detail}"
-
-        monkeypatch.setenv("RESPAN_SPAN_NAME_STYLE", "legacy")
-        assert _export_span_name(span) == legacy_name
-        monkeypatch.delenv("RESPAN_SPAN_NAME_STYLE")
-
-
-def test_completion_and_application_streams_emit_canonical_stream_flag(
-    monkeypatch: pytest.MonkeyPatch,
-    captured_spans: list[dict[str, Any]],
-) -> None:
-    fake = _install_fake_writer_modules(monkeypatch)
-    instrumentor = WriterInstrumentor()
-    instrumentor.activate()
-
-    completion = fake.CompletionsResource().create(
-        model="palmyra-x5",
-        prompt="stream",
-        stream=True,
-    )
-    application = fake.ApplicationsResource().generate_content(
-        "app_1",
-        inputs=[{"id": "topic", "value": "tracing"}],
-        stream=True,
-    )
-    list(completion)
-    list(application)
-
-    assert len(captured_spans) == 2
-    assert all(
-        span["attrs"][TLSpanAttributes.LLM_IS_STREAMING] is True
-        for span in captured_spans
-    )
-    instrumentor.deactivate()
-
-
-def test_two_writer_instances_keep_patches_until_final_deactivate(
-    monkeypatch: pytest.MonkeyPatch,
-    captured_spans: list[dict[str, Any]],
-) -> None:
-    fake = _install_fake_writer_modules(monkeypatch)
-    original = fake.ChatResource.chat
-    first = WriterInstrumentor()
-    second = WriterInstrumentor()
-    first.activate()
-    second.activate()
-
-    first.deactivate()
-    fake.ChatResource().chat(**_chat_request_kwargs())
-    assert len(captured_spans) == 1
-    assert fake.ChatResource.chat is not original
-
-    second.deactivate()
-    assert fake.ChatResource.chat is original
-
-
-def test_writer_stream_keeps_call_time_parent(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fake = _install_fake_writer_modules(monkeypatch)
-    parent_ids: list[int] = []
-    monkeypatch.setattr(
-        _instrumentation,
-        "emit_writer_span",
-        lambda **_kwargs: parent_ids.append(
-            trace.get_current_span().get_span_context().span_id
-        ),
-    )
-    WriterInstrumentor().activate()
-    parent_span_id = 0x4321
-    parent = NonRecordingSpan(
-        SpanContext(
-            trace_id=0xABCDEF1234567890ABCDEF1234567890,
-            span_id=parent_span_id,
-            is_remote=False,
-            trace_flags=TraceFlags(TraceFlags.SAMPLED),
-            trace_state=None,
+    assert not any(
+        k in attrs
+        for k in (
+            "status_code",
+            "tools",
+            "model",
+            "respan.span.tool_calls",
+            "traceloop.span.kind",
         )
     )
-    token = context_api.attach(trace.set_span_in_context(parent))
-    try:
-        stream = fake.ChatResource().chat(**_chat_request_kwargs(), stream=True)
-    finally:
-        context_api.detach(token)
-
-    list(stream)
-    assert parent_ids == [parent_span_id]
-
-
-def test_writer_stream_retention_is_bounded() -> None:
-    chunks: list[Any] = []
-    for index in range(_instrumentation._MAX_STREAM_CHUNKS + 20):
-        _instrumentation._append_stream_chunk(chunks, index)
-
-    assert len(chunks) == _instrumentation._MAX_STREAM_CHUNKS
-    assert chunks[-1] == _instrumentation._MAX_STREAM_CHUNKS + 19
+    if operation in ("chat", "completion"):
+        assert attrs[S.LLM_USAGE_PROMPT_TOKENS] == 0
+        assert attrs[S.LLM_USAGE_COMPLETION_TOKENS] == 3
+        assert attrs[S.LLM_REQUEST_TYPE] == (
+            "chat" if operation == "chat" else "completion"
+        )
+        assert attrs["gen_ai.response.model"] != attrs[S.LLM_REQUEST_MODEL]
+    if operation in ("application", "parse_pdf"):
+        assert (
+            "application_id" if operation == "application" else "file_id"
+        ) in json.loads(attrs[IN])
+    if operation in ("web_search", "parse_pdf"):
+        assert attrs["respan.entity.log_type"] == "tool"
 
 
-def test_writer_error_span_retains_provider_status_for_ingestion(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured: list[Any] = []
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", OPS)
+async def test_native_async_resource_outcomes(setup, operation):
+    _, _, exporter = setup
+    runtime = NativeRuntime()
+    async with runtime.async_client() as client:
+        result = await invoke(client, operation)
+        assert type(result).__module__.startswith("writerai.types.")
+    assert (
+        len(owned(exporter)) == runtime.response_callbacks == len(runtime.requests) == 1
+    )
+    assert OUT in owned(exporter)[0].attributes
+
+
+@pytest.mark.parametrize("operation", ("chat", "completion", "graph", "application"))
+def test_native_300_stream_identity_type_original_chunks_and_close(setup, operation):
+    _, _, exporter = setup
+    runtime = NativeRuntime()
+    with runtime.client() as client:
+        stream = invoke(client, operation, stream=True)
+        assert type(stream) is Stream and runtime.bodies[0].reads == 0
+        native = stream
+        chunks = list(stream)
+        assert stream is native and len(chunks) == 300
+        stream.close()
+    attrs = owned(exporter)[0].attributes
+    assert len(json.loads(attrs[OUT])) == 300
+    assert attrs["gen_ai.completion.0.content"] == "".join(
+        str(i) + "," for i in range(300)
+    )
+    assert runtime.bodies[0].closes == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ("chat", "completion", "graph", "application"))
+async def test_native_async_300_stream_and_original_close(setup, operation):
+    _, _, exporter = setup
+    runtime = NativeRuntime()
+    async with runtime.async_client() as client:
+        stream = await invoke(client, operation, stream=True)
+        assert type(stream) is AsyncStream and runtime.bodies[0].reads == 0
+        chunks = [chunk async for chunk in stream]
+        await stream.close()
+        assert len(chunks) == 300
+    assert len(json.loads(owned(exporter)[0].attributes[OUT])) == 300
+    assert runtime.bodies[0].closes == 1
+
+
+@pytest.mark.parametrize(
+    "action", ("unread_close", "context", "early_close", "deactivate", "gc")
+)
+def test_native_pending_stream_protocol_cleanup_once(setup, action):
+    instrumentor, _, exporter = setup
+    runtime = NativeRuntime()
+    with runtime.client() as client:
+        stream = invoke(client, "chat", stream=True)
+        if action == "context":
+            with stream as native:
+                assert native is stream
+                next(stream)
+        elif action == "early_close":
+            next(stream)
+            stream.close()
+        elif action == "deactivate":
+            instrumentor.deactivate()
+            assert runtime.bodies[0].closes == 0
+            assert len(list(stream)) == 300
+            stream.close()
+        elif action == "gc":
+            ref = weakref.ref(stream)
+            del stream
+            gc.collect()
+            assert ref() is None
+        else:
+            stream.close()
+    assert len(owned(exporter)) == 1
+    assert (
+        OUT not in owned(exporter)[0].attributes
+        if action in ("unread_close", "deactivate", "gc")
+        else OUT in owned(exporter)[0].attributes
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ("unread_close", "early_close", "deactivate"))
+async def test_native_async_pending_close_cleanup(setup, action):
+    instrumentor, _, exporter = setup
+    runtime = NativeRuntime()
+    async with runtime.async_client() as client:
+        stream = await invoke(client, "chat", stream=True)
+        if action == "early_close":
+            await stream.__anext__()
+        if action == "deactivate":
+            instrumentor.deactivate()
+            assert runtime.bodies[0].closes == 0
+            assert len([x async for x in stream]) == 300
+        await stream.close()
+    assert len(owned(exporter)) == 1
+
+
+@pytest.mark.parametrize(
+    "key",
+    (
+        context._SUPPRESS_INSTRUMENTATION_KEY,
+        SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY,
+    ),
+)
+def test_native_suppression_precedes_all_telemetry_inspection(setup, monkeypatch, key):
+    _, _, exporter = setup
+    calls = []
+    original = adapter.request_attributes
     monkeypatch.setattr(
-        _otel_emitter,
-        "inject_span",
-        lambda *, span: captured.append(span),
+        adapter,
+        "request_attributes",
+        lambda *a, **k: (calls.append(1), original(*a, **k))[1],
+    )
+    runtime = NativeRuntime()
+    token = context.attach(context.set_value(key, True))
+    try:
+        with runtime.client() as client:
+            invoke(client, "chat")
+    finally:
+        context.detach(token)
+    assert calls == [] and owned(exporter) == [] and len(runtime.requests) == 1
+
+
+def test_actual_sampler_before_body_and_model_inspection(monkeypatch):
+    provider = TracerProvider(sampler=ALWAYS_OFF)
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    inst = WriterInstrumentor(tracer_provider=provider)
+    calls = []
+    monkeypatch.setattr(
+        adapter, "request_attributes", lambda *a, **k: calls.append(1) or {}
+    )
+    inst.activate()
+    try:
+        with NativeRuntime().client() as client:
+            invoke(client, "chat")
+    finally:
+        inst.deactivate()
+        provider.shutdown()
+    assert calls == [] and exporter.get_finished_spans() == ()
+
+
+@pytest.mark.parametrize("kind", ("canonical", "traceloop", "env", "capture"))
+def test_initial_content_veto_cannot_widen(setup, monkeypatch, kind):
+    inst, provider, exporter = setup
+    runtime = NativeRuntime()
+    if kind == "capture":
+        inst.deactivate()
+        inst = WriterInstrumentor(tracer_provider=provider, capture_content=False)
+        inst.activate()
+    key = (
+        ENABLE_CONTENT_TRACING_KEY
+        if kind == "canonical"
+        else "override_enable_content_tracing"
+    )
+    token = (
+        context.attach(context.set_value(key, False))
+        if kind in ("canonical", "traceloop")
+        else None
+    )
+    if kind == "env":
+        monkeypatch.setenv("RESPAN_TRACE_CONTENT", "off")
+    try:
+        with runtime.client() as client:
+            stream = invoke(client, "chat", stream=True)
+            if token is not None:
+                context.detach(token)
+                token = None
+            if kind == "env":
+                monkeypatch.delenv("RESPAN_TRACE_CONTENT")
+            list(stream)
+            stream.close()
+    finally:
+        if token is not None:
+            context.detach(token)
+        if kind == "capture":
+            inst.deactivate()
+    attrs = owned(exporter)[0].attributes
+    assert IN not in attrs and OUT not in attrs and owned(exporter)[0].events == ()
+
+
+@pytest.mark.parametrize(
+    "key", (ENABLE_CONTENT_TRACING_KEY, "traceloop.enable_content_tracing")
+)
+@pytest.mark.parametrize("phase", ("initial", "active", "finished"))
+def test_native_application_ancestor_attribute_denial_is_irreversible(
+    setup, key, phase
+):
+    _, provider, exporter = setup
+    tracer = provider.get_tracer("application")
+    runtime = NativeRuntime()
+    parent = tracer.start_span(
+        "parent", attributes={key: False} if phase == "initial" else {}
+    )
+    with trace.use_span(parent, end_on_exit=False):
+        if phase == "initial":
+            parent.set_attribute(key, True)
+        elif phase == "active":
+            parent.set_attribute(key, False)
+            with tracer.start_as_current_span("generic-child"):
+                pass
+            parent.set_attribute(key, True)
+        else:
+            parent.set_attribute(key, False)
+            parent.end()
+        with runtime.client() as client:
+            invoke(client, "chat")
+    parent.end()
+    attrs = owned(exporter)[0].attributes
+    assert IN not in attrs and OUT not in attrs
+
+
+def test_late_explicit_detach_without_consumption_removes_retained_body(setup):
+    _, _, exporter = setup
+    runtime = NativeRuntime()
+    with runtime.client() as client:
+        stream = invoke(client, "chat", stream=True)
+        token = context.attach(context.set_value(ENABLE_CONTENT_TRACING_KEY, False))
+        context.detach(token)
+        list(stream)
+        stream.close()
+    assert (
+        IN not in owned(exporter)[0].attributes
+        and OUT not in owned(exporter)[0].attributes
     )
 
-    _otel_emitter.emit_writer_span(
-        name="writer.chat",
-        attrs={},
-        start_ns=time.time_ns(),
-        error_message="RateLimitError: provider limit",
-        status_code=429,
+
+def test_actual_supplied_and_ambient_context_remote_and_unknown_tuple_carriers(setup):
+    _, provider, exporter = setup
+    runtime = NativeRuntime()
+    tracer = provider.get_tracer("app")
+    parent = tracer.start_span("observed")
+    sc = parent.get_span_context()
+    for remote in (False, True):
+        carrier = NonRecordingSpan(
+            SpanContext(
+                sc.trace_id + 1, sc.span_id, is_remote=remote, trace_flags=TraceFlags(1)
+            )
+        )
+        token = context.attach(trace.set_span_in_context(carrier))
+        try:
+            with runtime.client() as client:
+                invoke(client, "chat")
+        finally:
+            context.detach(token)
+    assert (
+        IN not in owned(exporter)[0].attributes and IN in owned(exporter)[1].attributes
+    )
+    token = context.attach(context.set_value(ENABLE_CONTENT_TRACING_KEY, False))
+    supplied = context.set_value(ENABLE_CONTENT_TRACING_KEY, True, context.Context())
+    parent2 = tracer.start_span("supplied", context=supplied)
+    context.detach(token)
+    with trace.use_span(parent2), runtime.client() as client:
+        invoke(client, "chat")
+    parent.end()
+    assert IN not in owned(exporter)[2].attributes
+
+
+def test_native_two_pending_siblings_survive_exporter_suppression(setup):
+    _, provider, exporter = setup
+    runtime = NativeRuntime()
+    with (
+        provider.get_tracer("app").start_as_current_span("parent"),
+        runtime.client() as client,
+    ):
+        a = invoke(client, "chat", stream=True)
+        b = invoke(client, "chat", stream=True)
+        list(a)
+        a.close()
+        list(b)
+        b.close()
+    assert all(IN in s.attributes and OUT in s.attributes for s in owned(exporter))
+
+
+def test_native_generator_full_history_schema_vector_false_zero_and_parse(setup):
+    _, _, exporter = setup
+    runtime = NativeRuntime(vector=True)
+    schema = {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "api_key": {"type": "string", "default": "controlled-secret"},
+                    "zero": {"type": "integer", "default": 0},
+                    "flag": {"type": "boolean", "default": False},
+                },
+            },
+        },
+    }
+    with runtime.client() as client:
+        response = client.chat.chat(
+            model="native-writer",
+            messages=(
+                {"role": "user", "content": "x" * 10000 + str(i)} for i in range(75)
+            ),
+            tools=[schema],
+            temperature=0,
+            max_tokens=0,
+            extra_query={"answer": 0},
+        )
+        assert (
+            len(runtime.requests[-1]["messages"]) == 75
+            and len(response.native_vector) == 5001
+        )
+
+        class Output(BaseModel):
+            value: int
+            summary: str
+            sentiment: str
+
+        parsed = client.chat.parse(
+            model="native-writer",
+            messages=[{"role": "user", "content": "parse"}],
+            response_format=Output,
+        )
+        assert parsed.choices[0].message.parsed.value == 0
+    attrs = owned(exporter)[0].attributes
+    request = json.loads(attrs[IN])
+    output = json.loads(attrs[OUT])[0]
+    assert (
+        len(request["messages"]) == 75
+        and len(request["messages"][-1]["content"]) > 10000
+    )
+    assert len(output["native_vector"]) == 5001 and output["feedback"]["false"] is False
+    assert (
+        request["tools"][0]["function"]["parameters"]["properties"]["api_key"][
+            "default"
+        ]
+        == "[REDACTED]"
+    )
+    assert (
+        request["tools"][0]["function"]["parameters"]["properties"]["zero"]["default"]
+        == 0
+    )
+    assert (
+        json.loads(owned(exporter)[1].attributes[IN])["response_format"]["type"]
+        == "json_schema"
+    )
+    assert len(owned(exporter)) == 2
+
+
+def test_native_empty_feedback_not_gated_on_projected_messages(setup):
+    _, _, exporter = setup
+    runtime = NativeRuntime(empty=True)
+    with runtime.client() as client:
+        response = invoke(client, "chat")
+        assert response.choices == []
+    assert (
+        json.loads(owned(exporter)[0].attributes[OUT])[0]["feedback"]["blocked"] is True
+    )
+    assert "gen_ai.completion.0.content" not in owned(exporter)[0].attributes
+
+
+def test_native_fragmented_and_quoted_credentials_complete_arguments(setup):
+    _, _, exporter = setup
+    runtime = NativeRuntime(chunks=2, secret_fragments=True)
+    with runtime.client() as client:
+        native = list(invoke(client, "chat", stream=True))
+        assert "controlled-" in native[0].choices[0].delta.content
+    attrs = owned(exporter)[0].attributes
+    assert "controlled-" not in attrs[OUT] and 'secret"' not in attrs[OUT]
+    arguments = json.loads(attrs["gen_ai.completion.0.tool_calls"])[0]["function"][
+        "arguments"
+    ]
+    assert json.loads(arguments) == {
+        "private_key": "[REDACTED]",
+        "zero": 0,
+        "flag": False,
+    }
+
+
+@pytest.mark.parametrize("kind", ("http", "sse"))
+def test_native_errors_identity_actual_http_partial_output_no_fabrication(setup, kind):
+    _, _, exporter = setup
+    runtime = NativeRuntime(error=kind == "http", stream_error=kind == "sse")
+    with (
+        runtime.client() as client,
+        pytest.raises(RateLimitError if kind == "http" else APIError) as error,
+    ):
+        if kind == "http":
+            invoke(client, "chat")
+        else:
+            list(invoke(client, "chat", stream=True))
+    span = owned(exporter)[0]
+    assert (
+        span.status.status_code.name == "ERROR"
+        and span.attributes["error.type"] == type(error.value).__name__
+    )
+    if kind == "http":
+        assert (
+            span.attributes["http.response.status_code"] == 429
+            and OUT not in span.attributes
+        )
+    else:
+        assert len(json.loads(span.attributes[OUT])) == 2
+    assert "status_code" not in span.attributes
+
+
+def test_native_retry_and_callbacks_are_sdk_owned(setup):
+    _, _, exporter = setup
+    runtime = NativeRuntime(retry=True)
+    with runtime.client(max_retries=1) as client:
+        invoke(client, "chat")
+    assert (
+        len(runtime.requests) == runtime.response_callbacks == 2
+        and len(owned(exporter)) == 1
     )
 
-    assert len(captured) == 1
-    assert captured[0].attributes["status_code"] == 429
-    assert captured[0].status.is_ok is False
+
+@pytest.mark.parametrize(
+    "fault", ("request", "response", "attributes", "end", "detach")
+)
+def test_telemetry_faults_preserve_native_results_cleanup_and_ambient(
+    setup, monkeypatch, fault
+):
+    _, _, _exporter = setup
+    ambient = context.get_current()
+    runtime = NativeRuntime()
+
+    def fail(*args, **kwargs):
+        context.attach(context.set_value("telemetry-fault", True))
+        raise RuntimeError("telemetry fault")
+
+    if fault == "request":
+        monkeypatch.setattr(adapter, "request_attributes", fail)
+    elif fault == "response":
+        monkeypatch.setattr(adapter, "response_attributes", fail)
+    elif fault == "attributes":
+        monkeypatch.setattr(adapter._Call, "set_attributes", fail)
+    elif fault == "end":
+        monkeypatch.setattr("opentelemetry.sdk.trace._Span.end", fail)
+    else:
+        monkeypatch.setattr(context, "detach", fail)
+    with runtime.client() as client:
+        response = invoke(client, "chat")
+        assert response.choices[0].message.content == "native response"
+    assert context.get_current() is ambient and len(runtime.requests) == 1
+
+
+def test_foreign_start_fault_ends_scrubs_owned_partial_span(monkeypatch):
+    provider = TracerProvider()
+    seen = []
+    ambient = context.get_current()
+
+    class Foreign(SpanProcessor):
+        def on_start(self, span, parent_context=None):
+            seen.append(span)
+            span.add_event("private", {"private": "controlled"})
+            context.attach(context.set_value("fault", True))
+            raise RuntimeError("foreign telemetry")
+
+    foreign = Foreign()
+    provider.add_span_processor(foreign)
+    inst = WriterInstrumentor(tracer_provider=provider)
+    inst.activate()
+    try:
+        with NativeRuntime().client() as client:
+            invoke(client, "chat")
+        assert (
+            seen[0].end_time is not None
+            and not seen[0].events
+            and context.get_current() is ambient
+        )
+    finally:
+        inst.deactivate()
+        provider.shutdown()
+
+
+def test_actual_unknown_payload_and_propagated_metaclass_hooks_not_executed(setup):
+    _, _, exporter = setup
+    calls = []
+
+    class Meta(type):
+        def __hash__(cls):
+            calls.append("hash")
+            return type.__hash__(cls)
+
+        def __eq__(cls, other):
+            calls.append("eq")
+            return cls is other
+
+    class Unknown(metaclass=Meta):
+        def __getattribute__(self, key):
+            calls.append("get")
+            raise AssertionError(key)
+
+        def __bool__(self):
+            calls.append("bool")
+            raise AssertionError
+
+    value = Unknown()
+    assert json.loads(json_dumps(value)) == {"type": "Unknown"}
+    token = _PROPAGATED_ATTRIBUTES.set({"customer_identifier": value})
+    try:
+        with NativeRuntime().client() as client:
+            invoke(client, "chat")
+    finally:
+        _PROPAGATED_ATTRIBUTES.reset(token)
+    assert calls == [] and len(owned(exporter)) == 1
+
+
+def test_native_shared_conflicts_foreign_and_mutate_then_raise_rollback(
+    setup, monkeypatch
+):
+    inst, provider, _ = setup
+    other = WriterInstrumentor(tracer_provider=provider)
+    other.activate()
+    with pytest.raises(ValueError):
+        WriterInstrumentor(capture_content=False, tracer_provider=provider).activate()
+    from writerai.resources.chat import ChatResource
+
+    original = ChatResource.chat
+
+    def foreign(*args, **kwargs):
+        return original(*args, **kwargs)
+
+    ChatResource.chat = foreign
+    inst.deactivate()
+    other.deactivate()
+    assert ChatResource.chat is foreign
+    ChatResource.chat = original.__wrapped__
+    import builtins
+
+    def fail(owner, name, value):
+        builtins.setattr(owner, name, value)
+        if owner is ChatResource and name == "chat":
+            raise RuntimeError("mutated setter")
+
+    monkeypatch.setattr(adapter, "setattr", fail, raising=False)
+    fresh = WriterInstrumentor(tracer_provider=provider)
+    with pytest.raises(RuntimeError):
+        fresh.activate()
+    assert ChatResource.chat is original.__wrapped__ and not adapter._PATCHES
+
+
+def test_serializer_quoted_auth_json_schema_and_urls_idempotent():
+    for raw in [
+        'Authorization: Bearer "controlled-secret"',
+        "Basic 'controlled secret'",
+        'private_key="controlled secret"',
+        "https://example.invalid/path?api%5Fkey=controlled-secret",
+    ]:
+        safe = safe_text(raw)
+        assert (
+            "controlled-secret" not in safe
+            and "controlled secret" not in safe
+            and safe_text(safe) == safe
+        )
+    raw = '{"private_key":"controlled secret","zero":0,"flag":false}'
+    safe = safe_text(raw)
+    assert (
+        json.loads(safe) == {"private_key": "[REDACTED]", "zero": 0, "flag": False}
+        and safe_text(safe) == safe
+    )
+
+
+def test_native_plural_cookie_credentials_are_redacted(setup):
+    _, _, exporter = setup
+    with NativeRuntime().client() as client:
+        invoke(client, "chat", extra_body={"cookies": "controlled-cookie-secret"})
+    assert json.loads(owned(exporter)[0].attributes[IN])["cookies"] == "[REDACTED]"

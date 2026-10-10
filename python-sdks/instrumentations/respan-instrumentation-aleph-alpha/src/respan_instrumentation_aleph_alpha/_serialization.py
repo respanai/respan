@@ -1,4 +1,4 @@
-"""Serialize complete builtins and known Ragas storage without user conversion hooks."""
+"""Serialize builtins and known native Aleph Alpha storage without user hooks."""
 
 from __future__ import annotations
 
@@ -11,13 +11,13 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 REDACTED = "[REDACTED]"
 _SECRET = re.compile(
-    r"(?i)(api[_-]?key|authorization|password|secret|access[_-]?token|refresh[_-]?token|session[_-]?token|token|credentials?|private[_-]?key|cookie)$"
+    r"(?i)(api[_-]?key|authorization|password|secret|access[_-]?token|session[_-]?token|token|credentials?|private[_-]?key|cookie)$"
 )
 _AUTH = re.compile(
     r"""(?i)\b(Bearer|Basic)\s+(?!\[REDACTED\])(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[A-Za-z0-9._~+/=-]+)"""
 )
 _ASSIGN = re.compile(
-    r"""(?ix)(["']?(?:api[_-]?key|authorization|password|secret|session[_-]?token|access[_-]?token|refresh[_-]?token|token|credentials?|private[_-]?key|cookie)["']?)(\s*[:=]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}]+)"""
+    r"""(?ix)(["']?(?:api[_-]?key|authorization|password|secret|session[_-]?token|access[_-]?token|token|credentials?|private[_-]?key|cookie)["']?)(\s*[:=]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}]+)"""
 )
 _URL = re.compile(r"https?://[^\s\"'<>]+")
 
@@ -56,6 +56,8 @@ def redact_text(value: str) -> str:
             return REDACTED
 
     value = _URL.sub(url, value)
+    # Plain diagnostic strings can contain literal backslash-quoted credentials,
+    # as well as JSON strings decoded above. Consume the whole native token.
     value = re.sub(
         r"""(?i)\b(Bearer|Basic)\s+(\\+)(["'])(?:[\s\S]*?)(?<!\\)\2\3""",
         lambda m: f"{m.group(1)} {REDACTED}",
@@ -95,56 +97,49 @@ def native_storage(value: Any, base: type) -> dict | None:
     return None
 
 
-def native_dict(value):
+_NATIVE_BASES = None
+_ENUM_BASES = None
+
+
+def initialize_native_types():
+    global _NATIVE_BASES, _ENUM_BASES
+    if _NATIVE_BASES is not None:
+        return
+    import importlib
+    from dataclasses import is_dataclass
+    from enum import Enum
+
+    bases, enums = [], []
+    for name in (
+        "prompt",
+        "completion",
+        "embedding",
+        "chat",
+        "evaluation",
+        "explanation",
+        "steering",
+    ):
+        module = importlib.import_module("aleph_alpha_client." + name)
+        for value in vars(module).values():
+            if (
+                isinstance(value, type)
+                and type.__getattribute__(value, "__module__") == module.__name__
+            ):
+                if is_dataclass(value):
+                    bases.append(value)
+                elif issubclass(value, Enum):
+                    enums.append(value)
+    _NATIVE_BASES, _ENUM_BASES = tuple(bases), tuple(enums)
+
+
+def native_dict(value: Any) -> dict[str, Any] | None:
     if type(value) is dict:
         return value
-    from pydantic import BaseModel
-    from ragas.dataset import DataTable
-    from ragas.dataset_schema import EvaluationDataset, EvaluationResult
-    from ragas.metrics.result import MetricResult
-
-    if any(
-        item is BaseModel
-        for item in type.__dict__["__mro__"].__get__(type(value), type(type(value)))
-    ):
-        data = dict(native_storage(value, BaseModel) or {})
-        descriptor = type.__getattribute__(BaseModel, "__dict__").get(
-            "__pydantic_extra__"
-        )
-        if any(
-            type(descriptor) is t
-            for t in (types.GetSetDescriptorType, types.MemberDescriptorType)
-        ):
-            extra = descriptor.__get__(value, BaseModel)
-            if type(extra) is dict:
-                data.update(extra)
-        return data
-    if type(value) is EvaluationDataset:
-        data = native_storage(value, EvaluationDataset) or {}
-        return {"samples": data.get("samples", [])}
-    if type(value) is EvaluationResult:
-        data = native_storage(value, EvaluationResult) or {}
-        return {
-            k: data[k]
-            for k in ("scores", "dataset", "binary_columns", "traces", "run_id")
-            if k in data
-        }
-    if any(
-        item is MetricResult
-        for item in type.__dict__["__mro__"].__get__(type(value), type(type(value)))
-    ):
-        data = native_storage(value, MetricResult) or {}
-        return {
-            "value": data.get("_value"),
-            "reason": data.get("reason"),
-            "traces": data.get("traces"),
-        }
-    if any(
-        item is DataTable
-        for item in type.__dict__["__mro__"].__get__(type(value), type(type(value)))
-    ):
-        data = native_storage(value, DataTable) or {}
-        return {"name": data.get("name"), "data": data.get("_data", [])}
+    initialize_native_types()
+    for base in _NATIVE_BASES:
+        data = native_storage(value, base)
+        if data is not None:
+            return data
     return None
 
 
@@ -199,42 +194,25 @@ def json_value(
         return value if math.isfinite(value) else None
     if type(value) is str:
         return redact_text(value)
+    initialize_native_types()
+    for base in _ENUM_BASES:
+        data = native_storage(value, base)
+        if data is not None:
+            return json_value(data.get("_value_"), seen=seen)
     active = seen if seen is not None else set()
     if id(value) in active:
         return None
     active.add(id(value))
     try:
-        from uuid import UUID
-
-        import numpy as np
-
-        if type(value) is UUID:
-            return UUID.__str__(value)
-        if type(value) is np.ndarray:
-            return json_value(np.ndarray.tolist(value), seen=active)
-        if any(
-            type(value) is t
-            for t in (
-                np.float16,
-                np.float32,
-                np.float64,
-                np.int8,
-                np.int16,
-                np.int32,
-                np.int64,
-                np.uint8,
-                np.uint16,
-                np.uint32,
-                np.uint64,
-                np.bool_,
-            )
-        ):
-            return json_value(value.item(), seen=active)
         data = native_dict(value)
         if data is not None:
             is_schema = schema or _schema(data)
             result = {}
             for key, item in data.items():
+                if type(key) is tuple and all(type(part) is str for part in key):
+                    key = json.dumps(list(key), separators=(",", ":"))
+                if any(type(key) is t for t in (int, bool, type(None))):
+                    key = json.dumps(key)
                 if type(key) is not str:
                     continue
                 sensitive = bool(_SECRET.search(key))
@@ -264,11 +242,7 @@ def json_value(
                 json_value(item, seen=active, credential_schema=credential_schema)
                 for item in value
             ]
-        return (
-            "<"
-            + type.__dict__["__name__"].__get__(type(value), type(type(value)))
-            + ">"
-        )
+        return None
     finally:
         active.discard(id(value))
 

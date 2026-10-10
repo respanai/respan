@@ -12,10 +12,11 @@ packages = [
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
 ragas = ">=0.4.3,<0.5.0"
+# Ragas 0.4.3 imports ChatVertexAI from the pre-0.4 community namespace.
 langchain-community = ">=0.3.0,<0.4.0"
 opentelemetry-api = ">=1.38.0,<2.0.0"
-opentelemetry-semantic-conventions-ai = ">=0.4.1"
-respan-sdk = ">=2.6.1"
+opentelemetry-semantic-conventions-ai = ">=0.5.1,<0.6"
+respan-sdk = ">=2.6.26"
 respan-tracing = "^2.17.0"
 
 [tool.poetry.plugins."respan.instrumentations"]

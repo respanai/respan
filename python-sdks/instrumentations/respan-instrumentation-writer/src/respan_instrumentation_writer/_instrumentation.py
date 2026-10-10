@@ -1,1091 +1,767 @@
-"""Writer SDK instrumentation plugin for Respan."""
+"""Observe released native Writer calls and streams with real OTel sampling."""
 
+# ruff: noqa: BLE001 -- telemetry failures never log native payloads.
 from __future__ import annotations
 
+import contextvars
+import functools
 import importlib
-import logging
-import time
-from collections.abc import Callable
-from itertools import islice
-from threading import Condition, RLock
-from types import TracebackType
-from typing import Any, Self
+import importlib.metadata
+import inspect
+import threading
+import types
+import weakref
+from dataclasses import dataclass
 
-from opentelemetry import context as context_api
-from respan_tracing.core.tracer import RespanTracer
-
-from respan_instrumentation_writer._constants import (
-    ANALYZE_METHOD_NAME,
-    APPLICATION_ID_KEY,
-    ASYNC_APPLICATIONS_CLASS_NAME,
-    ASYNC_CHAT_CLASS_NAME,
-    ASYNC_COMPLETIONS_CLASS_NAME,
-    ASYNC_GRAPHS_CLASS_NAME,
-    ASYNC_TOOLS_CLASS_NAME,
-    ASYNC_TRANSLATION_CLASS_NAME,
-    ASYNC_VISION_CLASS_NAME,
-    CHAT_METHOD_NAME,
-    CREATE_METHOD_NAME,
-    FILE_ID_KEY,
-    GENERATE_CONTENT_METHOD_NAME,
-    PARSE_PDF_METHOD_NAME,
-    QUESTION_METHOD_NAME,
-    STREAM_KEY,
-    SYNC_APPLICATIONS_CLASS_NAME,
-    SYNC_CHAT_CLASS_NAME,
-    SYNC_COMPLETIONS_CLASS_NAME,
-    SYNC_GRAPHS_CLASS_NAME,
-    SYNC_TOOLS_CLASS_NAME,
-    SYNC_TRANSLATION_CLASS_NAME,
-    SYNC_VISION_CLASS_NAME,
-    TRANSLATE_METHOD_NAME,
-    WEB_SEARCH_METHOD_NAME,
-    WRITER_APPLICATION_GENERATE_SPAN_NAME,
-    WRITER_APPLICATIONS_MODULE,
-    WRITER_CHAT_MODULE,
-    WRITER_CHAT_SPAN_NAME,
-    WRITER_COMPLETION_SPAN_NAME,
-    WRITER_COMPLETIONS_MODULE,
-    WRITER_GRAPH_QUESTION_SPAN_NAME,
-    WRITER_GRAPHS_MODULE,
-    WRITER_INSTRUMENTATION_NAME,
-    WRITER_PARSE_PDF_TOOL_NAME,
-    WRITER_TOOLS_MODULE,
-    WRITER_TRANSLATION_MODULE,
-    WRITER_TRANSLATION_SPAN_NAME,
-    WRITER_VISION_MODULE,
-    WRITER_VISION_SPAN_NAME,
-    WRITER_WEB_SEARCH_TOOL_NAME,
+from opentelemetry import context, trace
+from opentelemetry.sdk.util import BoundedList
+from opentelemetry.semconv._incubating.attributes.error_attributes import ERROR_MESSAGE
+from opentelemetry.semconv.attributes.error_attributes import ERROR_TYPE
+from opentelemetry.semconv.attributes.http_attributes import HTTP_RESPONSE_STATUS_CODE
+from opentelemetry.semconv_ai import SpanAttributes
+from opentelemetry.trace import Status, StatusCode
+from respan_sdk.constants.span_attributes import (
+    RESPAN_LOG_TYPE,
+    RESPAN_METADATA,
+    RESPAN_PROMPT,
+    RESPAN_SPAN_ATTRIBUTES_MAP,
 )
-from respan_instrumentation_writer._otel_emitter import emit_writer_span
+from respan_tracing.core.tracer import RespanTracer
+from respan_tracing.utils.span_factory import _PROPAGATED_ATTRIBUTES
+
+from respan_instrumentation_writer._otel_emitter import (
+    base_attributes,
+    request_attributes,
+    response_attributes,
+)
+from respan_instrumentation_writer._policy import (
+    CREATING_CALL,
+    AncestorPolicy,
+    suppressed,
+)
 from respan_instrumentation_writer._serialization import (
+    REDACTED,
+    json_dumps,
     provider_status_code,
     safe_exception_message,
-)
-from respan_instrumentation_writer._translator import (
-    build_application_generate_attrs,
-    build_chat_attrs,
-    build_completion_attrs,
-    build_graph_question_attrs,
-    build_tool_attrs,
-    build_translation_attrs,
-    build_vision_attrs,
-    request_kwargs_with_positionals,
+    safe_text,
+    safe_type_name,
+    sensitive_key,
+    to_jsonable,
 )
 
-logger = logging.getLogger(__name__)
-
-_original_sync_chat = None
-_original_async_chat = None
-_original_sync_completion_create = None
-_original_async_completion_create = None
-_original_sync_graph_question = None
-_original_async_graph_question = None
-_original_sync_application_generate = None
-_original_async_application_generate = None
-_original_sync_vision_analyze = None
-_original_async_vision_analyze = None
-_original_sync_translation_translate = None
-_original_async_translation_translate = None
-_original_sync_tool_web_search = None
-_original_async_tool_web_search = None
-_original_sync_tool_parse_pdf = None
-_original_async_tool_parse_pdf = None
-_activation_lock = RLock()
-_activation_condition = Condition(_activation_lock)
-_activation_count = 0
-_activation_installing = False
-_installed_methods: dict[tuple[type[Any], str], Any] = {}
-_MAX_STREAM_CHUNKS = 256
-
-_ITERABLE_REQUEST_FIELDS = {
-    "graph_ids",
-    "inputs",
-    "messages",
-    "tools",
-    "variables",
-}
-
-_RESTORE_TARGETS = (
-    ("sync_chat", CHAT_METHOD_NAME, "_original_sync_chat"),
-    ("async_chat", CHAT_METHOD_NAME, "_original_async_chat"),
-    ("sync_completions", CREATE_METHOD_NAME, "_original_sync_completion_create"),
-    ("async_completions", CREATE_METHOD_NAME, "_original_async_completion_create"),
-    ("sync_graphs", QUESTION_METHOD_NAME, "_original_sync_graph_question"),
-    ("async_graphs", QUESTION_METHOD_NAME, "_original_async_graph_question"),
-    (
-        "sync_applications",
-        GENERATE_CONTENT_METHOD_NAME,
-        "_original_sync_application_generate",
-    ),
-    (
-        "async_applications",
-        GENERATE_CONTENT_METHOD_NAME,
-        "_original_async_application_generate",
-    ),
-    ("sync_vision", ANALYZE_METHOD_NAME, "_original_sync_vision_analyze"),
-    ("async_vision", ANALYZE_METHOD_NAME, "_original_async_vision_analyze"),
-    ("sync_translation", TRANSLATE_METHOD_NAME, "_original_sync_translation_translate"),
-    (
-        "async_translation",
-        TRANSLATE_METHOD_NAME,
-        "_original_async_translation_translate",
-    ),
-    ("sync_tools", WEB_SEARCH_METHOD_NAME, "_original_sync_tool_web_search"),
-    ("async_tools", WEB_SEARCH_METHOD_NAME, "_original_async_tool_web_search"),
-    ("sync_tools", PARSE_PDF_METHOD_NAME, "_original_sync_tool_parse_pdf"),
-    ("async_tools", PARSE_PDF_METHOD_NAME, "_original_async_tool_parse_pdf"),
-)
+_LOCK = threading.RLock()
+_ACTIVATION_COUNT = 0
+_ENABLED = False
+_CAPTURE_CONTENT = True
+_PROVIDER = None
+_POLICIES = weakref.WeakKeyDictionary()
+_PATCHES = []
+_PENDING = weakref.WeakSet()
+_ACTIVE_CALL = contextvars.ContextVar("respan_writer_active_call", default=None)
 
 
-def _complete_installation(*, success: bool) -> None:
-    global _activation_count, _activation_installing
-    with _activation_condition:
-        if success:
-            _activation_count = 1
-        _activation_installing = False
-        _activation_condition.notify_all()
+def _provider():
+    return _PROVIDER if _PROVIDER is not None else trace.get_tracer_provider()
 
 
-def _get_module_attr(module_path: str, attr_name: str) -> Any:
-    module = importlib.import_module(module_path)
-    attr_value = getattr(module, attr_name, None)
-    if attr_value is None:
-        raise AttributeError(f"{module_path}.{attr_name}")
-    return attr_value
+def _policy():
+    provider = _provider()
+    with _LOCK:
+        policy = _POLICIES.get(provider)
+        if policy is None:
+            if not callable(getattr(provider, "add_span_processor", None)):
+                return None
+            policy = AncestorPolicy(_CAPTURE_CONTENT)
+            _POLICIES[provider] = policy
+            try:
+                provider.add_span_processor(policy)
+                processor = getattr(provider, "_active_span_processor", None)
+                if processor is not None:
+                    processor._span_processors = (
+                        policy,
+                        *(
+                            item
+                            for item in processor._span_processors
+                            if item is not policy
+                        ),
+                    )
+            except BaseException:
+                _remove_policies()
+                raise
+        policy.setting = _CAPTURE_CONTENT
+        policy.enabled = True
+        return policy
 
 
-def _load_resource_classes() -> dict[str, type[Any]]:
-    return {
-        "sync_chat": _get_module_attr(WRITER_CHAT_MODULE, SYNC_CHAT_CLASS_NAME),
-        "async_chat": _get_module_attr(WRITER_CHAT_MODULE, ASYNC_CHAT_CLASS_NAME),
-        "sync_completions": _get_module_attr(
-            WRITER_COMPLETIONS_MODULE,
-            SYNC_COMPLETIONS_CLASS_NAME,
-        ),
-        "async_completions": _get_module_attr(
-            WRITER_COMPLETIONS_MODULE,
-            ASYNC_COMPLETIONS_CLASS_NAME,
-        ),
-        "sync_graphs": _get_module_attr(WRITER_GRAPHS_MODULE, SYNC_GRAPHS_CLASS_NAME),
-        "async_graphs": _get_module_attr(WRITER_GRAPHS_MODULE, ASYNC_GRAPHS_CLASS_NAME),
-        "sync_applications": _get_module_attr(
-            WRITER_APPLICATIONS_MODULE,
-            SYNC_APPLICATIONS_CLASS_NAME,
-        ),
-        "async_applications": _get_module_attr(
-            WRITER_APPLICATIONS_MODULE,
-            ASYNC_APPLICATIONS_CLASS_NAME,
-        ),
-        "sync_vision": _get_module_attr(WRITER_VISION_MODULE, SYNC_VISION_CLASS_NAME),
-        "async_vision": _get_module_attr(WRITER_VISION_MODULE, ASYNC_VISION_CLASS_NAME),
-        "sync_translation": _get_module_attr(
-            WRITER_TRANSLATION_MODULE,
-            SYNC_TRANSLATION_CLASS_NAME,
-        ),
-        "async_translation": _get_module_attr(
-            WRITER_TRANSLATION_MODULE,
-            ASYNC_TRANSLATION_CLASS_NAME,
-        ),
-        "sync_tools": _get_module_attr(WRITER_TOOLS_MODULE, SYNC_TOOLS_CLASS_NAME),
-        "async_tools": _get_module_attr(WRITER_TOOLS_MODULE, ASYNC_TOOLS_CLASS_NAME),
-    }
-
-
-def _is_omitted(value: Any) -> bool:
-    return type(value).__name__ in {"Omit", "NotGiven"}
-
-
-def _materialize_iterable(value: Any) -> Any:
-    if value is None or _is_omitted(value):
-        return value
-    if isinstance(value, (str, bytes, dict, list, tuple)):
-        return value
+def _attempt(fn, default=None):
     try:
-        return list(islice(iter(value), 50))
-    except (TypeError, RuntimeError):
-        return value
-
-
-def _snapshot_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
-    snapshot = dict(kwargs)
-    for field_name in _ITERABLE_REQUEST_FIELDS:
-        if field_name in snapshot:
-            snapshot[field_name] = _materialize_iterable(snapshot[field_name])
-    return snapshot
-
-
-def _append_stream_chunk(chunks: list[Any], chunk: Any) -> None:
-    if len(chunks) < _MAX_STREAM_CHUNKS:
-        chunks.append(chunk)
-    else:
-        chunks[-1] = chunk
-
-
-def _is_stream_request(request_kwargs: dict[str, Any]) -> bool:
-    return request_kwargs.get(STREAM_KEY) is True
-
-
-def _emit_safely(
-    *,
-    span_name: str,
-    attrs_builder: Callable[..., dict[str, Any]],
-    request_kwargs: dict[str, Any],
-    start_ns: int,
-    response_or_chunks: Any = None,
-    error_message: str | None = None,
-    status_code: int = 200,
-    otel_context: Any = None,
-) -> None:
-    token = None
-    try:
-        if otel_context is not None:
-            token = context_api.attach(otel_context)
-        attrs = attrs_builder(
-            request_kwargs=request_kwargs,
-            response_or_chunks=response_or_chunks,
-        )
-        emit_writer_span(
-            name=span_name,
-            attrs=attrs,
-            start_ns=start_ns,
-            error_message=error_message,
-            status_code=status_code,
-        )
+        return fn()
     except BaseException:
-        logger.debug("Failed to build Writer span attrs", exc_info=True)
-    finally:
-        if token is not None:
-            context_api.detach(token)
+        return default
 
 
-def _emit_unary_safely(
-    *,
-    span_name: str,
-    attrs_builder: Callable[..., dict[str, Any]],
-    request_kwargs: dict[str, Any],
-    start_ns: int,
-    response: Any = None,
-    error_message: str | None = None,
-    status_code: int = 200,
-    otel_context: Any = None,
-) -> None:
-    token = None
-    try:
-        if otel_context is not None:
-            token = context_api.attach(otel_context)
-        attrs = attrs_builder(request_kwargs=request_kwargs, response=response)
-        emit_writer_span(
-            name=span_name,
-            attrs=attrs,
-            start_ns=start_ns,
-            error_message=error_message,
-            status_code=status_code,
+def _propagated_attributes():
+    # The released bridge calls str() on metadata. Read the same canonical
+    # ContextVar without invoking arbitrary customer formatting hooks.
+    values = _PROPAGATED_ATTRIBUTES.get()
+    result = {}
+    if type(values) is not dict:
+        return result
+    for key, value in values.items():
+        if type(key) is not str or key not in RESPAN_SPAN_ATTRIBUTES_MAP:
+            continue
+        target = RESPAN_SPAN_ATTRIBUTES_MAP[key]
+        if target == RESPAN_METADATA and type(value) is dict:
+            for name, item in value.items():
+                if type(name) is str:
+                    cleaned = REDACTED if sensitive_key(name) else to_jsonable(item)
+                    result[f"{target}.{safe_text(name)}"] = (
+                        cleaned if type(cleaned) is str else json_dumps(cleaned)
+                    )
+        elif target == RESPAN_PROMPT:
+            result[target] = json_dumps(value)
+        elif any(type(value) is kind for kind in (str, bool, int, float)):
+            result[target] = to_jsonable(value)
+    return result
+
+
+def _restore_context(ambient):
+    if context.get_current() is ambient:
+        return
+    _attempt(lambda: context._RUNTIME_CONTEXT.attach(ambient))
+    if context.get_current() is not ambient:
+        state = object.__getattribute__(context._RUNTIME_CONTEXT, "__dict__")
+        for candidate in state.values():
+            if type(candidate) is contextvars.ContextVar:
+                candidate.set(ambient)
+                break
+
+
+class _Call:
+    def __init__(self, kwargs, *, name, operation):
+        self.span = None
+        self.creation_name = name
+        self.policy = None
+        self.finished = False
+        self.failed = False
+        self.operation = operation
+        self.chunks = []
+        self.content = set()
+        self.cleanups = []
+        self.propagated = {}
+        self.priority = {}
+        self.base = base_attributes(operation)
+        self.base[SpanAttributes.TRACELOOP_ENTITY_NAME] = name
+        self.base[SpanAttributes.TRACELOOP_ENTITY_PATH] = (
+            "" if not trace.get_current_span().get_span_context().is_valid else name
         )
-    except BaseException:
-        logger.debug("Failed to build Writer span attrs", exc_info=True)
-    finally:
+        _PENDING.add(self)
+        self.policy = _policy()
+        creation_token = CREATING_CALL.set(self)
+        try:
+            self.span = (
+                _provider()
+                .get_tracer(
+                    "writer",
+                    importlib.metadata.version("respan-instrumentation-writer"),
+                )
+                .start_span(name, kind=trace.SpanKind.CLIENT, attributes=self.base)
+            )
+        finally:
+            CREATING_CALL.reset(creation_token)
+        if self.recording() and self.allowed():
+            self.propagated = _propagated_attributes()
+            self.set_attributes(request_attributes(kwargs, operation))
+
+    def __del__(self):
+        try:
+            if not getattr(self, "finished", True):
+                if self.recording():
+                    _observe(self, lambda: self.output(self.chunks))
+                self.finish(completed=False)
+        except BaseException:  # noqa: S110 - GC telemetry must not affect native resources.
+            pass
+
+    def recording(self):
+        return self.span is not None and bool(_attempt(self.span.is_recording, False))
+
+    def scrub(self):
+        self.chunks.clear()
+        self.propagated.clear()
+        self.priority.clear()
+        attributes = getattr(self.span, "_attributes", None)
+        structural = set(self.base) | {ERROR_TYPE, HTTP_RESPONSE_STATUS_CODE}
+        if attributes is not None:
+            for key in list(attributes):
+                if key not in structural:
+                    _attempt(lambda key=key: attributes.pop(key, None))
+        if getattr(self.span, "_events", None) is not None:
+            self.span._events = BoundedList(0)
+        status = getattr(self.span, "status", None)
+        if status is not None:
+            self.span._status = Status(status.status_code)
+
+    def allowed(self, *, honor_suppression=True):
+        value = (
+            not self.failed
+            and self.policy is not None
+            and self.policy.observe(self.span, honor_suppression=honor_suppression)
+        )
+        if not value:
+            self.scrub()
+        return value
+
+    def set_attributes(self, values):
+        priority = {
+            SpanAttributes.TRACELOOP_ENTITY_INPUT,
+            SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+            SpanAttributes.LLM_REQUEST_FUNCTIONS,
+            SpanAttributes.LLM_REQUEST_MODEL,
+            SpanAttributes.LLM_REQUEST_TYPE,
+            f"{RESPAN_METADATA}.writer.result",
+            RESPAN_LOG_TYPE,
+        }
+        for key, value in values.items():
+            if key not in priority:
+                self.content.add(key)
+                self.span.set_attribute(key, value)
+        # Reassert structure/propagation after indexed convenience fields. Full
+        # native JSON is last under the SDK's own attribute-count bounds.
+        for key, value in {**self.base, **self.propagated}.items():
+            self.content.add(key)
+            self.span.set_attribute(key, value)
+        self.priority.update(
+            {key: value for key, value in values.items() if key in priority}
+        )
+        for key, value in self.priority.items():
+            self.content.add(key)
+            self.span.set_attribute(key, value)
+
+    def capture(self, response):
+        if self.recording() and self.allowed():
+            self.chunks.append(response)
+
+    def output(self, response):
+        if self.recording() and self.allowed():
+            self.set_attributes(response_attributes(response, self.operation))
+
+    def error(self, exc):
+        if not self.recording():
+            return
+        allowed = self.allowed()
+        message = safe_exception_message(exc) if allowed else None
+        self.span.set_status(Status(StatusCode.ERROR, message))
+        self.span.set_attribute(ERROR_TYPE, safe_type_name(exc))
+        code = provider_status_code(exc)
+        if code is not None:
+            self.span.set_attribute(HTTP_RESPONSE_STATUS_CODE, code)
+        if message is not None:
+            self.content.add(ERROR_MESSAGE)
+            self.span.set_attribute(ERROR_MESSAGE, message)
+
+    def attach(self):
+        ambient = context.get_current()
+        try:
+            token = (
+                context.attach(trace.set_span_in_context(self.span))
+                if self.recording()
+                else None
+            )
+        except BaseException:
+            _attempt(lambda: _restore_context(ambient))
+            raise
+        return token, ambient
+
+    def detach(self, state):
+        if state is None:
+            return
+        token, ambient = state
+        if not self.finished:
+            _attempt(lambda: self.allowed(honor_suppression=False))
         if token is not None:
-            context_api.detach(token)
+            try:
+                context.detach(token)
+            except BaseException:
+                _attempt(lambda: context._RUNTIME_CONTEXT.detach(token))
+        _attempt(lambda: _restore_context(ambient))
+
+    def finish(self, error=None, *, completed=True):
+        if self.finished:
+            return
+        self.finished = True
+        if self.recording():
+            if error is None and completed:
+                _attempt(lambda: self.span.set_status(Status(StatusCode.OK)))
+            elif error is not None:
+                _attempt(lambda: self.error(error))
+            if not _attempt(lambda: self.allowed(honor_suppression=False), False):
+                _attempt(self.scrub)
+            ambient = context.get_current()
+            try:
+                _attempt(self.span.end)
+            finally:
+                _attempt(lambda: _restore_context(ambient))
+        for cleanup in reversed(self.cleanups):
+            _attempt(cleanup)
+        self.cleanups.clear()
+        self.chunks.clear()
+        self.content.clear()
+        self.propagated.clear()
+        self.priority.clear()
+        self.policy = None
+        _PENDING.discard(self)
 
 
-class _SyncStreamCapture:
-    def __init__(
-        self,
-        *,
-        stream: Any,
-        span_name: str,
-        attrs_builder: Callable[..., dict[str, Any]],
-        request_kwargs: dict[str, Any],
-        start_ns: int,
-        otel_context: Any,
-    ) -> None:
-        self._stream = stream
-        self._iterator = iter(stream)
-        self._span_name = span_name
-        self._attrs_builder = attrs_builder
-        self._request_kwargs = request_kwargs
-        self._start_ns = start_ns
-        self._otel_context = otel_context
-        self._chunks: list[Any] = []
-        self._emitted = False
-        self.response = getattr(stream, "response", None)
+def _observe(call, fn, *, keep_context=False):
+    ambient = context.get_current()
+    try:
+        return fn()
+    except BaseException:
+        call.failed = True
+        _attempt(call.scrub)
+        _attempt(lambda: _restore_context(ambient))
+        return None
+    finally:
+        if not keep_context:
+            if not call.finished and call.policy is not None and call.span is not None:
+                _attempt(
+                    lambda: call.policy.observe(call.span, honor_suppression=False)
+                )
+            _attempt(lambda: _restore_context(ambient))
 
-    def __iter__(self) -> _SyncStreamCapture:
+
+class _Iterator:
+    def __init__(self, source, call):
+        self.source = source
+        self.call = call
+
+    def __iter__(self):
         return self
 
-    def __next__(self) -> Any:
+    def __next__(self):
+        return self._step(lambda: next(self.source))
+
+    def send(self, value):
+        return self._step(lambda: self.source.send(value))
+
+    def throw(self, *args):
+        return self._step(lambda: self.source.throw(*args))
+
+    def _step(self, fn):
+        state = _observe(self.call, self.call.attach, keep_context=True)
         try:
-            chunk = next(self._iterator)
+            chunk = fn()
         except StopIteration:
-            self._emit_success()
+            _observe(self.call, lambda: self.call.output(self.call.chunks))
+            self.call.finish()
             raise
         except BaseException as exc:
-            self._emit_error(exc)
+            _observe(self.call, lambda: self.call.output(self.call.chunks))
+            self.call.finish(exc)
             raise
-        _append_stream_chunk(self._chunks, chunk)
-        return chunk
+        else:
+            _observe(self.call, lambda: self.call.capture(chunk))
+            return chunk
+        finally:
+            self.call.detach(state)
 
-    def __enter__(self) -> Self:
-        enter = getattr(self._stream, "__enter__", None)
-        if callable(enter):
-            entered = enter()
-            if entered is not self._stream:
-                self._stream = entered
-                self._iterator = iter(entered)
-                self.response = getattr(entered, "response", self.response)
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: TracebackType | None,
-    ) -> Any:
-        exit_method = getattr(self._stream, "__exit__", None)
-        result = None
-        if callable(exit_method):
-            result = exit_method(exc_type, exc_val, exc_tb)
-        if exc_val is not None:
-            self._emit_error(exc_val)
-        elif not self._emitted:
-            self._emit_success()
-        return result
-
-    def close(self) -> None:
-        close = getattr(self._stream, "close", None)
-        if callable(close):
-            close()
-        if not self._emitted:
-            self._emit_success()
-
-    def _emit_success(self) -> None:
-        if self._emitted:
-            return
-        self._emitted = True
-        _emit_safely(
-            span_name=self._span_name,
-            attrs_builder=self._attrs_builder,
-            request_kwargs=self._request_kwargs,
-            start_ns=self._start_ns,
-            response_or_chunks=self._chunks,
-            otel_context=self._otel_context,
-        )
-
-    def _emit_error(self, exc: BaseException) -> None:
-        if self._emitted:
-            return
-        self._emitted = True
-        _emit_safely(
-            span_name=self._span_name,
-            attrs_builder=self._attrs_builder,
-            request_kwargs=self._request_kwargs,
-            start_ns=self._start_ns,
-            response_or_chunks=self._chunks,
-            error_message=safe_exception_message(exc),
-            status_code=provider_status_code(exc),
-            otel_context=self._otel_context,
-        )
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._stream, name)
-
-
-class _AsyncStreamCapture:
-    def __init__(
-        self,
-        *,
-        stream: Any,
-        span_name: str,
-        attrs_builder: Callable[..., dict[str, Any]],
-        request_kwargs: dict[str, Any],
-        start_ns: int,
-        otel_context: Any,
-    ) -> None:
-        self._stream = stream
-        self._iterator = None
-        self._span_name = span_name
-        self._attrs_builder = attrs_builder
-        self._request_kwargs = request_kwargs
-        self._start_ns = start_ns
-        self._otel_context = otel_context
-        self._chunks: list[Any] = []
-        self._emitted = False
-        self.response = getattr(stream, "response", None)
-
-    def __aiter__(self) -> _AsyncStreamCapture:
-        self._iterator = self._stream.__aiter__()
-        return self
-
-    async def __anext__(self) -> Any:
-        if self._iterator is None:
-            self._iterator = self._stream.__aiter__()
+    def close(self):
         try:
-            chunk = await self._iterator.__anext__()
+            return self.source.close()
+        except BaseException as exc:
+            self.call.finish(exc)
+            raise
+        finally:
+            _observe(self.call, lambda: self.call.output(self.call.chunks))
+            self.call.finish()
+
+
+class _AsyncIterator:
+    def __init__(self, source, call):
+        self.source = source
+        self.call = call
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        return await self._step(self.source.__anext__)
+
+    async def asend(self, value):
+        return await self._step(lambda: self.source.asend(value))
+
+    async def athrow(self, *args):
+        return await self._step(lambda: self.source.athrow(*args))
+
+    async def _step(self, fn):
+        state = _observe(self.call, self.call.attach, keep_context=True)
+        try:
+            chunk = await fn()
         except StopAsyncIteration:
-            self._emit_success()
+            _observe(self.call, lambda: self.call.output(self.call.chunks))
+            self.call.finish()
             raise
         except BaseException as exc:
-            self._emit_error(exc)
+            _observe(self.call, lambda: self.call.output(self.call.chunks))
+            self.call.finish(exc)
             raise
-        _append_stream_chunk(self._chunks, chunk)
-        return chunk
+        else:
+            _observe(self.call, lambda: self.call.capture(chunk))
+            return chunk
+        finally:
+            self.call.detach(state)
 
-    async def __aenter__(self) -> Self:
-        enter = getattr(self._stream, "__aenter__", None)
-        if callable(enter):
-            entered = await enter()
-            if entered is not self._stream:
-                self._stream = entered
-                self._iterator = entered.__aiter__()
-                self.response = getattr(entered, "response", self.response)
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: TracebackType | None,
-    ) -> Any:
-        exit_method = getattr(self._stream, "__aexit__", None)
-        result = None
-        if callable(exit_method):
-            result = await exit_method(exc_type, exc_val, exc_tb)
-        if exc_val is not None:
-            self._emit_error(exc_val)
-        elif not self._emitted:
-            self._emit_success()
-        return result
-
-    async def close(self) -> None:
-        close = getattr(self._stream, "aclose", None) or getattr(
-            self._stream, "close", None
-        )
-        if callable(close):
-            result = close()
-            if hasattr(result, "__await__"):
-                await result
-        if not self._emitted:
-            self._emit_success()
-
-    async def aclose(self) -> None:
-        await self.close()
-
-    def _emit_success(self) -> None:
-        if self._emitted:
-            return
-        self._emitted = True
-        _emit_safely(
-            span_name=self._span_name,
-            attrs_builder=self._attrs_builder,
-            request_kwargs=self._request_kwargs,
-            start_ns=self._start_ns,
-            response_or_chunks=self._chunks,
-            otel_context=self._otel_context,
-        )
-
-    def _emit_error(self, exc: BaseException) -> None:
-        if self._emitted:
-            return
-        self._emitted = True
-        _emit_safely(
-            span_name=self._span_name,
-            attrs_builder=self._attrs_builder,
-            request_kwargs=self._request_kwargs,
-            start_ns=self._start_ns,
-            response_or_chunks=self._chunks,
-            error_message=safe_exception_message(exc),
-            status_code=provider_status_code(exc),
-            otel_context=self._otel_context,
-        )
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._stream, name)
-
-
-def _wrap_sync_streamable(
-    *,
-    original: Any,
-    span_name: str,
-    attrs_builder: Callable[..., dict[str, Any]],
-    positional_names: tuple[str, ...] = (),
-) -> Any:
-    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        kwargs = _snapshot_kwargs(kwargs)
-        request_kwargs = request_kwargs_with_positionals(
-            kwargs=kwargs,
-            positional_values=args,
-            positional_names=positional_names,
-        )
-        start_ns = time.time_ns()
-        otel_context = context_api.get_current()
+    async def aclose(self):
         try:
-            response = original(self, *args, **kwargs)
+            return await self.source.aclose()
         except BaseException as exc:
-            _emit_safely(
-                span_name=span_name,
-                attrs_builder=attrs_builder,
-                request_kwargs=request_kwargs,
-                start_ns=start_ns,
-                error_message=safe_exception_message(exc),
-                status_code=provider_status_code(exc),
-                otel_context=otel_context,
-            )
+            self.call.finish(exc)
             raise
+        finally:
+            _observe(self.call, lambda: self.call.output(self.call.chunks))
+            self.call.finish()
 
-        if _is_stream_request(request_kwargs):
-            return _SyncStreamCapture(
-                stream=response,
-                span_name=span_name,
-                attrs_builder=attrs_builder,
-                request_kwargs=request_kwargs,
-                start_ns=start_ns,
-                otel_context=otel_context,
+
+def _tap_stream(source, call):
+    from writerai import AsyncStream, Stream
+
+    kind = type(source)
+    if kind is not Stream and kind is not AsyncStream:
+        return False
+    state = object.__getattribute__(source, "__dict__")
+    iterator = state.get("_iterator")
+    if type(iterator) is not (
+        types.GeneratorType if kind is Stream else types.AsyncGeneratorType
+    ):
+        return False
+    tap = (
+        _Iterator(iterator, call) if kind is Stream else _AsyncIterator(iterator, call)
+    )
+    missing = object()
+    saved = state.get("close", missing)
+    original_close = object.__getattribute__(source, "close")
+    if kind is Stream:
+
+        @functools.wraps(original_close)
+        def close():
+            error = None
+            try:
+                return original_close()
+            except BaseException as exc:
+                error = exc
+                raise
+            finally:
+                _observe(call, lambda call=call: call.output(call.chunks))
+                call.finish(error)
+    else:
+
+        @functools.wraps(original_close)
+        async def close():
+            error = None
+            try:
+                return await original_close()
+            except BaseException as exc:
+                error = exc
+                raise
+            finally:
+                _observe(call, lambda call=call: call.output(call.chunks))
+                call.finish(error)
+
+    def restore():
+        if state.get("_iterator") is tap:
+            state["_iterator"] = iterator
+        if state.get("close") is close:
+            if saved is missing:
+                state.pop("close", None)
+            else:
+                state["close"] = saved
+
+    call.cleanups.append(restore)
+    state["_iterator"] = tap
+    state["close"] = close
+    return True
+
+
+def _start(kwargs, *, name, operation):
+    ambient = context.get_current()
+    call = None
+    try:
+        if (
+            not _ENABLED
+            or suppressed()
+            or not WriterInstrumentor._is_respan_tracing_enabled()
+        ):
+            return None
+        call = _Call.__new__(_Call)
+        call.__init__(kwargs, name=name, operation=operation)
+        return call
+    except BaseException:
+        if call is not None and getattr(call, "span", None) is not None:
+            call.failed = True
+            _attempt(call.scrub)
+            _attempt(lambda: call.finish(completed=False))
+        return None
+    finally:
+        _attempt(lambda: _restore_context(ambient))
+
+
+def _wrap(original, name, operation, asynchronous):
+    if asynchronous:
+
+        @functools.wraps(original)
+        async def async_call(instance, *args, **kwargs):
+            supplied = _positional_kwargs(args, kwargs, operation)
+            call = _start(supplied, name=name, operation=operation)
+            active = _ACTIVE_CALL.set(call)
+            state = (
+                _observe(call, call.attach, keep_context=True)
+                if call is not None
+                else None
             )
+            try:
+                response = await original(instance, *args, **kwargs)
+            except BaseException as exc:
+                if call is not None:
+                    call.finish(exc)
+                raise
+            finally:
+                _ACTIVE_CALL.reset(active)
+                if call is not None:
+                    call.detach(state)
+            if call is None:
+                return response
+            if call.recording() and _observe(call, lambda: _tap_stream(response, call)):
+                return response
+            _observe(call, lambda: call.output(response))
+            call.finish()
+            return response
 
-        _emit_safely(
-            span_name=span_name,
-            attrs_builder=attrs_builder,
-            request_kwargs=request_kwargs,
-            start_ns=start_ns,
-            response_or_chunks=response,
-            otel_context=otel_context,
+        return async_call
+
+    @functools.wraps(original)
+    def sync_call(instance, *args, **kwargs):
+        supplied = _positional_kwargs(args, kwargs, operation)
+        call = _start(supplied, name=name, operation=operation)
+        active = _ACTIVE_CALL.set(call)
+        state = (
+            _observe(call, call.attach, keep_context=True) if call is not None else None
         )
+        try:
+            response = original(instance, *args, **kwargs)
+        except BaseException as exc:
+            if call is not None:
+                call.finish(exc)
+            raise
+        finally:
+            _ACTIVE_CALL.reset(active)
+            if call is not None:
+                call.detach(state)
+        if call is None:
+            return response
+        if call.recording() and _observe(call, lambda: _tap_stream(response, call)):
+            return response
+        _observe(call, lambda: call.output(response))
+        call.finish()
         return response
 
-    return wrapper
+    return sync_call
 
 
-def _wrap_async_streamable(
-    *,
-    original: Any,
-    span_name: str,
-    attrs_builder: Callable[..., dict[str, Any]],
-    positional_names: tuple[str, ...] = (),
-) -> Any:
-    async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        kwargs = _snapshot_kwargs(kwargs)
-        request_kwargs = request_kwargs_with_positionals(
-            kwargs=kwargs,
-            positional_values=args,
-            positional_names=positional_names,
-        )
-        start_ns = time.time_ns()
-        otel_context = context_api.get_current()
-        try:
-            response = await original(self, *args, **kwargs)
-        except BaseException as exc:
-            _emit_safely(
-                span_name=span_name,
-                attrs_builder=attrs_builder,
-                request_kwargs=request_kwargs,
-                start_ns=start_ns,
-                error_message=safe_exception_message(exc),
-                status_code=provider_status_code(exc),
-                otel_context=otel_context,
+@dataclass
+class _Patch:
+    cls: object
+    method_name: str
+    original: object
+    wrapper: object
+
+
+def _detach_guard(original):
+    @functools.wraps(original)
+    def detach(token):
+        for call in tuple(_PENDING):
+            if not call.finished and call.span is not None:
+                _attempt(lambda call=call: call.allowed(honor_suppression=False))
+        return original(token)
+
+    return detach
+
+
+def _load_targets():
+    targets = []
+    for module, prefix, method, operation in [
+        ("chat", "Chat", "chat", "chat"),
+        ("completions", "Completions", "create", "completion"),
+        ("graphs", "Graphs", "question", "graph"),
+        (
+            "applications.applications",
+            "Applications",
+            "generate_content",
+            "application",
+        ),
+        ("vision", "Vision", "analyze", "vision"),
+        ("translation", "Translation", "translate", "translation"),
+        ("tools", "Tools", "web_search", "web_search"),
+        ("tools", "Tools", "parse_pdf", "parse_pdf"),
+    ]:
+        imported = importlib.import_module("writerai.resources." + module)
+        for asynchronous, cls in enumerate(
+            (prefix + "Resource", "Async" + prefix + "Resource")
+        ):
+            targets.append(
+                (
+                    getattr(imported, cls),
+                    method,
+                    operation
+                    if operation in {"web_search", "parse_pdf"}
+                    else "writer." + operation,
+                    operation,
+                    bool(asynchronous),
+                )
             )
-            raise
+    return targets
 
-        if _is_stream_request(request_kwargs):
-            return _AsyncStreamCapture(
-                stream=response,
-                span_name=span_name,
-                attrs_builder=attrs_builder,
-                request_kwargs=request_kwargs,
-                start_ns=start_ns,
-                otel_context=otel_context,
+
+def _positional_kwargs(args, kwargs, operation):
+    supplied = dict(kwargs)
+    key = {"application": "application_id", "parse_pdf": "file_id"}.get(operation)
+    if args and key is not None:
+        supplied[key] = args[0]
+    return supplied
+
+
+def _build_request_wrapper(original):
+    @functools.wraps(original)
+    def build(instance, *args, **kwargs):
+        request = original(instance, *args, **kwargs)
+        call = _ACTIVE_CALL.get()
+        if call is not None and call.recording() and _observe(call, call.allowed):
+
+            def capture():
+                import json
+
+                import httpx
+
+                if type(request) is not httpx.Request:
+                    return
+                state = object.__getattribute__(request, "__dict__")
+                content = state.get("_content")
+                if type(content) is bytes:
+                    body = json.loads(content)
+                    if type(body) is dict:
+                        supplied = json.loads(
+                            call.priority.get(
+                                SpanAttributes.TRACELOOP_ENTITY_INPUT, "{}"
+                            )
+                        )
+                        for key in ("application_id", "file_id", "extra_query"):
+                            if key in supplied and key not in body:
+                                body[key] = supplied[key]
+                        call.set_attributes(request_attributes(body, call.operation))
+
+            _observe(call, capture)
+        return request
+
+    return build
+
+
+def _restore():
+    for patch in reversed(_PATCHES):
+        if inspect.getattr_static(patch.cls, patch.method_name, None) is patch.wrapper:
+            _attempt(
+                lambda patch=patch: setattr(
+                    patch.cls, patch.method_name, patch.original
+                )
             )
-
-        _emit_safely(
-            span_name=span_name,
-            attrs_builder=attrs_builder,
-            request_kwargs=request_kwargs,
-            start_ns=start_ns,
-            response_or_chunks=response,
-            otel_context=otel_context,
-        )
-        return response
-
-    return wrapper
+    _PATCHES.clear()
 
 
-def _wrap_sync_unary(
-    *,
-    original: Any,
-    span_name: str,
-    attrs_builder: Callable[..., dict[str, Any]],
-    positional_names: tuple[str, ...] = (),
-) -> Any:
-    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        kwargs = _snapshot_kwargs(kwargs)
-        request_kwargs = request_kwargs_with_positionals(
-            kwargs=kwargs,
-            positional_values=args,
-            positional_names=positional_names,
-        )
-        start_ns = time.time_ns()
-        otel_context = context_api.get_current()
-        try:
-            response = original(self, *args, **kwargs)
-        except BaseException as exc:
-            _emit_unary_safely(
-                span_name=span_name,
-                attrs_builder=attrs_builder,
-                request_kwargs=request_kwargs,
-                start_ns=start_ns,
-                error_message=safe_exception_message(exc),
-                status_code=provider_status_code(exc),
-                otel_context=otel_context,
+def _remove_policies():
+    for provider, policy in list(_POLICIES.items()):
+        policy.enabled = False
+        policy.clear()
+        processor = getattr(provider, "_active_span_processor", None)
+        processors = getattr(processor, "_span_processors", ())
+        if processor is not None:
+            processor._span_processors = tuple(
+                item for item in processors if item is not policy
             )
-            raise
-
-        _emit_unary_safely(
-            span_name=span_name,
-            attrs_builder=attrs_builder,
-            request_kwargs=request_kwargs,
-            start_ns=start_ns,
-            response=response,
-            otel_context=otel_context,
-        )
-        return response
-
-    return wrapper
-
-
-def _wrap_async_unary(
-    *,
-    original: Any,
-    span_name: str,
-    attrs_builder: Callable[..., dict[str, Any]],
-    positional_names: tuple[str, ...] = (),
-) -> Any:
-    async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        kwargs = _snapshot_kwargs(kwargs)
-        request_kwargs = request_kwargs_with_positionals(
-            kwargs=kwargs,
-            positional_values=args,
-            positional_names=positional_names,
-        )
-        start_ns = time.time_ns()
-        otel_context = context_api.get_current()
-        try:
-            response = await original(self, *args, **kwargs)
-        except BaseException as exc:
-            _emit_unary_safely(
-                span_name=span_name,
-                attrs_builder=attrs_builder,
-                request_kwargs=request_kwargs,
-                start_ns=start_ns,
-                error_message=safe_exception_message(exc),
-                status_code=provider_status_code(exc),
-                otel_context=otel_context,
-            )
-            raise
-
-        _emit_unary_safely(
-            span_name=span_name,
-            attrs_builder=attrs_builder,
-            request_kwargs=request_kwargs,
-            start_ns=start_ns,
-            response=response,
-            otel_context=otel_context,
-        )
-        return response
-
-    return wrapper
-
-
-def _make_tool_attrs_builder(tool_name: str) -> Callable[..., dict[str, Any]]:
-    def builder(
-        *, request_kwargs: dict[str, Any], response: Any = None
-    ) -> dict[str, Any]:
-        return build_tool_attrs(
-            tool_name=tool_name,
-            request_kwargs=request_kwargs,
-            response=response,
-        )
-
-    return builder
+    _POLICIES.clear()
 
 
 class WriterInstrumentor:
-    """Respan instrumentor for the Writer Python SDK."""
+    name = "writer"
 
-    name = WRITER_INSTRUMENTATION_NAME
-
-    def __init__(self) -> None:
+    def __init__(self, *, capture_content=True, tracer_provider=None):
+        self._capture_content = capture_content
+        self._provider = tracer_provider
         self._is_instrumented = False
 
     @staticmethod
-    def _is_respan_tracing_enabled() -> bool:
+    def _is_respan_tracing_enabled():
         tracer = getattr(RespanTracer, "_instance", None)
-        if tracer is None:
-            return True
-        return bool(getattr(tracer, "is_enabled", True))
+        return tracer is None or bool(getattr(tracer, "is_enabled", True))
 
-    def activate(self) -> None:
-        """Monkey-patch the Writer SDK."""
-        global _original_sync_chat, _original_async_chat
-        global _original_sync_completion_create, _original_async_completion_create
-        global _original_sync_graph_question, _original_async_graph_question
-        global _original_sync_application_generate, _original_async_application_generate
-        global _original_sync_vision_analyze, _original_async_vision_analyze
-        global \
-            _original_sync_translation_translate, \
-            _original_async_translation_translate
-        global _original_sync_tool_web_search, _original_async_tool_web_search
-        global _original_sync_tool_parse_pdf, _original_async_tool_parse_pdf
-        global _activation_count, _activation_installing
-
-        with _activation_condition:
-            if self._is_instrumented:
+    def activate(self):
+        global _ACTIVATION_COUNT, _CAPTURE_CONTENT, _PROVIDER, _ENABLED
+        with _LOCK:
+            if self._is_instrumented or not self._is_respan_tracing_enabled():
                 return
-            while _activation_installing:
-                _activation_condition.wait()
-            if _activation_count:
-                _activation_count += 1
-                self._is_instrumented = True
-                return
-            _activation_installing = True
+            if _ACTIVATION_COUNT:
+                if (
+                    self._capture_content != _CAPTURE_CONTENT
+                    or self._provider is not _PROVIDER
+                ):
+                    raise ValueError(
+                        "Writer capture_content/tracer_provider must match the active instrumentor"
+                    )
+            else:
+                try:
+                    targets = _load_targets()
+                except ImportError:
+                    return
+                _CAPTURE_CONTENT = self._capture_content
+                _PROVIDER = self._provider
+                try:
+                    for cls, method, name, operation, asynchronous in targets:
+                        original = inspect.getattr_static(cls, method)
+                        wrapper = _wrap(original, name, operation, asynchronous)
+                        _PATCHES.append(_Patch(cls, method, original, wrapper))
+                        setattr(cls, method, wrapper)
+                    base_client = importlib.import_module(
+                        "writerai._base_client"
+                    ).BaseClient
+                    original = inspect.getattr_static(base_client, "_build_request")
+                    owned = _build_request_wrapper(original)
+                    _PATCHES.append(
+                        _Patch(base_client, "_build_request", original, owned)
+                    )
+                    base_client._build_request = owned
+                    original = inspect.getattr_static(context, "detach")
+                    owned = _detach_guard(original)
+                    _PATCHES.append(_Patch(context, "detach", original, owned))
+                    context.detach = owned
+                    _policy()
+                except BaseException:
+                    _restore()
+                    _remove_policies()
+                    raise
+                _ENABLED = True
+            _ACTIVATION_COUNT += 1
             self._is_instrumented = True
 
-        if not self._is_respan_tracing_enabled():
-            logger.info(
-                "Writer instrumentation skipped because Respan tracing is disabled"
-            )
-            self.deactivate()
-            _complete_installation(success=False)
-            return
-
-        try:
-            classes = _load_resource_classes()
-        except (AttributeError, ImportError) as exc:
-            logger.warning(
-                "Failed to activate Writer instrumentation - missing dependency: %s",
-                exc,
-            )
-            self.deactivate()
-            _complete_installation(success=False)
-            return
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to activate Writer instrumentation: %s", exc)
-            self.deactivate()
-            _complete_installation(success=False)
-            return
-
-        try:
-            sync_chat = classes["sync_chat"]
-            async_chat = classes["async_chat"]
-            sync_completions = classes["sync_completions"]
-            async_completions = classes["async_completions"]
-            sync_graphs = classes["sync_graphs"]
-            async_graphs = classes["async_graphs"]
-            sync_applications = classes["sync_applications"]
-            async_applications = classes["async_applications"]
-            sync_vision = classes["sync_vision"]
-            async_vision = classes["async_vision"]
-            sync_translation = classes["sync_translation"]
-            async_translation = classes["async_translation"]
-            sync_tools = classes["sync_tools"]
-            async_tools = classes["async_tools"]
-
-            if _original_sync_chat is None:
-                _original_sync_chat = getattr(sync_chat, CHAT_METHOD_NAME)
-            setattr(
-                sync_chat,
-                CHAT_METHOD_NAME,
-                _wrap_sync_streamable(
-                    original=_original_sync_chat,
-                    span_name=WRITER_CHAT_SPAN_NAME,
-                    attrs_builder=build_chat_attrs,
-                ),
-            )
-
-            if _original_async_chat is None:
-                _original_async_chat = getattr(async_chat, CHAT_METHOD_NAME)
-            setattr(
-                async_chat,
-                CHAT_METHOD_NAME,
-                _wrap_async_streamable(
-                    original=_original_async_chat,
-                    span_name=WRITER_CHAT_SPAN_NAME,
-                    attrs_builder=build_chat_attrs,
-                ),
-            )
-
-            if _original_sync_completion_create is None:
-                _original_sync_completion_create = getattr(
-                    sync_completions,
-                    CREATE_METHOD_NAME,
-                )
-            setattr(
-                sync_completions,
-                CREATE_METHOD_NAME,
-                _wrap_sync_streamable(
-                    original=_original_sync_completion_create,
-                    span_name=WRITER_COMPLETION_SPAN_NAME,
-                    attrs_builder=build_completion_attrs,
-                ),
-            )
-
-            if _original_async_completion_create is None:
-                _original_async_completion_create = getattr(
-                    async_completions,
-                    CREATE_METHOD_NAME,
-                )
-            setattr(
-                async_completions,
-                CREATE_METHOD_NAME,
-                _wrap_async_streamable(
-                    original=_original_async_completion_create,
-                    span_name=WRITER_COMPLETION_SPAN_NAME,
-                    attrs_builder=build_completion_attrs,
-                ),
-            )
-
-            if _original_sync_graph_question is None:
-                _original_sync_graph_question = getattr(
-                    sync_graphs, QUESTION_METHOD_NAME
-                )
-            setattr(
-                sync_graphs,
-                QUESTION_METHOD_NAME,
-                _wrap_sync_streamable(
-                    original=_original_sync_graph_question,
-                    span_name=WRITER_GRAPH_QUESTION_SPAN_NAME,
-                    attrs_builder=build_graph_question_attrs,
-                ),
-            )
-
-            if _original_async_graph_question is None:
-                _original_async_graph_question = getattr(
-                    async_graphs,
-                    QUESTION_METHOD_NAME,
-                )
-            setattr(
-                async_graphs,
-                QUESTION_METHOD_NAME,
-                _wrap_async_streamable(
-                    original=_original_async_graph_question,
-                    span_name=WRITER_GRAPH_QUESTION_SPAN_NAME,
-                    attrs_builder=build_graph_question_attrs,
-                ),
-            )
-
-            if _original_sync_application_generate is None:
-                _original_sync_application_generate = getattr(
-                    sync_applications,
-                    GENERATE_CONTENT_METHOD_NAME,
-                )
-            setattr(
-                sync_applications,
-                GENERATE_CONTENT_METHOD_NAME,
-                _wrap_sync_streamable(
-                    original=_original_sync_application_generate,
-                    span_name=WRITER_APPLICATION_GENERATE_SPAN_NAME,
-                    attrs_builder=build_application_generate_attrs,
-                    positional_names=(APPLICATION_ID_KEY,),
-                ),
-            )
-
-            if _original_async_application_generate is None:
-                _original_async_application_generate = getattr(
-                    async_applications,
-                    GENERATE_CONTENT_METHOD_NAME,
-                )
-            setattr(
-                async_applications,
-                GENERATE_CONTENT_METHOD_NAME,
-                _wrap_async_streamable(
-                    original=_original_async_application_generate,
-                    span_name=WRITER_APPLICATION_GENERATE_SPAN_NAME,
-                    attrs_builder=build_application_generate_attrs,
-                    positional_names=(APPLICATION_ID_KEY,),
-                ),
-            )
-
-            if _original_sync_vision_analyze is None:
-                _original_sync_vision_analyze = getattr(
-                    sync_vision, ANALYZE_METHOD_NAME
-                )
-            setattr(
-                sync_vision,
-                ANALYZE_METHOD_NAME,
-                _wrap_sync_unary(
-                    original=_original_sync_vision_analyze,
-                    span_name=WRITER_VISION_SPAN_NAME,
-                    attrs_builder=build_vision_attrs,
-                ),
-            )
-
-            if _original_async_vision_analyze is None:
-                _original_async_vision_analyze = getattr(
-                    async_vision,
-                    ANALYZE_METHOD_NAME,
-                )
-            setattr(
-                async_vision,
-                ANALYZE_METHOD_NAME,
-                _wrap_async_unary(
-                    original=_original_async_vision_analyze,
-                    span_name=WRITER_VISION_SPAN_NAME,
-                    attrs_builder=build_vision_attrs,
-                ),
-            )
-
-            if _original_sync_translation_translate is None:
-                _original_sync_translation_translate = getattr(
-                    sync_translation,
-                    TRANSLATE_METHOD_NAME,
-                )
-            setattr(
-                sync_translation,
-                TRANSLATE_METHOD_NAME,
-                _wrap_sync_unary(
-                    original=_original_sync_translation_translate,
-                    span_name=WRITER_TRANSLATION_SPAN_NAME,
-                    attrs_builder=build_translation_attrs,
-                ),
-            )
-
-            if _original_async_translation_translate is None:
-                _original_async_translation_translate = getattr(
-                    async_translation,
-                    TRANSLATE_METHOD_NAME,
-                )
-            setattr(
-                async_translation,
-                TRANSLATE_METHOD_NAME,
-                _wrap_async_unary(
-                    original=_original_async_translation_translate,
-                    span_name=WRITER_TRANSLATION_SPAN_NAME,
-                    attrs_builder=build_translation_attrs,
-                ),
-            )
-
-            if _original_sync_tool_web_search is None:
-                _original_sync_tool_web_search = getattr(
-                    sync_tools, WEB_SEARCH_METHOD_NAME
-                )
-            setattr(
-                sync_tools,
-                WEB_SEARCH_METHOD_NAME,
-                _wrap_sync_unary(
-                    original=_original_sync_tool_web_search,
-                    span_name=WRITER_WEB_SEARCH_TOOL_NAME,
-                    attrs_builder=_make_tool_attrs_builder(WRITER_WEB_SEARCH_TOOL_NAME),
-                ),
-            )
-
-            if _original_async_tool_web_search is None:
-                _original_async_tool_web_search = getattr(
-                    async_tools,
-                    WEB_SEARCH_METHOD_NAME,
-                )
-            setattr(
-                async_tools,
-                WEB_SEARCH_METHOD_NAME,
-                _wrap_async_unary(
-                    original=_original_async_tool_web_search,
-                    span_name=WRITER_WEB_SEARCH_TOOL_NAME,
-                    attrs_builder=_make_tool_attrs_builder(WRITER_WEB_SEARCH_TOOL_NAME),
-                ),
-            )
-
-            if _original_sync_tool_parse_pdf is None:
-                _original_sync_tool_parse_pdf = getattr(
-                    sync_tools, PARSE_PDF_METHOD_NAME
-                )
-            setattr(
-                sync_tools,
-                PARSE_PDF_METHOD_NAME,
-                _wrap_sync_unary(
-                    original=_original_sync_tool_parse_pdf,
-                    span_name=WRITER_PARSE_PDF_TOOL_NAME,
-                    attrs_builder=_make_tool_attrs_builder(WRITER_PARSE_PDF_TOOL_NAME),
-                    positional_names=(FILE_ID_KEY,),
-                ),
-            )
-
-            if _original_async_tool_parse_pdf is None:
-                _original_async_tool_parse_pdf = getattr(
-                    async_tools,
-                    PARSE_PDF_METHOD_NAME,
-                )
-            setattr(
-                async_tools,
-                PARSE_PDF_METHOD_NAME,
-                _wrap_async_unary(
-                    original=_original_async_tool_parse_pdf,
-                    span_name=WRITER_PARSE_PDF_TOOL_NAME,
-                    attrs_builder=_make_tool_attrs_builder(WRITER_PARSE_PDF_TOOL_NAME),
-                    positional_names=(FILE_ID_KEY,),
-                ),
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to activate Writer instrumentation: %s", exc)
-            for class_key, method_name, _ in _RESTORE_TARGETS:
-                resource_class = classes.get(class_key)
-                if resource_class is not None:
-                    _installed_methods[(resource_class, method_name)] = getattr(
-                        resource_class,
-                        method_name,
-                        None,
-                    )
-            self.deactivate()
-            _complete_installation(success=False)
-            return
-
-        for class_key, method_name, _ in _RESTORE_TARGETS:
-            resource_class = classes.get(class_key)
-            if resource_class is not None:
-                _installed_methods[(resource_class, method_name)] = getattr(
-                    resource_class,
-                    method_name,
-                )
-        _complete_installation(success=True)
-        logger.info("Writer instrumentation activated")
-
-    def deactivate(self) -> None:
-        """Deactivate the instrumentation."""
-        global _activation_count, _activation_installing
-
-        with _activation_condition:
+    def deactivate(self):
+        global _ACTIVATION_COUNT, _ENABLED
+        with _LOCK:
             if not self._is_instrumented:
                 return
             self._is_instrumented = False
-            _activation_count = max(_activation_count - 1, 0)
-            if _activation_count:
-                return
-            _activation_installing = True
-
-        try:
-            classes = _load_resource_classes()
-        except BaseException:
-            logger.debug(
-                "Failed to load Writer resources during teardown", exc_info=True
-            )
-            classes = {}
-
-        for class_key, method_name, original_name in _RESTORE_TARGETS:
-            original = globals().get(original_name)
-            resource_class = classes.get(class_key)
-            try:
-                if original is not None and resource_class is not None:
-                    current = getattr(resource_class, method_name, None)
-                    if current is _installed_methods.get((resource_class, method_name)):
-                        setattr(resource_class, method_name, original)
-            except BaseException:
-                logger.debug(
-                    "Failed to restore Writer resource %s.%s",
-                    class_key,
-                    method_name,
-                    exc_info=True,
-                )
-            finally:
-                if resource_class is not None:
-                    _installed_methods.pop((resource_class, method_name), None)
-                globals()[original_name] = None
-
-        _complete_installation(success=False)
-        logger.info("Writer instrumentation deactivated")
+            _ACTIVATION_COUNT = max(0, _ACTIVATION_COUNT - 1)
+            if _ACTIVATION_COUNT == 0:
+                _ENABLED = False
+                for call in tuple(_PENDING):
+                    if call.recording():
+                        _observe(call, lambda call=call: call.output(call.chunks))
+                    call.finish()
+                _restore()
+                _remove_policies()

@@ -1,654 +1,803 @@
-"""IBM watsonx.ai SDK instrumentation plugin for Respan."""
+"""Observe official Watsonx HTTP/NDJSON calls without changing native outcomes."""
 
+# ruff: noqa: BLE001 -- telemetry failures preserve native results and cleanup.
 from __future__ import annotations
 
+import builtins
+import functools
 import importlib
+import inspect
+import json
 import logging
-import time
-from collections.abc import AsyncIterator, Callable, Iterator
-from threading import Condition, RLock
-from typing import Any
+import threading
+import types
+import weakref
+from contextvars import ContextVar
 
+from opentelemetry import context, trace
+from opentelemetry.sdk.util import BoundedList
+from opentelemetry.semconv._incubating.attributes.error_attributes import ERROR_MESSAGE
+from opentelemetry.semconv.attributes.error_attributes import ERROR_TYPE
+from opentelemetry.semconv.attributes.http_attributes import HTTP_RESPONSE_STATUS_CODE
+from opentelemetry.semconv_ai import SpanAttributes
+from opentelemetry.trace import SpanKind, Status, StatusCode
+from respan_sdk.constants.span_attributes import (
+    RESPAN_METADATA,
+    RESPAN_SPAN_ATTRIBUTES_MAP,
+)
 from respan_tracing.core.tracer import RespanTracer
+from respan_tracing.utils.span_factory import _PROPAGATED_ATTRIBUTES
 
-from respan_instrumentation_watsonx._constants import (
-    ACHAT_METHOD_NAME,
-    ACHAT_STREAM_METHOD_NAME,
-    AEMBED_DOCUMENTS_METHOD_NAME,
-    AEMBED_QUERY_METHOD_NAME,
-    AEMBEDDINGS_GENERATE_METHOD_NAME,
-    AGENERATE_METHOD_NAME,
-    AGENERATE_STREAM_METHOD_NAME,
-    CHAT_METHOD_NAME,
-    CHAT_STREAM_METHOD_NAME,
-    EMBED_DOCUMENTS_METHOD_NAME,
-    EMBED_QUERY_METHOD_NAME,
-    EMBEDDINGS_CLASS_NAME,
-    EMBEDDINGS_GENERATE_METHOD_NAME,
-    EMBEDDINGS_MODULE,
-    GENERATE_METHOD_NAME,
-    GENERATE_TEXT_METHOD_NAME,
-    GENERATE_TEXT_STREAM_METHOD_NAME,
-    MODEL_INFERENCE_CLASS_NAME,
-    MODEL_INFERENCE_MODULE,
-    WATSONX_INSTRUMENTATION_NAME,
+from ._otel_emitter import base_attributes, build_attributes
+from ._privacy import (
+    _STARTING,
+    PolicyObserver,
+    content_allowed,
+    json_text,
+    suppressed,
+    text,
+    value,
 )
-from respan_instrumentation_watsonx._otel_emitter import (
-    current_trace_parent_ids,
-    emit_chat_span,
-    emit_embedding_span,
-    emit_text_span,
-)
-from respan_instrumentation_watsonx._serialization import (
-    provider_status_code,
-    safe_exception_message,
-)
+from ._translator import native_value
 
 logger = logging.getLogger(__name__)
-
-_original_methods: dict[tuple[type[Any], str], Any] = {}
-_installed_methods: dict[tuple[type[Any], str], Any] = {}
-_activation_lock = RLock()
-_activation_condition = Condition(_activation_lock)
-_activation_count = 0
-_activation_installing = False
-_MAX_STREAM_CHUNKS = 256
-
-_TEXT_PROMPT_METHODS = {
-    GENERATE_METHOD_NAME,
-    GENERATE_TEXT_METHOD_NAME,
-    GENERATE_TEXT_STREAM_METHOD_NAME,
-    AGENERATE_METHOD_NAME,
-    AGENERATE_STREAM_METHOD_NAME,
-}
-_CHAT_MESSAGE_METHODS = {
-    CHAT_METHOD_NAME,
-    CHAT_STREAM_METHOD_NAME,
-    ACHAT_METHOD_NAME,
-    ACHAT_STREAM_METHOD_NAME,
-}
-_EMBEDDING_INPUT_METHODS = {
-    EMBEDDINGS_GENERATE_METHOD_NAME,
-    AEMBEDDINGS_GENERATE_METHOD_NAME,
-}
-_EMBEDDING_TEXTS_METHODS = {
-    EMBED_DOCUMENTS_METHOD_NAME,
-    AEMBED_DOCUMENTS_METHOD_NAME,
-}
-_EMBEDDING_TEXT_METHODS = {
-    EMBED_QUERY_METHOD_NAME,
-    AEMBED_QUERY_METHOD_NAME,
-}
+_LOCK = threading.RLock()
+_OWNERS = set()
+_CONFIG = None
+_PATCHES = []
+_OBSERVERS = []
+_HOOKS = []
+_PENDING = weakref.WeakSet()
+_ACTIVE = ContextVar("respan_watsonx_call", default=None)
 
 
-def _get_module_attr(module_path: str, attr_name: str) -> Any:
-    module = importlib.import_module(module_path)
-    attr_value = getattr(module, attr_name, None)
-    if attr_value is None:
-        raise AttributeError(f"{module_path}.{attr_name}")
-    return attr_value
+def _provider(config):
+    return config[1] if config[1] is not None else RespanTracer().tracer_provider
 
 
-def _load_watsonx_classes() -> tuple[type[Any], type[Any]]:
-    return (
-        _get_module_attr(MODEL_INFERENCE_MODULE, MODEL_INFERENCE_CLASS_NAME),
-        _get_module_attr(EMBEDDINGS_MODULE, EMBEDDINGS_CLASS_NAME),
-    )
+def _observer(provider):
+    with _LOCK:
+        for existing, observer in _OBSERVERS:
+            if existing is provider:
+                return observer
+        observer = PolicyObserver()
+        _OBSERVERS.append((provider, observer))
+        provider.add_span_processor(observer)
+        # Observe a partially started span before a foreign processor can fail.
+        processors = provider._active_span_processor
+        processors._span_processors = (observer,) + tuple(
+            item for item in processors._span_processors if item is not observer
+        )
+        return observer
 
 
-def _request_kwargs_from_call(
-    *,
-    method_name: str,
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    positional_arg_name: str | None = None,
-) -> dict[str, Any]:
-    result = dict(kwargs)
-    if not args:
+def _restore_context(ambient):
+    try:
+        if context.get_current() is ambient:
+            return
+        runtime = context._RUNTIME_CONTEXT
+        current = getattr(runtime, "_current_context", None)
+        if current is not None:
+            current.set(ambient)
+        else:
+            runtime.attach(ambient)
+    except BaseException:
+        logger.debug("Watsonx context restoration failed")
+
+
+def _detach(token, ambient):
+    try:
+        context.detach(token)
+    except BaseException:
+        logger.debug("Watsonx context detach failed")
+    _restore_context(ambient)
+
+
+def _model_only(request):
+    if type(request) is dict and type(request.get("model_id")) is str:
+        return {"model_id": text(request["model_id"])}
+    return {}
+
+
+def _propagated():
+    source = _PROPAGATED_ATTRIBUTES.get()
+    result = {}
+    if type(source) is not dict:
         return result
-    if positional_arg_name is not None:
-        result.setdefault(positional_arg_name, args[0])
-        return result
-    if method_name in _TEXT_PROMPT_METHODS:
-        result.setdefault("prompt", args[0])
-    elif method_name in _CHAT_MESSAGE_METHODS:
-        result.setdefault("messages", args[0])
-    elif method_name in _EMBEDDING_INPUT_METHODS:
-        result.setdefault("inputs", args[0])
-    elif method_name in _EMBEDDING_TEXTS_METHODS:
-        result.setdefault("texts", args[0])
-    elif method_name in _EMBEDDING_TEXT_METHODS:
-        result.setdefault("text", args[0])
+    for key, item in source.items():
+        if type(key) is str and key in RESPAN_SPAN_ATTRIBUTES_MAP:
+            target = RESPAN_SPAN_ATTRIBUTES_MAP[key]
+            if target == RESPAN_METADATA:
+                if type(item) is dict:
+                    result[target] = json_text(item)
+            elif any(type(item) is kind for kind in (str, bool, int, float)):
+                result[target] = value(item)
     return result
 
 
-def _is_iterator(value: Any) -> bool:
-    if isinstance(value, str | bytes | bytearray | dict | list | tuple):
-        return False
-    return hasattr(value, "__iter__")
-
-
-def _append_stream_chunk(chunks: list[Any], chunk: Any) -> None:
-    """Keep bounded raw stream state while retaining the terminal chunk."""
-    if len(chunks) < _MAX_STREAM_CHUNKS:
-        chunks.append(chunk)
-    else:
-        chunks[-1] = chunk
-
-
-def _wrap_sync_iterator(
-    *,
-    iterator: Iterator[Any],
-    emit: Callable[..., None],
-    instance: Any,
-    request_kwargs: dict[str, Any],
-    start_ns: int,
-    response_kwarg_name: str,
-    trace_id: str | None,
-    parent_id: str | None,
-) -> Iterator[Any]:
-    chunks: list[Any] = []
-    emitted = False
-    try:
-        for chunk in iterator:
-            _append_stream_chunk(chunks, chunk)
-            yield chunk
-    except GeneratorExit:
-        emit(
-            instance=instance,
-            request_kwargs=request_kwargs,
-            start_ns=start_ns,
-            **{response_kwarg_name: chunks},
-            is_streaming=True,
-            trace_id=trace_id,
-            parent_id=parent_id,
-        )
-        emitted = True
-        raise
-    except BaseException as exc:
-        emit(
-            instance=instance,
-            request_kwargs=request_kwargs,
-            start_ns=start_ns,
-            **{response_kwarg_name: chunks},
-            error_message=safe_exception_message(exc),
-            status_code=provider_status_code(exc),
-            is_streaming=True,
-            trace_id=trace_id,
-            parent_id=parent_id,
-        )
-        emitted = True
-        raise
-    else:
-        emit(
-            instance=instance,
-            request_kwargs=request_kwargs,
-            start_ns=start_ns,
-            **{response_kwarg_name: chunks},
-            is_streaming=True,
-            trace_id=trace_id,
-            parent_id=parent_id,
-        )
-        emitted = True
-    finally:
-        if not emitted:
-            emit(
-                instance=instance,
-                request_kwargs=request_kwargs,
-                start_ns=start_ns,
-                **{response_kwarg_name: chunks},
-                is_streaming=True,
-                trace_id=trace_id,
-                parent_id=parent_id,
-            )
-        close = getattr(iterator, "close", None)
-        if callable(close):
-            try:
-                close()
-            except BaseException:
-                logger.debug("Failed to close Watsonx stream", exc_info=True)
-
-
-async def _wrap_async_iterator(
-    *,
-    async_iterator: AsyncIterator[Any],
-    emit: Callable[..., None],
-    instance: Any,
-    request_kwargs: dict[str, Any],
-    start_ns: int,
-    response_kwarg_name: str,
-    trace_id: str | None,
-    parent_id: str | None,
-) -> AsyncIterator[Any]:
-    chunks: list[Any] = []
-    emitted = False
-    try:
-        async for chunk in async_iterator:
-            _append_stream_chunk(chunks, chunk)
-            yield chunk
-    except (GeneratorExit, StopAsyncIteration):
-        emit(
-            instance=instance,
-            request_kwargs=request_kwargs,
-            start_ns=start_ns,
-            **{response_kwarg_name: chunks},
-            is_streaming=True,
-            trace_id=trace_id,
-            parent_id=parent_id,
-        )
-        emitted = True
-        raise
-    except BaseException as exc:
-        emit(
-            instance=instance,
-            request_kwargs=request_kwargs,
-            start_ns=start_ns,
-            **{response_kwarg_name: chunks},
-            error_message=safe_exception_message(exc),
-            status_code=provider_status_code(exc),
-            is_streaming=True,
-            trace_id=trace_id,
-            parent_id=parent_id,
-        )
-        emitted = True
-        raise
-    else:
-        emit(
-            instance=instance,
-            request_kwargs=request_kwargs,
-            start_ns=start_ns,
-            **{response_kwarg_name: chunks},
-            is_streaming=True,
-            trace_id=trace_id,
-            parent_id=parent_id,
-        )
-        emitted = True
-    finally:
-        if not emitted:
-            emit(
-                instance=instance,
-                request_kwargs=request_kwargs,
-                start_ns=start_ns,
-                **{response_kwarg_name: chunks},
-                is_streaming=True,
-                trace_id=trace_id,
-                parent_id=parent_id,
-            )
-        close = getattr(async_iterator, "aclose", None)
-        if callable(close):
-            try:
-                await close()
-            except BaseException:
-                logger.debug("Failed to close Watsonx async stream", exc_info=True)
-
-
-def _wrap_sync_method(
-    *,
-    original: Any,
-    method_name: str,
-    emit: Callable[..., None],
-    response_kwarg_name: str,
-    positional_arg_name: str | None = None,
-    stream: bool = False,
-) -> Any:
-    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        start_ns = time.time_ns()
-        trace_id, parent_id = current_trace_parent_ids()
-        request_kwargs = _request_kwargs_from_call(
-            method_name=method_name,
-            args=args,
-            kwargs=kwargs,
-            positional_arg_name=positional_arg_name,
-        )
+class _Call:
+    def __init__(self, mode, request, stream, config):
+        self.ctx = context.get_current()
+        self.carrier = trace.get_current_span(self.ctx)
+        provider = _provider(config)
+        self.observer = _observer(provider)
+        self.mode, self.stream = mode, stream
+        self.span = None
+        starting = _STARTING.set(self)
         try:
-            response = original(self, *args, **kwargs)
-        except BaseException as exc:
-            emit(
-                instance=self,
-                request_kwargs=request_kwargs,
-                start_ns=start_ns,
-                error_message=safe_exception_message(exc),
-                status_code=provider_status_code(exc),
-                trace_id=trace_id,
-                parent_id=parent_id,
+            self.span = trace.get_tracer(__name__, tracer_provider=provider).start_span(
+                "watsonx." + mode, context=self.ctx, kind=SpanKind.CLIENT
             )
-            raise
-
-        if stream or _is_iterator(response):
-            return _wrap_sync_iterator(
-                iterator=response,
-                emit=emit,
-                instance=self,
-                request_kwargs=request_kwargs,
-                start_ns=start_ns,
-                response_kwarg_name=response_kwarg_name,
-                trace_id=trace_id,
-                parent_id=parent_id,
-            )
-
-        emit(
-            instance=self,
-            request_kwargs=request_kwargs,
-            start_ns=start_ns,
-            **{response_kwarg_name: response},
-            trace_id=trace_id,
-            parent_id=parent_id,
+        finally:
+            _STARTING.reset(starting)
+        self.recording = self.span.is_recording()
+        self.allowed = bool(
+            config[0]
+            and self.recording
+            and content_allowed(self.ctx)
+            and self.observer.allowed(self.carrier)
         )
-        return response
-
-    return wrapper
-
-
-def _wrap_async_method(
-    *,
-    original: Any,
-    method_name: str,
-    emit: Callable[..., None],
-    response_kwarg_name: str,
-    positional_arg_name: str | None = None,
-    stream: bool = False,
-) -> Any:
-    async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        start_ns = time.time_ns()
-        trace_id, parent_id = current_trace_parent_ids()
-        request_kwargs = _request_kwargs_from_call(
-            method_name=method_name,
-            args=args,
-            kwargs=kwargs,
-            positional_arg_name=positional_arg_name,
-        )
+        request = request() if self.recording else {}
+        self.request = _model_only(request) if self.recording else {}
+        self.propagated = {}
+        self.payload = None
+        self.frames = []
+        self.pending = None
+        self.http_code = None
+        self.undo = []
+        self.done = False
+        _PENDING.add(self)
         try:
-            pending_response = original(self, *args, **kwargs)
-            if hasattr(pending_response, "__aiter__"):
-                response = pending_response
-            else:
-                response = await pending_response
-        except BaseException as exc:
-            emit(
-                instance=self,
-                request_kwargs=request_kwargs,
-                start_ns=start_ns,
-                error_message=safe_exception_message(exc),
-                status_code=provider_status_code(exc),
-                trace_id=trace_id,
-                parent_id=parent_id,
-            )
-            raise
+            if self.allowed:
+                self.request = native_value(request)
+                self.propagated = _propagated()
+        except BaseException:
+            self.allowed = False
+            self.request = _model_only(request) if self.recording else {}
 
-        if stream or hasattr(response, "__aiter__"):
-            return _wrap_async_iterator(
-                async_iterator=response,
-                emit=emit,
-                instance=self,
-                request_kwargs=request_kwargs,
-                start_ns=start_ns,
-                response_kwarg_name=response_kwarg_name,
-                trace_id=trace_id,
-                parent_id=parent_id,
-            )
-
-        emit(
-            instance=self,
-            request_kwargs=request_kwargs,
-            start_ns=start_ns,
-            **{response_kwarg_name: response},
-            trace_id=trace_id,
-            parent_id=parent_id,
+    def policy(self):
+        if self.done:
+            return False
+        self.allowed = bool(
+            self.allowed
+            and content_allowed(self.ctx)
+            and content_allowed()
+            and not suppressed(self.ctx)
+            and self.observer.allowed(self.carrier)
+            and self.observer.allowed(trace.get_current_span())
         )
-        return response
+        if not self.allowed:
+            self.observer.deny(self.span)
+            self.request = _model_only(self.request) if self.recording else {}
+            self.propagated.clear()
+            self.payload = self.pending = None
+            self.frames.clear()
+        return self.allowed
 
-    return wrapper
+    def explicit_policy(self):
+        # OTel SimpleSpanProcessor suppresses instrumentation while exporting.
+        # That transient guard must not veto unrelated pending siblings.
+        if not content_allowed(self.ctx) or not content_allowed():
+            self.allowed = False
+            self.policy()
+
+    def tap(self, owner, name, replacement):
+        original = getattr(owner, name)
+        owned = replacement(original)
+        had_own = name in owner.__dict__
+        self.undo.append((weakref.ref(owner), name, original, owned, had_own))
+        setattr(owner, name, owned)
+
+    def response(self, response):
+        import httpx
+
+        if type(response) is not httpx.Response or self.done:
+            return
+        self.http_code = response.status_code
+        if not self.recording:
+            return
+
+        def json_tap(original):
+            def decoded(*args, **kwargs):
+                result = original(*args, **kwargs)
+                try:
+                    if self.policy() and type(result) is dict:
+                        self.payload = value(result)
+                except BaseException:
+                    self.allowed = False
+                    self.policy()
+                return result
+
+            return decoded
+
+        def lines_tap(original):
+            def lines(*args, **kwargs):
+                for line in original(*args, **kwargs):
+                    self.line(line)
+                    yield line
+
+            return lines
+
+        def async_lines_tap(original):
+            async def lines(*args, **kwargs):
+                async for line in original(*args, **kwargs):
+                    self.line(line)
+                    yield line
+
+            return lines
+
+        self.tap(response, "json", json_tap)
+        if self.stream:
+            self.tap(response, "iter_lines", lines_tap)
+            self.tap(response, "aiter_lines", async_lines_tap)
+
+    def line(self, line):
+        try:
+            self.pending = None
+            if self.policy() and type(line) is str and line.startswith("data:"):
+                decoded = json.loads(line.partition(":")[2])
+                if type(decoded) is dict and not decoded.get("error"):
+                    self.pending = decoded
+        except BaseException:
+            # Native JSON parsing still runs and raises its original error.
+            self.pending = None
+
+    def chunk(self, chunk):
+        if self.done:
+            return
+        try:
+            if self.policy():
+                self.frames.append(
+                    self.pending if self.pending is not None else native_value(chunk)
+                )
+            self.pending = None
+        except BaseException:
+            self.allowed = False
+            self.policy()
+
+    def finish(self, response=None, error=None):
+        if self.done:
+            return
+        ambient = context.get_current()
+        try:
+            allowed = self.policy()
+            if self.recording:
+                payload = (self.frames or None) if self.stream else self.payload
+                if (
+                    not self.stream
+                    and allowed
+                    and (
+                        type(response) is dict
+                        or (
+                            type(response) is list
+                            and all(type(item) is dict for item in response)
+                        )
+                    )
+                ):
+                    payload = native_value(response)
+                if payload is None and response is not None and allowed:
+                    payload = native_value(response)
+                attrs = build_attributes(
+                    mode=self.mode,
+                    request=self.request,
+                    payload=payload,
+                    stream=self.stream,
+                    capture_content=allowed,
+                )
+                if allowed:
+                    attrs.update(self.propagated)
+                if self.http_code is not None:
+                    attrs[HTTP_RESPONSE_STATUS_CODE] = self.http_code
+                if error is not None:
+                    cls = type(error)
+                    attrs[ERROR_TYPE] = type.__getattribute__(cls, "__name__")
+                    # Exact installed exceptions only; subclasses may override hooks.
+                    import httpx
+                    import ibm_watsonx_ai.wml_client_error as errors
+
+                    known = any(
+                        cls is candidate
+                        for module in (builtins, httpx, errors)
+                        for candidate in vars(module).values()
+                        if type(candidate) is type
+                        and issubclass(candidate, BaseException)
+                    )
+                    args = BaseException.args.__get__(error)
+                    message = (
+                        text(args[0])
+                        if allowed
+                        and known
+                        and type(args) is tuple
+                        and args
+                        and type(args[0]) is str
+                        else None
+                    )
+                    if message is not None:
+                        attrs[ERROR_MESSAGE] = message
+                    self.span.set_status(Status(StatusCode.ERROR, message))
+                self.span.set_attributes(attrs)
+        except BaseException:
+            logger.debug("Watsonx telemetry mapping failed")
+        finally:
+            try:
+                if self.recording and not self.policy():
+                    self.scrub()
+            except BaseException:
+                if self.recording:
+                    self.scrub()
+            # Mark done before SDK processors enter transient export suppression.
+            self.done = True
+            try:
+                self.span.end()
+            except BaseException:
+                logger.debug("Watsonx telemetry end failed")
+            _restore_context(ambient)
+            for ref, name, original, owned, had_own in self.undo:
+                owner = ref()
+                if owner is not None and getattr(owner, name, None) is owned:
+                    try:
+                        if had_own:
+                            setattr(owner, name, original)
+                        else:
+                            delattr(owner, name)
+                    except BaseException:
+                        logger.debug("Watsonx response tap restoration failed")
+            self.undo.clear()
+            self.request = None
+            self.payload = self.pending = self.ctx = self.carrier = None
+            self.frames.clear()
+            self.propagated.clear()
+            _PENDING.discard(self)
+
+    def scrub(self):
+        structural = set(base_attributes(self.mode)) | {
+            SpanAttributes.TRACELOOP_ENTITY_NAME,
+            SpanAttributes.TRACELOOP_ENTITY_PATH,
+            SpanAttributes.LLM_REQUEST_MODEL,
+            SpanAttributes.LLM_IS_STREAMING,
+            HTTP_RESPONSE_STATUS_CODE,
+            ERROR_TYPE,
+        }
+        for key in tuple(self.span.attributes or {}):
+            if key not in structural:
+                self.span._attributes.pop(key, None)
+        self.span._events = BoundedList(0)
+        if self.span.status.status_code is StatusCode.ERROR:
+            self.span._status = Status(StatusCode.ERROR)
 
 
-def _patch_method(target_class: type[Any], method_name: str, replacement: Any) -> None:
-    original = getattr(target_class, method_name, None)
-    if original is None:
+def _hook(response):
+    state = _ACTIVE.get()
+    if state is not None:
+        try:
+            state.response(response)
+        except BaseException:
+            logger.debug("Watsonx response observation failed")
+
+
+def _request_hook(request):
+    state = _ACTIVE.get()
+    if state is None or state.done or not state.recording:
         return
-    key = (target_class, method_name)
-    if key not in _original_methods:
-        _original_methods[key] = original
-    wrapped = replacement(original=_original_methods[key])
-    setattr(target_class, method_name, wrapped)
-    _installed_methods[key] = wrapped
+    try:
+        import httpx
+
+        if type(request) is httpx.Request and state.policy():
+            decoded = json.loads(request.content)
+            if type(decoded) is dict:
+                native = value(decoded)
+                state.request.setdefault("native_requests", []).append(native)
+                state.request["native_request"] = native
+                for key, item in native.items():
+                    if (
+                        key not in ("inputs", "input", "messages")
+                        or key not in state.request
+                    ):
+                        state.request[key] = item
+    except BaseException:
+        logger.debug("Watsonx native request observation failed")
 
 
-def _complete_installation(*, success: bool) -> None:
-    global _activation_count, _activation_installing
-    with _activation_condition:
-        if success:
-            _activation_count = 1
-        _activation_installing = False
-        _activation_condition.notify_all()
+async def _async_hook(response):
+    _hook(response)
+
+
+async def _async_request_hook(request):
+    _request_hook(request)
+
+
+def _transport(instance):
+    import httpx
+
+    sdk = object.__getattribute__(instance, "__dict__").get("_client")
+    state = object.__getattribute__(sdk, "__dict__")
+    with _LOCK:
+        for name in ("_httpx_client", "_async_httpx_client"):
+            owner = state.get(name)
+            if not any(
+                type(owner) is kind for kind in (httpx.Client, httpx.AsyncClient)
+            ):
+                continue
+            if any(ref() is owner for ref, _ in _HOOKS):
+                continue
+            hooks = {
+                "request": _async_request_hook
+                if type(owner) is httpx.AsyncClient
+                else _request_hook,
+                "response": _async_hook if type(owner) is httpx.AsyncClient else _hook,
+            }
+            _HOOKS.append((weakref.ref(owner), hooks))
+            for kind, hook in hooks.items():
+                owner.event_hooks[kind].append(hook)
+
+
+def _enabled():
+    instance = getattr(RespanTracer, "_instance", None)
+    return instance is None or bool(getattr(instance, "is_enabled", True))
+
+
+def _start(mode, request, stream, client):
+    state = None
+    ambient = context.get_current()
+    try:
+        state = _Call.__new__(_Call)
+        state.__init__(mode, request, stream, _CONFIG)
+        _transport(client)
+        return state
+    except BaseException:
+        if state is not None and getattr(state, "span", None) is not None:
+            try:
+                state.scrub()
+                state.span.end()
+            except BaseException:
+                logger.debug("Watsonx startup span end failed")
+            _PENDING.discard(state)
+        logger.debug("Watsonx telemetry startup failed")
+        return None
+    finally:
+        _restore_context(ambient)
+
+
+def _run(state, operation, finish_errors=True):
+    if state.done:
+        return operation()
+    ambient = context.get_current()
+    token = None
+    active = _ACTIVE.set(state)
+    try:
+        try:
+            token = context.attach(trace.set_span_in_context(state.span))
+        except BaseException:
+            _restore_context(ambient)
+        try:
+            return operation()
+        except (StopIteration, StopAsyncIteration, GeneratorExit):
+            raise
+        except BaseException as error:
+            if finish_errors:
+                state.finish(error=error)
+            raise
+    finally:
+        _ACTIVE.reset(active)
+        if token is not None:
+            _detach(token, ambient)
+        else:
+            _restore_context(ambient)
+
+
+async def _arun(state, operation, finish_errors=True):
+    if state.done:
+        return await operation()
+    ambient = context.get_current()
+    token = None
+    active = _ACTIVE.set(state)
+    try:
+        try:
+            token = context.attach(trace.set_span_in_context(state.span))
+        except BaseException:
+            _restore_context(ambient)
+        try:
+            return await operation()
+        except (StopIteration, StopAsyncIteration, GeneratorExit):
+            raise
+        except BaseException as error:
+            if finish_errors:
+                state.finish(error=error)
+            raise
+    finally:
+        _ACTIVE.reset(active)
+        if token is not None:
+            _detach(token, ambient)
+        else:
+            _restore_context(ambient)
+
+
+class _Stream:
+    """Delegate every native generator operation, including pre-first close."""
+
+    def __init__(self, native, state):
+        self.native, self.state = native, state
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self._advance(lambda: next(self.native))
+
+    def _advance(self, operation):
+        try:
+            result = _run(self.state, operation, False)
+        except StopIteration:
+            self.state.finish()
+            raise
+        except BaseException as error:
+            if self.native.gi_frame is None:
+                self.state.finish(error=error)
+            raise
+        else:
+            self.state.chunk(result)
+            return result
+
+    def send(self, value):
+        return self._advance(lambda: self.native.send(value))
+
+    def throw(self, *args):
+        return self._advance(lambda: self.native.throw(*args))
+
+    def close(self):
+        try:
+            return _run(self.state, self.native.close)
+        finally:
+            self.state.finish()
+
+    def __del__(self):
+        try:
+            self.close()
+        except BaseException:
+            logger.debug("Watsonx garbage collection cleanup failed")
+
+    def __getattr__(self, name):
+        return getattr(self.native, name)
+
+
+class _AsyncStream:
+    def __init__(self, native, state):
+        self.native, self.state = native, state
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        return await self._advance(self.native.__anext__)
+
+    async def _advance(self, operation):
+        try:
+            result = await _arun(self.state, operation, False)
+        except StopAsyncIteration:
+            self.state.finish()
+            raise
+        except BaseException as error:
+            if self.native.ag_frame is None:
+                self.state.finish(error=error)
+            raise
+        else:
+            self.state.chunk(result)
+            return result
+
+    async def asend(self, value):
+        return await self._advance(lambda: self.native.asend(value))
+
+    async def athrow(self, *args):
+        return await self._advance(lambda: self.native.athrow(*args))
+
+    async def aclose(self):
+        try:
+            return await _arun(self.state, self.native.aclose)
+        finally:
+            self.state.finish()
+
+    def __del__(self):
+        try:
+            self.state.finish()
+        except BaseException:
+            logger.debug("Watsonx garbage collection cleanup failed")
+
+    def __getattr__(self, name):
+        return getattr(self.native, name)
+
+
+def _snapshot(original, instance, args, kwargs):
+    bound = inspect.signature(original).bind(instance, *args, **kwargs)
+    bound.apply_defaults()
+    request = {key: item for key, item in bound.arguments.items() if key != "self"}
+    fields = object.__getattribute__(instance, "__dict__")
+    model = fields.get("_model_id", fields.get("model_id"))
+    if type(model) is str:
+        request["model_id"] = model
+    if request.get("params") is None and "params" in fields:
+        request["params"] = fields["params"]
+    return request
+
+
+def _wrap(original, mode, method, asynchronous=False):
+    if asynchronous:
+
+        @functools.wraps(original)
+        async def call(instance, *args, **kwargs):
+            if (
+                _CONFIG is None
+                or _ACTIVE.get() is not None
+                or suppressed()
+                or not _enabled()
+            ):
+                return await original(instance, *args, **kwargs)
+            state = _start(
+                mode,
+                lambda: _snapshot(original, instance, args, kwargs),
+                "stream" in method,
+                instance,
+            )
+            if state is None:
+                return await original(instance, *args, **kwargs)
+            response = await _arun(state, lambda: original(instance, *args, **kwargs))
+            if type(response) is types.AsyncGeneratorType:
+                state.stream = True
+                return _AsyncStream(response, state)
+            state.finish(response=response)
+            return response
+
+        return call
+
+    @functools.wraps(original)
+    def call(instance, *args, **kwargs):
+        if (
+            _CONFIG is None
+            or _ACTIVE.get() is not None
+            or suppressed()
+            or not _enabled()
+        ):
+            return original(instance, *args, **kwargs)
+        state = _start(
+            mode,
+            lambda: _snapshot(original, instance, args, kwargs),
+            "stream" in method,
+            instance,
+        )
+        if state is None:
+            return original(instance, *args, **kwargs)
+        response = _run(state, lambda: original(instance, *args, **kwargs))
+        if type(response) is types.GeneratorType:
+            state.stream = True
+            return _Stream(response, state)
+        state.finish(response=response)
+        return response
+
+    return call
+
+
+def _detach_guard(original):
+    @functools.wraps(original)
+    def detach(token):
+        for state in tuple(_PENDING):
+            if not state.done:
+                try:
+                    state.explicit_policy()
+                except BaseException:
+                    logger.debug("Watsonx content policy observation failed")
+        return original(token)
+
+    return detach
 
 
 class WatsonxInstrumentor:
-    """Respan instrumentor for the IBM watsonx.ai Python SDK."""
+    """Instrument the four inference methods of the official Watsonx SDK."""
 
-    name = WATSONX_INSTRUMENTATION_NAME
+    name = "watsonx"
 
-    def __init__(self) -> None:
+    def __init__(self, *, capture_content=True, tracer_provider=None):
+        self.config = (capture_content, tracer_provider)
         self._is_instrumented = False
 
-    @staticmethod
-    def _is_respan_tracing_enabled() -> bool:
-        tracer = getattr(RespanTracer, "_instance", None)
-        if tracer is None:
-            return True
-        return bool(getattr(tracer, "is_enabled", True))
-
-    def activate(self) -> None:
-        """Monkey-patch Watsonx model and embedding methods."""
-        global _activation_count, _activation_installing
-        with _activation_condition:
-            if self._is_instrumented:
+    def activate(self):
+        global _CONFIG
+        with _LOCK:
+            if self in _OWNERS:
                 return
-            if not self._is_respan_tracing_enabled():
-                logger.info(
-                    "Watsonx instrumentation skipped because Respan tracing is disabled"
+            if _OWNERS and self.config != _CONFIG:
+                raise ValueError(
+                    "Watsonx is active with a different content/provider configuration"
                 )
-                return
-            while _activation_installing:
-                _activation_condition.wait()
-            if _activation_count:
-                _activation_count += 1
-                self._is_instrumented = True
-                return
-            _activation_installing = True
+            if not _OWNERS:
+                try:
+                    sdk = importlib.import_module("ibm_watsonx_ai.foundation_models")
+                    _observer(_provider(self.config))
+                    for owner, mode, names in (
+                        (
+                            sdk.ModelInference,
+                            "generate",
+                            (
+                                "generate",
+                                "generate_text",
+                                "generate_text_stream",
+                                "agenerate",
+                                "agenerate_stream",
+                            ),
+                        ),
+                        (
+                            sdk.ModelInference,
+                            "chat",
+                            ("chat", "chat_stream", "achat", "achat_stream"),
+                        ),
+                        (
+                            sdk.Embeddings,
+                            "embed",
+                            (
+                                "generate",
+                                "embed_documents",
+                                "embed_query",
+                                "agenerate",
+                                "aembed_documents",
+                                "aembed_query",
+                            ),
+                        ),
+                    ):
+                        for method in names:
+                            original = inspect.getattr_static(owner, method, None)
+                            if original is None:
+                                continue
+                            owned = _wrap(
+                                original,
+                                mode,
+                                method,
+                                inspect.iscoroutinefunction(original),
+                            )
+                            _PATCHES.append((owner, method, original, owned))
+                            setattr(owner, method, owned)
+                    original = context.detach
+                    owned = _detach_guard(original)
+                    _PATCHES.append((context, "detach", original, owned))
+                    context.detach = owned
+                    _CONFIG = self.config
+                except ImportError:
+                    _cleanup()
+                    return
+                except BaseException:
+                    _cleanup()
+                    logger.debug("Watsonx activation failed")
+                    return
+            _OWNERS.add(self)
             self._is_instrumented = True
 
-        try:
-            ModelInference, Embeddings = _load_watsonx_classes()
-        except (AttributeError, ImportError) as exc:
-            logger.warning(
-                "Failed to activate Watsonx instrumentation - missing dependency: %s",
-                exc,
-            )
-            self.deactivate()
-            _complete_installation(success=False)
-            return
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to activate Watsonx instrumentation: %s", exc)
-            self.deactivate()
-            _complete_installation(success=False)
-            return
-
-        try:
-            for method_name in (GENERATE_METHOD_NAME, GENERATE_TEXT_METHOD_NAME):
-                _patch_method(
-                    ModelInference,
-                    method_name,
-                    lambda original, method_name=method_name: _wrap_sync_method(
-                        original=original,
-                        method_name=method_name,
-                        emit=emit_text_span,
-                        response_kwarg_name="response_or_chunks",
-                        positional_arg_name="prompt",
-                    ),
-                )
-            _patch_method(
-                ModelInference,
-                GENERATE_TEXT_STREAM_METHOD_NAME,
-                lambda original: _wrap_sync_method(
-                    original=original,
-                    method_name=GENERATE_TEXT_STREAM_METHOD_NAME,
-                    emit=emit_text_span,
-                    response_kwarg_name="response_or_chunks",
-                    positional_arg_name="prompt",
-                    stream=True,
-                ),
-            )
-            for method_name in (AGENERATE_METHOD_NAME,):
-                _patch_method(
-                    ModelInference,
-                    method_name,
-                    lambda original, method_name=method_name: _wrap_async_method(
-                        original=original,
-                        method_name=method_name,
-                        emit=emit_text_span,
-                        response_kwarg_name="response_or_chunks",
-                        positional_arg_name="prompt",
-                    ),
-                )
-            _patch_method(
-                ModelInference,
-                AGENERATE_STREAM_METHOD_NAME,
-                lambda original: _wrap_async_method(
-                    original=original,
-                    method_name=AGENERATE_STREAM_METHOD_NAME,
-                    emit=emit_text_span,
-                    response_kwarg_name="response_or_chunks",
-                    positional_arg_name="prompt",
-                    stream=True,
-                ),
-            )
-            _patch_method(
-                ModelInference,
-                CHAT_METHOD_NAME,
-                lambda original: _wrap_sync_method(
-                    original=original,
-                    method_name=CHAT_METHOD_NAME,
-                    emit=emit_chat_span,
-                    response_kwarg_name="response_or_chunks",
-                    positional_arg_name="messages",
-                ),
-            )
-            _patch_method(
-                ModelInference,
-                CHAT_STREAM_METHOD_NAME,
-                lambda original: _wrap_sync_method(
-                    original=original,
-                    method_name=CHAT_STREAM_METHOD_NAME,
-                    emit=emit_chat_span,
-                    response_kwarg_name="response_or_chunks",
-                    positional_arg_name="messages",
-                    stream=True,
-                ),
-            )
-            _patch_method(
-                ModelInference,
-                ACHAT_METHOD_NAME,
-                lambda original: _wrap_async_method(
-                    original=original,
-                    method_name=ACHAT_METHOD_NAME,
-                    emit=emit_chat_span,
-                    response_kwarg_name="response_or_chunks",
-                    positional_arg_name="messages",
-                ),
-            )
-            _patch_method(
-                ModelInference,
-                ACHAT_STREAM_METHOD_NAME,
-                lambda original: _wrap_async_method(
-                    original=original,
-                    method_name=ACHAT_STREAM_METHOD_NAME,
-                    emit=emit_chat_span,
-                    response_kwarg_name="response_or_chunks",
-                    positional_arg_name="messages",
-                    stream=True,
-                ),
-            )
-
-            for method_name in (
-                EMBEDDINGS_GENERATE_METHOD_NAME,
-                EMBED_DOCUMENTS_METHOD_NAME,
-                EMBED_QUERY_METHOD_NAME,
-            ):
-                positional_arg_name = "inputs"
-                if method_name == EMBED_DOCUMENTS_METHOD_NAME:
-                    positional_arg_name = "texts"
-                elif method_name == EMBED_QUERY_METHOD_NAME:
-                    positional_arg_name = "text"
-                _patch_method(
-                    Embeddings,
-                    method_name,
-                    lambda original, method_name=method_name, positional_arg_name=positional_arg_name: (
-                        _wrap_sync_method(
-                            original=original,
-                            method_name=method_name,
-                            emit=emit_embedding_span,
-                            response_kwarg_name="response",
-                            positional_arg_name=positional_arg_name,
-                        )
-                    ),
-                )
-            for method_name in (
-                AEMBEDDINGS_GENERATE_METHOD_NAME,
-                AEMBED_DOCUMENTS_METHOD_NAME,
-                AEMBED_QUERY_METHOD_NAME,
-            ):
-                positional_arg_name = "inputs"
-                if method_name == AEMBED_DOCUMENTS_METHOD_NAME:
-                    positional_arg_name = "texts"
-                elif method_name == AEMBED_QUERY_METHOD_NAME:
-                    positional_arg_name = "text"
-                _patch_method(
-                    Embeddings,
-                    method_name,
-                    lambda original, method_name=method_name, positional_arg_name=positional_arg_name: (
-                        _wrap_async_method(
-                            original=original,
-                            method_name=method_name,
-                            emit=emit_embedding_span,
-                            response_kwarg_name="response",
-                            positional_arg_name=positional_arg_name,
-                        )
-                    ),
-                )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to activate Watsonx instrumentation: %s", exc)
-            self.deactivate()
-            _complete_installation(success=False)
-            return
-
-        _complete_installation(success=True)
-        logger.info("Watsonx instrumentation activated")
-
-    def deactivate(self) -> None:
-        """Restore original Watsonx SDK methods."""
-        global _activation_count
-        with _activation_lock:
-            if not self._is_instrumented:
-                return
+    def deactivate(self):
+        with _LOCK:
+            _OWNERS.discard(self)
             self._is_instrumented = False
-            _activation_count = max(_activation_count - 1, 0)
-            if _activation_count:
-                return
-            for (target_class, method_name), original in list(
-                _original_methods.items()
-            ):
-                try:
-                    current = getattr(target_class, method_name, None)
-                    installed = _installed_methods.get((target_class, method_name))
-                    if current is installed:
-                        setattr(target_class, method_name, original)
-                except Exception:
-                    logger.debug(
-                        "Failed to restore Watsonx method %s.%s",
-                        target_class,
-                        method_name,
-                        exc_info=True,
-                    )
-                finally:
-                    _original_methods.pop((target_class, method_name), None)
-                    _installed_methods.pop((target_class, method_name), None)
-        logger.info("Watsonx instrumentation deactivated")
+            if not _OWNERS:
+                _cleanup()
+
+
+def _cleanup():
+    global _CONFIG
+    for state in tuple(_PENDING):
+        state.finish()
+    for owner, name, original, owned in reversed(_PATCHES):
+        if getattr(owner, name, None) is owned:
+            setattr(owner, name, original)
+    _PATCHES.clear()
+    for ref, hooks in _HOOKS:
+        owner = ref()
+        if owner is not None:
+            for kind, hook in hooks.items():
+                owner.event_hooks[kind][:] = [
+                    item for item in owner.event_hooks[kind] if item is not hook
+                ]
+    _HOOKS.clear()
+    for provider, observer in _OBSERVERS:
+        processor = getattr(provider, "_active_span_processor", None)
+        processors = getattr(processor, "_span_processors", ())
+        if any(item is observer for item in processors):
+            processor._span_processors = tuple(
+                item for item in processors if item is not observer
+            )
+    _OBSERVERS.clear()
+    _CONFIG = None

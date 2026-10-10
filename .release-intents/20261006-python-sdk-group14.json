@@ -1,0 +1,9 @@
+{
+  "summary": "Support current Aleph Alpha, Watsonx, Writer, and Ragas Python APIs with complete sampled content and native lifecycle handling",
+  "packages": {
+    "respan-instrumentation-aleph-alpha": "minor",
+    "respan-instrumentation-watsonx": "minor",
+    "respan-instrumentation-writer": "minor",
+    "respan-instrumentation-ragas": "minor"
+  }
+}
