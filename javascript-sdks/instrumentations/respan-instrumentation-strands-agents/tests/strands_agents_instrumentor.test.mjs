@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { BasicTracerProvider } from "@opentelemetry/sdk-trace-base";
-import { RespanCompositeProcessor } from "../../../respan-tracing/dist/processor/composite.js";
+import { RespanCompositeProcessor } from "@respan/tracing/dist/processor/composite.js";
 
 import {
   StrandsAgentsInstrumentor,
@@ -109,9 +109,11 @@ test("enriches Strands agent spans with canonical Respan attrs", () => {
   assert.deepEqual(JSON.parse(attrs[ENTITY_OUTPUT]), [
     { role: "assistant", content: "It is sunny." },
   ]);
-  assert.deepEqual(JSON.parse(attrs[LLM_REQUEST_FUNCTIONS]), [
-    { type: "function", function: { name: "get_weather" } },
+  assert.equal(attrs[LLM_REQUEST_FUNCTIONS], undefined);
+  assert.deepEqual(JSON.parse(attrs["respan.metadata"]).strands_agent_tools, [
+    "get_weather",
   ]);
+
   assert.equal(attrs["gen_ai.system"], undefined);
   assert.equal(attrs["gen_ai.request.model"], undefined);
   assert.equal(attrs["gen_ai.usage.input_tokens"], undefined);
@@ -154,7 +156,7 @@ test("enriches Strands chat spans with messages, usage, and tool calls", () => {
 
   assert.equal(attrs[RESPAN_LOG_TYPE], "chat");
   assert.equal(attrs[LLM_REQUEST_TYPE], "chat");
-  assert.equal(attrs["gen_ai.system"], "openai");
+  assert.equal(attrs["gen_ai.system"], "strands-agents");
   assert.equal(attrs["gen_ai.request.model"], "gpt-4.1-nano");
   assert.equal(attrs["gen_ai.usage.input_tokens"], 12);
   assert.equal(attrs["gen_ai.usage.output_tokens"], 4);
@@ -208,9 +210,9 @@ test("enriches Strands tool spans with canonical input and output", () => {
     id: "tool_1",
     arguments: { city: "Seattle" },
   });
-  assert.equal(attrs[ENTITY_OUTPUT], "Sunny and 72F.");
+  assert.equal(JSON.parse(attrs[ENTITY_OUTPUT]), "Sunny and 72F.");
   assert.equal(attrs["gen_ai.tool.name"], undefined);
-  assert.equal(attrs["gen_ai.tool.call.id"], undefined);
+  assert.equal(attrs["gen_ai.tool.call.id"], "tool_1");
   assert.equal(attrs["gen_ai.tool.status"], undefined);
   assert.equal(attrs["gen_ai.system"], undefined);
   assert.equal(attrs[LLM_REQUEST_TYPE], undefined);
@@ -246,7 +248,8 @@ test("recovers tool-only structured output on its owning agent and clears it", a
   const structured = {
     city: "Tokyo",
     score: 92,
-    rationale: "Reliable transit, compact neighborhoods, and strong food options.",
+    rationale:
+      "Reliable transit, compact neighborhoods, and strong food options.",
   };
   const toolSpan = makeSpan({
     name: "execute_tool strands_structured_output",
@@ -292,9 +295,10 @@ test("recovers tool-only structured output on its owning agent and clears it", a
   processor.onEnd(cycleSpan);
   processor.onEnd(agentSpan);
 
-  assert.deepEqual(JSON.parse(agentSpan.attributes[ENTITY_OUTPUT]), [
-    { role: "assistant", content: structured },
-  ]);
+  assert.deepEqual(
+    JSON.parse(processor.prepareForExport(agentSpan).attributes[ENTITY_OUTPUT]),
+    [{ role: "assistant", content: structured }],
+  );
 
   const reusedAgent = makeSpan({
     name: "invoke_agent ReusedTrace",
@@ -308,9 +312,12 @@ test("recovers tool-only structured output on its owning agent and clears it", a
     events: [event(EVENT_CHOICE, { message: "" })],
   });
   processor.onEnd(reusedAgent);
-  assert.deepEqual(JSON.parse(reusedAgent.attributes[ENTITY_OUTPUT]), [
-    { role: "assistant", content: "" },
-  ]);
+  assert.deepEqual(
+    JSON.parse(
+      processor.prepareForExport(reusedAgent).attributes[ENTITY_OUTPUT],
+    ),
+    [{ role: "assistant", content: "" }],
+  );
 
   await processor.shutdown();
 });
@@ -412,7 +419,10 @@ test("OTel 2.10 cached tracers translate complete events and drain in-flight spa
     assert.deepEqual(JSON.parse(delegatedSpans[0].attributes[ENTITY_OUTPUT]), [
       { role: "assistant", content: "hello back" },
     ]);
-    assert.equal(delegatedSpans[0].attributes["gen_ai.operation.name"], undefined);
+    assert.equal(
+      delegatedSpans[0].attributes["gen_ai.operation.name"],
+      undefined,
+    );
     assert.equal(delegatedSpans[0].attributes["gen_ai.usage.input_tokens"], 8);
     assertNoOffContractAliases(delegatedSpans[0].attributes);
 
@@ -433,18 +443,17 @@ test("OTel 2.10 cached tracers translate complete events and drain in-flight spa
     assert.equal(delegatedSpans[1].attributes[RESPAN_LOG_TYPE], "chat");
     assert.match(delegatedSpans[1].attributes[ENTITY_OUTPUT], /drained/);
 
-    tracerBeforeActivation.startSpan("chat", {
-      attributes: {
-        "gen_ai.system": "strands-agents",
-        "gen_ai.operation.name": "chat",
-        "gen_ai.request.model": "raw-after-deactivation",
-      },
-    }).end();
+    tracerBeforeActivation
+      .startSpan("chat", {
+        attributes: {
+          "gen_ai.system": "strands-agents",
+          "gen_ai.operation.name": "chat",
+          "gen_ai.request.model": "raw-after-deactivation",
+        },
+      })
+      .end();
     assert.equal(delegatedSpans[2].attributes[RESPAN_LOG_TYPE], undefined);
-    assert.equal(
-      delegatedSpans[2].attributes["gen_ai.operation.name"],
-      "chat",
-    );
+    assert.equal(delegatedSpans[2].attributes["gen_ai.operation.name"], "chat");
   } finally {
     instrumentor.deactivate();
     await provider.shutdown();
@@ -491,4 +500,43 @@ test("failed activation releases semconv ownership and restores the exact enviro
       process.env.OTEL_SEMCONV_STABILITY_OPT_IN = previousOptIn;
     }
   }
+});
+
+test("agent schemas merge inherited metadata without LLM request fields", () => {
+  const schema = {
+    type: "object",
+    properties: Object.fromEntries(
+      Array.from({ length: 75 }, (_, i) => [`field${i}`, { type: "string" }]),
+    ),
+  };
+  const definitions = [{ name: "lookup", inputSchema: schema }];
+  const span = makeSpan({
+    name: "invoke_agent Schema",
+    attributes: {
+      "gen_ai.system": "strands-agents",
+      "gen_ai.operation.name": "invoke_agent",
+      "respan.metadata": JSON.stringify({ inherited: "kept" }),
+      "gen_ai.agent.tools": JSON.stringify(["lookup"]),
+      "gen_ai.tool.definitions": JSON.stringify(definitions),
+      "gen_ai.request.model": "gpt-4.1-nano",
+      "gen_ai.response.model": "gpt-4.1-nano",
+      "gen_ai.usage.reasoning.output_tokens": 3,
+      "gen_ai.usage.input_tokens": 5,
+      "llm.usage.total_tokens": 5,
+    },
+  });
+  enrichStrandsAgentsSpan(span);
+  const metadata = JSON.parse(span.attributes["respan.metadata"]);
+  assert.equal(metadata.inherited, "kept");
+  assert.deepEqual(metadata.strands_agent_tools, ["lookup"]);
+  assert.deepEqual(metadata.strands_tool_definitions, definitions);
+  assert.equal(span.attributes["llm.request.functions"], undefined);
+  assert.equal(span.attributes["gen_ai.request.model"], undefined);
+  assert.equal(span.attributes["gen_ai.response.model"], undefined);
+  assert.equal(
+    span.attributes["gen_ai.usage.reasoning.output_tokens"],
+    undefined,
+  );
+  assert.equal(span.attributes["gen_ai.usage.input_tokens"], undefined);
+  assert.equal(span.attributes["llm.usage.total_tokens"], undefined);
 });

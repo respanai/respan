@@ -1,0 +1,9 @@
+{
+  "summary": "Support latest native Google ADK, Mastra, Strands Agents, and Superagent with sampler-first privacy, lossless mapping, and native request lifecycle handling",
+  "packages": {
+    "@respan/instrumentation-google-adk": "minor",
+    "@respan/instrumentation-mastra": "minor",
+    "@respan/instrumentation-strands-agents": "minor",
+    "@respan/instrumentation-superagent": "minor"
+  }
+}

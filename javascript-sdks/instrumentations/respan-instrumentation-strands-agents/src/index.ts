@@ -20,16 +20,32 @@ import { STRANDS_SEMCONV_TOOL_DEFINITIONS_OPT_IN } from "./_constants.js";
 
 export interface StrandsAgentsInstrumentorOptions {
   includeToolDefinitions?: boolean;
+  traceContent?: boolean;
 }
 
 const TRANSFORMER_KEY = "@respan/instrumentation-strands-agents";
-let semconvOptInOwnerCount = 0;
-let originalSemconvOptIn: string | undefined;
+interface SharedOwners {
+  contentDisabled: Set<object>;
+  semconvOwners: Set<object>;
+  originalSemconvOptIn?: string;
+  enabledSemconvOptIn?: string;
+}
+const OWNER_STATE = Symbol.for(
+  "respan.instrumentation.strands-agents.owners.v1",
+);
+const globalOwners = globalThis as typeof globalThis & {
+  [OWNER_STATE]?: SharedOwners;
+};
+const owners = (globalOwners[OWNER_STATE] ??= {
+  contentDisabled: new Set(),
+  semconvOwners: new Set(),
+});
 
 export class StrandsAgentsInstrumentor {
   public readonly name = "strands-agents";
 
   private readonly _includeToolDefinitions: boolean;
+  private readonly _traceContent: boolean;
   private _ownsSemconvOptIn = false;
   private _processor: StrandsAgentsSpanProcessor | null = null;
   private _transformer: RespanSpanTransformer | null = null;
@@ -38,6 +54,7 @@ export class StrandsAgentsInstrumentor {
 
   constructor(options: StrandsAgentsInstrumentorOptions = {}) {
     this._includeToolDefinitions = options.includeToolDefinitions ?? true;
+    this._traceContent = options.traceContent !== false;
   }
 
   activate(): void {
@@ -45,10 +62,13 @@ export class StrandsAgentsInstrumentor {
       return;
     }
 
+    if (!this._traceContent) owners.contentDisabled.add(this);
     this._enableSemconvOptIns();
     try {
       if (!this._processor) {
-        this._processor = new StrandsAgentsSpanProcessor();
+        this._processor = new StrandsAgentsSpanProcessor({
+          traceContent: () => owners.contentDisabled.size === 0,
+        });
       }
       const processor = this._processor;
       if (!this._transformer) {
@@ -56,6 +76,7 @@ export class StrandsAgentsInstrumentor {
           onStart: (span, parentContext) =>
             processor.onStart(span, parentContext),
           onEnd: (span) => processor.onEnd(span),
+          prepareForExport: (span) => processor.prepareForExport(span),
           dispose: () => {
             void processor.shutdown();
           },
@@ -67,6 +88,7 @@ export class StrandsAgentsInstrumentor {
       );
       this._isInstrumented = true;
     } catch (error) {
+      owners.contentDisabled.delete(this);
       this._restoreSemconvOptIns();
       throw error;
     }
@@ -77,6 +99,7 @@ export class StrandsAgentsInstrumentor {
       return;
     }
 
+    owners.contentDisabled.delete(this);
     this._registration?.unregister();
     this._registration = null;
     this._restoreSemconvOptIns();
@@ -91,7 +114,7 @@ export class StrandsAgentsInstrumentor {
     if (!this._includeToolDefinitions || this._ownsSemconvOptIn) {
       return;
     }
-    acquireSemconvOptIn();
+    acquireSemconvOptIn(this);
     this._ownsSemconvOptIn = true;
   }
 
@@ -100,40 +123,39 @@ export class StrandsAgentsInstrumentor {
       return;
     }
     this._ownsSemconvOptIn = false;
-    releaseSemconvOptIn();
+    releaseSemconvOptIn(this);
   }
 }
 
-function acquireSemconvOptIn(): void {
-  if (semconvOptInOwnerCount === 0) {
-    originalSemconvOptIn = process.env.OTEL_SEMCONV_STABILITY_OPT_IN;
+function acquireSemconvOptIn(owner: object): void {
+  if (owners.semconvOwners.size === 0) {
+    owners.originalSemconvOptIn = process.env.OTEL_SEMCONV_STABILITY_OPT_IN;
     const values = new Set(
-      (originalSemconvOptIn ?? "")
+      (owners.originalSemconvOptIn ?? "")
         .split(",")
         .map((value) => value.trim())
         .filter(Boolean),
     );
     values.add(STRANDS_SEMCONV_TOOL_DEFINITIONS_OPT_IN);
-    process.env.OTEL_SEMCONV_STABILITY_OPT_IN = [...values].sort().join(",");
+    owners.enabledSemconvOptIn = [...values].sort().join(",");
+    process.env.OTEL_SEMCONV_STABILITY_OPT_IN = owners.enabledSemconvOptIn;
   }
-  semconvOptInOwnerCount += 1;
+  owners.semconvOwners.add(owner);
 }
 
-function releaseSemconvOptIn(): void {
-  if (semconvOptInOwnerCount === 0) {
-    return;
+function releaseSemconvOptIn(owner: object): void {
+  owners.semconvOwners.delete(owner);
+  if (owners.semconvOwners.size) return;
+  if (
+    process.env.OTEL_SEMCONV_STABILITY_OPT_IN === owners.enabledSemconvOptIn
+  ) {
+    if (owners.originalSemconvOptIn === undefined)
+      delete process.env.OTEL_SEMCONV_STABILITY_OPT_IN;
+    else
+      process.env.OTEL_SEMCONV_STABILITY_OPT_IN = owners.originalSemconvOptIn;
   }
-  semconvOptInOwnerCount -= 1;
-  if (semconvOptInOwnerCount > 0) {
-    return;
-  }
-
-  if (originalSemconvOptIn === undefined) {
-    delete process.env.OTEL_SEMCONV_STABILITY_OPT_IN;
-  } else {
-    process.env.OTEL_SEMCONV_STABILITY_OPT_IN = originalSemconvOptIn;
-  }
-  originalSemconvOptIn = undefined;
+  owners.originalSemconvOptIn = undefined;
+  owners.enabledSemconvOptIn = undefined;
 }
 
 export { enrichStrandsAgentsSpan, StrandsAgentsSpanProcessor };

@@ -28,10 +28,11 @@
   },
   "dependencies": {
     "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/core": "^2.10.0",
     "@opentelemetry/sdk-trace-base": "^2.10.0",
     "@opentelemetry/semantic-conventions": "^1.43.0",
     "@respan/respan-sdk": "^1.1.7",
-    "@respan/tracing": "workspace:^",
+    "@respan/tracing": "^1.6.1",
     "@traceloop/ai-semantic-conventions": "^0.13.0"
   },
   "peerDependencies": {
@@ -43,7 +44,7 @@
     }
   },
   "devDependencies": {
-    "@strands-agents/sdk": "^1.5.0",
+    "@strands-agents/sdk": "^1.20.0",
     "@types/node": "^22.15.29",
     "typescript": "^5.7.3"
   }

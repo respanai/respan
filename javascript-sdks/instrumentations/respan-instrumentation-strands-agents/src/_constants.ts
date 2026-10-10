@@ -13,8 +13,7 @@ export const STRANDS_OPERATION_EXECUTE_NODE = "execute_node";
 export const STRANDS_OPERATION_INVOKE_GRAPH = "invoke_graph";
 export const STRANDS_OPERATION_INVOKE_SWARM = "invoke_swarm";
 export const STRANDS_OPERATION_INVOKE_PREFIX = "invoke_";
-export const STRANDS_STRUCTURED_OUTPUT_TOOL_NAME =
-  "strands_structured_output";
+export const STRANDS_STRUCTURED_OUTPUT_TOOL_NAME = "strands_structured_output";
 
 export const STRANDS_AGENT_TOOLS_ATTR = "gen_ai.agent.tools";
 export const STRANDS_TOOL_STATUS_ATTR = "gen_ai.tool.status";
@@ -44,3 +43,11 @@ export const STRANDS_TOP_LEVEL_ALIAS_ATTRS_TO_STRIP = new Set([
 ]);
 
 export const STRANDS_RAW_ATTR_PREFIXES_TO_STRIP = ["event_loop."] as const;
+
+export const STRANDS_SYSTEM_PROMPT_ATTR = "system_prompt";
+
+export const STRANDS_AGENT_INPUT_ATTR = "gen_ai.agent.input";
+export const STRANDS_CYCLE_ID_ATTR = "agent_loop.cycle_id";
+export const STRANDS_SPAN_NAME_ATTR = "name";
+
+export const STRANDS_TRACE_CONTENT_ATTR = "allow_trace_content";

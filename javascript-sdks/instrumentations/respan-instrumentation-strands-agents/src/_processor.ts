@@ -13,9 +13,12 @@ import {
   ATTR_GEN_AI_PROMPT,
   ATTR_GEN_AI_PROVIDER_NAME,
   ATTR_GEN_AI_REQUEST_MODEL,
+  ATTR_GEN_AI_RESPONSE_MODEL,
   ATTR_GEN_AI_SYSTEM,
   ATTR_GEN_AI_SYSTEM_INSTRUCTIONS,
   ATTR_GEN_AI_TOOL_CALL_ID,
+  ATTR_GEN_AI_TOOL_CALL_ARGUMENTS,
+  ATTR_GEN_AI_TOOL_CALL_RESULT,
   ATTR_GEN_AI_TOOL_DEFINITIONS,
   ATTR_GEN_AI_TOOL_DESCRIPTION,
   ATTR_GEN_AI_TOOL_NAME,
@@ -29,10 +32,6 @@ import {
   EVENT_GEN_AI_CLIENT_INFERENCE_OPERATION_DETAILS,
   EVENT_GEN_AI_SYSTEM_MESSAGE,
   EVENT_GEN_AI_TOOL_MESSAGE,
-  GEN_AI_SYSTEM_VALUE_ANTHROPIC,
-  GEN_AI_SYSTEM_VALUE_AWS_BEDROCK,
-  GEN_AI_SYSTEM_VALUE_GCP_GEMINI,
-  GEN_AI_SYSTEM_VALUE_OPENAI,
 } from "@opentelemetry/semantic-conventions/incubating";
 import { RespanLogType, RespanSpanAttributes } from "@respan/respan-sdk";
 import { SpanAttributes } from "@traceloop/ai-semantic-conventions";
@@ -55,12 +54,21 @@ import {
   STRANDS_RAW_ATTR_PREFIXES_TO_STRIP,
   STRANDS_STRUCTURED_OUTPUT_TOOL_NAME,
   STRANDS_SYSTEM_NAME,
+  STRANDS_SYSTEM_PROMPT_ATTR,
   STRANDS_TOP_LEVEL_ALIAS_ATTRS_TO_STRIP,
   STRANDS_TOOL_JSON_SCHEMA_ATTR,
   STRANDS_TOOL_STATUS_ATTR,
   STRANDS_USAGE_CACHE_WRITE_INPUT_TOKENS_ATTR,
   STRANDS_USAGE_TOTAL_TOKENS_ATTR,
 } from "./_constants.js";
+
+import {
+  ContentPolicy,
+  contentAllowed,
+  copyData,
+  snapshotSpan,
+  dataProperty,
+} from "./_privacy.js";
 
 type SpanAttributesRecord = Record<string, any>;
 type SpanEventRecord = {
@@ -80,8 +88,6 @@ type StrandsTraceState = {
 const RESPAN_LOG_METHOD_TS_TRACING = "ts_tracing";
 const GEN_AI_PROMPT_PREFIX = `${ATTR_GEN_AI_PROMPT}.`;
 const GEN_AI_COMPLETION_PREFIX = `${ATTR_GEN_AI_COMPLETION}.`;
-const LLM_USAGE_CACHE_READ_INPUT_TOKENS_ATTR =
-  "llm.usage.cache_read_input_tokens";
 
 const STRANDS_RAW_ATTRS_TO_STRIP = new Set([
   ATTR_GEN_AI_AGENT_NAME,
@@ -90,7 +96,9 @@ const STRANDS_RAW_ATTRS_TO_STRIP = new Set([
   ATTR_GEN_AI_PROVIDER_NAME,
   ATTR_GEN_AI_AGENT_ID,
   STRANDS_AGENT_TOOLS_ATTR,
-  ATTR_GEN_AI_TOOL_CALL_ID,
+  STRANDS_SYSTEM_PROMPT_ATTR,
+  ATTR_GEN_AI_TOOL_CALL_ARGUMENTS,
+  ATTR_GEN_AI_TOOL_CALL_RESULT,
   STRANDS_TOOL_STATUS_ATTR,
   ATTR_GEN_AI_TOOL_DEFINITIONS,
   ATTR_GEN_AI_TOOL_DESCRIPTION,
@@ -100,11 +108,14 @@ const STRANDS_RAW_ATTRS_TO_STRIP = new Set([
   ATTR_GEN_AI_SYSTEM_INSTRUCTIONS,
   STRANDS_EVENT_START_TIME_ATTR,
   STRANDS_EVENT_END_TIME_ATTR,
+  STRANDS_USAGE_TOTAL_TOKENS_ATTR,
+  STRANDS_USAGE_CACHE_WRITE_INPUT_TOKENS_ATTR,
 ]);
 
 const STRANDS_NON_LLM_ATTRS_TO_STRIP = new Set([
   ATTR_GEN_AI_SYSTEM,
   ATTR_GEN_AI_REQUEST_MODEL,
+  ATTR_GEN_AI_RESPONSE_MODEL,
   ATTR_GEN_AI_USAGE_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_OUTPUT_TOKENS,
   ATTR_GEN_AI_USAGE_PROMPT_TOKENS,
@@ -114,10 +125,10 @@ const STRANDS_NON_LLM_ATTRS_TO_STRIP = new Set([
   STRANDS_USAGE_TOTAL_TOKENS_ATTR,
   STRANDS_USAGE_CACHE_WRITE_INPUT_TOKENS_ATTR,
   SpanAttributes.LLM_REQUEST_TYPE,
+  SpanAttributes.LLM_REQUEST_FUNCTIONS,
   ATTR_GEN_AI_USAGE_PROMPT_TOKENS,
   ATTR_GEN_AI_USAGE_COMPLETION_TOKENS,
   SpanAttributes.LLM_USAGE_TOTAL_TOKENS,
-  LLM_USAGE_CACHE_READ_INPUT_TOKENS_ATTR,
 ]);
 
 const OFF_CONTRACT_ALIAS_ATTRS = new Set([
@@ -129,19 +140,34 @@ const OFF_CONTRACT_ALIAS_ATTRS = new Set([
 
 export class StrandsAgentsSpanProcessor implements SpanProcessor {
   private readonly _traceStates = new Map<string, StrandsTraceState>();
+  private readonly _policy: ContentPolicy;
+  private readonly _prepared = new WeakMap<object, ReadableSpan>();
 
-  onStart(_span: Span, _parentContext: Context): void {
-    // Translation happens on ended spans so message/usage events are complete.
+  constructor(options: { traceContent?: boolean | (() => boolean) } = {}) {
+    this._policy = new ContentPolicy(options.traceContent ?? true);
+  }
+
+  onStart(span: Span, parentContext: Context): void {
+    this._policy.onStart(span, parentContext);
+  }
+
+  prepareForExport(span: ReadableSpan): ReadableSpan {
+    const prepared = this._prepared.get(span);
+    this._prepared.delete(span);
+    return prepared ? snapshotSpan(prepared, this._policy.allowed(span)) : span;
   }
 
   onEnd(span: ReadableSpan): void {
+    const original = span;
+    this._policy.finish(span);
+    if (!isStrandsAgentsSpan(span, span.attributes)) return;
+    span = translatedStrandsAgentsSpan(span, this._policy.allowed(span));
+    this._prepared.set(original, span);
     const traceId = span.spanContext().traceId;
     const spanId = span.spanContext().spanId;
     const parentSpanId = span.parentSpanContext?.spanId;
     const state = this._traceState(traceId);
     state.parents.set(spanId, parentSpanId);
-
-    enrichStrandsAgentsSpan(span);
 
     const attrs = (span as any).attributes as SpanAttributesRecord | undefined;
     if (
@@ -152,7 +178,7 @@ export class StrandsAgentsSpanProcessor implements SpanProcessor {
       const output = normalizeStructuredOutput(
         attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT],
       );
-      if (!isEmptyValue(output)) {
+      if (output !== undefined) {
         state.structuredOutputs.set(spanId, { output });
       }
     }
@@ -162,7 +188,14 @@ export class StrandsAgentsSpanProcessor implements SpanProcessor {
       this._clearAgentState(spanId, state);
     }
 
-    if (!parentSpanId) {
+    if (
+      attrs?.[RespanSpanAttributes.RESPAN_LOG_TYPE] === RespanLogType.WORKFLOW
+    )
+      this._clearAgentState(spanId, state);
+    if (
+      !parentSpanId ||
+      (state.parents.size === 0 && state.structuredOutputs.size === 0)
+    ) {
       this._traceStates.delete(traceId);
     }
   }
@@ -193,7 +226,9 @@ export class StrandsAgentsSpanProcessor implements SpanProcessor {
     agentSpanId: string,
     state: StrandsTraceState,
   ): void {
-    if (hasMeaningfulAgentOutput(attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT])) {
+    if (
+      hasMeaningfulAgentOutput(attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT])
+    ) {
       return;
     }
 
@@ -251,9 +286,6 @@ function isDescendantSpan(
 
 function normalizeStructuredOutput(value: unknown): unknown {
   let parsed = safeJsonLoads(value);
-  if (typeof parsed === "string") {
-    parsed = safeJsonLoads(parsed);
-  }
   if (Array.isArray(parsed) && parsed.length === 1) {
     parsed = parsed[0];
   }
@@ -276,20 +308,28 @@ function hasMeaningfulAgentOutput(value: unknown): boolean {
   });
 }
 
+/** Retained in-place helper; the instrumentor uses a private export copy. */
 export function enrichStrandsAgentsSpan(span: ReadableSpan): void {
-  const originalAttrs = (span as any).attributes as SpanAttributesRecord | undefined;
-  if (!originalAttrs) {
-    return;
-  }
+  const translated = translatedStrandsAgentsSpan(span, contentAllowed());
+  if (translated !== span) replaceSpanAttributes(span, translated.attributes);
+}
 
-  const attrs = { ...originalAttrs };
-  if (!isStrandsAgentsSpan(span, attrs)) {
-    return;
-  }
+function translatedStrandsAgentsSpan(
+  span: ReadableSpan,
+  captureContent: boolean,
+): ReadableSpan {
+  const originalAttrs = (span as any).attributes as
+    SpanAttributesRecord | undefined;
+  if (!originalAttrs || !isStrandsAgentsSpan(span, originalAttrs)) return span;
+  span = snapshotSpan(
+    span,
+    captureContent && (span.spanContext().traceFlags & 1) !== 0,
+  );
+  const attrs = { ...span.attributes };
 
   const logType = extractLogType(span, attrs);
   if (!logType) {
-    return;
+    return span;
   }
 
   switch (logType) {
@@ -309,28 +349,29 @@ export function enrichStrandsAgentsSpan(span: ReadableSpan): void {
       enrichToolSpan(span, attrs);
       break;
     default:
-      return;
+      return span;
   }
 
   replaceSpanAttributes(span, stripRawAttrs(attrs, logType));
+  return span;
 }
 
 function isStrandsAgentsSpan(
   span: ReadableSpan,
   attrs: SpanAttributesRecord,
 ): boolean {
-  const operationName = attrs[ATTR_GEN_AI_OPERATION_NAME];
+  const scope = span.instrumentationScope?.name;
+  const service = process.env.OTEL_SERVICE_NAME || STRANDS_SYSTEM_NAME;
   return (
-    attrs[ATTR_GEN_AI_SYSTEM] === STRANDS_SYSTEM_NAME ||
-    attrs[ATTR_GEN_AI_PROVIDER_NAME] === STRANDS_SYSTEM_NAME ||
-    KNOWN_STRANDS_OPERATIONS.has(String(operationName)) ||
-    typeof attrs[ATTR_GEN_AI_AGENT_NAME] === "string" ||
-    typeof attrs[ATTR_GEN_AI_TOOL_NAME] === "string" ||
-    span.name.startsWith(`${STRANDS_OPERATION_INVOKE_AGENT} `) ||
-    span.name.startsWith(`${STRANDS_OPERATION_EXECUTE_TOOL} `) ||
-    span.name.startsWith(`${STRANDS_OPERATION_INVOKE_GRAPH} `) ||
-    span.name.startsWith(`${STRANDS_OPERATION_INVOKE_SWARM} `) ||
-    isStrandsTaskSpanName(span.name)
+    dataProperty(attrs, ATTR_GEN_AI_SYSTEM) === STRANDS_SYSTEM_NAME ||
+    dataProperty(attrs, ATTR_GEN_AI_PROVIDER_NAME) === STRANDS_SYSTEM_NAME ||
+    (scope === service &&
+      dataProperty(attrs, STRANDS_EVENT_START_TIME_ATTR) !== undefined &&
+      (KNOWN_STRANDS_OPERATIONS.has(
+        dataProperty(attrs, ATTR_GEN_AI_OPERATION_NAME),
+      ) ||
+        isStrandsTaskSpanName(span.name) ||
+        span.name.startsWith("execute_node")))
   );
 }
 
@@ -433,16 +474,28 @@ function enrichAgentSpan(
     outputMessages: extractOutputMessages(span, attrs),
   });
 
-  const toolDefinitions = extractToolDefinitions(attrs);
-  if (toolDefinitions?.length) {
-    attrs[SpanAttributes.LLM_REQUEST_FUNCTIONS] = safeJson(toolDefinitions);
+  const observedNames = safeJsonLoads(attrs[STRANDS_AGENT_TOOLS_ATTR]);
+  const observedDefinitions = safeJsonLoads(
+    attrs[ATTR_GEN_AI_TOOL_DEFINITIONS] ??
+      attrs[SpanAttributes.LLM_REQUEST_FUNCTIONS],
+  );
+  if (observedNames !== undefined || observedDefinitions !== undefined) {
+    const inherited = safeJsonLoads(
+      attrs[RespanSpanAttributes.RESPAN_METADATA],
+    );
+    attrs[RespanSpanAttributes.RESPAN_METADATA] = safeJson({
+      ...(isRecord(inherited) ? inherited : {}),
+      ...(observedNames !== undefined
+        ? { strands_agent_tools: observedNames }
+        : {}),
+      ...(observedDefinitions !== undefined
+        ? { strands_tool_definitions: observedDefinitions }
+        : {}),
+    });
   }
 }
 
-function enrichTaskSpan(
-  span: ReadableSpan,
-  attrs: SpanAttributesRecord,
-): void {
+function enrichTaskSpan(span: ReadableSpan, attrs: SpanAttributesRecord): void {
   const operationName = attrs[ATTR_GEN_AI_OPERATION_NAME];
   const entityName =
     typeof operationName === "string" && operationName
@@ -459,17 +512,22 @@ function enrichTaskSpan(
   });
 }
 
-function enrichChatSpan(
-  span: ReadableSpan,
-  attrs: SpanAttributesRecord,
-): void {
+function enrichChatSpan(span: ReadableSpan, attrs: SpanAttributesRecord): void {
   setCommonAttrs(attrs, {
     logType: RespanLogType.CHAT,
     entityName: STRANDS_OPERATION_CHAT,
     entityPath: STRANDS_OPERATION_CHAT,
   });
   attrs[SpanAttributes.LLM_REQUEST_TYPE] = RespanLogType.CHAT;
-  attrs[ATTR_GEN_AI_SYSTEM] = inferGenAISystem(attrs[ATTR_GEN_AI_REQUEST_MODEL]);
+  const provider =
+    attrs[ATTR_GEN_AI_PROVIDER_NAME] ?? attrs[ATTR_GEN_AI_SYSTEM];
+  attrs[ATTR_GEN_AI_SYSTEM] =
+    typeof provider === "string" && provider !== STRANDS_SYSTEM_NAME
+      ? provider
+      : STRANDS_SYSTEM_NAME;
+  const definitions = extractToolDefinitions(attrs);
+  if (definitions?.length)
+    attrs[SpanAttributes.LLM_REQUEST_FUNCTIONS] = safeJson(definitions);
 
   const inputMessages = extractInputMessages(span, attrs);
   const outputMessages = extractOutputMessages(span, attrs);
@@ -483,10 +541,7 @@ function enrichChatSpan(
   setUsageAttrs(attrs);
 }
 
-function enrichToolSpan(
-  span: ReadableSpan,
-  attrs: SpanAttributesRecord,
-): void {
+function enrichToolSpan(span: ReadableSpan, attrs: SpanAttributesRecord): void {
   const toolName = extractToolName(span, attrs);
   setCommonAttrs(attrs, {
     logType: RespanLogType.TOOL,
@@ -494,27 +549,51 @@ function enrichToolSpan(
     entityPath: toolName,
   });
 
-  const toolArguments = extractToolEventPayload(
-    span,
-    EVENT_GEN_AI_TOOL_MESSAGE,
-    "content",
-  );
-  const toolResult = extractToolEventPayload(
-    span,
-    EVENT_GEN_AI_CHOICE,
-    "message",
-  );
+  const toolArguments =
+    attrs[ATTR_GEN_AI_TOOL_CALL_ARGUMENTS] ??
+    extractToolEventPayload(span, EVENT_GEN_AI_TOOL_MESSAGE, "content") ??
+    modernToolPayload(span, "input");
+  const toolResult =
+    attrs[ATTR_GEN_AI_TOOL_CALL_RESULT] ??
+    extractToolEventPayload(span, EVENT_GEN_AI_CHOICE, "message") ??
+    modernToolPayload(span, "output");
 
   attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safeJson({
     name: toolName,
-    id: attrs[ATTR_GEN_AI_TOOL_CALL_ID] ?? "",
-    arguments: toSerializableValue(safeJsonLoads(toolArguments)),
+    ...(typeof attrs[ATTR_GEN_AI_TOOL_CALL_ID] === "string"
+      ? { id: attrs[ATTR_GEN_AI_TOOL_CALL_ID] }
+      : {}),
+    ...(toolArguments !== undefined
+      ? { arguments: toSerializableValue(safeJsonLoads(toolArguments)) }
+      : {}),
   });
 
   if (toolResult !== undefined) {
-    const output = contentForMessage(toolResult);
-    attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = jsonString(output);
+    const output = contentForMessage(safeJsonLoads(toolResult));
+    attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safeJson(output);
   }
+}
+
+function modernToolPayload(
+  span: ReadableSpan,
+  direction: "input" | "output",
+): unknown {
+  const messages = operationDetailMessages(
+    span,
+    direction === "input"
+      ? ATTR_GEN_AI_INPUT_MESSAGES
+      : ATTR_GEN_AI_OUTPUT_MESSAGES,
+    "tool",
+  );
+  for (const message of messages ?? []) {
+    for (const block of Array.isArray(message.content) ? message.content : []) {
+      if (direction === "input" && isRecord(block.toolUse))
+        return block.toolUse.input;
+      if (direction === "output" && isRecord(block.toolResult))
+        return block.toolResult.content;
+    }
+  }
+  return undefined;
 }
 
 function setCommonAttrs(
@@ -523,7 +602,6 @@ function setCommonAttrs(
 ): void {
   attrs[RespanSpanAttributes.RESPAN_LOG_METHOD] = RESPAN_LOG_METHOD_TS_TRACING;
   attrs[RespanSpanAttributes.RESPAN_LOG_TYPE] = options.logType;
-  attrs[ATTR_GEN_AI_SYSTEM] = STRANDS_SYSTEM_NAME;
   attrs[SpanAttributes.TRACELOOP_ENTITY_NAME] = options.entityName;
   attrs[SpanAttributes.TRACELOOP_ENTITY_PATH] = options.entityPath;
   delete attrs[SpanAttributes.TRACELOOP_SPAN_KIND];
@@ -537,16 +615,22 @@ function setInputOutputAttrs(
   },
 ): void {
   if (options.inputMessages?.length) {
-    attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safeJson(options.inputMessages);
+    attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safeJson(
+      options.inputMessages,
+    );
   }
   if (options.outputMessages?.length) {
-    attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safeJson(options.outputMessages);
+    attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = safeJson(
+      options.outputMessages,
+    );
   }
 }
 
 function existingWorkflowName(attrs: SpanAttributesRecord): string | undefined {
   const workflowName = attrs[SpanAttributes.TRACELOOP_WORKFLOW_NAME];
-  return typeof workflowName === "string" && workflowName ? workflowName : undefined;
+  return typeof workflowName === "string" && workflowName
+    ? workflowName
+    : undefined;
 }
 
 function isStrandsTaskSpanName(spanName: string): boolean {
@@ -625,32 +709,35 @@ function extractInputMessages(
   span: ReadableSpan,
   attrs: SpanAttributesRecord,
 ): Array<Record<string, any>> | undefined {
-  const attrMessages = normalizeMessages(attrs[ATTR_GEN_AI_INPUT_MESSAGES], "user");
-  if (attrMessages?.length) {
-    return attrMessages;
-  }
-
+  const attrMessages = normalizeMessages(
+    attrs[ATTR_GEN_AI_INPUT_MESSAGES],
+    "user",
+  );
   const operationMessages = operationDetailMessages(
     span,
     ATTR_GEN_AI_INPUT_MESSAGES,
     "user",
   );
-  if (operationMessages?.length) {
-    return operationMessages;
-  }
-
   const legacyMessages = legacyInputMessages(span);
-  const systemInstructions = attrs[ATTR_GEN_AI_SYSTEM_INSTRUCTIONS];
-  if (systemInstructions !== undefined) {
-    const systemMessage = normalizeMessage(
-      { role: "system", content: systemInstructions },
-      "system",
-    );
-    if (systemMessage) {
-      return [systemMessage, ...(legacyMessages ?? [])];
-    }
+  const messages = attrMessages ?? operationMessages ?? legacyMessages ?? [];
+  const instructions =
+    attrs[ATTR_GEN_AI_SYSTEM_INSTRUCTIONS] ??
+    attrs[STRANDS_SYSTEM_PROMPT_ATTR] ??
+    getEvents(span).find(
+      ([name, eventAttrs]) =>
+        name === EVENT_GEN_AI_CLIENT_INFERENCE_OPERATION_DETAILS &&
+        ATTR_GEN_AI_SYSTEM_INSTRUCTIONS in eventAttrs,
+    )?.[1][ATTR_GEN_AI_SYSTEM_INSTRUCTIONS];
+  if (instructions !== undefined) {
+    const parsed = safeJsonLoads(instructions);
+    const content =
+      Array.isArray(parsed) &&
+      parsed.some((part) => isRecord(part) && "type" in part)
+        ? partsToContent(parsed)
+        : parsed;
+    messages.unshift({ role: "system", content: contentForMessage(content) });
   }
-  return legacyMessages?.length ? legacyMessages : undefined;
+  return messages.length ? messages : undefined;
 }
 
 function extractOutputMessages(
@@ -697,13 +784,15 @@ function operationDetailMessages(
   return messages.length ? messages : undefined;
 }
 
-function legacyInputMessages(span: ReadableSpan): Array<Record<string, any>> | undefined {
+function legacyInputMessages(
+  span: ReadableSpan,
+): Array<Record<string, any>> | undefined {
   const messages: Array<Record<string, any>> = [];
   for (const [eventName, eventAttrs] of getEvents(span)) {
     let normalized: Record<string, any> | undefined;
     if (eventName === EVENT_GEN_AI_SYSTEM_MESSAGE) {
       normalized = normalizeMessage(
-        { role: "system", content: eventAttrs.content },
+        { role: "system", content: safeJsonLoads(eventAttrs.content) },
         "system",
       );
     } else if (
@@ -715,7 +804,10 @@ function legacyInputMessages(span: ReadableSpan): Array<Record<string, any>> | u
         -STRANDS_EVENT_MESSAGE_SUFFIX.length,
       );
       normalized = normalizeMessage(
-        { role: eventAttrs.role ?? role, content: eventAttrs.content },
+        {
+          role: eventAttrs.role ?? role,
+          content: safeJsonLoads(eventAttrs.content),
+        },
         role,
       );
     }
@@ -736,7 +828,14 @@ function legacyOutputMessages(
       continue;
     }
     const normalized = normalizeMessage(
-      { role: eventAttrs.role ?? defaultRole, content: eventAttrs.message },
+      {
+        role: eventAttrs.role ?? defaultRole,
+        content:
+          span.attributes[ATTR_GEN_AI_OPERATION_NAME] ===
+          STRANDS_OPERATION_INVOKE_AGENT
+            ? eventAttrs.message
+            : safeJsonLoads(eventAttrs.message),
+      },
       defaultRole,
     );
     if (normalized) {
@@ -779,9 +878,27 @@ function normalizeMessage(
   if (content === undefined && parsedMessage.parts !== undefined) {
     content = partsToContent(parsedMessage.parts);
   }
+  const normalizedContent = contentForMessage(content);
+  const toolResults = Array.isArray(normalizedContent)
+    ? normalizedContent.filter(
+        (block) => isRecord(block) && isRecord(block.toolResult),
+      )
+    : [];
   return {
-    role: String(role),
-    content: contentForMessage(content),
+    ...parsedMessage,
+    role:
+      toolResults.length &&
+      Array.isArray(normalizedContent) &&
+      toolResults.length === normalizedContent.length
+        ? "tool"
+        : typeof role === "string"
+          ? role
+          : defaultRole,
+    content: normalizedContent,
+    ...(toolResults.length === 1
+      ? { tool_call_id: toolResults[0].toolResult.toolUseId }
+      : {}),
+    parts: undefined,
   };
 }
 
@@ -823,7 +940,7 @@ function partsToContent(parts: unknown): unknown {
 }
 
 function contentForMessage(content: unknown): unknown {
-  const parsedContent = safeJsonLoads(content);
+  const parsedContent = content;
   const text = extractTextFromContent(parsedContent);
   if (text !== undefined) {
     return text;
@@ -832,7 +949,7 @@ function contentForMessage(content: unknown): unknown {
 }
 
 function extractTextFromContent(content: unknown): string | undefined {
-  const parsed = safeJsonLoads(content);
+  const parsed = content;
   if (typeof parsed === "string") {
     return parsed;
   }
@@ -869,6 +986,10 @@ function setIndexedMessages(
     attrs[`${indexedPrefix}.role`] = String(message.role ?? "");
     const content = message.content;
     attrs[`${indexedPrefix}.content`] = messageContentAttrValue(content);
+    for (const field of ["tool_call_id", "name"]) {
+      if (typeof message[field] === "string")
+        attrs[`${indexedPrefix}.${field}`] = message[field];
+    }
     const toolCalls = toolCallsFromContent(content);
     if (toolCalls.length) {
       attrs[`${indexedPrefix}.tool_calls`] = safeJson(toolCalls);
@@ -927,10 +1048,10 @@ function normalizeToolCall(
   args: unknown,
 ): Record<string, any> {
   return {
-    id: String(toolCallId ?? ""),
+    ...(typeof toolCallId === "string" ? { id: toolCallId } : {}),
     type: "function",
     function: {
-      name: String(name ?? ""),
+      name: typeof name === "string" ? name : "",
       arguments: jsonString(args) ?? "",
     },
   };
@@ -986,7 +1107,9 @@ function normalizeToolDefinition(
 
   const functionPayload: Record<string, any> = { name: toolName };
   if (toolDefinition.description) {
-    functionPayload.description = toSerializableValue(toolDefinition.description);
+    functionPayload.description = toSerializableValue(
+      toolDefinition.description,
+    );
   }
   const inputSchema = toolDefinition.inputSchema ?? toolDefinition.parameters;
   if (inputSchema !== undefined) {
@@ -997,22 +1120,24 @@ function normalizeToolDefinition(
 
 function setUsageAttrs(attrs: SpanAttributesRecord): void {
   const promptTokens = coerceInteger(
-    attrs[ATTR_GEN_AI_USAGE_INPUT_TOKENS] ?? attrs[ATTR_GEN_AI_USAGE_PROMPT_TOKENS],
+    attrs[ATTR_GEN_AI_USAGE_INPUT_TOKENS] ??
+      attrs[ATTR_GEN_AI_USAGE_PROMPT_TOKENS],
   );
   const completionTokens = coerceInteger(
     attrs[ATTR_GEN_AI_USAGE_OUTPUT_TOKENS] ??
       attrs[ATTR_GEN_AI_USAGE_COMPLETION_TOKENS],
   );
-  const totalTokens =
-    coerceInteger(STRANDS_USAGE_TOTAL_TOKENS_ATTR in attrs
-      ? attrs[STRANDS_USAGE_TOTAL_TOKENS_ATTR]
-      : attrs[SpanAttributes.LLM_USAGE_TOTAL_TOKENS]) ??
-    (promptTokens !== undefined || completionTokens !== undefined
-      ? (promptTokens ?? 0) + (completionTokens ?? 0)
-      : undefined);
+  const totalTokens = coerceInteger(
+    attrs[STRANDS_USAGE_TOTAL_TOKENS_ATTR] ??
+      attrs[SpanAttributes.LLM_USAGE_TOTAL_TOKENS],
+  );
+  const cacheCreationTokens = coerceInteger(
+    attrs[STRANDS_USAGE_CACHE_WRITE_INPUT_TOKENS_ATTR] ??
+      attrs[ATTR_GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS],
+  );
   const cacheReadTokens = coerceInteger(
     attrs[ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS] ??
-      attrs[LLM_USAGE_CACHE_READ_INPUT_TOKENS_ATTR],
+      attrs[ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS],
   );
 
   if (promptTokens !== undefined) {
@@ -1026,8 +1151,10 @@ function setUsageAttrs(attrs: SpanAttributesRecord): void {
   if (totalTokens !== undefined) {
     attrs[SpanAttributes.LLM_USAGE_TOTAL_TOKENS] = totalTokens;
   }
+  if (cacheCreationTokens !== undefined)
+    attrs[ATTR_GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS] = cacheCreationTokens;
   if (cacheReadTokens !== undefined) {
-    attrs[LLM_USAGE_CACHE_READ_INPUT_TOKENS_ATTR] = cacheReadTokens;
+    attrs[ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS] = cacheReadTokens;
   }
 }
 
@@ -1043,10 +1170,19 @@ function stripRawAttrs(
     if (OFF_CONTRACT_ALIAS_ATTRS.has(key)) {
       continue;
     }
-    if (STRANDS_RAW_ATTR_PREFIXES_TO_STRIP.some((prefix) => key.startsWith(prefix))) {
+    if (
+      STRANDS_RAW_ATTR_PREFIXES_TO_STRIP.some((prefix) =>
+        key.startsWith(prefix),
+      )
+    ) {
       continue;
     }
-    if (logType !== RespanLogType.CHAT && STRANDS_NON_LLM_ATTRS_TO_STRIP.has(key)) {
+    if (
+      logType !== RespanLogType.CHAT &&
+      (STRANDS_NON_LLM_ATTRS_TO_STRIP.has(key) ||
+        key.startsWith("gen_ai.usage.") ||
+        key.startsWith("llm.usage."))
+    ) {
       continue;
     }
     stripped[key] = value;
@@ -1054,7 +1190,10 @@ function stripRawAttrs(
   return stripped;
 }
 
-function replaceSpanAttributes(span: ReadableSpan, attrs: SpanAttributesRecord): void {
+function replaceSpanAttributes(
+  span: ReadableSpan,
+  attrs: SpanAttributesRecord,
+): void {
   const target = (span as any).attributes as SpanAttributesRecord;
   for (const key of Object.keys(target)) {
     delete target[key];
@@ -1089,32 +1228,6 @@ function getEvents(span: ReadableSpan): Array<[string, Record<string, any>]> {
   return events;
 }
 
-function inferGenAISystem(model: unknown): string {
-  const modelText = String(model ?? "").toLowerCase();
-  if (
-    modelText.startsWith("gpt-") ||
-    modelText.startsWith("o") ||
-    modelText.includes("openai")
-  ) {
-    return GEN_AI_SYSTEM_VALUE_OPENAI;
-  }
-  if (modelText.includes("claude") || modelText.includes("anthropic")) {
-    return GEN_AI_SYSTEM_VALUE_ANTHROPIC;
-  }
-  if (modelText.includes("gemini") || modelText.includes("google")) {
-    return GEN_AI_SYSTEM_VALUE_GCP_GEMINI;
-  }
-  if (
-    modelText.includes("bedrock") ||
-    modelText.startsWith("global.") ||
-    modelText.startsWith("us.") ||
-    modelText.startsWith("eu.")
-  ) {
-    return GEN_AI_SYSTEM_VALUE_AWS_BEDROCK;
-  }
-  return STRANDS_SYSTEM_NAME;
-}
-
 function safeJsonLoads(value: unknown): unknown {
   if (typeof value !== "string") {
     return value;
@@ -1127,7 +1240,7 @@ function safeJsonLoads(value: unknown): unknown {
 }
 
 function jsonString(value: unknown): string | undefined {
-  if (value === undefined || value === null) {
+  if (value === undefined) {
     return undefined;
   }
   if (typeof value === "string") {
@@ -1142,56 +1255,18 @@ function safeJson(value: unknown): string {
       typeof innerValue === "bigint" ? innerValue.toString() : innerValue,
     );
   } catch {
-    return String(value);
+    return "null";
   }
 }
 
 function toSerializableValue(value: unknown): unknown {
-  if (value === null || value === undefined) {
-    return value;
-  }
-  if (
-    typeof value === "string" ||
-    typeof value === "number" ||
-    typeof value === "boolean"
-  ) {
-    return value;
-  }
-  if (typeof value === "bigint") {
-    return value.toString();
-  }
-  if (value instanceof Date) {
-    return value.toISOString();
-  }
-  if (Array.isArray(value)) {
-    return value.map((item) => toSerializableValue(item));
-  }
-  if (isRecord(value)) {
-    if (typeof value.toJSON === "function") {
-      try {
-        return toSerializableValue(value.toJSON());
-      } catch {
-        // Fall through to structural copy.
-      }
-    }
-    const normalized: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value)) {
-      normalized[key] = toSerializableValue(item);
-    }
-    return normalized;
-  }
-  return String(value);
+  return copyData(value);
 }
 
 function coerceInteger(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return Math.trunc(value);
-  }
-  if (typeof value === "string" && value.trim()) {
-    const parsed = Number.parseInt(value, 10);
-    return Number.isFinite(parsed) ? parsed : undefined;
-  }
-  return undefined;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, any> {

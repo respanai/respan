@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { trace } from "@opentelemetry/api";
+import { ROOT_CONTEXT, trace } from "@opentelemetry/api";
 import {
   BasicTracerProvider,
   InMemorySpanExporter,
@@ -452,8 +452,11 @@ test("translates ADK tool spans with normalized input and output", () => {
   assert.deepEqual(JSON.parse(attrs["traceloop.entity.output"]), {
     forecast: "sunny",
   });
-  assert.equal(attrs["respan.metadata.google_adk_tool_call_id"], "call_1");
-  assert.equal(attrs["respan.metadata.google_adk_tool_type"], "FunctionTool");
+  assert.equal(attrs["gen_ai.tool.call.id"], "call_1");
+  assert.equal(
+    JSON.parse(attrs["respan.metadata"]).google_adk_tool_type,
+    "FunctionTool",
+  );
   assert.equal(attrs["gen_ai.tool.name"], undefined);
   assert.equal(attrs["gcp.vertex.agent.tool_call_args"], undefined);
   assert.equal(attrs.tool_calls, undefined);
@@ -463,7 +466,10 @@ test("translates ADK workflow and agent spans", () => {
   const workflowSpan = createSpan("invocation", {});
   translateGoogleADKSpan(workflowSpan);
   assert.equal(workflowSpan.attributes["respan.entity.log_type"], "workflow");
-  assert.equal(workflowSpan.attributes["traceloop.entity.name"], "google_adk.invocation");
+  assert.equal(
+    workflowSpan.attributes["traceloop.entity.name"],
+    "google_adk.invocation",
+  );
   assert.equal(workflowSpan.attributes["traceloop.entity.path"], "");
 
   const agentSpan = createSpan("invoke_agent weather_agent", {
@@ -475,12 +481,20 @@ test("translates ADK workflow and agent spans", () => {
   translateGoogleADKSpan(agentSpan);
   assert.equal(agentSpan.attributes["respan.entity.log_type"], "agent");
   assert.equal(agentSpan.attributes["traceloop.entity.name"], "weather_agent");
-  assert.equal(agentSpan.attributes["respan.metadata.agent_name"], "weather_agent");
   assert.equal(
-    agentSpan.attributes["respan.metadata.google_adk_agent_description"],
+    agentSpan.attributes["respan.metadata.agent_name"],
+    "weather_agent",
+  );
+  assert.equal(
+    JSON.parse(agentSpan.attributes["respan.metadata"])
+      .google_adk_agent_description,
     "Answer weather questions.",
   );
-  assert.equal(agentSpan.attributes["respan.metadata.google_adk_conversation_id"], "session-1");
+  assert.equal(
+    JSON.parse(agentSpan.attributes["respan.metadata"])
+      .google_adk_conversation_id,
+    "session-1",
+  );
   assert.equal(agentSpan.attributes["gen_ai.agent.name"], undefined);
 });
 
@@ -489,12 +503,14 @@ test("translator marks ADK span names at start so Respan exports them", () => {
   const attributes = {};
   const span = {
     name: "call_llm",
+    attributes,
+    instrumentationScope: { name: "gcp.vertex.agent" },
     setAttribute(key, value) {
       attributes[key] = value;
     },
   };
 
-  translator.onStart(span, {});
+  translator.onStart(span, ROOT_CONTEXT);
 
   assert.equal(attributes["respan.entity.log_method"], "ts_tracing");
   assert.equal(attributes["respan.entity.log_type"], "chat");
@@ -502,59 +518,23 @@ test("translator marks ADK span names at start so Respan exports them", () => {
   assert.equal(attributes["traceloop.entity.path"], "google_adk.call_llm");
 });
 
-test("translator hook mutates ADK spans before the active processor receives them", () => {
-  const startedSpans = [];
-  const capturedSpans = [];
-  const originalGetTracerProvider = trace.getTracerProvider.bind(trace);
-  const activeSpanProcessor = {
-    onStart(span) {
-      startedSpans.push(span);
-    },
-    onEnd(span) {
-      capturedSpans.push(span);
-    },
-  };
+test("activation requires a compatible initialized Respan host", () => {
+  const instrumentor = new GoogleADKInstrumentor();
+  assert.throws(
+    () => instrumentor.activate(),
+    /No compatible Respan span-transformer host/,
+  );
+  assert.equal(instrumentor.isActive(), false);
+  instrumentor.deactivate();
+});
 
-  Object.defineProperty(trace, "getTracerProvider", {
-    configurable: true,
-    writable: true,
-    value() {
-      return { activeSpanProcessor };
-    },
-  });
-
-  try {
-    const originalOnStart = activeSpanProcessor.onStart;
-    const originalOnEnd = activeSpanProcessor.onEnd;
-    const instrumentor = new GoogleADKInstrumentor();
-    instrumentor.activate();
-    assert.equal(instrumentor.isActive(), true);
-    assert.notEqual(activeSpanProcessor.onStart, originalOnStart);
-    assert.notEqual(activeSpanProcessor.onEnd, originalOnEnd);
-
-    const span = createSpan("execute_tool get_weather", {
-      "gen_ai.operation.name": "execute_tool",
-      "gen_ai.tool.name": "get_weather",
-      "gcp.vertex.agent.tool_call_args": JSON.stringify({ city: "Tokyo" }),
-      "gcp.vertex.agent.tool_response": JSON.stringify({ forecast: "sunny" }),
-    });
-    activeSpanProcessor.onStart(span, {});
-    activeSpanProcessor.onEnd(span);
-
-    assert.equal(startedSpans.length, 1);
-    assert.equal(capturedSpans.length, 1);
-    assert.equal(capturedSpans[0].attributes["respan.entity.log_type"], "tool");
-    assert.equal(capturedSpans[0].attributes["gcp.vertex.agent.tool_response"], undefined);
-
-    instrumentor.deactivate();
-    assert.equal(instrumentor.isActive(), false);
-    assert.equal(activeSpanProcessor.onStart, originalOnStart);
-    assert.equal(activeSpanProcessor.onEnd, originalOnEnd);
-  } finally {
-    Object.defineProperty(trace, "getTracerProvider", {
-      configurable: true,
-      writable: true,
-      value: originalGetTracerProvider,
-    });
-  }
+test("foreign GenAI operations and matching span names stay untouched", () => {
+  const span = createSpan("call_llm", { "gen_ai.operation.name": "chat" });
+  span.instrumentationScope = { name: "another.library" };
+  const original = span.setAttribute;
+  const translator = new GoogleADKTranslator();
+  translator.onStart(span, ROOT_CONTEXT);
+  translateGoogleADKSpan(span);
+  assert.deepEqual(span.attributes, { "gen_ai.operation.name": "chat" });
+  assert.equal(span.setAttribute, original);
 });
