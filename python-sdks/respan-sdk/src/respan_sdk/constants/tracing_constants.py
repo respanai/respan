@@ -12,6 +12,11 @@ RESPAN_TRACING_INGEST_ENDPOINT = "https://api.respan.ai/api/v1/traces/ingest"
 # when the ingest endpoint is itself observed, not to drop trace data.
 RESPAN_DOGFOOD_HEADER = "X-Respan-Dogfood"
 
+# The Respan gateway returns the unique_id of the log row it wrote for a
+# request in this response header. An instrumented LLM call that sees it links
+# its span to that row (RESPAN_GATEWAY_LOG_ID) instead of re-reporting usage.
+RESPAN_LOG_ID_RESPONSE_HEADER = "X-Respan-Log-Id"
+
 
 def resolve_tracing_ingest_endpoint(base_url: Optional[str] = None) -> str:
     """Build tracing ingest endpoint from an optional base URL."""

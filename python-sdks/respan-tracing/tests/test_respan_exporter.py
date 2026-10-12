@@ -22,6 +22,7 @@ from respan_sdk.constants.span_attributes import (
     GEN_AI_SYSTEM,
     LLM_REQUEST_MODEL,
     LLM_REQUEST_TYPE,
+    RESPAN_GATEWAY_LOG_ID,
     RESPAN_INTERNAL_DROP_SPAN,
     RESPAN_INTERNAL_SPAN_NAME_DETAIL,
     RESPAN_INTERNAL_SPAN_NAME_KIND,
@@ -465,6 +466,41 @@ def test_get_enrichment_attrs_preserves_existing_internal_tracing_sdk_version(
     extra = _get_enrichment_attrs(span)
 
     assert RESPAN_METADATA_INTERNAL_TRACING_SDK_VERSION not in extra
+
+
+def test_prepare_spans_exports_gateway_linked_llm_span_as_link_only():
+    """A span whose call the Respan gateway logged keeps the link, not usage/content."""
+    attributes = {
+        "respan.entity.log_type": "chat",
+        LLM_REQUEST_MODEL: "gpt-4.1-nano",
+        RESPAN_GATEWAY_LOG_ID: "gateway-row-1",
+        "gen_ai.usage.prompt_tokens": 4,
+        "gen_ai.usage.cache_read_input_tokens": 2,
+        "llm.usage.total_tokens": 6,
+        "gen_ai.prompt.0.content": "hi",
+        "gen_ai.completion.0.content": "hello",
+        "traceloop.entity.input": '[{"role": "user", "content": "hi"}]',
+        "traceloop.entity.output": '[{"role": "assistant", "content": "hello"}]',
+    }
+    linked = _make_span(name="openai.chat", span_id=3101, attributes=attributes)
+    direct = _make_span(
+        name="openai.chat",
+        span_id=3102,
+        attributes={k: v for k, v in attributes.items() if k != RESPAN_GATEWAY_LOG_ID},
+    )
+
+    linked_out, direct_out = _prepare_spans_for_export([linked, direct])
+
+    assert dict(linked_out.attributes) == {
+        "respan.entity.log_type": "chat",
+        LLM_REQUEST_MODEL: "gpt-4.1-nano",
+        RESPAN_GATEWAY_LOG_ID: "gateway-row-1",
+        RESPAN_METADATA_INTERNAL_TRACING_SDK_VERSION: linked_out.attributes[
+            RESPAN_METADATA_INTERNAL_TRACING_SDK_VERSION
+        ],
+    }
+    assert direct_out.attributes["llm.usage.total_tokens"] == 6
+    assert direct_out.attributes["gen_ai.prompt.0.content"] == "hi"
 
 
 def test_prepare_spans_keeps_all_provider_spans():

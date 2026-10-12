@@ -1,0 +1,8 @@
+{
+  "summary": "An OpenAI call answered by the Respan gateway links its span to the gateway's log row (`respan.gateway.log_id`, read from the `X-Respan-Log-Id` response header) and exports no usage or content of its own, so the call is no longer counted twice when a gateway user also traces.",
+  "packages": {
+    "respan-sdk": "minor",
+    "respan-tracing": "minor",
+    "respan-instrumentation-openai": "minor"
+  }
+}

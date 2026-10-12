@@ -12,7 +12,7 @@ packages = [
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
 respan-tracing = "^2.3.0"
-respan-sdk = ">=2.6.0"
+respan-sdk = ">=2.9.0"
 opentelemetry-semantic-conventions-ai = ">=0.5.1,<0.6.0"
 # Optional: the instrumentor lazy-imports openai and no-ops when it is absent, so
 # the app brings its own openai. Install with the SDK via the `instruments` extra.

@@ -37,6 +37,13 @@ ASYNC_RESPONSES_CLASS = "AsyncResponses"
 CREATE_METHOD = "create"
 PARSE_METHOD = "parse"
 
+# Every request's raw httpx response passes through this method on the base
+# clients; it is where the Respan gateway's log-id response header is read.
+BASE_CLIENT_MODULE = "openai._base_client"
+SYNC_BASE_CLIENT_CLASS = "SyncAPIClient"
+ASYNC_BASE_CLIENT_CLASS = "AsyncAPIClient"
+PROCESS_RESPONSE_METHOD = "_process_response"
+
 # --- request-type values (what the backend keys on via llm.request.type) ----
 
 REQUEST_TYPE_CHAT = "chat"

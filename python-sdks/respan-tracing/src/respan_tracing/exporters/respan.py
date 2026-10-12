@@ -82,6 +82,7 @@ from respan_sdk.constants.span_attributes import (
     GEN_AI_TOOL_NAME,
     LLM_REQUEST_MODEL,
     LLM_REQUEST_TYPE,
+    RESPAN_GATEWAY_LOG_ID,
     RESPAN_INTERNAL_DROP_SPAN,
     RESPAN_INTERNAL_EXPORT_PARENT,
     RESPAN_INTERNAL_SPAN_NAME_DETAIL,
@@ -401,6 +402,35 @@ def _strip_claude_agent_llm_attributes(attrs: Mapping[str, Any]) -> Dict[str, An
     }
 
 
+# A span linked to a Respan gateway log row (RESPAN_GATEWAY_LOG_ID) is a link
+# only: the gateway row already carries the call's usage, cost and content. The
+# span must not report them a second time (the server estimates tokens from
+# content when usage is absent), so both are dropped and the trace shows the row.
+_GATEWAY_LINKED_DROPPED_PREFIXES = (
+    "gen_ai.usage.",
+    "llm.usage.",
+    "gen_ai.prompt.",
+    "gen_ai.completion.",
+)
+_GATEWAY_LINKED_DROPPED_KEYS = frozenset(
+    {
+        "prompt_cache_hit_tokens",
+        "prompt_cache_creation_tokens",
+        SpanAttributes.TRACELOOP_ENTITY_INPUT,
+        SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+    }
+)
+
+
+def _strip_gateway_linked_metrics(attrs: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value
+        for key, value in attrs.items()
+        if key not in _GATEWAY_LINKED_DROPPED_KEYS
+        and not key.startswith(_GATEWAY_LINKED_DROPPED_PREFIXES)
+    }
+
+
 def _prepare_spans_for_export(spans: Sequence[ReadableSpan]) -> List[ReadableSpan]:
     prepared_spans: List[ReadableSpan] = []
 
@@ -434,6 +464,16 @@ def _prepare_spans_for_export(spans: Sequence[ReadableSpan]) -> List[ReadableSpa
                 original_span=prepared_span,
                 overrides={
                     OTEL_SPAN_ATTRIBUTES_FIELD: _strip_claude_agent_llm_attributes(
+                        prepared_span.attributes or {}
+                    )
+                },
+            )
+
+        if (prepared_span.attributes or {}).get(RESPAN_GATEWAY_LOG_ID):
+            prepared_span = ModifiedSpan(
+                original_span=prepared_span,
+                overrides={
+                    OTEL_SPAN_ATTRIBUTES_FIELD: _strip_gateway_linked_metrics(
                         prepared_span.attributes or {}
                     )
                 },

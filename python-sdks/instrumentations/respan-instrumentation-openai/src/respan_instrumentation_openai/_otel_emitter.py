@@ -14,7 +14,10 @@ from respan_sdk.constants.llm_logging import (
     LOG_TYPE_EMBEDDING,
     LOG_TYPE_TEXT,
 )
-from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
+from respan_sdk.constants.span_attributes import (
+    RESPAN_GATEWAY_LOG_ID,
+    RESPAN_LOG_TYPE,
+)
 from respan_sdk.utils.data_processing.id_processing import (
     format_span_id,
     format_trace_id,
@@ -45,6 +48,31 @@ _USAGE_INPUT = getattr(
 _USAGE_OUTPUT = getattr(
     SpanAttributes, "LLM_USAGE_OUTPUT_TOKENS", "gen_ai.usage.output_tokens"
 )
+
+
+# A span linked to a Respan gateway log row is a link only. The gateway row
+# already carries the call's usage, cost and content; the span reporting them
+# again would count the call twice (the server estimates tokens from content
+# when usage is absent), so both are dropped and the trace shows the row.
+_LINKED_DROPPED_PREFIXES = (
+    "gen_ai.usage.",
+    "llm.usage.",
+    f"{SpanAttributes.LLM_PROMPTS}.",
+    f"{SpanAttributes.LLM_COMPLETIONS}.",
+)
+_LINKED_DROPPED_KEYS = frozenset(
+    {SpanAttributes.TRACELOOP_ENTITY_INPUT, SpanAttributes.TRACELOOP_ENTITY_OUTPUT}
+)
+
+
+def _link_to_gateway_log(attrs: dict[str, Any], gateway_log_id: str) -> None:
+    attrs[RESPAN_GATEWAY_LOG_ID] = gateway_log_id
+    for key in [
+        key
+        for key in attrs
+        if key in _LINKED_DROPPED_KEYS or key.startswith(_LINKED_DROPPED_PREFIXES)
+    ]:
+        del attrs[key]
 
 
 def current_trace_parent_ids() -> tuple[str | None, str | None]:
@@ -233,6 +261,7 @@ def emit_span(
     status_code: int = 200,
     trace_id: str | None = None,
     parent_id: str | None = None,
+    gateway_log_id: str | None = None,
 ) -> None:
     try:
         if trace_id is None and parent_id is None:
@@ -252,6 +281,8 @@ def emit_span(
                     }
                 ),
             )
+        if gateway_log_id:
+            _link_to_gateway_log(attrs, gateway_log_id)
         span = build_readable_span(
             name=span_name,
             trace_id=trace_id,
@@ -279,6 +310,7 @@ def _emit(
     status_code: int,
     trace_id: str | None,
     parent_id: str | None,
+    gateway_log_id: str | None = None,
 ) -> None:
     try:
         attrs = builder(request_kwargs=request_kwargs, response=response)
@@ -294,6 +326,7 @@ def _emit(
         status_code=status_code,
         trace_id=trace_id,
         parent_id=parent_id,
+        gateway_log_id=gateway_log_id,
     )
 
 
@@ -307,6 +340,7 @@ def emit_chat_span(
     status_code=200,
     trace_id=None,
     parent_id=None,
+    gateway_log_id=None,
 ) -> None:
     _emit(
         build_chat_attrs,
@@ -319,6 +353,7 @@ def emit_chat_span(
         status_code=status_code,
         trace_id=trace_id,
         parent_id=parent_id,
+        gateway_log_id=gateway_log_id,
     )
 
 
@@ -332,6 +367,7 @@ def emit_completion_span(
     status_code=200,
     trace_id=None,
     parent_id=None,
+    gateway_log_id=None,
 ) -> None:
     _emit(
         build_completion_attrs,
@@ -344,6 +380,7 @@ def emit_completion_span(
         status_code=status_code,
         trace_id=trace_id,
         parent_id=parent_id,
+        gateway_log_id=gateway_log_id,
     )
 
 
@@ -357,6 +394,7 @@ def emit_response_span(
     status_code=200,
     trace_id=None,
     parent_id=None,
+    gateway_log_id=None,
 ) -> None:
     _emit(
         build_response_attrs,
@@ -369,6 +407,7 @@ def emit_response_span(
         status_code=status_code,
         trace_id=trace_id,
         parent_id=parent_id,
+        gateway_log_id=gateway_log_id,
     )
 
 
@@ -382,6 +421,7 @@ def emit_embedding_span(
     status_code=200,
     trace_id=None,
     parent_id=None,
+    gateway_log_id=None,
 ) -> None:
     _emit(
         build_embedding_attrs,
@@ -394,4 +434,5 @@ def emit_embedding_span(
         status_code=status_code,
         trace_id=trace_id,
         parent_id=parent_id,
+        gateway_log_id=gateway_log_id,
     )

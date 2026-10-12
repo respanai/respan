@@ -14,20 +14,25 @@ from contextvars import ContextVar
 from functools import wraps
 from typing import Any, Self
 
+from respan_sdk.constants.tracing_constants import RESPAN_LOG_ID_RESPONSE_HEADER
 from respan_tracing.core.tracer import RespanTracer
 
 from respan_instrumentation_openai import _otel_emitter as emitter
 from respan_instrumentation_openai._constants import (
+    ASYNC_BASE_CLIENT_CLASS,
     ASYNC_CHAT_CLASS,
     ASYNC_COMPLETIONS_CLASS,
     ASYNC_EMBEDDINGS_CLASS,
     ASYNC_RESPONSES_CLASS,
+    BASE_CLIENT_MODULE,
     CHAT_MODULE,
     COMPLETIONS_MODULE,
     CREATE_METHOD,
     EMBEDDINGS_MODULE,
     PARSE_METHOD,
+    PROCESS_RESPONSE_METHOD,
     RESPONSES_MODULE,
+    SYNC_BASE_CLIENT_CLASS,
     SYNC_CHAT_CLASS,
     SYNC_COMPLETIONS_CLASS,
     SYNC_EMBEDDINGS_CLASS,
@@ -50,6 +55,43 @@ _REFCOUNT = 0
 _SUPPRESS_OPENAI_INSTRUMENTATION: ContextVar[bool] = ContextVar(
     "respan_suppress_openai_instrumentation", default=False
 )
+
+
+# Set by each instrumented call for its duration; the patched
+# ``_process_response`` writes the gateway log id of the response into it.
+_GATEWAY_LOG_ID_SLOT: ContextVar[list[str] | None] = ContextVar(
+    "respan_openai_gateway_log_id_slot", default=None
+)
+
+
+def _header_log_id(response: Any) -> str | None:
+    try:
+        value = response.headers.get(RESPAN_LOG_ID_RESPONSE_HEADER)
+    except BaseException:  # noqa: BLE001 - header capture must never break a call
+        return None
+    return value if isinstance(value, str) and value else None
+
+
+def _record_gateway_log_id(response: Any) -> None:
+    slot = _GATEWAY_LOG_ID_SLOT.get()
+    if slot is None:
+        return
+    log_id = _header_log_id(response)
+    if log_id:
+        slot[:] = [log_id]
+
+
+def _gateway_log_id(slot: list[str], exc: BaseException | None = None) -> str | None:
+    """The Respan gateway log id of this call's response, if it went through it."""
+    if slot:
+        return slot[0]
+    if exc is None:
+        return None
+    try:
+        response = getattr(exc, "response", None)
+    except BaseException:  # noqa: BLE001 - never mask the provider error
+        return None
+    return _header_log_id(response) if response is not None else None
 
 
 def _is_openai_instrumentation_suppressed() -> bool:
@@ -322,6 +364,7 @@ class _SyncStreamWrapper:
         start_ns: int,
         trace_id: str | None,
         parent_id: str | None,
+        gateway_log_id: str | None = None,
     ) -> None:
         self._iterator = iterator
         self._kind = kind
@@ -329,6 +372,7 @@ class _SyncStreamWrapper:
         self._start_ns = start_ns
         self._trace_id = trace_id
         self._parent_id = parent_id
+        self._gateway_log_id = gateway_log_id
         self._accumulator = _StreamAccumulator(kind)
         self._finished = False
         self._source_closed = False
@@ -363,6 +407,7 @@ class _SyncStreamWrapper:
             start_ns=self._start_ns,
             trace_id=self._trace_id,
             parent_id=self._parent_id,
+            gateway_log_id=self._gateway_log_id,
             **kwargs,
         )
 
@@ -419,6 +464,7 @@ class _AsyncStreamWrapper:
         start_ns: int,
         trace_id: str | None,
         parent_id: str | None,
+        gateway_log_id: str | None = None,
     ) -> None:
         self._iterator = iterator
         self._kind = kind
@@ -426,6 +472,7 @@ class _AsyncStreamWrapper:
         self._start_ns = start_ns
         self._trace_id = trace_id
         self._parent_id = parent_id
+        self._gateway_log_id = gateway_log_id
         self._accumulator = _StreamAccumulator(kind)
         self._finished = False
         self._source_closed = False
@@ -460,6 +507,7 @@ class _AsyncStreamWrapper:
             start_ns=self._start_ns,
             trace_id=self._trace_id,
             parent_id=self._parent_id,
+            gateway_log_id=self._gateway_log_id,
             **kwargs,
         )
 
@@ -516,6 +564,8 @@ def _make_sync_wrapper(original: Any, *, kind: str) -> Any:
         request_kwargs = _request_kwargs_from_call(original, self, args, kwargs)
         start_ns = time.time_ns()
         trace_id, parent_id = emitter.current_trace_parent_ids()
+        slot: list[str] = []
+        token = _GATEWAY_LOG_ID_SLOT.set(slot)
         try:
             response = original(self, *args, **kwargs)
         except BaseException as exc:
@@ -524,9 +574,12 @@ def _make_sync_wrapper(original: Any, *, kind: str) -> Any:
                 start_ns=start_ns,
                 trace_id=trace_id,
                 parent_id=parent_id,
+                gateway_log_id=_gateway_log_id(slot, exc),
                 **_error_kwargs(exc),
             )
             raise
+        finally:
+            _GATEWAY_LOG_ID_SLOT.reset(token)
         if kind != "embedding" and _is_stream(response):
             return _SyncStreamWrapper(
                 response,
@@ -535,6 +588,7 @@ def _make_sync_wrapper(original: Any, *, kind: str) -> Any:
                 start_ns=start_ns,
                 trace_id=trace_id,
                 parent_id=parent_id,
+                gateway_log_id=_gateway_log_id(slot),
             )
         emit_fn(
             request_kwargs=request_kwargs,
@@ -542,6 +596,7 @@ def _make_sync_wrapper(original: Any, *, kind: str) -> Any:
             start_ns=start_ns,
             trace_id=trace_id,
             parent_id=parent_id,
+            gateway_log_id=_gateway_log_id(slot),
         )
         return response
 
@@ -560,6 +615,8 @@ def _make_async_wrapper(original: Any, *, kind: str) -> Any:
         request_kwargs = _request_kwargs_from_call(original, self, args, kwargs)
         start_ns = time.time_ns()
         trace_id, parent_id = emitter.current_trace_parent_ids()
+        slot: list[str] = []
+        token = _GATEWAY_LOG_ID_SLOT.set(slot)
         try:
             pending = original(self, *args, **kwargs)
             response = await pending if inspect.isawaitable(pending) else pending
@@ -569,9 +626,12 @@ def _make_async_wrapper(original: Any, *, kind: str) -> Any:
                 start_ns=start_ns,
                 trace_id=trace_id,
                 parent_id=parent_id,
+                gateway_log_id=_gateway_log_id(slot, exc),
                 **_error_kwargs(exc),
             )
             raise
+        finally:
+            _GATEWAY_LOG_ID_SLOT.reset(token)
         if kind != "embedding" and _is_stream(response):
             return _AsyncStreamWrapper(
                 response,
@@ -580,6 +640,7 @@ def _make_async_wrapper(original: Any, *, kind: str) -> Any:
                 start_ns=start_ns,
                 trace_id=trace_id,
                 parent_id=parent_id,
+                gateway_log_id=_gateway_log_id(slot),
             )
         emit_fn(
             request_kwargs=request_kwargs,
@@ -587,10 +648,29 @@ def _make_async_wrapper(original: Any, *, kind: str) -> Any:
             start_ns=start_ns,
             trace_id=trace_id,
             parent_id=parent_id,
+            gateway_log_id=_gateway_log_id(slot),
         )
         return response
 
     wrapper.__respan_openai_wrapper__ = True
+    return wrapper
+
+
+def _make_sync_process_response_wrapper(original: Any, **_kwargs: Any) -> Any:
+    @wraps(original)
+    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+        _record_gateway_log_id(kwargs.get("response"))
+        return original(self, *args, **kwargs)
+
+    return wrapper
+
+
+def _make_async_process_response_wrapper(original: Any, **_kwargs: Any) -> Any:
+    @wraps(original)
+    async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+        _record_gateway_log_id(kwargs.get("response"))
+        return await original(self, *args, **kwargs)
+
     return wrapper
 
 
@@ -664,6 +744,12 @@ def _patch(
     _ORIGINAL_METHODS[key] = original
     if kind == "stream_close":
         factory = _make_async_close_wrapper if is_async else _make_sync_close_wrapper
+    elif kind == "process_response":
+        factory = (
+            _make_async_process_response_wrapper
+            if is_async
+            else _make_sync_process_response_wrapper
+        )
     else:
         factory = _make_async_wrapper if is_async else _make_sync_wrapper
     try:
@@ -690,6 +776,20 @@ _TARGETS = [
     (RESPONSES_MODULE, ASYNC_RESPONSES_CLASS, PARSE_METHOD, "response", True),
     (EMBEDDINGS_MODULE, SYNC_EMBEDDINGS_CLASS, CREATE_METHOD, "embedding", False),
     (EMBEDDINGS_MODULE, ASYNC_EMBEDDINGS_CLASS, CREATE_METHOD, "embedding", True),
+    (
+        BASE_CLIENT_MODULE,
+        SYNC_BASE_CLIENT_CLASS,
+        PROCESS_RESPONSE_METHOD,
+        "process_response",
+        False,
+    ),
+    (
+        BASE_CLIENT_MODULE,
+        ASYNC_BASE_CLIENT_CLASS,
+        PROCESS_RESPONSE_METHOD,
+        "process_response",
+        True,
+    ),
     (
         "openai.lib.streaming.chat",
         "ChatCompletionStream",

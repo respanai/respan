@@ -66,6 +66,11 @@ class RespanSpanAttributes(str, Enum):
     LOG_ROOT_ID = "respan.entity.log_root_id"
     LOG_SOURCE = "respan.entity.log_source"
 
+    # Gateway link: the LLM call went through the Respan gateway, which logged
+    # it (and its cost) as its own row; the span points at that row instead of
+    # carrying its own usage.
+    GATEWAY_LOG_ID = "respan.gateway.log_id"
+
 
 # ---------------------------------------------------------------------------
 # Flat convenience aliases (avoid .value boilerplate in SDK code)
@@ -112,6 +117,7 @@ RESPAN_LOG_ID = RespanSpanAttributes.LOG_ID.value
 RESPAN_LOG_PARENT_ID = RespanSpanAttributes.LOG_PARENT_ID.value
 RESPAN_LOG_ROOT_ID = RespanSpanAttributes.LOG_ROOT_ID.value
 RESPAN_LOG_SOURCE = RespanSpanAttributes.LOG_SOURCE.value
+RESPAN_GATEWAY_LOG_ID = RespanSpanAttributes.GATEWAY_LOG_ID.value
 
 # ---------------------------------------------------------------------------
 # Mapping: user-facing kwargs → span attribute keys
