@@ -53,6 +53,16 @@ REQUEST_TYPE_EMBEDDING = "embedding"
 # ``opentelemetry-semantic-conventions-ai`` 0.5.x does not expose this key.
 GEN_AI_RESPONSE_ID = "gen_ai.response.id"
 
+# --- Respan gateway link ------------------------------------------------------
+# Same values as ``respan_sdk.constants`` RESPAN_LOG_ID_RESPONSE_HEADER /
+# RESPAN_GATEWAY_LOG_ID; restated here so this package keeps working on the
+# released respan-sdk floor.
+
+# The Respan gateway returns the unique_id of the log row it wrote here.
+RESPAN_LOG_ID_RESPONSE_HEADER = "X-Respan-Log-Id"
+# A span whose call that row records carries the id and no usage/content.
+RESPAN_GATEWAY_LOG_ID = "respan.gateway.log_id"
+
 # --- response / message field keys ------------------------------------------
 
 ROLE_KEY = "role"

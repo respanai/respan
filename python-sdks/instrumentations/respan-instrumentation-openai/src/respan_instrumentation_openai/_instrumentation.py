@@ -14,7 +14,6 @@ from contextvars import ContextVar
 from functools import wraps
 from typing import Any, Self
 
-from respan_sdk.constants.tracing_constants import RESPAN_LOG_ID_RESPONSE_HEADER
 from respan_tracing.core.tracer import RespanTracer
 
 from respan_instrumentation_openai import _otel_emitter as emitter
@@ -31,6 +30,7 @@ from respan_instrumentation_openai._constants import (
     EMBEDDINGS_MODULE,
     PARSE_METHOD,
     PROCESS_RESPONSE_METHOD,
+    RESPAN_LOG_ID_RESPONSE_HEADER,
     RESPONSES_MODULE,
     SYNC_BASE_CLIENT_CLASS,
     SYNC_CHAT_CLASS,

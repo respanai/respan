@@ -15,8 +15,10 @@ from openai import AsyncOpenAI, AuthenticationError, OpenAI
 from respan_instrumentation_openai import _instrumentation as instrumentation
 from respan_instrumentation_openai import _otel_emitter as emitter
 from respan_instrumentation_openai._instrumentation import OpenAIInstrumentor
-from respan_sdk.constants.span_attributes import RESPAN_GATEWAY_LOG_ID
-from respan_sdk.constants.tracing_constants import RESPAN_LOG_ID_RESPONSE_HEADER
+from respan_instrumentation_openai._constants import (
+    RESPAN_GATEWAY_LOG_ID,
+    RESPAN_LOG_ID_RESPONSE_HEADER,
+)
 
 GATEWAY_LOG_ID = "4f1c1b0e5c8a4d3e9b7a6f5e4d3c2b1a"
 USAGE = {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}

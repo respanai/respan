@@ -14,10 +14,7 @@ from respan_sdk.constants.llm_logging import (
     LOG_TYPE_EMBEDDING,
     LOG_TYPE_TEXT,
 )
-from respan_sdk.constants.span_attributes import (
-    RESPAN_GATEWAY_LOG_ID,
-    RESPAN_LOG_TYPE,
-)
+from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
 from respan_sdk.utils.data_processing.id_processing import (
     format_span_id,
     format_trace_id,
@@ -35,6 +32,7 @@ from respan_instrumentation_openai._constants import (
     REQUEST_TYPE_CHAT,
     REQUEST_TYPE_COMPLETION,
     REQUEST_TYPE_EMBEDDING,
+    RESPAN_GATEWAY_LOG_ID,
     RESPONSE_SPAN_NAME,
 )
 
