@@ -1,0 +1,4 @@
+{
+  "packages": { "@respan/cli": "minor" },
+  "summary": "Add a shared MCP tool discovery/call entry point and remove coding-agent integrate commands."
+}

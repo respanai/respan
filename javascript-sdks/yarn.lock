@@ -5016,6 +5016,7 @@ __metadata:
   resolution: "@respan/cli@workspace:respan-cli"
   dependencies:
     "@inquirer/prompts": "npm:^7"
+    "@modelcontextprotocol/sdk": "npm:^1.25.1"
     "@oclif/core": "npm:^4"
     "@oclif/plugin-autocomplete": "npm:^3"
     "@oclif/plugin-help": "npm:^6"
