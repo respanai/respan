@@ -1,0 +1,6 @@
+{
+  "packages": {
+    "@respan/cli": "minor"
+  },
+  "summary": "Deprecate the interactive setup wizard in favor of the existing docs prompts and remove bundled setup skills from the CLI."
+}
