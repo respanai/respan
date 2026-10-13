@@ -217,7 +217,7 @@ const assistantFinal = {
 async function replayRun(
   pi,
   ctx,
-  { toolOutput = "README.md", shutdown = true } = {},
+  { toolOutput = "README.md", shutdown = true, providerHeaders = [] } = {},
 ) {
   await pi.emit("session_start", { reason: "startup" }, ctx);
   await pi.emit(
@@ -231,6 +231,13 @@ async function replayRun(
   );
   await pi.emit("agent_start", {}, ctx);
   await pi.emit("context", { messages: [userMessage] }, ctx);
+  if (providerHeaders[0]) {
+    await pi.emit(
+      "after_provider_response",
+      { status: 200, headers: providerHeaders[0] },
+      ctx,
+    );
+  }
   await pi.emit("turn_start", { turnIndex: 0, timestamp: Date.now() }, ctx);
   await pi.emit(
     "message_start",
@@ -287,6 +294,13 @@ async function replayRun(
     { messages: [userMessage, assistantWithTool, toolResultMessage] },
     ctx,
   );
+  if (providerHeaders[1]) {
+    await pi.emit(
+      "after_provider_response",
+      { status: 200, headers: providerHeaders[1] },
+      ctx,
+    );
+  }
   await pi.emit("turn_start", { turnIndex: 1, timestamp: Date.now() }, ctx);
   await pi.emit("message_end", { message: assistantFinal }, ctx);
   await pi.emit(
@@ -824,6 +838,41 @@ test("defaults: full context and system prompt on every chat span, no truncation
     assert.equal(metadata(span)["truncated"], undefined);
     assertCommonContract(span);
   }
+});
+
+test("a call the Respan gateway served links to its log instead of carrying usage and content", async () => {
+  captureState.spans = [];
+  const instrumentor = new PiInstrumentor();
+  instrumentor.activate();
+  const pi = createFakePi();
+  instrumentor.extension(pi);
+  await replayRun(pi, createFakeCtx(), {
+    providerHeaders: [
+      { "content-type": "application/json", "X-Respan-Log-Id": "gw-log-1" },
+      { "content-type": "application/json" },
+    ],
+  });
+
+  const [linked, direct] = spansByLogType("chat");
+  assert.equal(linked.attributes["respan.gateway.log_id"], "gw-log-1");
+  for (const key of Object.keys(linked.attributes)) {
+    assert.ok(
+      !/^(gen_ai\.(usage|prompt|completion)|llm\.usage)\./.test(key),
+      `linked span still carries ${key}`,
+    );
+  }
+  assert.equal(linked.attributes["traceloop.entity.input"], undefined);
+  assert.equal(linked.attributes["traceloop.entity.output"], undefined);
+  assert.equal(metadata(linked)["estimated_cost_usd"], undefined);
+  // Its place in the trace stays.
+  assert.equal(parentSpanId(linked), spanByLogType("agent").spanContext().spanId);
+  assertCommonContract(linked);
+
+  // A call the gateway did not serve is untouched.
+  assert.equal(direct.attributes["respan.gateway.log_id"], undefined);
+  assert.equal(direct.attributes["gen_ai.prompt.1.role"], "user");
+  assert.ok(direct.attributes["gen_ai.usage.input_tokens"] > 0);
+  instrumentor.deactivate();
 });
 
 test("promptCapture: delta records only the messages appended since the previous LLM call", async () => {

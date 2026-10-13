@@ -172,8 +172,7 @@ export class PiCapturePolicy {
       const tracer = trace.getTracer("@respan/instrumentation-pi");
       if (
         types.isProxy(tracer) ||
-        !nativeTracerPrototype ||
-        Object.getPrototypeOf(tracer) !== nativeTracerPrototype
+        !nativeTracerPrototypes.has(Object.getPrototypeOf(tracer))
       ) {
         this.emit = false;
         this.content = false;
@@ -328,19 +327,43 @@ export class PiCapturePolicy {
 // OTel 2.10 owns Tracer in sdk-trace-base; 2.12 moved it to sdk-trace.
 // Bind to exact installed class identity and data descriptors, never an unknown
 // custom provider's private fields or getters. Unknown providers fail closed.
-let nativeTracerPrototype: object | undefined;
-try {
-  const require = createRequire(import.meta.url);
-  const base = createRequire(require.resolve("@opentelemetry/sdk-trace-base"));
-  let Tracer;
+//
+// An install routinely holds more than one OTel copy: @respan/tracing starts
+// NodeSDK, and @opentelemetry/sdk-node pins sdk-trace-base / sdk-trace-node to
+// an exact version, while this package's own ^range resolves to a newer one.
+// The registered tracer then comes from NodeSDK's copy, so accept the Tracer
+// class of every native copy on that chain, not just ours.
+const nativeTracerPrototypes = new Set<object>();
+function addNativeTracer(from: NodeRequire): void {
   try {
-    Tracer = base("./Tracer.js").Tracer;
+    const base = createRequire(from.resolve("@opentelemetry/sdk-trace-base"));
+    let Tracer;
+    try {
+      Tracer = base("./Tracer.js").Tracer;
+    } catch {
+      Tracer = base("@opentelemetry/sdk-trace/build/src/Tracer.js").Tracer;
+    }
+    if (Tracer?.prototype) nativeTracerPrototypes.add(Tracer.prototype);
   } catch {
-    Tracer = base("@opentelemetry/sdk-trace/build/src/Tracer.js").Tracer;
+    /* Unsupported/private ABI: fail closed. */
   }
-  nativeTracerPrototype = Tracer?.prototype;
-} catch {
-  /* Unsupported/private ABI: fail closed. */
+}
+function requireFrom(from: NodeRequire, name: string): NodeRequire | undefined {
+  try {
+    return createRequire(from.resolve(name));
+  } catch {
+    return undefined;
+  }
+}
+{
+  const self = createRequire(import.meta.url);
+  addNativeTracer(self);
+  const tracing = requireFrom(self, "@respan/tracing");
+  const nodeSdk = tracing && requireFrom(tracing, "@opentelemetry/sdk-node");
+  const traceNode = nodeSdk && requireFrom(nodeSdk, "@opentelemetry/sdk-trace-node");
+  for (const from of [tracing, nodeSdk, traceNode]) {
+    if (from) addNativeTracer(from);
+  }
 }
 function dataMethod(value: any, key: string): Function | undefined {
   if (!value || typeof value !== "object" || types.isProxy(value))

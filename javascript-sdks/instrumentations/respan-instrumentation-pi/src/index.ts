@@ -374,6 +374,9 @@ export class PiInstrumentor implements RespanInstrumentation {
         toolResults: event.toolResults,
       });
     });
+    on("after_provider_response", (event) => {
+      tracer.onProviderResponse(event.headers);
+    });
     on("message_start", (event) => {
       tracer.onMessageStart(event.message);
     });

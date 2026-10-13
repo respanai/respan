@@ -306,6 +306,14 @@ call / tool with `Interrupted before completion`. In delta mode
 message in the full context, so readers know earlier messages were elided.
 Images are never captured (rendered as `[image:<mimeType>]`).
 
+**Calls through the Respan gateway are counted once.** When the gateway answers
+an LLM call, its response carries `X-Respan-Log-Id`, and pi hands that header to
+the extension (`after_provider_response`). The `pi.chat` span then carries
+`respan.gateway.log_id` and no usage, cost or prompt/completion content: the
+gateway's own log row already has them, and the trace shows that row in the
+span's place. This needs the pi extension; `attach()` (SDK subscribe mode) does
+not see response headers, so its chat spans are not linked.
+
 ## Scale, long-running sessions, and resumed sessions
 
 This package was designed for fleets of unattended pi agents (thousands of
