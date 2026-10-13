@@ -2,13 +2,7 @@ import { Flags } from '@oclif/core';
 import { SetupBaseCommand } from '../../lib/setup-base-command.js';
 
 export default class Setup extends SetupBaseCommand {
-  static description = `Interactive setup wizard for Respan.
-
-Sets up your API key, installs skills and SDK docs for your preferred
-coding agents, and optionally runs a setup agent. Asks whether you want
-to set up tracing or gateway routing.
-
-This is the recommended way to get started with Respan.`;
+  static description = 'Deprecated setup entry point. Prints tracing and gateway setup prompts.';
 
   static examples = [
     'npx @respan/cli setup',
@@ -22,10 +16,10 @@ This is the recommended way to get started with Respan.`;
   static flags = {
     ...SetupBaseCommand.baseFlags,
     agent: Flags.string({
-      description: 'Agent to configure (claude-code, cursor, codex-cli, gemini-cli, opencode)',
+      description: 'Deprecated compatibility flag; no agent is launched',
     }),
     'no-instrument': Flags.boolean({
-      description: 'Skip agent selection and opening after setup',
+      description: 'Deprecated compatibility flag; setup only prints a prompt',
       default: false,
     }),
   };
@@ -34,7 +28,7 @@ This is the recommended way to get started with Respan.`;
     const { flags } = await this.parse(Setup);
     this.globalFlags = flags;
 
-    // No mode → runSetup asks "Tracing or Gateway?"
+    // No mode: print both prompts without an interactive question.
     await this.runSetup(undefined, {
       agent: flags.agent,
       noInstrument: flags['no-instrument'],

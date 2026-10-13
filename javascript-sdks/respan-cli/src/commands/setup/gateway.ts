@@ -2,11 +2,7 @@ import { Flags } from '@oclif/core';
 import { SetupBaseCommand } from '../../lib/setup-base-command.js';
 
 export default class SetupGateway extends SetupBaseCommand {
-  static description = `Set up Respan gateway routing in this project.
-
-Runs the gateway setup flow directly (skips the "Tracing or Gateway?"
-question). Sets up your API key, installs the Respan skill, and optionally
-opens your coding agent to route the detected framework through the gateway.`;
+  static description = 'Deprecated gateway setup entry point. Prints the official gateway setup prompt.';
 
   static examples = [
     'respan setup gateway',
@@ -17,10 +13,10 @@ opens your coding agent to route the detected framework through the gateway.`;
   static flags = {
     ...SetupBaseCommand.baseFlags,
     agent: Flags.string({
-      description: 'Agent to configure (claude-code, cursor, codex-cli, gemini-cli, opencode)',
+      description: 'Deprecated compatibility flag; no agent is launched',
     }),
     'no-instrument': Flags.boolean({
-      description: 'Skip agent selection and opening after setup',
+      description: 'Deprecated compatibility flag; setup only prints a prompt',
       default: false,
     }),
   };
