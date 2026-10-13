@@ -1,445 +1,221 @@
-/**
- * Respan instrumentation plugin for LlamaIndex TypeScript.
- *
- * The plugin attaches event handlers to LlamaIndex's CallbackManager and emits
- * OTEL ReadableSpan objects into the active Respan tracing pipeline.
- */
-
-import { hrTime } from "@opentelemetry/core";
-import { RespanLogType } from "@respan/respan-sdk";
+/** Observes released LlamaIndex methods and native tool execution events. */
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 import {
-  LLAMA_INDEX_EVENTS,
-  type LlamaIndexEventName,
-} from "./_constants.js";
-import {
-  LlamaIndexSpanEmitter,
-  formatAgentStepId,
-  formatTaskInput,
-  formatTaskOutput,
+  observe,
+  ToolObserver,
+  type Operation,
+  type Options,
 } from "./_emitter.js";
-import { sanitizeErrorMessage } from "./_helpers.js";
+import { data } from "./_privacy.js";
 
-export interface LlamaIndexInstrumentorOptions {
-  workflowName?: string;
-  llamaIndexModule?: Record<string, any>;
+export interface LlamaIndexInstrumentorOptions extends Options {
+  /** Explicit module(s), including separately installed provider/core copies. */
+  llamaIndexModule?: Record<string, any> | Record<string, any>[];
 }
-
-type CallbackManagerLike = {
-  on(event: string, handler: (event: any) => void): unknown;
-  off(event: string, handler: (event: any) => void): unknown;
-};
-
-type HandlerBinding = {
-  event: LlamaIndexEventName;
-  handler: (event: any) => void;
-};
-
-type LlamaIndexSettingsLike = {
-  llm?: unknown;
-  withLLM?: (llm: unknown, fn: (...args: any[]) => any) => any;
-};
-
-type PatchedLlm = Record<string, any> & {
-  chat: (...args: any[]) => any;
-};
-
-function eventDetail(event: any): Record<string, any> {
-  return event?.detail && typeof event.detail === "object" ? event.detail : {};
+interface Patch {
+  target: any;
+  method: string;
+  descriptor: PropertyDescriptor;
+  wrapped: Function;
+  owners: Set<LlamaIndexInstrumentor>;
+  event: boolean;
 }
-
-function eventId(
-  detail: Record<string, any>,
-  fallbackPrefix: string,
-  event?: any,
-): string {
-  return eventCorrelationId(detail, event) ??
-    `${fallbackPrefix}-${Math.random().toString(16).slice(2)}`;
-}
-
-function eventCorrelationId(
-  detail: Record<string, any>,
-  event?: any,
-): string | undefined {
-  const value = detail.id ?? event?.reason?.id;
-  return value === undefined || value === null || value === ""
-    ? undefined
-    : String(value);
-}
-
-function eventCaller(event: any): object | undefined {
-  const callers = event?.reason?.computedCallers;
-  if (!Array.isArray(callers)) return undefined;
-  return callers.find(
-    (caller) => caller && typeof caller === "object" && typeof caller.chat === "function",
-  );
-}
-
-function callerModel(caller: object | undefined): string | undefined {
-  if (!caller) return undefined;
-  const callerRecord = caller as Record<string, any>;
-  const model = callerRecord.model ?? callerRecord.metadata?.model;
-  return typeof model === "string" && model.trim() ? model : undefined;
-}
+const patches = new Map<any, Map<string, Patch>>();
 
 export class LlamaIndexInstrumentor {
-  public readonly name = "llama-index";
-  private readonly _options: LlamaIndexInstrumentorOptions;
-  private readonly _emitter: LlamaIndexSpanEmitter;
-  private _callbackManager: CallbackManagerLike | null = null;
-  private _bindings: HandlerBinding[] = [];
-  private _isInstrumented = false;
-  private _settings: LlamaIndexSettingsLike | null = null;
-  private _llmDescriptor?: PropertyDescriptor;
-  private _llmDescriptorWasOwn = false;
-  private _settingsWithLLM?: LlamaIndexSettingsLike["withLLM"];
-  private _withLLMWasOwn = false;
-  private readonly _patchedLlms = new Map<object, PropertyDescriptor | undefined>();
-
-  constructor(options: LlamaIndexInstrumentorOptions = {}) {
-    this._options = options;
-    this._emitter = new LlamaIndexSpanEmitter({
-      workflowName: options.workflowName,
-    });
-  }
-
-  async activate(): Promise<void> {
-    if (this._isInstrumented) {
-      return;
-    }
-
-    let llamaIndex: any = this._options.llamaIndexModule;
-    try {
-      llamaIndex ??= await import("llamaindex");
-    } catch (error) {
-      console.warn(
-        "[respan] LlamaIndexInstrumentor failed to activate: install the `llamaindex` package.",
-        error,
-      );
-      return;
-    }
-
-    const callbackManager = llamaIndex.Settings?.callbackManager;
-    if (
-      !callbackManager ||
-      typeof callbackManager.on !== "function" ||
-      typeof callbackManager.off !== "function"
-    ) {
-      console.warn(
-        "[respan] LlamaIndexInstrumentor failed to activate: no compatible LlamaIndex CallbackManager found.",
-      );
-      return;
-    }
-
-    this._callbackManager = callbackManager;
-    this._patchSettings(llamaIndex.Settings as LlamaIndexSettingsLike);
-    this._bindings = this._buildHandlers();
-    for (const binding of this._bindings) {
-      callbackManager.on(binding.event, binding.handler);
-    }
-    this._isInstrumented = true;
-  }
-
-  deactivate(): void {
-    if (!this._isInstrumented || !this._callbackManager) {
-      return;
-    }
-
-    for (const binding of this._bindings) {
-      try {
-        this._callbackManager.off(binding.event, binding.handler);
-      } catch {
-        // Ignore removal failures; instrumentation must not break user code.
-      }
-    }
-
-    this._emitter.flushPending({
-      errorMessage: "LlamaIndex operation ended without a matching completion event",
-      endTime: hrTime(),
-    });
-    this._restoreSettings();
-    this._emitter.clear();
-    this._bindings = [];
-    this._callbackManager = null;
-    this._isInstrumented = false;
-  }
-
-  private _buildHandlers(): HandlerBinding[] {
-    return [
-      {
-        event: LLAMA_INDEX_EVENTS.LLM_START,
-        handler: (event) => {
-          const detail = eventDetail(event);
-          const caller = eventCaller(event);
-          this._emitter.startLLM({
-            id: eventId(detail, "llm"),
-            messages: detail.messages,
-            startTime: hrTime(),
-            model: callerModel(caller) ?? this._settingsModel(),
-            caller,
-          });
-        },
-      },
-      {
-        event: LLAMA_INDEX_EVENTS.LLM_END,
-        handler: (event) => {
-          const detail = eventDetail(event);
-          this._emitter.endLLM({
-            id: eventId(detail, "llm"),
-            response: detail.response,
-            endTime: hrTime(),
-          });
-        },
-      },
-      {
-        event: LLAMA_INDEX_EVENTS.LLM_TOOL_CALL,
-        handler: (event) => {
-          const detail = eventDetail(event);
-          this._emitter.recordToolCall({
-            toolCall: detail.toolCall,
-            startTime: hrTime(),
-          });
-        },
-      },
-      {
-        event: LLAMA_INDEX_EVENTS.LLM_TOOL_RESULT,
-        handler: (event) => {
-          const detail = eventDetail(event);
-          this._emitter.emitToolResult({
-            toolCall: detail.toolCall,
-            toolResult: detail.toolResult,
-            endTime: hrTime(),
-          });
-        },
-      },
-      this._startEndBinding(
-        LLAMA_INDEX_EVENTS.QUERY_START,
-        LLAMA_INDEX_EVENTS.QUERY_END,
-        "llamaindex.query",
-        RespanLogType.WORKFLOW,
-        "query",
-      ),
-      this._startEndBinding(
-        LLAMA_INDEX_EVENTS.RETRIEVE_START,
-        LLAMA_INDEX_EVENTS.RETRIEVE_END,
-        "llamaindex.retrieve",
-        RespanLogType.TASK,
-        "retrieve",
-      ),
-      this._startEndBinding(
-        LLAMA_INDEX_EVENTS.SYNTHESIZE_START,
-        LLAMA_INDEX_EVENTS.SYNTHESIZE_END,
-        "llamaindex.synthesize",
-        RespanLogType.TASK,
-        "synthesize",
-      ),
-      this._startEndBinding(
-        LLAMA_INDEX_EVENTS.CHUNKING_START,
-        LLAMA_INDEX_EVENTS.CHUNKING_END,
-        "llamaindex.chunking",
-        RespanLogType.TASK,
-        "chunking",
-      ),
-      this._startEndBinding(
-        LLAMA_INDEX_EVENTS.NODE_PARSING_START,
-        LLAMA_INDEX_EVENTS.NODE_PARSING_END,
-        "llamaindex.node_parsing",
-        RespanLogType.TASK,
-        "node-parsing",
-      ),
-      {
-        event: LLAMA_INDEX_EVENTS.AGENT_START,
-        handler: (event) => {
-          const detail = eventDetail(event);
-          const id = formatAgentStepId(detail) ?? eventId(detail, "agent");
-          this._emitter.startRecord({
-            id,
-            name: "llamaindex.agent",
-            logType: RespanLogType.AGENT,
-            startTime: hrTime(),
-            input: formatTaskInput(detail),
-          });
-        },
-      },
-      {
-        event: LLAMA_INDEX_EVENTS.AGENT_END,
-        handler: (event) => {
-          const detail = eventDetail(event);
-          const id = formatAgentStepId(detail) ?? eventId(detail, "agent");
-          this._emitter.endRecord({
-            id,
-            output: formatTaskOutput(detail),
-            endTime: hrTime(),
-          });
-        },
-      },
-    ].flat();
-  }
-
-  private _startEndBinding(
-    startEvent: LlamaIndexEventName,
-    endEvent: LlamaIndexEventName,
-    name: string,
-    logType: string,
-    fallbackPrefix: string,
-  ): HandlerBinding[] {
-    const pendingIds: string[] = [];
-    return [
-      {
-        event: startEvent,
-        handler: (event) => {
-          const detail = eventDetail(event);
-          const id = eventId(detail, fallbackPrefix, event);
-          pendingIds.push(id);
-          this._emitter.startRecord({
-            id,
-            name,
-            logType,
-            startTime: hrTime(),
-            input: formatTaskInput(detail),
-          });
-        },
-      },
-      {
-        event: endEvent,
-        handler: (event) => {
-          const detail = eventDetail(event);
-          const correlatedId = eventCorrelationId(detail, event);
-          const correlatedIndex = correlatedId
-            ? pendingIds.lastIndexOf(correlatedId)
-            : -1;
-          const id = correlatedIndex >= 0
-            ? pendingIds.splice(correlatedIndex, 1)[0]
-            : pendingIds.pop() ?? correlatedId ?? eventId(detail, fallbackPrefix, event);
-          this._emitter.endRecord({
-            id,
-            output: formatTaskOutput(detail),
-            endTime: hrTime(),
-          });
-        },
-      },
-    ];
-  }
-
-  private _patchSettings(settings: LlamaIndexSettingsLike): void {
-    this._settings = settings;
-    this._llmDescriptorWasOwn = Object.hasOwn(settings, "llm");
-    let descriptorOwner: object | null = settings;
-    while (descriptorOwner && !Object.getOwnPropertyDescriptor(descriptorOwner, "llm")) {
-      descriptorOwner = Object.getPrototypeOf(descriptorOwner);
-    }
-    this._llmDescriptor = descriptorOwner
-      ? Object.getOwnPropertyDescriptor(descriptorOwner, "llm")
-      : undefined;
-    const originalDescriptor = this._llmDescriptor;
-    if (originalDescriptor?.get && originalDescriptor.set && originalDescriptor.configurable) {
-      const instrumentor = this;
-      Object.defineProperty(settings, "llm", {
-        ...originalDescriptor,
-        get: originalDescriptor.get,
-        set(value: unknown) {
-          originalDescriptor.set?.call(settings, instrumentor._patchLlm(value));
-        },
-      });
-      try {
-        this._patchLlm(originalDescriptor.get.call(settings));
-      } catch {
-        // LlamaIndex throws while no default LLM has been configured.
-      }
-    }
-
-    if (typeof settings.withLLM === "function") {
-      this._withLLMWasOwn = Object.hasOwn(settings, "withLLM");
-      this._settingsWithLLM = settings.withLLM;
-      const originalWithLLM = settings.withLLM;
-      settings.withLLM = (llm, fn) => originalWithLLM.call(settings, this._patchLlm(llm), fn);
-    }
-  }
-
-  private _settingsModel(): string | undefined {
-    try {
-      const llm = this._settings?.llm;
-      return llm && typeof llm === "object" ? callerModel(llm) : undefined;
-    } catch {
-      return undefined;
-    }
-  }
-
-  private _patchLlm(value: unknown): unknown {
-    if (!value || typeof value !== "object") return value;
-    const llm = value as PatchedLlm;
-    if (typeof llm.chat !== "function" || this._patchedLlms.has(llm)) return llm;
-
-    const ownDescriptor = Object.getOwnPropertyDescriptor(llm, "chat");
-    const originalChat = llm.chat;
-    const instrumentor = this;
-    const wrappedChat = async function (this: object, ...args: any[]): Promise<any> {
-      const caller = this;
-      try {
-        const response = await originalChat.apply(this, args);
-        if (response && typeof response === "object" && Symbol.asyncIterator in response) {
-          const originalIterator = response[Symbol.asyncIterator].bind(response);
-          response[Symbol.asyncIterator] = async function* () {
-            try {
-              yield* originalIterator();
-            } catch (error) {
-              instrumentor._recordLlmFailure(caller, error);
-              throw error;
-            }
-          };
-        }
-        return response;
-      } catch (error) {
-        instrumentor._recordLlmFailure(this, error);
-        throw error;
-      }
+  readonly name = "llama-index";
+  private active = false;
+  private activation?: Promise<void>;
+  private readonly targets = new Set<Patch>();
+  private readonly toolObserver: ToolObserver;
+  constructor(private readonly options: LlamaIndexInstrumentorOptions = {}) {
+    this.options = { ...options };
+    this.toolObserver = new ToolObserver(this.options);
+    this.toolObserver.onDrain = () => {
+      if (!this.active) this.deactivate();
     };
-    Object.defineProperty(llm, "chat", {
-      configurable: true,
-      enumerable: ownDescriptor?.enumerable ?? false,
-      writable: true,
-      value: wrappedChat,
-    });
-    this._patchedLlms.set(llm, ownDescriptor);
-    return llm;
   }
-
-  private _recordLlmFailure(caller: object, error: unknown): void {
-    this._emitter.failLLMForCaller({
-      caller,
-      errorMessage: sanitizeErrorMessage(error),
-      endTime: hrTime(),
-    });
+  isActive(): boolean {
+    return this.active;
   }
-
-  private _restoreSettings(): void {
-    if (this._settings && this._llmDescriptor) {
-      if (this._llmDescriptorWasOwn) {
-        Object.defineProperty(this._settings, "llm", this._llmDescriptor);
-      } else {
-        delete (this._settings as Record<string, unknown>).llm;
+  activate(): Promise<void> {
+    if (this.activation)
+      return this.active
+        ? this.activation
+        : this.activation.then(() => this.activate());
+    if (this.active) return Promise.resolve();
+    this.active = true;
+    this.activation = this.install()
+      .catch((error) => {
+        this.deactivate();
+        throw error;
+      })
+      .finally(() => {
+        this.activation = undefined;
+      });
+    return this.activation;
+  }
+  private async install(): Promise<void> {
+    const explicit = this.options.llamaIndexModule;
+    const modules = explicit
+      ? Array.isArray(explicit)
+        ? explicit
+        : [explicit]
+      : await nativeModules();
+    if (!this.active) return;
+    for (const module of modules) {
+      for (const [name, value] of Object.entries(module)) {
+        if (typeof value !== "function" || !value.prototype) continue;
+        const target = value.prototype;
+        if (name === "CallbackManager")
+          this.patch(
+            target,
+            "dispatchEvent",
+            "task",
+            name,
+            true,
+            module.getEventCaller,
+          );
+        for (const method of Object.getOwnPropertyNames(target)) {
+          const operation = classify(name, method);
+          if (operation)
+            this.patch(target, method, operation, `${name}.${method}`);
+        }
       }
     }
-    if (this._settings && this._settingsWithLLM) {
-      if (this._withLLMWasOwn) {
-        this._settings.withLLM = this._settingsWithLLM;
-      } else {
-        delete (this._settings as Record<string, unknown>).withLLM;
-      }
+  }
+  private patch(
+    target: any,
+    method: string,
+    operation: Operation,
+    name: string,
+    event = false,
+    getEventCaller?: () => unknown,
+  ): void {
+    const descriptor = Object.getOwnPropertyDescriptor(target, method);
+    if (
+      !descriptor ||
+      typeof descriptor.value !== "function" ||
+      descriptor.writable === false
+    )
+      return;
+    let methods = patches.get(target);
+    if (!methods) patches.set(target, (methods = new Map()));
+    let patch = methods.get(method);
+    if (!patch) {
+      const original = descriptor.value;
+      const owners = new Set<LlamaIndexInstrumentor>();
+      const wrapped = function (this: any, ...args: any[]) {
+        const startsEvent = event && /-(start|call)$/.test(args[0]);
+        const owner = startsEvent
+          ? [...owners].find((owner) => owner.active)
+          : owners.values().next().value;
+        if (!owner) return original.apply(this, args);
+        const effective = {
+          ...owner.options,
+          traceContent: [...owners].every(
+            (o) => o.options.traceContent !== false,
+          ),
+          recordInputs: [...owners].every(
+            (o) => o.options.recordInputs !== false,
+          ),
+          recordOutputs: [...owners].every(
+            (o) => o.options.recordOutputs !== false,
+          ),
+        };
+        if (event) {
+          try {
+            for (const listener of startsEvent ? [owner] : owners)
+              listener.toolObserver.event(
+                args[0],
+                args[1],
+                this,
+                getEventCaller?.(),
+                effective,
+              );
+          } catch {}
+          return original.apply(this, args);
+        }
+        return observe(original, this, args, operation, name, effective);
+      };
+      patch = { target, method, descriptor, wrapped, owners, event };
+      Object.defineProperty(target, method, { ...descriptor, value: wrapped });
+      methods.set(method, patch);
     }
-    for (const [llm, descriptor] of this._patchedLlms) {
-      if (descriptor) {
-        Object.defineProperty(llm, "chat", descriptor);
-      } else {
-        delete (llm as Record<string, unknown>).chat;
-      }
+    patch.owners.add(this);
+    this.targets.add(patch);
+  }
+  deactivate(): void {
+    this.active = false;
+    for (const patch of this.targets) {
+      if (patch.event && this.toolObserver.hasPending()) continue;
+      this.targets.delete(patch);
+      patch.owners.delete(this);
+      if (patch.owners.size) continue;
+      if (data(patch.target, patch.method) === patch.wrapped)
+        Object.defineProperty(patch.target, patch.method, patch.descriptor);
+      patches.get(patch.target)?.delete(patch.method);
+      if (!patches.get(patch.target)?.size) patches.delete(patch.target);
     }
-    this._patchedLlms.clear();
-    this._settings = null;
-    this._llmDescriptor = undefined;
-    this._llmDescriptorWasOwn = false;
-    this._settingsWithLLM = undefined;
-    this._withLLMWasOwn = false;
   }
 }
-
-export { LlamaIndexSpanEmitter } from "./_emitter.js";
+function classify(name: string, method: string): Operation | undefined {
+  if (method === "getOpenAIEmbedding") return "embedding";
+  if (method === "complete" && name === "BaseLLM") return "text";
+  if (method === "chat") {
+    if (/Agent|Runner/.test(name)) return "agent";
+    if (/ChatEngine/.test(name)) return "workflow";
+    if (/OpenAI|LLM/.test(name)) return "chat";
+  }
+  if (method === "query" && /QueryEngine/.test(name)) return "workflow";
+  if (
+    ["retrieve", "synthesize", "getNodesFromDocuments", "splitText"].includes(
+      method,
+    )
+  )
+    return "task";
+  return undefined;
+}
+async function nativeModules(): Promise<Record<string, any>[]> {
+  const modules: Record<string, any>[] = [];
+  const require = createRequire(import.meta.url);
+  const specs = [
+    "llamaindex",
+    "@llamaindex/openai",
+    "@llamaindex/core/global",
+    "@llamaindex/core/llms",
+    "@llamaindex/core/agent",
+    "@llamaindex/core/query-engine",
+    "@llamaindex/core/retriever",
+    "@llamaindex/core/response-synthesizers",
+    "@llamaindex/core/node-parser",
+  ];
+  const roots = [require];
+  for (const spec of ["llamaindex", "@llamaindex/openai"]) {
+    try {
+      roots.push(createRequire(require.resolve(spec)));
+    } catch {}
+  }
+  const seen = new Set<string>();
+  for (const resolver of roots)
+    for (const spec of specs) {
+      try {
+        // Resolve ESM with import condition: require entrypoints may contain a separate SDK copy.
+        const location = resolver
+          .resolve(spec)
+          .replace(/\/index\.cjs$/, "/index.js")
+          .replace(/\/dist\/cjs\/index\.js$/, "/dist/index.js");
+        if (seen.has(location)) continue;
+        seen.add(location);
+        modules.push(await import(pathToFileURL(location).href));
+      } catch {
+        /* Optional provider and core modules need not be installed. */
+      }
+    }
+  if (!modules.length)
+    throw new Error(
+      "Install llamaindex >=0.12.0 before activating LlamaIndexInstrumentor.",
+    );
+  return modules;
+}

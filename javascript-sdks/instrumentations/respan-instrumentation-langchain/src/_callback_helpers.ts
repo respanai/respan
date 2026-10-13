@@ -1,648 +1,374 @@
-import { context, trace } from "@opentelemetry/api";
-import { ensureSpanId, ensureTraceId } from "@respan/tracing";
-
-export const RESPAN_LOG_METHOD_TS_TRACING = "ts_tracing";
-export const STATUS_CODE_ATTR = "status_code";
+import { types } from "node:util";
+import type { Span } from "@opentelemetry/api";
+import { data, snapshot, type CapturePolicy } from "./_privacy.js";
 
 export const LANGCHAIN_RUN_ID_ATTR = "langchain.run_id";
 export const LANGCHAIN_PARENT_RUN_ID_ATTR = "langchain.parent_run_id";
 export const LANGCHAIN_FRAMEWORK_ATTR = "langchain.framework";
-export const LANGCHAIN_TAGS_ATTR = "langchain.tags";
-export const LANGCHAIN_METADATA_ATTR = "langchain.metadata";
-export const LANGCHAIN_SERIALIZED_ATTR = "langchain.serialized";
-
-const JSON_CODE_FENCE_RE =
-  /^\s*(?<fence>`{3,}|~{3,})[ \t]*(?<language>jsonc?)?[ \t]*\r?\n(?<body>.*?)(?:\r?\n)?\k<fence>\s*$/is;
-
-const EMPTY_VALUES = new Set<unknown>([undefined, null, ""]);
-
-export type HrTimeTuple = [number, number];
-export type FrameworkName = "langchain" | "langgraph" | "langflow";
 export interface LangChainCallbackConfig {
   callbacks?: unknown;
 }
-
-export type SpanAttributesRecord = Record<string, unknown>;
-
 export interface RespanCallbackHandlerOptions {
   includeContent?: boolean;
   includeMetadata?: boolean;
+  recordInputs?: boolean;
+  recordOutputs?: boolean;
   groupLangflowRootRuns?: boolean;
   maxCachedRuns?: number;
 }
-
-interface ActiveParent {
-  traceId: string;
-  spanId: string;
-}
-
-interface MessageLikeRecord extends Record<string, unknown> {
-  _getType?: () => unknown;
-  getType?: () => unknown;
-}
-
+export type SpanAttributesRecord = Record<string, any>;
 export interface RunRecord {
   runId: string;
-  traceId: string;
-  spanId: string;
-  parentRunId?: string;
-  parentSpanId?: string;
+  span: Span;
+  policy: CapturePolicy;
   name: string;
-  entityPath: string;
+  path: string;
   workflowName: string;
   logType: string;
-  spanKind: string;
-  startTime: HrTimeTuple;
-  inputValue?: unknown;
-  serialized?: unknown;
-  tags?: string[];
-  metadata?: Record<string, unknown>;
-  framework: FrameworkName;
-  extraAttributes: SpanAttributesRecord;
-  streamedTokens: string[];
+  model?: string;
+  tokens: string[];
+  indexed: SpanAttributesRecord;
 }
-
-export function generateTraceId(): string {
-  return ensureTraceId();
-}
-
-export function runIdToHex(runId: unknown): string {
-  if (runId === undefined || runId === null || runId === "") {
-    return generateTraceId();
-  }
-
-  const value = String(runId);
-  const compactUuid = value.replace(/-/g, "");
-  if (/^[0-9a-f]{32}$/i.test(compactUuid)) {
-    return compactUuid.toLowerCase();
-  }
-  return ensureTraceId(value);
-}
-
-export function deriveSpanId(...parts: unknown[]): string {
-  const id = ensureSpanId(parts.map(String).join("|"));
-  return /^0+$/.test(id) ? "0000000000000001" : id;
-}
-
-export function getActiveOtelParent(): ActiveParent | undefined {
-  const spanContext = trace.getSpan(context.active())?.spanContext();
-  if (!spanContext?.traceId || !spanContext?.spanId) {
-    return undefined;
-  }
-  if (/^0+$/.test(spanContext.traceId) || /^0+$/.test(spanContext.spanId)) {
-    return undefined;
-  }
-  return {
-    traceId: spanContext.traceId,
-    spanId: spanContext.spanId,
-  };
-}
-
-export function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-export function toSerializableValue(
+export function isPlainRecord(
   value: unknown,
-  seen = new WeakSet<object>(),
-): unknown {
-  if (
-    value === undefined ||
-    value === null ||
-    typeof value === "string" ||
-    typeof value === "number" ||
-    typeof value === "boolean"
-  ) {
-    return value;
-  }
-  if (typeof value === "bigint") {
-    return value.toString();
-  }
-  if (value instanceof Date) {
-    return value.toISOString();
-  }
-  if (Array.isArray(value)) {
-    return value.map((item) => toSerializableValue(item, seen));
-  }
-  if (typeof value === "object") {
-    if (seen.has(value)) {
-      return "[Circular]";
-    }
-    seen.add(value);
-
-    const withJson = value as { toJSON?: () => unknown };
-    if (typeof withJson.toJSON === "function") {
-      try {
-        return toSerializableValue(withJson.toJSON(), seen);
-      } catch {
-        // Fall through to enumerable properties.
-      }
-    }
-
-    const output: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      if (typeof item === "function" || typeof item === "symbol" || item === undefined) {
-        continue;
-      }
-      output[key] = toSerializableValue(item, seen);
-    }
-    return output;
-  }
-  return String(value);
+): value is Record<string, unknown> {
+  return (
+    !!value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    !types.isProxy(value)
+  );
 }
-
-export function safeJsonString(value: unknown): string {
-  if (value === undefined || value === null) return "";
-  if (typeof value === "string") return value;
+export const toSerializableValue = snapshot;
+export function safeJsonString(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
   try {
-    return JSON.stringify(value);
+    return JSON.stringify(snapshot(value));
   } catch {
-    return String(value);
+    return undefined;
   }
 }
-
 export function setIfPresent(
   attrs: SpanAttributesRecord,
   key: string,
   value: unknown,
 ): void {
-  if (EMPTY_VALUES.has(value)) return;
-  if (Array.isArray(value) && value.length === 0) return;
-  attrs[key] = value;
+  if (value !== undefined) attrs[key] = value;
 }
-
-function stripJsonCodeFence(value: string): string {
-  const match = JSON_CODE_FENCE_RE.exec(value);
-  if (!match?.groups) {
-    return value;
-  }
-
-  const body = match.groups.body.trim();
-  if (match.groups.language) {
-    return body;
-  }
-
-  try {
-    JSON.parse(body);
-    return body;
-  } catch {
-    return value;
-  }
-}
-
-export function normalizeOutputForLogging(value: unknown): unknown {
-  if (typeof value === "string") {
-    return stripJsonCodeFence(value);
-  }
-  if (Array.isArray(value)) {
-    return value.map(normalizeOutputForLogging);
-  }
-  if (isPlainRecord(value)) {
-    return Object.fromEntries(
-      Object.entries(value).map(([key, item]) => [
-        key,
-        normalizeOutputForLogging(item),
-      ]),
-    );
-  }
-  return value;
-}
-
-function normalizeRole(role: unknown): string {
-  const normalized = String(role ?? "unknown").toLowerCase();
-  switch (normalized) {
-    case "human":
-    case "chat":
-      return "user";
-    case "ai":
-      return "assistant";
-    case "function":
-      return "tool";
-    default:
-      return normalized;
-  }
-}
-
-function messageToDict(message: unknown): Record<string, unknown> {
-  const raw = toSerializableValue(message);
-  const rawRecord = isPlainRecord(raw) ? raw : {};
-  const original: MessageLikeRecord = isPlainRecord(message)
-    ? message
-    : {};
-  const role =
-    rawRecord.role ??
-    rawRecord.type ??
-    original?.role ??
-    original?.type ??
-    (typeof original?._getType === "function" ? original._getType() : undefined) ??
-    (typeof original?.getType === "function" ? original.getType() : undefined);
-
-  const content = rawRecord.content ?? original?.content;
-  const output: Record<string, unknown> = {
-    role: normalizeRole(role),
-    content: toSerializableValue(content),
-  };
-
-  for (const key of ["id", "name", "tool_call_id"]) {
-    const item = rawRecord[key] ?? original?.[key];
-    if (!EMPTY_VALUES.has(item)) {
-      output[key] = toSerializableValue(item);
-    }
-  }
-
-  const toolCalls = rawRecord.tool_calls ?? rawRecord.toolCalls ?? original?.tool_calls ?? original?.toolCalls;
-  if (!EMPTY_VALUES.has(toolCalls)) {
-    output.tool_calls = toSerializableValue(toolCalls);
-  }
-
-  const additionalKwargs =
-    rawRecord.additional_kwargs ??
-    rawRecord.additionalKwargs ??
-    original?.additional_kwargs ??
-    original?.additionalKwargs;
-  if (isPlainRecord(additionalKwargs)) {
-    for (const key of ["tool_calls", "toolCalls", "function_call", "functionCall"]) {
-      if (additionalKwargs[key] !== undefined && output[key] === undefined) {
-        output[key] = toSerializableValue(additionalKwargs[key]);
-      }
-    }
-  }
-
-  return output;
-}
-
-export function normalizeChatMessages(messages: unknown): Record<string, unknown>[][] {
-  const conversations = Array.isArray(messages) ? messages : [messages];
-  return conversations.map((conversation) => {
-    const items = Array.isArray(conversation) ? conversation : [conversation];
-    return items.map(messageToDict);
-  });
-}
-
 export function extractName(
   serialized: unknown,
   fallback: string,
-  explicitName?: unknown,
+  explicit?: unknown,
 ): string {
-  if (typeof explicitName === "string" && explicitName.trim()) {
-    return explicitName.trim();
-  }
-  if (typeof serialized === "string" && serialized.trim()) {
-    return serialized.trim();
-  }
-  if (isPlainRecord(serialized)) {
-    for (const key of ["name", "id", "type"]) {
-      const value = serialized[key];
-      if (typeof value === "string" && value.trim()) {
-        return key === "id" && value.includes(".")
-          ? value.split(".").at(-1) ?? fallback
-          : value.trim();
-      }
-      if (Array.isArray(value) && value.length > 0) {
-        return String(value[value.length - 1]);
-      }
-    }
-    const kwargs = serialized.kwargs;
-    if (isPlainRecord(kwargs)) {
-      for (const key of ["name", "model", "modelName", "model_name", "repo_id"]) {
-        const value = kwargs[key];
-        if (typeof value === "string" && value.trim()) {
-          return value.trim();
-        }
-      }
-    }
-  }
-  return fallback;
+  if (typeof explicit === "string" && explicit) return explicit;
+  const name = data(serialized, "name");
+  if (typeof name === "string" && name) return name;
+  const ids = data(serialized, "id");
+  const last = Array.isArray(ids) ? data(ids, ids.length - 1) : undefined;
+  return typeof last === "string" && last ? last : fallback;
 }
-
 export function detectFramework({
-  serialized,
   tags,
   metadata,
-  name,
 }: {
+  tags?: unknown;
+  metadata?: unknown;
   serialized?: unknown;
-  tags?: string[];
-  metadata?: Record<string, unknown>;
   name?: string;
-}): FrameworkName {
-  const haystack: string[] = [];
-  haystack.push(...(tags ?? []).map((tag) => String(tag).toLowerCase()));
-  if (metadata) {
-    haystack.push(...Object.keys(metadata).map((key) => key.toLowerCase()));
-    haystack.push(
-      ...Object.values(metadata)
-        .filter((value) => typeof value === "string")
-        .map((value) => String(value).toLowerCase()),
-    );
-  }
-  if (serialized !== undefined) {
-    haystack.push(safeJsonString(toSerializableValue(serialized)).toLowerCase());
-  }
-  if (name) {
-    haystack.push(name.toLowerCase());
-  }
-
-  const text = haystack.join(" ");
-  if (text.includes("langflow")) return "langflow";
-  if (text.includes("langgraph") || text.includes("__pregel") || text.includes("graph:")) {
+}): "langchain" | "langgraph" | "langflow" {
+  if (
+    data(metadata, "framework") === "langflow" ||
+    typeof data(metadata, "langflow_component") === "string"
+  )
+    return "langflow";
+  if (
+    data(metadata, "framework") === "langgraph" ||
+    data(metadata, "langgraph_node") !== undefined
+  )
     return "langgraph";
+  if (Array.isArray(tags) && !types.isProxy(tags)) {
+    for (let i = 0; i < tags.length; i++) {
+      const tag = data(tags, i);
+      if (tag === "langflow") return "langflow";
+      if (tag === "langgraph") return "langgraph";
+    }
   }
   return "langchain";
 }
-
-function coerceInteger(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return Math.trunc(value);
-  }
-  if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) {
-    return Math.trunc(Number(value));
+export function extractModel(
+  serialized?: unknown,
+  response?: unknown,
+  metadata?: unknown,
+  extra?: unknown,
+): string | undefined {
+  const invocation =
+    data(extra, "invocation_params") ?? data(extra, "invocationParams");
+  const kwargs = data(serialized, "kwargs");
+  const output = data(response, "llmOutput") ?? data(response, "llm_output");
+  for (const [obj, keys] of [
+    [metadata, ["ls_model_name"]],
+    [invocation, ["model", "model_name", "modelName"]],
+    [kwargs, ["model", "modelName", "model_name"]],
+    [output, ["model_name", "modelName", "model"]],
+  ] as const) {
+    for (const key of keys) {
+      const value = data(obj, key);
+      if (typeof value === "string" && value) return value;
+    }
   }
   return undefined;
 }
-
-function firstDefined(...values: unknown[]): unknown {
-  return values.find((value) => value !== undefined && value !== null);
+function messageToDict(message: unknown): Record<string, any> {
+  let role = data(message, "role") ?? data(message, "type");
+  if (
+    typeof role !== "string" &&
+    message &&
+    typeof message === "object" &&
+    !types.isProxy(message)
+  ) {
+    const ctor = data(Object.getPrototypeOf(message), "constructor");
+    const name = data(ctor, "name");
+    role = (
+      {
+        HumanMessage: "user",
+        HumanMessageChunk: "user",
+        AIMessage: "assistant",
+        AIMessageChunk: "assistant",
+        SystemMessage: "system",
+        SystemMessageChunk: "system",
+        ToolMessage: "tool",
+        ToolMessageChunk: "tool",
+        FunctionMessage: "tool",
+      } as Record<string, string>
+    )[name];
+  }
+  role =
+    role === "human"
+      ? "user"
+      : role === "ai"
+        ? "assistant"
+        : role === "function"
+          ? "tool"
+          : role;
+  const result: Record<string, any> = {};
+  if (typeof role === "string") result.role = role;
+  const content = data(message, "content");
+  if (content !== undefined) result.content = snapshot(content);
+  for (const key of ["id", "name", "tool_call_id", "tool_calls"]) {
+    const value = data(message, key);
+    if (value !== undefined) result[key] = snapshot(value);
+  }
+  const additional = data(message, "additional_kwargs");
+  for (const key of ["tool_calls", "function_call"])
+    if (result[key] === undefined && data(additional, key) !== undefined)
+      result[key] = snapshot(data(additional, key));
+  return result;
 }
-
+function arrayData(value: unknown): unknown[] {
+  if (!Array.isArray(value) || types.isProxy(value)) return [];
+  const items: unknown[] = [];
+  for (let index = 0; index < data(value, "length"); index++)
+    items.push(data(value, index));
+  return items;
+}
+export function normalizeChatMessages(
+  messages: unknown,
+): Record<string, any>[][] {
+  return arrayData(messages).map((conversation) =>
+    (Array.isArray(conversation)
+      ? arrayData(conversation)
+      : [conversation]
+    ).map(messageToDict),
+  );
+}
+export function normalizeOutputForLogging(value: unknown): unknown {
+  return snapshot(value);
+}
+export function extractLlmOutput(response: unknown): {
+  outputPayload: unknown;
+  completionMessages: Record<string, any>[];
+} {
+  const generations = data(response, "generations");
+  if (!Array.isArray(generations) || types.isProxy(generations))
+    return { outputPayload: snapshot(response), completionMessages: [] };
+  const batches = arrayData(generations).map((batch) =>
+    (Array.isArray(batch) ? arrayData(batch) : [batch]).map((generation) => {
+      const message = data(generation, "message");
+      return message !== undefined
+        ? messageToDict(message)
+        : { role: "assistant", content: snapshot(data(generation, "text")) };
+    }),
+  );
+  return { outputPayload: batches, completionMessages: batches.flat() };
+}
+export function extractToolCallsFromMessages(
+  messages: Record<string, any>[],
+): Record<string, any>[] | undefined {
+  const calls: Record<string, any>[] = [];
+  for (const message of messages) {
+    const raw = data(message, "tool_calls");
+    if (!Array.isArray(raw)) continue;
+    for (const call of raw) {
+      if (!isPlainRecord(call)) continue;
+      if (data(call, "function")) {
+        calls.push(snapshot(call));
+        continue;
+      }
+      const name = data(call, "name");
+      if (typeof name !== "string") continue;
+      calls.push({
+        id: data(call, "id"),
+        type: "function",
+        function: {
+          name,
+          arguments: safeJsonString(
+            data(call, "args") ?? data(call, "arguments"),
+          ),
+        },
+      });
+    }
+  }
+  return calls.length ? calls : undefined;
+}
+function integer(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0
+    ? value
+    : undefined;
+}
 export function extractUsage(response: unknown): {
   promptTokens?: number;
   completionTokens?: number;
   totalTokens?: number;
+  cacheReadInputTokens?: number;
 } {
-  const payloads: unknown[] = [];
-  const responseRecord = isPlainRecord(response) ? response : {};
-  const llmOutput = responseRecord.llmOutput ?? responseRecord.llm_output;
-  if (isPlainRecord(llmOutput)) {
-    payloads.push(
-      llmOutput.tokenUsage,
-      llmOutput.token_usage,
-      llmOutput.usage,
-      llmOutput.usage_metadata,
-      llmOutput.estimatedTokenUsage,
-      llmOutput,
-    );
-  }
-  payloads.push(responseRecord.usage, responseRecord.usage_metadata);
-
-  const generations = responseRecord.generations;
-  if (Array.isArray(generations) && generations.length > 0) {
-    const firstBatch = Array.isArray(generations[0]) ? generations[0] : [generations[0]];
-    const firstGeneration = firstBatch[0];
-    const message = isPlainRecord(firstGeneration) ? firstGeneration.message : undefined;
-    if (isPlainRecord(message)) {
-      payloads.push(message.usage_metadata, message.usageMetadata);
-      const responseMetadata = message.response_metadata ?? message.responseMetadata;
-      if (isPlainRecord(responseMetadata)) {
-        payloads.push(
-          responseMetadata.tokenUsage,
-          responseMetadata.token_usage,
-          responseMetadata.usage,
-          responseMetadata.usage_metadata,
-          responseMetadata,
-        );
-      }
-    }
-  }
-
-  for (const payload of payloads) {
-    if (!isPlainRecord(payload)) continue;
-    const promptTokens = coerceInteger(firstDefined(
-      payload.prompt_tokens,
-      payload.promptTokens,
-      payload.input_tokens,
-      payload.inputTokens,
-    ));
-    const completionTokens = coerceInteger(firstDefined(
-      payload.completion_tokens,
-      payload.completionTokens,
-      payload.output_tokens,
-      payload.outputTokens,
-    ));
-    let totalTokens = coerceInteger(firstDefined(
-      payload.total_tokens,
-      payload.totalTokens,
-      payload.total,
-    ));
-    if (totalTokens === undefined && (promptTokens !== undefined || completionTokens !== undefined)) {
-      totalTokens = (promptTokens ?? 0) + (completionTokens ?? 0);
-    }
-    if (promptTokens !== undefined || completionTokens !== undefined || totalTokens !== undefined) {
-      const usage: {
-        promptTokens?: number;
-        completionTokens?: number;
-        totalTokens?: number;
-      } = {};
-      if (promptTokens !== undefined) usage.promptTokens = promptTokens;
-      if (completionTokens !== undefined) usage.completionTokens = completionTokens;
-      if (totalTokens !== undefined) usage.totalTokens = totalTokens;
-      return usage;
-    }
-  }
-
-  return {};
-}
-
-export function extractModel(
-  serialized?: unknown,
-  response?: unknown,
-  metadata?: Record<string, unknown>,
-): string | undefined {
-  const candidates: unknown[] = [];
-  if (metadata) {
-    candidates.push(metadata.ls_model_name, metadata.model, metadata.modelName, metadata.model_name);
-  }
-  if (isPlainRecord(serialized)) {
-    const kwargs = serialized.kwargs;
-    if (isPlainRecord(kwargs)) {
-      candidates.push(kwargs.model, kwargs.modelName, kwargs.model_name, kwargs.repo_id);
-    }
-    candidates.push(serialized.model, serialized.modelName, serialized.model_name);
-  }
-  const responseRecord = isPlainRecord(response) ? response : {};
-  const llmOutput = responseRecord.llmOutput ?? responseRecord.llm_output;
-  if (isPlainRecord(llmOutput)) {
-    candidates.push(llmOutput.model_name, llmOutput.modelName, llmOutput.model);
-  }
-
-  return candidates.find(
-    (candidate): candidate is string => typeof candidate === "string" && candidate.trim().length > 0,
+  const llm = data(response, "llmOutput") ?? data(response, "llm_output");
+  const generations = data(response, "generations");
+  const firstBatch = data(generations, 0);
+  const message = data(
+    data(Array.isArray(firstBatch) ? firstBatch : [firstBatch], 0),
+    "message",
   );
-}
-
-function generationToMessage(generation: unknown): Record<string, unknown> {
-  const generationRecord = isPlainRecord(generation) ? generation : {};
-  const message = generationRecord.message;
-  if (message !== undefined) {
-    return messageToDict(message);
-  }
-  const text = generationRecord.text;
-  if (text !== undefined) {
-    return { role: "assistant", content: toSerializableValue(text) };
-  }
-  return { role: "assistant", content: toSerializableValue(generation) };
-}
-
-export function extractLlmOutput(response: unknown): {
-  outputPayload: unknown;
-  completionMessages: Record<string, unknown>[];
-} {
-  const responseRecord = isPlainRecord(response) ? response : {};
-  const generations = responseRecord.generations;
-  if (Array.isArray(generations)) {
-    const normalizedBatches: Record<string, unknown>[][] = [];
-    const completionMessages: Record<string, unknown>[] = [];
-    for (const batch of generations) {
-      const batchItems = Array.isArray(batch) ? batch : [batch];
-      const normalizedBatch = batchItems.map(generationToMessage);
-      normalizedBatches.push(normalizedBatch);
-      completionMessages.push(...normalizedBatch);
+  const meta = data(message, "response_metadata");
+  const candidates = [
+    data(llm, "tokenUsage"),
+    data(llm, "token_usage"),
+    data(llm, "usage"),
+    data(llm, "usage_metadata"),
+    data(response, "usage"),
+    data(response, "usage_metadata"),
+    data(message, "usage_metadata"),
+    data(meta, "tokenUsage"),
+    data(meta, "token_usage"),
+    data(meta, "usage"),
+  ];
+  const out: Record<string, number> = {};
+  for (const candidate of candidates) {
+    for (const [name, keys] of [
+      ["promptTokens", ["prompt_tokens", "promptTokens", "input_tokens"]],
+      [
+        "completionTokens",
+        ["completion_tokens", "completionTokens", "output_tokens"],
+      ],
+      ["totalTokens", ["total_tokens", "totalTokens"]],
+    ] as const) {
+      if (out[name] !== undefined) continue;
+      for (const key of keys) {
+        const value = integer(data(candidate, key));
+        if (value !== undefined) {
+          out[name] = value;
+          break;
+        }
+      }
     }
-    return { outputPayload: normalizedBatches, completionMessages };
+    const details =
+      data(candidate, "input_token_details") ??
+      data(candidate, "prompt_tokens_details");
+    const cached = integer(
+      data(details, "cache_read") ?? data(details, "cached_tokens"),
+    );
+    if (cached !== undefined) out.cacheReadInputTokens = cached;
   }
-
-  const serialized = toSerializableValue(response);
-  const message =
-    isPlainRecord(serialized) && serialized.content !== undefined
-      ? serialized
-      : { role: "assistant", content: serialized };
-  return {
-    outputPayload: serialized,
-    completionMessages: [message as Record<string, unknown>],
-  };
+  return out;
 }
-
-export function extractToolCallsFromMessages(
-  messages: Record<string, unknown>[],
-): Record<string, unknown>[] | undefined {
-  const toolCalls: Record<string, unknown>[] = [];
-  for (const message of messages) {
-    const rawCalls = message.tool_calls ?? message.toolCalls;
-    if (!Array.isArray(rawCalls)) continue;
-    for (const rawCall of rawCalls) {
-      if (!isPlainRecord(rawCall)) continue;
-      const call: Record<string, unknown> = { ...rawCall };
-      if (!call.type) call.type = "function";
-      if (!call.id && (call.toolCallId || call.tool_call_id)) {
-        call.id = call.toolCallId ?? call.tool_call_id;
-      }
-      if (!call.function && call.name) {
-        call.function = {
-          name: call.name,
-          arguments: safeJsonString(call.args ?? call.arguments),
-        };
-      }
-      toolCalls.push(toSerializableValue(call) as Record<string, unknown>);
-    }
-  }
-  return toolCalls.length > 0 ? toolCalls : undefined;
-}
-
-export function extractToolNamesFromSerialized(serialized: unknown): string[] | undefined {
-  const names = (extractTools({ serialized }) ?? [])
-    .map((tool) => {
-      const functionDefinition = tool.function;
-      if (isPlainRecord(functionDefinition) && typeof functionDefinition.name === "string") {
-        return functionDefinition.name;
-      }
-      return undefined;
-    })
-    .filter((name): name is string => typeof name === "string" && name.length > 0);
-  return names.length > 0 ? names : undefined;
-}
-
-function collectToolCandidates(value: unknown, candidates: unknown[]): void {
-  if (!isPlainRecord(value)) return;
-
-  const rawTools = value.tools ?? value.functions;
-  if (Array.isArray(rawTools)) {
-    candidates.push(...rawTools);
-  }
-
-  for (const key of [
-    "invocation_params",
-    "invocationParams",
-    "kwargs",
-    "options",
-    "config",
-    "model_kwargs",
-    "modelKwargs",
-  ]) {
-    collectToolCandidates(value[key], candidates);
-  }
-}
-
-function normalizeToolDefinition(tool: unknown): Record<string, unknown> | undefined {
-  const serializableTool = toSerializableValue(tool);
-  if (!isPlainRecord(serializableTool)) return undefined;
-
-  const functionDefinition = serializableTool.function;
-  if (isPlainRecord(functionDefinition) && typeof functionDefinition.name === "string") {
-    return {
-      ...serializableTool,
-      type: typeof serializableTool.type === "string" ? serializableTool.type : "function",
-      function: functionDefinition,
-    };
-  }
-
-  const name = serializableTool.name ?? serializableTool.toolName ?? serializableTool.id;
-  if (typeof name !== "string" || !name.trim()) return undefined;
-
-  const parameters =
-    serializableTool.parameters ??
-    serializableTool.schema ??
-    serializableTool.args_schema ??
-    serializableTool.argsSchema;
-
-  const normalizedFunction: Record<string, unknown> = {
-    name: name.trim(),
-  };
-  setIfPresent(normalizedFunction, "description", serializableTool.description);
-  setIfPresent(normalizedFunction, "parameters", parameters);
-
-  return {
-    type: "function",
-    function: normalizedFunction,
-  };
-}
-
 export function extractTools({
   serialized,
   extraParams,
 }: {
   serialized?: unknown;
   extraParams?: unknown;
-}): Record<string, unknown>[] | undefined {
+}): Record<string, any>[] | undefined {
   const candidates: unknown[] = [];
-  collectToolCandidates(extraParams, candidates);
-  collectToolCandidates(serialized, candidates);
-
+  const seen = new WeakSet<object>();
+  function collect(value: unknown) {
+    if (!isPlainRecord(value) || seen.has(value)) return;
+    seen.add(value);
+    const tools = data(value, "tools") ?? data(value, "functions");
+    if (Array.isArray(tools) && !types.isProxy(tools))
+      candidates.push(...arrayData(tools));
+    for (const key of [
+      "invocation_params",
+      "invocationParams",
+      "kwargs",
+      "options",
+      "config",
+      "model_kwargs",
+      "modelKwargs",
+    ])
+      collect(data(value, key));
+  }
+  collect(extraParams);
+  collect(serialized);
   const tools = candidates
-    .map(normalizeToolDefinition)
-    .filter((tool): tool is Record<string, unknown> => tool !== undefined);
-
-  return tools.length > 0 ? tools : undefined;
+    .map((tool) => {
+      const fn = data(tool, "function");
+      if (typeof data(fn, "name") === "string") return snapshot(tool);
+      const name = data(tool, "name");
+      if (typeof name !== "string") return undefined;
+      const functionDefinition: Record<string, any> = { name };
+      const description = data(tool, "description");
+      if (description !== undefined)
+        functionDefinition.description = snapshot(description);
+      const parameters = data(tool, "parameters") ?? data(tool, "schema");
+      if (parameters !== undefined)
+        functionDefinition.parameters = snapshot(parameters);
+      return { type: "function", function: functionDefinition };
+    })
+    .filter(Boolean);
+  const unique = [
+    ...new Map(tools.map((tool) => [JSON.stringify(tool), tool])).values(),
+  ];
+  return unique.length ? unique : undefined;
 }
-
-export function normalizeTags(tags?: unknown): string[] | undefined {
-  if (!Array.isArray(tags)) return undefined;
-  return tags.map(String);
+export function extractToolNamesFromSerialized(
+  serialized: unknown,
+): string[] | undefined {
+  const names = extractTools({ serialized })
+    ?.map((tool) => tool.function?.name)
+    .filter((name): name is string => typeof name === "string");
+  return names?.length ? names : undefined;
 }
-
-export function normalizeMetadata(metadata?: unknown): Record<string, unknown> | undefined {
-  if (!isPlainRecord(metadata)) return undefined;
-  return { ...metadata };
+export function normalizeTags(tags: unknown): string[] | undefined {
+  return Array.isArray(tags)
+    ? snapshot(tags)?.filter((tag: unknown) => typeof tag === "string")
+    : undefined;
 }
-
+export function normalizeMetadata(
+  metadata: unknown,
+): Record<string, any> | undefined {
+  return isPlainRecord(metadata) ? snapshot(metadata) : undefined;
+}
+export function getErrorMessage(error: unknown): string | undefined {
+  const message = data(error, "message");
+  return typeof message === "string"
+    ? message
+    : typeof error === "string"
+      ? error
+      : undefined;
+}
 export function trimMap<K, V>(map: Map<K, V>, maxSize: number): void {
   while (map.size > maxSize) {
-    const firstKey = map.keys().next().value;
-    if (firstKey === undefined) return;
-    map.delete(firstKey);
+    const first = map.keys().next();
+    if (first.done) return;
+    map.delete(first.value);
   }
-}
-
-export function getErrorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  return String(error);
 }

@@ -25,56 +25,57 @@ export interface OperationConfig {
   spanName: string;
 }
 
-export const CLIENT_OPERATION_CONFIG: Record<McpClientMethod, OperationConfig> = {
-  connect: {
-    entityName: "mcp.initialize",
-    logType: RespanLogType.TASK,
-    operation: "client.connect",
-    spanName: "mcp.initialize",
-  },
-  listTools: {
-    entityName: "mcp.list_tools",
-    logType: RespanLogType.TASK,
-    operation: "client.list_tools",
-    spanName: "mcp.list_tools",
-  },
-  callTool: {
-    entityName: "mcp.call_tool",
-    logType: RespanLogType.TOOL,
-    operation: "client.call_tool",
-    spanName: "mcp.call_tool",
-  },
-  listResources: {
-    entityName: "mcp.list_resources",
-    logType: RespanLogType.TASK,
-    operation: "client.list_resources",
-    spanName: "mcp.list_resources",
-  },
-  readResource: {
-    entityName: "mcp.read_resource",
-    logType: RespanLogType.TASK,
-    operation: "client.read_resource",
-    spanName: "mcp.resource.read",
-  },
-  listResourceTemplates: {
-    entityName: "mcp.list_resource_templates",
-    logType: RespanLogType.TASK,
-    operation: "client.list_resource_templates",
-    spanName: "mcp.list_resource_templates",
-  },
-  listPrompts: {
-    entityName: "mcp.list_prompts",
-    logType: RespanLogType.TASK,
-    operation: "client.list_prompts",
-    spanName: "mcp.list_prompts",
-  },
-  getPrompt: {
-    entityName: "mcp.get_prompt",
-    logType: RespanLogType.TASK,
-    operation: "client.get_prompt",
-    spanName: "mcp.get_prompt",
-  },
-};
+export const CLIENT_OPERATION_CONFIG: Record<McpClientMethod, OperationConfig> =
+  {
+    connect: {
+      entityName: "mcp.initialize",
+      logType: RespanLogType.TASK,
+      operation: "client.connect",
+      spanName: "mcp.initialize",
+    },
+    listTools: {
+      entityName: "mcp.list_tools",
+      logType: RespanLogType.TASK,
+      operation: "client.list_tools",
+      spanName: "mcp.list_tools",
+    },
+    callTool: {
+      entityName: "mcp.call_tool",
+      logType: RespanLogType.TOOL,
+      operation: "client.call_tool",
+      spanName: "mcp.call_tool",
+    },
+    listResources: {
+      entityName: "mcp.list_resources",
+      logType: RespanLogType.TASK,
+      operation: "client.list_resources",
+      spanName: "mcp.list_resources",
+    },
+    readResource: {
+      entityName: "mcp.read_resource",
+      logType: RespanLogType.TASK,
+      operation: "client.read_resource",
+      spanName: "mcp.resource.read",
+    },
+    listResourceTemplates: {
+      entityName: "mcp.list_resource_templates",
+      logType: RespanLogType.TASK,
+      operation: "client.list_resource_templates",
+      spanName: "mcp.list_resource_templates",
+    },
+    listPrompts: {
+      entityName: "mcp.list_prompts",
+      logType: RespanLogType.TASK,
+      operation: "client.list_prompts",
+      spanName: "mcp.list_prompts",
+    },
+    getPrompt: {
+      entityName: "mcp.get_prompt",
+      logType: RespanLogType.TASK,
+      operation: "client.get_prompt",
+      spanName: "mcp.get_prompt",
+    },
+  };
 
 export const SERVER_TOOL_OPERATION_CONFIG: OperationConfig = {
   entityName: "mcp.tool",

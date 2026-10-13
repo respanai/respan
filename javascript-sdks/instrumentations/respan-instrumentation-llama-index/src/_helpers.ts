@@ -1,282 +1,96 @@
-import type { SpanContext } from "@opentelemetry/api";
-import type { ReadableSpan } from "@opentelemetry/sdk-trace-base";
-import { context, trace } from "@opentelemetry/api";
-import { TraceFlags } from "@opentelemetry/api";
-import { hrTime } from "@opentelemetry/core";
-import { buildReadableSpan, injectSpan } from "@respan/tracing";
-import {
-  INSTRUMENTATION_LIBRARY_NAME,
-  PACKAGE_VERSION,
-} from "./_constants.js";
+import { data, snapshot } from "./_privacy.js";
 
-export type SpanAttributes = Record<string, any>;
-export type HrTime = [number, number];
-
-export function safeJson(value: unknown): string {
-  if (value === undefined || value === null) {
-    return "";
-  }
-  if (typeof value === "string") {
-    return value;
-  }
+export function json(value: unknown): string | undefined {
   try {
-    return JSON.stringify(value);
+    return JSON.stringify(snapshot(value));
   } catch {
-    return String(value);
+    return undefined;
   }
 }
-
-export function sanitizeErrorMessage(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  return message
-    .replace(
-      /\b(authorization\s*:\s*bearer\s+)([^\s,;]+)/gi,
-      "$1[REDACTED]",
-    )
-    .replace(
-      /\b((?:api[_ -]?key|token|secret)\s*[=:]\s*)([^\s,;]+)/gi,
-      "$1[REDACTED]",
-    )
-    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, "[REDACTED]")
-    .slice(0, 4096);
+export function messages(value: unknown): any[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((m) => {
+    const copy = snapshot(m) ?? {};
+    const options = data(copy, "options");
+    const result = data(options, "toolResult");
+    if (result)
+      return {
+        role: "tool",
+        content: data(result, "result"),
+        tool_call_id: data(result, "id"),
+        name: data(result, "name"),
+      };
+    const out: any = {
+      role: data(copy, "role"),
+      content: data(copy, "content"),
+    };
+    const calls = data(options, "toolCall");
+    if (Array.isArray(calls)) out.tool_calls = calls.map(toolCall);
+    return out;
+  });
 }
-
-export function normalizeText(value: unknown): string {
-  if (value === undefined || value === null) {
-    return "";
-  }
-  if (typeof value === "string") {
-    return value;
-  }
-  if (Array.isArray(value)) {
-    const textParts = value
-      .map((part) => {
-        if (typeof part === "string") return part;
-        if (part && typeof part === "object" && "text" in part) {
-          return String((part as Record<string, unknown>).text ?? "");
-        }
-        return "";
-      })
-      .filter(Boolean);
-    if (textParts.length > 0) {
-      return textParts.join("\n");
-    }
-  }
-  return safeJson(value);
-}
-
-export function normalizeModel(model: unknown): string | undefined {
-  if (!model) return undefined;
-  return String(model).toLowerCase();
-}
-
-export function inferGenAISystem(model: unknown): string | undefined {
-  const normalized = normalizeModel(model);
-  if (!normalized) return undefined;
-  if (normalized.includes("gpt") || normalized.includes("o1") || normalized.includes("o3")) {
-    return "openai";
-  }
-  if (normalized.includes("claude")) return "anthropic";
-  if (normalized.includes("gemini")) return "google";
-  if (normalized.includes("bedrock")) return "bedrock";
-  return "llamaindex";
-}
-
-export function formatToolCall(toolCall: unknown): Record<string, unknown> {
-  const value =
-    toolCall && typeof toolCall === "object"
-      ? (toolCall as Record<string, unknown>)
-      : {};
-  const id = value.id ?? value.call_id ?? value.toolCallId;
-  const name = value.name ?? value.tool_name;
-  const input = value.input ?? value.arguments ?? value.args ?? {};
+export function toolCall(value: unknown): any {
+  const name = data(value, "name");
+  const input = data(value, "input");
   return {
-    id: id ? String(id) : undefined,
+    id: data(value, "id"),
     type: "function",
     function: {
-      name: name ? String(name) : "unknown_tool",
-      arguments: typeof input === "string" ? input : safeJson(input),
+      name,
+      arguments: typeof input === "string" ? input : json(input),
     },
   };
 }
-
-export function formatMessage(message: unknown): Record<string, unknown> {
-  const value =
-    message && typeof message === "object"
-      ? (message as Record<string, any>)
-      : { content: message };
-  const role = String(value.role ?? "user");
-  const formatted: Record<string, unknown> = {
-    role,
-    content: normalizeText(value.content),
-  };
-
-  const options =
-    value.options && typeof value.options === "object"
-      ? (value.options as Record<string, unknown>)
-      : {};
-  const toolCalls = options.toolCall;
-  if (Array.isArray(toolCalls) && toolCalls.length > 0) {
-    formatted.tool_calls = toolCalls.map(formatToolCall);
-  }
-  const toolResult = options.toolResult;
-  if (toolResult && typeof toolResult === "object") {
-    const result = toolResult as Record<string, unknown>;
-    formatted.role = "tool";
-    formatted.tool_call_id = result.id ? String(result.id) : undefined;
-    formatted.name = result.name ? String(result.name) : undefined;
-    formatted.content = normalizeText(result.result);
-  }
-
-  return formatted;
-}
-
-export function formatMessages(messages: unknown): Record<string, unknown>[] {
-  if (!Array.isArray(messages)) {
-    return [];
-  }
-  return messages.map(formatMessage);
-}
-
-export function extractResponseMessage(response: unknown): Record<string, unknown> {
-  const value =
-    response && typeof response === "object"
-      ? (response as Record<string, any>)
-      : {};
-  return formatMessage(value.message ?? { role: "assistant", content: response });
-}
-
-export function extractResponseText(response: unknown): string {
-  const message = extractResponseMessage(response);
-  return String(message.content ?? "");
-}
-
-export function extractResponseModel(response: unknown): string | undefined {
-  const value =
-    response && typeof response === "object"
-      ? (response as Record<string, any>)
-      : {};
-  const raw = value.raw;
-  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
-    const rawRecord = raw as Record<string, any>;
-    const model = rawRecord.model ?? rawRecord.response?.model;
-    if (model) return String(model);
-  }
-  if (Array.isArray(raw)) {
-    for (let index = raw.length - 1; index >= 0; index -= 1) {
-      const item = raw[index];
-      if (item && typeof item === "object" && "model" in item) {
-        return String((item as Record<string, unknown>).model);
+export function tools(value: unknown): any[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.map((t) => {
+    // Native FunctionTool.metadata is a library getter; do not invoke customer getters.
+    let owner: any = t;
+    let metadata = data(t, "metadata") ?? data(t, "_metadata");
+    while (metadata === undefined && owner && Object.getPrototypeOf(owner)) {
+      owner = Object.getPrototypeOf(owner);
+      const descriptor = Object.getOwnPropertyDescriptor(owner, "metadata");
+      if (descriptor?.get && owner.constructor?.name === "FunctionTool") {
+        metadata = descriptor.get.call(t);
+        break;
       }
     }
-  }
-  return undefined;
+    return { type: "function", function: snapshot(metadata) ?? {} };
+  });
 }
-
-export function extractUsage(response: unknown): {
-  inputTokens?: number;
-  outputTokens?: number;
-  totalTokens?: number;
-} {
-  const value =
-    response && typeof response === "object"
-      ? (response as Record<string, any>)
-      : {};
-
-  const candidates: Record<string, any>[] = [];
-  if (value.raw && typeof value.raw === "object" && !Array.isArray(value.raw)) {
-    candidates.push(value.raw.usage ?? value.raw.response?.usage ?? {});
-  }
-  if (Array.isArray(value.raw)) {
-    for (const item of value.raw) {
-      if (item && typeof item === "object") {
-        candidates.push((item as Record<string, any>).usage ?? {});
-      }
+export function usage(response: unknown): Record<string, number> {
+  const raw = data(response, "raw");
+  const candidates = Array.isArray(raw) ? raw : [raw];
+  for (let i = candidates.length - 1; i >= 0; i--) {
+    const candidate = candidates[i];
+    const value =
+      data(candidate, "usage") ??
+      data(data(candidate, "raw"), "usage") ??
+      data(data(candidate, "response"), "usage");
+    if (!value) continue;
+    const result: Record<string, number> = {};
+    for (const k of [
+      "prompt_tokens",
+      "completion_tokens",
+      "total_tokens",
+      "input_tokens",
+      "output_tokens",
+    ]) {
+      const n = data(value, k);
+      if (typeof n === "number" && Number.isFinite(n)) result[k] = n;
     }
+    const cached = data(data(value, "prompt_tokens_details"), "cached_tokens");
+    if (typeof cached === "number" && Number.isFinite(cached))
+      result.cached_tokens = cached;
+    if (Object.keys(result).length) return result;
   }
-  const options = value.message?.options;
-  if (options && typeof options === "object") {
-    candidates.push((options as Record<string, any>).usage ?? {});
-  }
-
-  for (let index = candidates.length - 1; index >= 0; index -= 1) {
-    const usage = candidates[index];
-    const inputTokens =
-      usage.prompt_tokens ?? usage.input_tokens ?? usage.promptTokens ?? usage.inputTokens;
-    const outputTokens =
-      usage.completion_tokens ??
-      usage.output_tokens ??
-      usage.completionTokens ??
-      usage.outputTokens;
-    const totalTokens = usage.total_tokens ?? usage.totalTokens;
-    if (
-      inputTokens !== undefined ||
-      outputTokens !== undefined ||
-      totalTokens !== undefined
-    ) {
-      return {
-        inputTokens: toNumber(inputTokens),
-        outputTokens: toNumber(outputTokens),
-        totalTokens: toNumber(totalTokens),
-      };
-    }
-  }
-
   return {};
 }
-
-export function toNumber(value: unknown): number | undefined {
-  if (value === undefined || value === null || value === "") {
-    return undefined;
-  }
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : undefined;
-}
-
-export function randomHex(length: number): string {
-  return Array.from({ length }, () =>
-    Math.floor(Math.random() * 16).toString(16)
-  ).join("");
-}
-
-export function activeSpanContext(): SpanContext | undefined {
-  return trace.getSpan(context.active())?.spanContext();
-}
-
-export function emitReadableSpan(opts: {
-  name: string;
-  traceId?: string;
-  spanId?: string;
-  parentId?: string;
-  startTime: HrTime;
-  endTime?: HrTime;
-  attributes: SpanAttributes;
-  errorMessage?: string;
-}): void {
-  const activeContext = activeSpanContext();
-  const span = buildReadableSpan({
-    name: opts.name,
-    traceId: opts.traceId ?? activeContext?.traceId,
-    spanId: opts.spanId,
-    parentId: opts.parentId ?? activeContext?.spanId,
-    startTimeHr: opts.startTime,
-    endTimeHr: opts.endTime ?? hrTime(),
-    attributes: opts.attributes,
-    errorMessage: opts.errorMessage,
-    mergePropagated: true,
-  }) as ReadableSpan & {
-    instrumentationScope?: { name: string; version?: string };
-    spanContext: () => ReturnType<ReadableSpan["spanContext"]>;
-  };
-
-  const originalSpanContext = span.spanContext.bind(span);
-  span.spanContext = () => ({
-    ...originalSpanContext(),
-    traceFlags: activeContext?.traceFlags ?? TraceFlags.SAMPLED,
-  });
-  span.instrumentationScope = {
-    name: INSTRUMENTATION_LIBRARY_NAME,
-    version: PACKAGE_VERSION,
-  };
-  injectSpan(span);
+export function responseMessage(response: unknown): any[] {
+  const message = data(response, "message");
+  if (message !== undefined) return messages([message]);
+  const text = data(response, "text");
+  return text === undefined
+    ? []
+    : [{ role: "assistant", content: snapshot(text) }];
 }

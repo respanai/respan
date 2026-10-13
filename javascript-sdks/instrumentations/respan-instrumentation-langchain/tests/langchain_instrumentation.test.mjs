@@ -1,505 +1,662 @@
 import assert from "node:assert/strict";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
-
-import { trace } from "@opentelemetry/api";
-
-import {
-  LangChainInstrumentor,
+const requireNative = createRequire(
+  process.env.LANGCHAIN_NATIVE_PROFILE
+    ? `${process.env.LANGCHAIN_NATIVE_PROFILE}/package.json`
+    : import.meta.url,
+);
+const load = (specifier) =>
+  import(pathToFileURL(requireNative.resolve(specifier)).href);
+const { context, trace, SpanStatusCode, TraceFlags } =
+  await load("@opentelemetry/api");
+const { suppressTracing } = await load("@opentelemetry/core");
+const { NodeTracerProvider } = await load("@opentelemetry/sdk-trace-node");
+const { CONTEXT_KEY_ALLOW_TRACE_CONTENT } = await load(
+  "@traceloop/ai-semantic-conventions",
+);
+const { RunnableLambda, RunnableSequence } = await load(
+  "@langchain/core/runnables",
+);
+const { DynamicTool } = await load("@langchain/core/tools");
+const { HumanMessage, AIMessage } = await load("@langchain/core/messages");
+const { ChatOpenAI } = await load("@langchain/openai");
+const {
   RespanCallbackHandler,
+  LangChainInstrumentor,
   addRespanCallback,
   getCallbackHandler,
-} from "../dist/index.js";
-import {
-  extractToolNamesFromSerialized,
-  extractTools,
-  extractUsage,
-  normalizeChatMessages,
-  toSerializableValue,
-} from "../dist/_callback_helpers.js";
-
+} = await import(
+  process.env.LANGCHAIN_INSTRUMENTATION_MODULE ?? "../dist/index.js"
+);
+let samplerOverride;
+let decision = 2,
+  calls = 0,
+  onStart;
 const captured = [];
-
-function resetProvider() {
-  captured.length = 0;
-  if (typeof trace.disable === "function") {
-    trace.disable();
-  }
-  trace.setGlobalTracerProvider({
-    activeSpanProcessor: {
-      onStart() {},
+const provider = new NodeTracerProvider({
+  sampler: {
+    shouldSample(_ctx, _id, _name, _kind, attrs) {
+      calls++;
+      assert.equal(attrs["traceloop.entity.input"], undefined);
+      return { decision: samplerOverride ? samplerOverride(_name) : decision };
+    },
+    toString() {
+      return "ControlledSampler";
+    },
+  },
+  spanProcessors: [
+    {
+      onStart(span) {
+        onStart?.(span);
+      },
       onEnd(span) {
         captured.push(span);
       },
-      forceFlush() {
-        return Promise.resolve();
-      },
-      shutdown() {
-        return Promise.resolve();
-      },
+      forceFlush: async () => {},
+      shutdown: async () => {},
     },
-    getTracer() {
-      return {
-        startSpan() {
-          throw new Error("startSpan should not be called in these tests");
+  ],
+});
+provider.register();
+function reset() {
+  captured.length = 0;
+  decision = 2;
+  calls = 0;
+  onStart = undefined;
+  samplerOverride = undefined;
+  delete process.env.RESPAN_TRACE_CONTENT;
+  delete process.env.TRACELOOP_TRACE_CONTENT;
+}
+function handler(options = {}) {
+  return new RespanCallbackHandler(options);
+}
+function fixtureModel({
+  tools = false,
+  error = false,
+  usage = true,
+  fetchHook,
+} = {}) {
+  const fetch = async (_url, init) => {
+    const body = JSON.parse(init.body);
+    fetchHook?.(body);
+    if (error)
+      return new Response(
+        JSON.stringify({
+          error: {
+            message: "controlled native failure",
+            type: "invalid_request_error",
+          },
+        }),
+        { status: 429, headers: { "content-type": "application/json" } },
+      );
+    const response = {
+      id: "chatcmpl-fixture",
+      object: "chat.completion",
+      created: 0,
+      model: "fixture-model",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: tools ? "" : "fixture result",
+            ...(tools
+              ? {
+                  tool_calls: [
+                    {
+                      id: "call_native_fixture",
+                      type: "function",
+                      function: { name: "lookup", arguments: '{"value":0}' },
+                    },
+                  ],
+                }
+              : {}),
+          },
+          finish_reason: tools ? "tool_calls" : "stop",
         },
-      };
-    },
+      ],
+      ...(usage
+        ? { usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } }
+        : {}),
+    };
+    if (body.stream) {
+      const chunks = [
+        {
+          id: response.id,
+          object: "chat.completion.chunk",
+          created: 0,
+          model: response.model,
+          choices: [
+            {
+              index: 0,
+              delta: { role: "assistant", content: "fixture " },
+              finish_reason: null,
+            },
+          ],
+        },
+        {
+          id: response.id,
+          object: "chat.completion.chunk",
+          created: 0,
+          model: response.model,
+          choices: [
+            { index: 0, delta: { content: "result" }, finish_reason: "stop" },
+          ],
+        },
+        {
+          id: response.id,
+          object: "chat.completion.chunk",
+          created: 0,
+          model: response.model,
+          choices: [],
+          usage: response.usage,
+        },
+      ];
+      return new Response(
+        chunks.map((c) => `data: ${JSON.stringify(c)}\n\n`).join("") +
+          "data: [DONE]\n\n",
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    }
+    return new Response(JSON.stringify(response), {
+      headers: { "content-type": "application/json" },
+    });
+  };
+  return new ChatOpenAI({
+    model: "fixture-model",
+    modelName: "fixture-model",
+    apiKey: "fixture-local-only",
+    openAIApiKey: "fixture-local-only",
+    maxRetries: 0,
+    configuration: { baseURL: "http://fixture.invalid/v1", fetch },
   });
 }
-
-function runId(index) {
-  return `00000000-0000-0000-0000-${String(index).padStart(12, "0")}`;
+function attrs(type) {
+  return captured.find((s) => s.attributes["respan.entity.log_type"] === type)
+    ?.attributes;
 }
-
-test("getCallbackHandler and addRespanCallback build callback configs without duplicate handlers", () => {
-  const first = getCallbackHandler();
-  const second = getCallbackHandler({ includeContent: false });
-  const existing = { name: "existing-callback" };
-  const config = { callbacks: [existing], tags: ["demo"] };
-
-  const nextConfig = addRespanCallback(config, first);
-  const dedupedConfig = addRespanCallback(nextConfig, second);
-
-  assert.ok(first instanceof RespanCallbackHandler);
-  assert.ok(second instanceof RespanCallbackHandler);
-  assert.notEqual(first, second);
-  assert.equal(first.groupLangflowRootRuns, true);
-  assert.equal(second.includeContent, false);
-  assert.deepEqual(config.callbacks, [existing]);
-  assert.deepEqual(nextConfig.callbacks, [existing, first]);
-  assert.equal(dedupedConfig.callbacks.length, 2);
-});
-
-test("LangChainInstrumentor exposes a reusable callback handler and lifecycle state", () => {
-  const instrumentor = new LangChainInstrumentor();
-
-  assert.equal(instrumentor.name, "langchain");
-  assert.equal(instrumentor.isActive(), false);
-
-  instrumentor.activate();
-  assert.equal(instrumentor.isActive(), true);
-
-  const config = instrumentor.addCallback({ metadata: { framework: "langchain" } });
-  assert.deepEqual(config.callbacks, [instrumentor.callbackHandler]);
-
-  instrumentor.deactivate();
-  assert.equal(instrumentor.isActive(), false);
-});
-
-test("chain root and child emit workflow and task spans with parent linkage", () => {
-  resetProvider();
-  const handler = new RespanCallbackHandler();
-  const rootRunId = runId(1);
-  const childRunId = runId(2);
-
-  handler.handleChainStart(
-    { name: "root_chain" },
-    { question: "hi" },
-    rootRunId,
-    undefined,
-    ["langgraph"],
-    { langgraph_node: "root" },
-  );
-  handler.handleChainStart(
-    { name: "child_chain" },
-    { input: "hi" },
-    childRunId,
-    rootRunId,
-  );
-  handler.handleChainEnd({ answer: "hello" }, childRunId);
-  handler.handleChainEnd({ done: true }, rootRunId);
-
-  const [childSpan, rootSpan] = captured;
-  assert.equal(childSpan.attributes["respan.entity.log_type"], "task");
-  assert.equal(rootSpan.attributes["respan.entity.log_type"], "workflow");
-  assert.equal(childSpan.spanContext().traceId, rootSpan.spanContext().traceId);
-  assert.equal(childSpan.parentSpanContext?.spanId, rootSpan.spanContext().spanId);
-  assert.equal(rootSpan.attributes["langchain.framework"], "langgraph");
-  assert.equal(rootSpan.attributes["traceloop.workflow.name"], "root_chain");
-  assert.equal(childSpan.attributes["traceloop.workflow.name"], "root_chain");
-  assert.equal(rootSpan.attributes["respan.trace.trace_group_identifier"], "root_chain");
-  assert.equal(childSpan.attributes["respan.trace.trace_group_identifier"], "root_chain");
-});
-
-test("explicit Langflow handler groups independent root runs into one trace", () => {
-  resetProvider();
-  const handler = getCallbackHandler();
-  const metadata = {
-    framework: "langflow",
-    langflow_component: "DemoComponent",
-  };
-
-  handler.handleToolStart(
-    { name: "route_to_workspace" },
-    { department: "security" },
-    runId(3),
-    undefined,
-    ["langflow"],
-    metadata,
-  );
-  handler.handleToolEnd("secops-critical", runId(3));
-  handler.handleChainStart(
-    { name: "component_chain" },
-    { question: "hi" },
-    runId(4),
-    undefined,
-    ["langflow"],
-    metadata,
-  );
-  handler.handleChainEnd({ answer: "ok" }, runId(4));
-
-  assert.equal(captured.length, 2);
-  assert.equal(captured[0].spanContext().traceId, captured[1].spanContext().traceId);
-  assert.equal(captured[0].parentSpanContext?.spanId, undefined);
-  assert.equal(
-    captured[1].parentSpanContext?.spanId,
-    captured[0].spanContext().spanId,
-  );
-  assert.equal(captured[0].attributes["traceloop.workflow.name"], "DemoComponent");
-  assert.equal(captured[1].attributes["traceloop.workflow.name"], "DemoComponent");
-});
-
-test("createAgent root emits one agent boundary and propagates its workflow name", () => {
-  resetProvider();
-  const handler = new RespanCallbackHandler();
-  const agentRunId = runId(41);
-  const childRunId = runId(42);
-
-  handler.handleChainStart(
-    { name: "LangGraph" },
-    { messages: [{ role: "user", content: "help" }] },
-    agentRunId,
-    undefined,
-    undefined,
-    {
-      ls_integration: "langchain_create_agent",
-      custom_identifier: "otel2-fix-marker",
-    },
-    undefined,
-    "support_agent",
-  );
-  handler.handleToolStart(
-    { name: "lookup" },
-    { query: "help" },
-    childRunId,
-    agentRunId,
-  );
-  handler.handleToolEnd({ result: "done" }, childRunId);
-  handler.handleChainEnd({ messages: [{ role: "assistant", content: "done" }] }, agentRunId);
-
-  const [toolSpan, agentSpan] = captured;
-  assert.equal(agentSpan.attributes["respan.entity.log_type"], "agent");
-  assert.equal(agentSpan.attributes["traceloop.span.kind"], undefined);
-  assert.equal(toolSpan.parentSpanContext?.spanId, agentSpan.spanContext().spanId);
-  assert.equal(toolSpan.attributes["traceloop.workflow.name"], "support_agent");
-  assert.equal(agentSpan.attributes["traceloop.workflow.name"], "support_agent");
-  assert.equal(agentSpan.attributes["respan.span_params.custom_identifier"], "otel2-fix-marker");
-  assert.equal(
-    captured.filter((span) => span.attributes["respan.entity.log_type"] === "agent").length,
-    1,
-  );
-});
-
-test("chat model output maps messages, usage, model, tool calls, and strips JSON fences", () => {
-  resetProvider();
-  const handler = new RespanCallbackHandler();
-  const llmRunId = runId(5);
-  const fencedJson = '```json\n{"owner":"Security Operations Team"}\n```';
-
-  handler.handleChatModelStart(
-    { name: "ChatOpenAI", kwargs: { model: "gpt-4o-mini" } },
-    [[{ type: "human", content: "Route this case" }]],
-    llmRunId,
-  );
-  handler.handleLLMEnd(
-    {
-      generations: [[{
-        message: {
-          type: "ai",
-          content: fencedJson,
-          tool_calls: [
-            { id: "call_1", name: "router", args: { department: "security" } },
-          ],
-          usage_metadata: { input_tokens: 12, output_tokens: 4 },
-        },
-      }]],
-      llmOutput: { model_name: "gpt-4o-mini" },
-    },
-    llmRunId,
-  );
-
-  const span = captured[0];
-  assert.equal(span.attributes["respan.entity.log_type"], "chat");
-  assert.equal(span.attributes["llm.request.type"], "chat");
-  assert.equal(span.attributes["gen_ai.request.model"], "gpt-4o-mini");
-  assert.equal(span.attributes["gen_ai.usage.prompt_tokens"], 12);
-  assert.equal(span.attributes["gen_ai.usage.completion_tokens"], 4);
-  assert.equal(span.attributes["gen_ai.prompt.0.role"], "user");
-  assert.equal(
-    span.attributes["gen_ai.completion.0.content"],
-    '{"owner":"Security Operations Team"}',
-  );
-  assert.equal(span.attributes["traceloop.entity.output"].includes("```"), false);
-  assert.equal(
-    JSON.parse(span.attributes["gen_ai.completion.0.tool_calls"])[0].function.name,
-    "router",
-  );
-  for (const alias of [
+const noAliases = (a) => {
+  for (const key of [
+    "status_code",
     "traceloop.span.kind",
+    "gen_ai.tool.name",
+    "gen_ai.tool.call.arguments",
+    "gen_ai.tool.call.result",
     "respan.span.tools",
     "respan.span.tool_calls",
-    "model",
-    "prompt_tokens",
-    "completion_tokens",
-    "total_request_tokens",
     "tools",
     "tool_calls",
-  ]) {
-    assert.equal(span.attributes[alias], undefined);
+  ])
+    assert.equal(a[key], undefined, key);
+};
+test("public exports, callback deduplication, and instrumentor lifecycle", async () => {
+  reset();
+  const inst = new LangChainInstrumentor();
+  assert.equal(inst.isActive(), false);
+  inst.activate();
+  assert.equal(inst.isActive(), true);
+  const cfg = inst.addCallback({ tags: ["native"] });
+  assert.equal(
+    addRespanCallback(cfg, getCallbackHandler()).callbacks.length,
+    1,
+  );
+  await RunnableLambda.from((x) => x).invoke(false, cfg);
+  assert.equal(captured.length, 1);
+  assert.equal(
+    JSON.parse(attrs("workflow")["traceloop.entity.output"]).output,
+    false,
+  );
+  inst.deactivate();
+  await RunnableLambda.from((x) => x).invoke(false, cfg);
+  assert.equal(captured.length, 1);
+  inst.activate();
+  await RunnableLambda.from((x) => x).invoke(null, cfg);
+  assert.equal(captured.length, 2);
+});
+test("released RunnableSequence preserves result identity and actual parent contexts", async () => {
+  reset();
+  const value = { answer: 0 };
+  const first = RunnableLambda.from(() => value);
+  const second = RunnableLambda.from((x) => x);
+  const sequence = RunnableSequence.from([first, second]);
+  const result = await sequence.invoke("native input", {
+    callbacks: [handler()],
+    runName: "native_workflow",
+  });
+  assert.equal(result, value);
+  const root = captured.find((s) => s.name === "native_workflow");
+  assert.ok(root);
+  assert.equal(root.attributes["traceloop.entity.path"], "");
+  const children = captured.filter((s) => s !== root);
+  assert.equal(children.length, 2);
+  for (const child of children) {
+    assert.equal(child.parentSpanContext.spanId, root.spanContext().spanId);
+    assert.equal(child.spanContext().traceId, root.spanContext().traceId);
+    noAliases(child.attributes);
   }
 });
-
-test("chat model start preserves full tool definitions from LangChain extra params", () => {
-  resetProvider();
-  const handler = new RespanCallbackHandler();
-  const llmRunId = runId(51);
-  const tools = [{
-    type: "function",
-    function: {
-      name: "route_case",
-      description: "Route the case to a department",
-      parameters: {
-        type: "object",
-        properties: {
-          department: { type: "string" },
-        },
-        required: ["department"],
+for (const sampling of [0, 1])
+  test(`native RunnableLambda sampler decision ${sampling} prevents telemetry traversal`, async () => {
+    reset();
+    decision = sampling;
+    let reads = 0;
+    const payload = {
+      toJSON() {
+        reads++;
+        return { secret: "no" };
+      },
+      get secret() {
+        reads++;
+        return "no";
+      },
+    };
+    await RunnableLambda.from((x) => x).invoke(payload, {
+      callbacks: [handler()],
+    });
+    assert.equal(calls, 1);
+    assert.equal(reads, 0);
+    assert.equal(captured.length, sampling === 1 ? 1 : 0);
+    if (captured[0])
+      assert.equal(captured[0].attributes["traceloop.entity.input"], undefined);
+  });
+test("disabled payload capture never calls getters, toJSON, or proxy traps", async () => {
+  reset();
+  let reads = 0;
+  const value = {
+    toJSON() {
+      reads++;
+      return "secret";
+    },
+    get secret() {
+      reads++;
+      return "secret";
+    },
+  };
+  const cb = handler({ includeContent: false, includeMetadata: false });
+  await RunnableLambda.from((x) => x).invoke(value, { callbacks: [cb] });
+  assert.equal(reads, 0);
+  cb.includeContent = true;
+  await RunnableLambda.from((x) => x).invoke(value, { callbacks: [cb] });
+  assert.equal(reads, 0);
+  for (const span of captured) {
+    assert.equal(span.attributes["traceloop.entity.input"], undefined);
+    assert.equal(span.attributes["traceloop.entity.output"], undefined);
+  }
+});
+test("independent input and output lanes preserve false, zero, empty and null", async () => {
+  reset();
+  await RunnableLambda.from(() => false).invoke(0, {
+    callbacks: [handler({ recordInputs: false })],
+  });
+  let a = attrs("workflow");
+  assert.equal(a["traceloop.entity.input"], undefined);
+  assert.equal(JSON.parse(a["traceloop.entity.output"]).output, false);
+  reset();
+  await RunnableLambda.from(() => null).invoke("", {
+    callbacks: [handler({ recordOutputs: false })],
+  });
+  a = attrs("workflow");
+  assert.equal(JSON.parse(a["traceloop.entity.input"]).input, "");
+  assert.equal(a["traceloop.entity.output"], undefined);
+  reset();
+  await RunnableLambda.from(() => null).invoke(0, { callbacks: [handler()] });
+  assert.equal(
+    JSON.parse(attrs("workflow")["traceloop.entity.output"]).output,
+    null,
+  );
+});
+test("constructor, env, canonical context and suppression remain ceilings", async () => {
+  reset();
+  const cb = handler();
+  process.env.RESPAN_TRACE_CONTENT = "false";
+  await RunnableLambda.from((x) => x).invoke(
+    { secret: 1 },
+    { callbacks: [cb] },
+  );
+  assert.equal(attrs("workflow")["traceloop.entity.input"], undefined);
+  reset();
+  await context.with(
+    context.active().setValue(CONTEXT_KEY_ALLOW_TRACE_CONTENT, false),
+    () =>
+      RunnableLambda.from((x) => x).invoke({ secret: 1 }, { callbacks: [cb] }),
+  );
+  assert.equal(attrs("workflow")["traceloop.entity.input"], undefined);
+  reset();
+  await context.with(suppressTracing(context.active()), () =>
+    RunnableLambda.from((x) => x).invoke({ secret: 1 }, { callbacks: [cb] }),
+  );
+  assert.equal(calls, 0);
+  assert.equal(captured.length, 0);
+});
+test("late actual RecordingSpan replacements stay private and status only accepts numeric codes", async () => {
+  reset();
+  const cb = handler({ includeContent: false });
+  let raw;
+  onStart = (span) => {
+    raw = span;
+  };
+  await RunnableLambda.from((x) => x).invoke("secret", { callbacks: [cb] });
+  let reads = 0;
+  raw.setAttributes({
+    "gen_ai.usage.secret": {
+      get payload() {
+        reads++;
+        return "secret";
       },
     },
-  }];
-
-  handler.handleChatModelStart(
-    { name: "ChatOpenAI", kwargs: { model: "gpt-4o-mini" } },
-    [[{ type: "human", content: "Route this case" }]],
-    llmRunId,
-    undefined,
-    { invocation_params: { tools } },
+    "gen_ai.usage.input_tokens": 0,
+  });
+  raw.attributes = {
+    "traceloop.entity.input": "secret",
+    "gen_ai.usage.secret": "secret",
+    "gen_ai.usage.input_tokens": 0,
+  };
+  raw.events = [{ name: "secret" }];
+  raw.status = { code: "2", message: "secret" };
+  assert.equal(raw.attributes["traceloop.entity.input"], undefined);
+  assert.equal(raw.attributes["gen_ai.usage.secret"], undefined);
+  assert.equal(raw.attributes["gen_ai.usage.input_tokens"], 0);
+  assert.deepEqual(raw.events, []);
+  assert.deepEqual(raw.status, { code: 0 });
+  assert.equal(reads, 0);
+  assert.throws(() =>
+    Object.defineProperty(raw, "attributes", { value: { secret: 1 } }),
   );
-  handler.handleLLMEnd(
-    {
-      generations: [[{
-        message: { type: "ai", content: "Done" },
-      }]],
-    },
-    llmRunId,
+});
+test("late observed ancestor veto cannot be restored and exporter suppression cannot revoke spans", async () => {
+  reset();
+  const parent = trace.getTracer("native-parent").startSpan("parent");
+  parent.setAttribute("allow_trace_content", false);
+  await context.with(trace.setSpan(context.active(), parent), () =>
+    RunnableLambda.from((x) => x).invoke("private", { callbacks: [handler()] }),
   );
-
+  parent.setAttribute("allow_trace_content", true);
+  await context.with(trace.setSpan(context.active(), parent), () =>
+    RunnableLambda.from((x) => x).invoke("still private", {
+      callbacks: [handler()],
+    }),
+  );
+  for (const span of captured)
+    assert.equal(span.attributes["traceloop.entity.input"], undefined);
+  reset();
+  await RunnableLambda.from((x) => x).invoke("visible", {
+    callbacks: [handler()],
+  });
   const span = captured[0];
-  assert.deepEqual(JSON.parse(span.attributes["llm.request.functions"]), tools);
-  assert.equal(span.attributes["respan.span.tools"], undefined);
-  assert.equal(span.attributes.tools, undefined);
-});
-
-test("LLM streaming falls back to collected text when final output is empty", () => {
-  resetProvider();
-  const handler = new RespanCallbackHandler();
-  const llmRunId = runId(6);
-
-  handler.handleLLMStart(
-    { name: "OpenAI", kwargs: { modelName: "text-davinci" } },
-    ["Write a haiku"],
-    llmRunId,
-  );
-  handler.handleLLMNewToken("old ", undefined, llmRunId);
-  handler.handleLLMNewToken("pond", undefined, llmRunId);
-  handler.handleLLMEnd(undefined, llmRunId);
-
-  const span = captured[0];
-  assert.equal(span.attributes["respan.entity.log_type"], "text");
-  assert.equal(span.attributes["llm.request.type"], "chat");
-  assert.equal(span.attributes["traceloop.entity.output"], "old pond");
-});
-
-test("handleText streaming fallback records chain text output", () => {
-  resetProvider();
-  const handler = new RespanCallbackHandler();
-  const chainRunId = runId(61);
-
-  handler.handleChainStart({ name: "streaming_chain" }, {}, chainRunId);
-  handler.handleText("hello ", chainRunId);
-  handler.handleText("world", chainRunId);
-  handler.handleChainEnd(undefined, chainRunId);
-
-  assert.equal(captured[0].attributes["traceloop.entity.output"], "hello world");
-});
-
-test("tool and retriever callbacks map fields and errors", () => {
-  resetProvider();
-  const handler = new RespanCallbackHandler();
-  const toolRunId = runId(7);
-  const retrieverRunId = runId(8);
-  const errorRunId = runId(9);
-
-  handler.handleToolStart({ name: "calculator" }, { expression: "2+2" }, toolRunId);
-  handler.handleToolEnd({ answer: 4 }, toolRunId);
-  handler.handleRetrieverStart({ name: "vectorstore" }, "query", retrieverRunId);
-  handler.handleRetrieverEnd([{ pageContent: "doc text", metadata: { source: "unit" } }], retrieverRunId);
-  handler.handleToolStart({ name: "failing_tool" }, "input", errorRunId);
-  handler.handleToolError(new Error("tool failed"), errorRunId);
-
-  const [toolSpan, retrieverSpan, errorSpan] = captured;
-  assert.equal(toolSpan.attributes["respan.entity.log_type"], "tool");
-  assert.equal(toolSpan.attributes["gen_ai.tool.name"], "calculator");
-  assert.equal(toolSpan.attributes["gen_ai.tool.call.arguments"], '{"expression":"2+2"}');
-  assert.equal(toolSpan.attributes["gen_ai.tool.call.result"], '{"answer":4}');
-  assert.equal(retrieverSpan.attributes["respan.entity.log_type"], "task");
-  assert.equal(retrieverSpan.attributes["traceloop.entity.output"].includes("doc text"), true);
-  assert.equal(errorSpan.status.code, 2);
-  assert.equal(errorSpan.attributes["error.message"], "tool failed");
-  assert.equal(errorSpan.attributes.status_code, 500);
-});
-
-test("chain, LLM, tool, and retriever error callbacks mark spans as failed", () => {
-  resetProvider();
-  const handler = new RespanCallbackHandler();
-  const chainRunId = runId(91);
-  const llmRunId = runId(92);
-  const toolRunId = runId(93);
-  const retrieverRunId = runId(94);
-
-  handler.handleChainStart({ name: "chain" }, {}, chainRunId);
-  handler.handleChainError(new Error("chain failed"), chainRunId);
-  handler.handleLLMStart({ name: "llm" }, ["prompt"], llmRunId);
-  handler.handleLLMError(new Error("llm failed"), llmRunId);
-  handler.handleToolStart({ name: "tool" }, "input", toolRunId);
-  handler.handleToolError(new Error("tool failed"), toolRunId);
-  handler.handleRetrieverStart({ name: "retriever" }, "query", retrieverRunId);
-  handler.handleRetrieverError(new Error("retriever failed"), retrieverRunId);
-
-  assert.deepEqual(
-    captured.map((span) => span.status.code),
-    [2, 2, 2, 2],
-  );
-  assert.deepEqual(
-    captured.map((span) => span.attributes["error.message"]),
-    ["chain failed", "llm failed", "tool failed", "retriever failed"],
-  );
-  assert.deepEqual(
-    captured.map((span) => span.attributes.status_code),
-    [500, 500, 500, 500],
-  );
-});
-
-test("agent action, agent end, and custom event emit event spans", () => {
-  resetProvider();
-  const handler = new RespanCallbackHandler();
-  const chainRunId = runId(10);
-
-  handler.handleChainStart({ name: "agent_chain" }, {}, chainRunId);
-  handler.handleAgentAction(
-    { tool: "search", toolInput: { q: "respan" }, log: "searching" },
-    chainRunId,
-  );
-  handler.handleAgentEnd({ returnValues: { output: "done" } }, chainRunId);
-  handler.handleCustomEvent("custom_step", { value: 1 }, chainRunId);
-  handler.handleChainEnd({ done: true }, chainRunId);
-
-  const [toolSpan, agentSpan, eventSpan, chainSpan] = captured;
-  assert.equal(toolSpan.attributes["respan.entity.log_type"], "tool");
-  assert.equal(toolSpan.attributes["gen_ai.tool.name"], "search");
-  assert.equal(agentSpan.attributes["respan.entity.log_type"], "agent");
-  assert.equal(eventSpan.name, "custom_step");
-  assert.equal(eventSpan.attributes["respan.entity.log_type"], "task");
-  assert.equal(chainSpan.attributes["respan.entity.log_type"], "workflow");
-  assert.deepEqual(
-    [toolSpan, agentSpan, eventSpan, chainSpan].map(
-      (span) => span.attributes["traceloop.workflow.name"],
+  context.with(suppressTracing(context.active()), () =>
+    assert.equal(
+      JSON.parse(span.attributes["traceloop.entity.input"]).input,
+      "visible",
     ),
-    ["agent_chain", "agent_chain", "agent_chain", "agent_chain"],
   );
+  parent.end();
 });
-
-test("pure helpers normalize messages, usage, serializable values, and tool definitions", () => {
-  const circular = { name: "root" };
-  circular.self = circular;
-  const serialized = toSerializableValue({
-    createdAt: new Date("2026-05-08T00:00:00.000Z"),
-    count: 1n,
-    circular,
-  });
-  assert.deepEqual(serialized, {
-    createdAt: "2026-05-08T00:00:00.000Z",
-    count: "1",
-    circular: {
-      name: "root",
-      self: "[Circular]",
-    },
-  });
-
-  assert.deepEqual(
-    normalizeChatMessages([{ type: "human", content: "hello" }]),
-    [[{ role: "user", content: "hello" }]],
-  );
-
-  assert.deepEqual(
-    extractUsage({
-      llmOutput: {
-        tokenUsage: {
-          promptTokens: "10",
-          completionTokens: 5.8,
-        },
-      },
-    }),
-    {
-      promptTokens: 10,
-      completionTokens: 5,
-      totalTokens: 15,
-    },
-  );
-  assert.deepEqual(extractUsage({ usage: { total_tokens: "7" } }), {
-    totalTokens: 7,
-  });
-  assert.deepEqual(extractUsage({}), {});
-
-  const langChainStyleTool = {
-    name: "search",
-    description: "Search docs",
-    schema: {
-      type: "object",
-      properties: { query: { type: "string" } },
-    },
-  };
-  const openAiStyleTool = {
+test("released ChatOpenAI native HTTP transport maps input, output, provider usage and full tools", async () => {
+  reset();
+  let request;
+  const model = fixtureModel({ tools: true, fetchHook: (x) => (request = x) });
+  const tools = Array.from({ length: 80 }, (_, i) => ({
     type: "function",
     function: {
-      name: "route",
-      parameters: { type: "object" },
+      name: i === 0 ? "lookup" : `lookup_${i}`,
+      description: "fixture",
+      parameters: { type: "object", properties: { value: { type: "number" } } },
+    },
+  }));
+  const messages = Array.from(
+    { length: 80 },
+    (_, i) =>
+      new HumanMessage(
+        i === 79
+          ? [
+              { type: "text", text: "last message" },
+              {
+                type: "image_url",
+                image_url: { url: "data:image/png;base64,AAAA" },
+              },
+            ]
+          : `message_${i}`,
+      ),
+  );
+  const response = await model
+    .bindTools(tools)
+    .invoke(messages, { callbacks: [handler()] });
+  assert.equal(response.tool_calls[0].id, "call_native_fixture");
+  assert.equal(request.tools.length, 80);
+  const a = attrs("chat");
+  assert.equal(JSON.parse(a["llm.request.functions"]).length, 80);
+  assert.equal(JSON.parse(a["traceloop.entity.input"])[0].length, 80);
+  assert.equal(
+    JSON.parse(a["traceloop.entity.output"])[0][0].tool_calls[0].id,
+    "call_native_fixture",
+  );
+  assert.equal(a["gen_ai.completion.0.role"], "assistant");
+  const min = requireNative("@langchain/core/package.json").version === "0.2.0";
+  assert.equal(a["gen_ai.usage.input_tokens"], min ? undefined : 0);
+  assert.equal(a["llm.usage.total_tokens"], min ? undefined : 0);
+  assert.equal(a["gen_ai.request.model"], "fixture-model");
+  noAliases(a);
+});
+test("released ChatOpenAI native SSE preserves chunks, stream methods and final text", async () => {
+  reset();
+  const stream = await fixtureModel().stream("native stream", {
+    callbacks: [handler()],
+  });
+  assert.equal(typeof stream.next, "function");
+  assert.equal(typeof stream.return, "function");
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  assert.equal(chunks.map((c) => c.content).join(""), "fixture result");
+  const a = attrs("chat");
+  assert.ok(a);
+  assert.equal(
+    JSON.parse(a["traceloop.entity.output"])[0][0].content,
+    "fixture result",
+  );
+});
+test("released model errors keep native identity and never fabricate success/status/output", async () => {
+  reset();
+  const cb = handler();
+  let callbackError;
+  const observer = {
+    name: "observer",
+    handleLLMError(error) {
+      callbackError = error;
     },
   };
-
-  assert.deepEqual(
-    extractTools({
-      serialized: { kwargs: { tools: [langChainStyleTool] } },
-      extraParams: { invocation_params: { tools: [openAiStyleTool] } },
+  await assert.rejects(
+    fixtureModel({ error: true }).invoke("native error", {
+      callbacks: [cb, observer],
     }),
-    [
-      openAiStyleTool,
-      {
-        type: "function",
-        function: {
-          name: "search",
-          description: "Search docs",
-          parameters: {
-            type: "object",
-            properties: { query: { type: "string" } },
-          },
-        },
-      },
-    ],
+    (error) => error === callbackError,
   );
-  assert.deepEqual(
-    extractToolNamesFromSerialized({ kwargs: { tools: [langChainStyleTool] } }),
-    ["search"],
-  );
-  assert.equal(extractTools({ serialized: { tools: ["bad-tool"] } }), undefined);
+  const span = captured[0];
+  assert.equal(span.status.code, SpanStatusCode.ERROR);
+  assert.equal(span.attributes["http.response.status_code"], 429);
+  assert.equal(span.attributes["traceloop.entity.output"], undefined);
+  assert.equal(span.attributes["gen_ai.completion.0.content"], undefined);
+  noAliases(span.attributes);
 });
+test("released tools preserve actual execution input/output and callback invocation ID when supported", async () => {
+  reset();
+  const tool = new DynamicTool({
+    name: "lookup",
+    description: "fixture",
+    func: async () => "",
+  });
+  const version = requireNative("@langchain/core/package.json").version;
+  if (version.startsWith("0.2."))
+    await tool.invoke("native argument", { callbacks: [handler()] });
+  else
+    await tool.invoke(
+      {
+        type: "tool_call",
+        id: "call_native_execution",
+        name: "lookup",
+        args: {},
+      },
+      { callbacks: [handler()] },
+    );
+  const a = attrs("tool");
+  assert.equal(JSON.parse(a["traceloop.entity.input"]).name, "lookup");
+  assert.equal(a["traceloop.entity.output"], '""');
+  if (!version.startsWith("0.2."))
+    assert.equal(a["gen_ai.tool.call.id"], "call_native_execution");
+  noAliases(a);
+});
+test("native RunnableLambda failure preserves exact error and drain after deactivation", async () => {
+  reset();
+  const error = new Error("native runnable failure");
+  await assert.rejects(
+    RunnableLambda.from(() => {
+      throw error;
+    }).invoke("x", { callbacks: [handler()] }),
+    (value) => value === error,
+  );
+  assert.equal(captured[0].status.code, 2);
+  reset();
+  let release;
+  const wait = new Promise((resolve) => (release = resolve));
+  const inst = new LangChainInstrumentor();
+  inst.activate();
+  const result = RunnableLambda.from(async () => {
+    await wait;
+    return 0;
+  }).invoke("x", inst.addCallback());
+  await new Promise((resolve) => setImmediate(resolve));
+  inst.deactivate();
+  release();
+  assert.equal(await result, 0);
+  assert.equal(captured.length, 1);
+  assert.equal(
+    JSON.parse(captured[0].attributes["traceloop.entity.output"]).output,
+    0,
+  );
+});
+test("shared callback owners stay active until the final deactivation", async () => {
+  reset();
+  const cb = handler();
+  const first = new LangChainInstrumentor({ callbackHandler: cb });
+  first.activate();
+  const second = new LangChainInstrumentor({ callbackHandler: cb });
+  await RunnableLambda.from((x) => x).invoke(1, first.addCallback());
+  assert.equal(captured.length, 1);
+  second.activate();
+  first.deactivate();
+  await RunnableLambda.from((x) => x).invoke(2, second.addCallback());
+  assert.equal(captured.length, 2);
+  second.deactivate();
+  await RunnableLambda.from((x) => x).invoke(3, second.addCallback());
+  assert.equal(captured.length, 2);
+});
+test("a non-recording parent does not preempt the actual child sampler", async () => {
+  reset();
+  decision = 0;
+  const parent = trace.getTracer("parent").startSpan("dropped_parent");
+  decision = 2;
+  await context.with(trace.setSpan(context.active(), parent), () =>
+    RunnableLambda.from((x) => x).invoke("admitted child", {
+      callbacks: [handler()],
+    }),
+  );
+  assert.equal(calls, 2);
+  assert.ok(attrs("workflow")["traceloop.entity.input"]);
+});
+test("late guarded parent veto removes captured descendants without restoration", async () => {
+  reset();
+  const cb = handler();
+  let root;
+  onStart = (span) => {
+    if (span.name === "late_parent") root = span;
+  };
+  const child = RunnableLambda.from((x) => {
+    root.setAttribute("allow_trace_content", false);
+    return x;
+  });
+  await RunnableSequence.from([RunnableLambda.from((x) => x), child]).invoke(
+    "private after start",
+    { callbacks: [cb], runName: "late_parent" },
+  );
+  root.setAttribute("allow_trace_content", true);
+  for (const span of captured) {
+    assert.equal(span.attributes["traceloop.entity.input"], undefined);
+    assert.equal(span.attributes["traceloop.entity.output"], undefined);
+  }
+});
+test("native missing provider usage stays absent and partial streams never fabricate errors", async () => {
+  reset();
+  await fixtureModel({ usage: false }).invoke("no usage", {
+    callbacks: [handler()],
+  });
+  const a = attrs("chat");
+  assert.equal(a["gen_ai.usage.input_tokens"], undefined);
+  assert.equal(a["llm.usage.total_tokens"], undefined);
+  reset();
+  const inst = new LangChainInstrumentor();
+  inst.activate();
+  let pending;
+  onStart = (span) => {
+    pending = span;
+  };
+  const stream = await fixtureModel().stream(
+    "cancel stream",
+    inst.addCallback(),
+  );
+  const first = await stream.next();
+  assert.equal(first.done, false);
+  await stream.return();
+  for (const span of captured)
+    assert.equal(span.attributes.status_code, undefined);
+});
+test("released tool output preserves a 5001-value vector without translator truncation", async () => {
+  reset();
+  const vector = Array.from({ length: 5001 }, (_, i) => i / 5001);
+  const tool = new DynamicTool({
+    name: "vector",
+    description: "fixture",
+    func: async () => JSON.stringify(vector),
+  });
+  await tool.invoke("x", { callbacks: [handler()] });
+  const text = JSON.parse(attrs("tool")["traceloop.entity.output"]);
+  assert.equal(JSON.parse(text).length, 5001);
+});
+test("a dropped native callback parent does not revoke a child sampled by the real sampler", async () => {
+  reset();
+  samplerOverride = (name) => (name === "dropped_native_parent" ? 0 : 2);
+  await RunnableSequence.from([
+    RunnableLambda.from((x) => x),
+    RunnableLambda.from((x) => x),
+  ]).invoke("sampled child payload", {
+    callbacks: [handler()],
+    runName: "dropped_native_parent",
+  });
+  assert.equal(calls, 3);
+  assert.equal(captured.length, 2);
+  for (const span of captured)
+    assert.ok(span.attributes["traceloop.entity.input"]);
+});
+test("late canonical context veto on the actual span is immutable", async () => {
+  reset();
+  let actual;
+  onStart = (span) => {
+    actual = span;
+  };
+  await RunnableLambda.from((value) => {
+    context.with(
+      context.active().setValue(CONTEXT_KEY_ALLOW_TRACE_CONTENT, false),
+      () => actual.setAttribute("late.payload", "controlled late payload"),
+    );
+    context.with(
+      context.active().setValue(CONTEXT_KEY_ALLOW_TRACE_CONTENT, true),
+      () => actual.setAttribute("traceloop.entity.input", "cannot restore"),
+    );
+    return value;
+  }).invoke("initial capture", { callbacks: [handler()] });
+  assert.equal(captured.length, 1);
+  assert.equal(actual.attributes["traceloop.entity.input"], undefined);
+  assert.equal(actual.attributes["traceloop.entity.output"], undefined);
+  assert.equal(actual.attributes["late.payload"], undefined);
+});
+test.after(() => provider.shutdown());

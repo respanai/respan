@@ -1,0 +1,8 @@
+{
+  "summary": "Support current LangChain, LlamaIndex, and MCP native SDK APIs with sampled spans, preserved native behavior, complete content, and immutable capture controls",
+  "packages": {
+    "@respan/instrumentation-langchain": "minor",
+    "@respan/instrumentation-llama-index": "minor",
+    "@respan/instrumentation-mcp": "minor"
+  }
+}

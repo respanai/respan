@@ -4,7 +4,7 @@
  *
  * The JavaScript LangChain ecosystem uses callback handlers for chain, tool,
  * retriever, LLM, and graph lifecycle events. This package provides a Respan
- * callback handler that emits ReadableSpan objects into the active
+ * callback handler that emits native OpenTelemetry spans into the active
  * `@respan/tracing` OpenTelemetry pipeline.
  */
 
@@ -39,14 +39,17 @@ export class LangChainInstrumentor {
     this.callbackHandler =
       options.callbackHandler ??
       getCallbackHandler(options.callbackHandlerOptions);
+    this.callbackHandler._setActive(false, this);
   }
 
   activate(): void {
     this._active = true;
+    this.callbackHandler._setActive(true, this);
   }
 
   deactivate(): void {
     this._active = false;
+    this.callbackHandler._setActive(false, this);
   }
 
   isActive(): boolean {
