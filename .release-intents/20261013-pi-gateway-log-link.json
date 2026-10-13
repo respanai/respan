@@ -1,0 +1,6 @@
+{
+  "summary": "pi: an LLM call answered by the Respan gateway links its chat span to the gateway's log row (`respan.gateway.log_id`, from the `X-Respan-Log-Id` header pi passes to `after_provider_response`) and exports no usage or content of its own, so the call is counted once. Also fixes 0.2.0 exporting no spans at all when @respan/tracing's NodeSDK resolves a different @opentelemetry/sdk-trace-base copy than this package (the usual npm install).",
+  "packages": {
+    "@respan/instrumentation-pi": "minor"
+  }
+}

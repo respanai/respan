@@ -54,7 +54,7 @@
     "@opentelemetry/core": "^2.10.0",
     "@opentelemetry/sdk-trace-base": "^2.10.0",
     "@opentelemetry/semantic-conventions": "^1.43.0",
-    "@respan/respan-sdk": "^1.2.0",
+    "@respan/respan-sdk": "^1.4.0",
     "@respan/tracing": "^1.3.0",
     "@traceloop/ai-semantic-conventions": "^0.13.0"
   },

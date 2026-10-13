@@ -6265,7 +6265,7 @@ __metadata:
     "@opentelemetry/core": "npm:^2.10.0"
     "@opentelemetry/sdk-trace-base": "npm:^2.10.0"
     "@opentelemetry/semantic-conventions": "npm:^1.43.0"
-    "@respan/respan-sdk": "npm:^1.2.0"
+    "@respan/respan-sdk": "npm:^1.4.0"
     "@respan/tracing": "npm:^1.3.0"
     "@traceloop/ai-semantic-conventions": "npm:^0.13.0"
     "@types/node": "npm:^22.15.29"
@@ -6451,7 +6451,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@respan/respan-sdk@npm:^1.0.0, @respan/respan-sdk@npm:^1.1.4, @respan/respan-sdk@npm:^1.1.7, @respan/respan-sdk@npm:^1.2.0, @respan/respan-sdk@npm:^1.3.2, @respan/respan-sdk@npm:^1.3.4, @respan/respan-sdk@workspace:^, @respan/respan-sdk@workspace:respan-sdk":
+"@respan/respan-sdk@npm:^1.0.0, @respan/respan-sdk@npm:^1.1.4, @respan/respan-sdk@npm:^1.1.7, @respan/respan-sdk@npm:^1.2.0, @respan/respan-sdk@npm:^1.3.2, @respan/respan-sdk@npm:^1.3.4, @respan/respan-sdk@npm:^1.4.0, @respan/respan-sdk@workspace:^, @respan/respan-sdk@workspace:respan-sdk":
   version: 0.0.0-use.local
   resolution: "@respan/respan-sdk@workspace:respan-sdk"
   dependencies:

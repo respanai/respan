@@ -78,6 +78,19 @@ const STATUS_CODE_ATTR = "status_code";
 const ERROR_MESSAGE_ATTR = "error.message";
 const LLM_USAGE_CACHE_READ_INPUT_TOKENS = "llm.usage.cache_read_input_tokens";
 const GEN_AI_PROMPT_PREFIX = SpanAttributes.LLM_PROMPTS;
+const RESPAN_LOG_ID_RESPONSE_HEADER = "x-respan-log-id";
+const GATEWAY_LINKED_DROPPED_PREFIXES = [
+  "gen_ai.usage.",
+  "llm.usage.",
+  `${SpanAttributes.LLM_PROMPTS}.`,
+  `${SpanAttributes.LLM_COMPLETIONS}.`,
+];
+const GATEWAY_LINKED_DROPPED_KEYS = new Set([
+  SpanAttributes.TRACELOOP_ENTITY_INPUT,
+  SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+  metadataKey("estimated_cost_usd"),
+  metadataKey("reasoning_tokens"),
+]);
 const GEN_AI_COMPLETION_PREFIX = SpanAttributes.LLM_COMPLETIONS;
 const INTERRUPTED_MESSAGE = "Interrupted before completion";
 const SHUTDOWN_MESSAGE = "Session shut down before the agent run completed";
@@ -186,6 +199,8 @@ interface PendingLlm {
   firstTokenTime?: HrTime;
   truncated: boolean;
   turnIndex?: number;
+  /** `X-Respan-Log-Id` of the Respan gateway call that served this LLM call. */
+  gatewayLogId?: string;
 }
 
 interface PendingTool {
@@ -380,6 +395,7 @@ export class PiSessionTracer {
       "errorMessage",
       "finalError",
       "model",
+      "headers",
     ]) {
       const value = own(event, field);
       if (value !== undefined) snapshot[field] = value;
@@ -590,6 +606,20 @@ export class PiSessionTracer {
     }
     pending.policy.observe();
     return pending.policy.recording && pending.policy.content;
+  }
+
+  /**
+   * Extension mode only (`after_provider_response`): when the Respan gateway
+   * served the pending LLM call, remember its log id. The chat span then links
+   * to that gateway log instead of carrying usage and content, so the call is
+   * counted once.
+   */
+  onProviderResponse(headers: unknown): void {
+    const pending = this.run?.pendingLlm.at(-1);
+    const gatewayLogId = headerLogId(headers);
+    if (pending && gatewayLogId) {
+      pending.gatewayLogId = gatewayLogId;
+    }
   }
 
   onContext(messages: unknown, options: PiContextOptions = {}): void {
@@ -1299,6 +1329,9 @@ export class PiSessionTracer {
     if (capture.truncated) {
       attrs[metadataKey("truncated")] = true;
     }
+    if (pending.gatewayLogId) {
+      linkToGatewayLog(attrs, pending.gatewayLogId);
+    }
 
     this.emitSpan({
       name: "pi.chat",
@@ -1895,6 +1928,33 @@ function addStatusAttributes(
   if (errorMessage) {
     attrs[ERROR_MESSAGE_ATTR] = errorMessage;
   }
+}
+
+function headerLogId(headers: unknown): string | undefined {
+  if (!isRecord(headers)) return undefined;
+  for (const name of Object.keys(headers)) {
+    if (name.toLowerCase() === RESPAN_LOG_ID_RESPONSE_HEADER) {
+      return nonEmptyString(own(headers, name));
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The gateway already logged this call with its usage, cost and content; the
+ * span keeps only its place in the trace plus the link. The backend estimates
+ * tokens from content when usage is absent, so content goes too.
+ */
+function linkToGatewayLog(attrs: Attrs, gatewayLogId: string): void {
+  for (const key of Object.keys(attrs)) {
+    if (
+      GATEWAY_LINKED_DROPPED_PREFIXES.some((prefix) => key.startsWith(prefix)) ||
+      GATEWAY_LINKED_DROPPED_KEYS.has(key)
+    ) {
+      delete attrs[key];
+    }
+  }
+  attrs[RespanSpanAttributes.RESPAN_GATEWAY_LOG_ID] = gatewayLogId;
 }
 
 function addUsageAttributes(attrs: Attrs, usage: unknown): void {
