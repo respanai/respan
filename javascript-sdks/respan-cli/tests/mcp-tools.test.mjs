@@ -8,7 +8,7 @@ import { resolveMcpUrl } from '../dist/lib/mcp-client.js';
 
 const exec = promisify(execFile);
 const cli = resolve('bin/run.js');
-const tool = (name) => ({ name, description: name, inputSchema: { type: 'object', properties: {} } });
+const tool = (name) => ({ name, description: name, inputSchema: { type: 'object', properties: {} }, _meta: { 'respan/category': name.startsWith('trace') ? 'traces' : 'logs' } });
 
 test('MCP commands use live schemas, follow pagination, and forward exact arguments', async () => {
   const requests = [];
@@ -36,6 +36,12 @@ test('MCP commands use live schemas, follow pagination, and forward exact argume
   try {
     const list = await exec(process.execPath, [cli, 'tools', 'list', '--mcp-url', url, '--json'], options);
     assert.deepEqual(JSON.parse(list.stdout).map((t) => t.name), ['log_list', 'trace_get']);
+    const filtered = await exec(process.execPath, [cli, 'tools', 'list', '--mcp-url', url, '--category', 'traces', '--json'], options);
+    assert.deepEqual(JSON.parse(filtered.stdout).map((t) => t.name), ['trace_get']);
+    assert.equal(JSON.parse(filtered.stdout)[0]._meta['respan/category'], 'traces');
+    const categories = await exec(process.execPath, [cli, 'tools', 'list', '--mcp-url', url, '--categories', '--json'], options);
+    assert.deepEqual(JSON.parse(categories.stdout), [{ category: 'logs', tool_count: 1 }, { category: 'traces', tool_count: 1 }]);
+    await assert.rejects(exec(process.execPath, [cli, 'tools', 'list', '--mcp-url', url, '--category', 'unknown'], options), /Unknown category/);
     const input = { page_size: 7, environment: 'test', filters: [{ field: 'latency', operator: 'gt', value: [5] }] };
     const call = await exec(process.execPath, [cli, 'tools', 'call', 'log_list', '--mcp-url', url, '--input', JSON.stringify(input)], options);
     assert.deepEqual(JSON.parse(JSON.parse(call.stdout).content[0].text), input);

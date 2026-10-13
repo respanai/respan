@@ -1,0 +1,6 @@
+{
+  "packages": {
+    "@respan/cli": "minor"
+  },
+  "summary": "Discover and filter shared MCP tool categories without maintaining a separate CLI catalog."
+}
