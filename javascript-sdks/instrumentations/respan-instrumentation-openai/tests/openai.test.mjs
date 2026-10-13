@@ -752,6 +752,92 @@ test("real OpenAI SDK compatibility matrix", async (t) => {
   }
 });
 
+const GATEWAY_LOG_ID = "4f1c1b0e5c8a4d3e9b7a6f5e4d3c2b1a";
+
+function gatewayClientFor(OpenAI, payload, { stream = false, status = 200, logId = GATEWAY_LOG_ID } = {}) {
+  return new OpenAI({
+    apiKey: "fixture-key",
+    maxRetries: 0,
+    fetch: async () =>
+      new Response(
+        stream
+          ? payload.map((item) => `data: ${JSON.stringify(item)}\n\n`).join("") +
+              "data: [DONE]\n\n"
+          : JSON.stringify(payload),
+        {
+          status,
+          headers: {
+            "content-type": stream ? "text/event-stream" : "application/json",
+            ...(logId ? { "x-respan-log-id": logId } : {}),
+          },
+        },
+      ),
+  });
+}
+
+function assertLinkOnly(attrs) {
+  assert.equal(attrs["respan.gateway.log_id"], GATEWAY_LOG_ID);
+  const leaked = Object.keys(attrs).filter(
+    (key) =>
+      key.startsWith("gen_ai.usage.") ||
+      key.startsWith("llm.usage.") ||
+      key.startsWith("gen_ai.prompt.") ||
+      key.startsWith("gen_ai.completion.") ||
+      key === "traceloop.entity.input" ||
+      key === "traceloop.entity.output",
+  );
+  assert.deepEqual(leaked, [], "a linked span carries no usage or content");
+}
+
+test("a Respan gateway response links the span instead of re-reporting it", async (t) => {
+  for (const moduleName of ["openai-v4", "openai-v5", "openai-v6", "openai-v7", "openai"]) {
+    await t.test(moduleName, async (t) => {
+      const sdk = await import(moduleName);
+      const OpenAI = sdk.default;
+      const instrumentor = new OpenAIInstrumentor({ openAI: sdk });
+      await instrumentor.activate();
+      t.after(() => instrumentor.deactivate());
+      t.beforeEach(() => exporter.reset());
+
+      await t.test("chat create", async () => {
+        const result = await gatewayClientFor(OpenAI, chatResult()).chat.completions.create(chatParams);
+        assert.equal(result.choices[0].message.content, "hello");
+        assertLinkOnly(onlySpan().attributes);
+      });
+
+      await t.test("chat stream", async () => {
+        const stream = await gatewayClientFor(
+          OpenAI,
+          [chatChunk({ role: "assistant", content: "hel" }), chatChunk({ content: "lo" }), chatChunk(null, { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 })],
+          { stream: true },
+        ).chat.completions.create({ ...chatParams, stream: true, stream_options: { include_usage: true } });
+        let text = "";
+        for await (const chunk of stream) text += chunk.choices[0]?.delta?.content ?? "";
+        assert.equal(text, "hello");
+        assertLinkOnly(onlySpan().attributes);
+      });
+
+      await t.test("error response", async () => {
+        await assert.rejects(
+          gatewayClientFor(OpenAI, { error: { message: "bad key", type: "invalid_request_error" } }, { status: 401 })
+            .chat.completions.create(chatParams),
+        );
+        const span = onlySpan();
+        assert.equal(span.status.code, SpanStatusCode.ERROR);
+        assertLinkOnly(span.attributes);
+      });
+
+      await t.test("a direct provider response keeps usage and content", async () => {
+        await gatewayClientFor(OpenAI, chatResult(), { logId: null }).chat.completions.create(chatParams);
+        const attrs = onlySpan().attributes;
+        assert.equal(attrs["respan.gateway.log_id"], undefined);
+        assert.equal(attrs["gen_ai.usage.input_tokens"], 10);
+        assert.equal(attrs["gen_ai.prompt.0.content"], "Say hello");
+      });
+    });
+  }
+});
+
 test("default resolution covers host ESM and CommonJS copies and Azure exclusion", async () => {
   exporter.reset();
   const sdk = await import("openai");

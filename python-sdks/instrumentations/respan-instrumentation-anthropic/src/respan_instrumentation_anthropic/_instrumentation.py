@@ -21,6 +21,11 @@ from respan_instrumentation_anthropic._constants import (
     SESSION_ERROR_EVENT,
     STREAM_METHOD_NAME,
 )
+from respan_instrumentation_anthropic import _gateway_link
+from respan_instrumentation_anthropic._gateway_link import (
+    GATEWAY_LOG_ID_SLOT,
+    gateway_log_id,
+)
 from respan_instrumentation_anthropic._managed_agents import (
     _wrap_async_events_stream,
     _wrap_sync_events_stream,
@@ -39,6 +44,8 @@ _original_sync_stream = None
 _original_async_stream = None
 _original_sync_events_stream = None
 _original_async_events_stream = None
+# (class, method) -> original, for the base clients' ``_process_response``.
+_original_process_responses: dict[tuple[type[Any], str], Any] = {}
 
 
 def _get_module_attr(module_path: str, attr_name: str) -> Any:
@@ -76,10 +83,19 @@ def _load_events_classes() -> tuple[type[Any], type[Any]]:
 
 
 def _emit_message_span_safely(
-    *, kwargs: dict[str, Any], message: Any, start_ns: int
+    *,
+    kwargs: dict[str, Any],
+    message: Any,
+    start_ns: int,
+    gateway_log_id: str | None = None,
 ) -> None:
     try:
-        _emit_message_spans(kwargs=kwargs, message=message, start_ns=start_ns)
+        _emit_message_spans(
+            kwargs=kwargs,
+            message=message,
+            start_ns=start_ns,
+            gateway_log_id=gateway_log_id,
+        )
     except Exception:
         logger.debug("Failed to build Anthropic span attrs", exc_info=True)
 
@@ -103,12 +119,19 @@ def _provider_status_code(exc: Exception) -> int:
     return 500
 
 
-def _emit_error_span(*, kwargs: dict[str, Any], start_ns: int, exc: Exception) -> None:
+def _emit_error_span(
+    *,
+    kwargs: dict[str, Any],
+    start_ns: int,
+    exc: BaseException,
+    gateway_log_id: str | None = None,
+) -> None:
     _emit_span(
         attrs=_build_error_attrs(kwargs=kwargs),
         start_ns=start_ns,
         error_message=str(exc),
         status_code=_provider_status_code(exc),
+        gateway_log_id=gateway_log_id,
     )
 
 
@@ -117,13 +140,27 @@ def _wrap_sync_create(original: Any) -> Any:
 
     def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
         start_ns = time.time_ns()
+        slot: list[str] = []
+        token = GATEWAY_LOG_ID_SLOT.set(slot)
         try:
             message = original(self, *args, **kwargs)
         except Exception as exc:
-            _emit_error_span(kwargs=kwargs, start_ns=start_ns, exc=exc)
+            _emit_error_span(
+                kwargs=kwargs,
+                start_ns=start_ns,
+                exc=exc,
+                gateway_log_id=gateway_log_id(slot, exc),
+            )
             raise
+        finally:
+            GATEWAY_LOG_ID_SLOT.reset(token)
 
-        _emit_message_span_safely(kwargs=kwargs, message=message, start_ns=start_ns)
+        _emit_message_span_safely(
+            kwargs=kwargs,
+            message=message,
+            start_ns=start_ns,
+            gateway_log_id=gateway_log_id(slot),
+        )
         return message
 
     return wrapper
@@ -134,13 +171,27 @@ def _wrap_async_create(original: Any) -> Any:
 
     async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
         start_ns = time.time_ns()
+        slot: list[str] = []
+        token = GATEWAY_LOG_ID_SLOT.set(slot)
         try:
             message = await original(self, *args, **kwargs)
         except Exception as exc:
-            _emit_error_span(kwargs=kwargs, start_ns=start_ns, exc=exc)
+            _emit_error_span(
+                kwargs=kwargs,
+                start_ns=start_ns,
+                exc=exc,
+                gateway_log_id=gateway_log_id(slot, exc),
+            )
             raise
+        finally:
+            GATEWAY_LOG_ID_SLOT.reset(token)
 
-        _emit_message_span_safely(kwargs=kwargs, message=message, start_ns=start_ns)
+        _emit_message_span_safely(
+            kwargs=kwargs,
+            message=message,
+            start_ns=start_ns,
+            gateway_log_id=gateway_log_id(slot),
+        )
         return message
 
     return wrapper
@@ -159,9 +210,15 @@ def _wrap_sync_stream(original: Any) -> Any:
             def __init__(self, cm: Any) -> None:
                 self._cm = cm
                 self._stream = None
+                self._slot: list[str] = []
 
             def __enter__(self) -> Any:
-                self._stream = self._cm.__enter__()
+                # The request is sent here: capture the gateway log id.
+                token = GATEWAY_LOG_ID_SLOT.set(self._slot)
+                try:
+                    self._stream = self._cm.__enter__()
+                finally:
+                    GATEWAY_LOG_ID_SLOT.reset(token)
                 return self._stream
 
             def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> Any:
@@ -175,12 +232,14 @@ def _wrap_sync_stream(original: Any) -> Any:
                             kwargs=kwargs,
                             message=final_message_getter(),
                             start_ns=start_ns,
+                            gateway_log_id=gateway_log_id(self._slot),
                         )
                     elif exc_val is not None:
                         _emit_error_span(
                             kwargs=kwargs,
                             start_ns=start_ns,
                             exc=exc_val,
+                            gateway_log_id=gateway_log_id(self._slot, exc_val),
                         )
                 except Exception:
                     logger.debug("Failed to emit stream span", exc_info=True)
@@ -207,9 +266,15 @@ def _wrap_async_stream(original: Any) -> Any:
             def __init__(self, cm: Any) -> None:
                 self._cm = cm
                 self._stream = None
+                self._slot: list[str] = []
 
             async def __aenter__(self) -> Any:
-                self._stream = await self._cm.__aenter__()
+                # The request is sent here: capture the gateway log id.
+                token = GATEWAY_LOG_ID_SLOT.set(self._slot)
+                try:
+                    self._stream = await self._cm.__aenter__()
+                finally:
+                    GATEWAY_LOG_ID_SLOT.reset(token)
                 return self._stream
 
             async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> Any:
@@ -223,12 +288,14 @@ def _wrap_async_stream(original: Any) -> Any:
                             kwargs=kwargs,
                             message=final_message_getter(),
                             start_ns=start_ns,
+                            gateway_log_id=gateway_log_id(self._slot),
                         )
                     elif exc_val is not None:
                         _emit_error_span(
                             kwargs=kwargs,
                             start_ns=start_ns,
                             exc=exc_val,
+                            gateway_log_id=gateway_log_id(self._slot, exc_val),
                         )
                 except Exception:
                     logger.debug("Failed to emit async stream span", exc_info=True)
@@ -240,6 +307,42 @@ def _wrap_async_stream(original: Any) -> Any:
         return _InstrumentedAsyncStream(cm=stream_cm)
 
     return wrapper
+
+
+def _patch_process_response() -> None:
+    """Read the Respan gateway's log id off every response (best effort)."""
+    try:
+        for class_name, wrap in (
+            (
+                _gateway_link.SYNC_BASE_CLIENT_CLASS,
+                _gateway_link.wrap_sync_process_response,
+            ),
+            (
+                _gateway_link.ASYNC_BASE_CLIENT_CLASS,
+                _gateway_link.wrap_async_process_response,
+            ),
+        ):
+            client_class = _get_module_attr(
+                module_path=_gateway_link.BASE_CLIENT_MODULE, attr_name=class_name
+            )
+            key = (client_class, _gateway_link.PROCESS_RESPONSE_METHOD)
+            if key in _original_process_responses:
+                continue
+            original = getattr(client_class, _gateway_link.PROCESS_RESPONSE_METHOD)
+            _original_process_responses[key] = original
+            setattr(client_class, _gateway_link.PROCESS_RESPONSE_METHOD, wrap(original))
+    except Exception:
+        logger.debug("Gateway log-id capture unavailable", exc_info=True)
+
+
+def _unpatch_process_response() -> None:
+    for key, original in list(_original_process_responses.items()):
+        client_class, method_name = key
+        try:
+            setattr(client_class, method_name, original)
+        except Exception:
+            logger.debug("Failed to restore %s", method_name, exc_info=True)
+        _original_process_responses.pop(key, None)
 
 
 class AnthropicInstrumentor:
@@ -319,6 +422,8 @@ class AnthropicInstrumentor:
             self.deactivate()
             return
 
+        _patch_process_response()
+
         try:
             Events, AsyncEvents = _load_events_classes()
 
@@ -379,6 +484,8 @@ class AnthropicInstrumentor:
                 _original_async_stream = None
         except Exception:
             logger.debug("Failed to restore Anthropic message methods", exc_info=True)
+
+        _unpatch_process_response()
 
         try:
             Events, AsyncEvents = _load_events_classes()

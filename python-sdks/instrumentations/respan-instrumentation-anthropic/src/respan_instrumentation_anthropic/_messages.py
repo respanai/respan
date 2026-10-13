@@ -23,6 +23,7 @@ from respan_sdk.constants.span_attributes import (
     LLM_USAGE_PROMPT_TOKENS,
     RESPAN_LOG_TYPE,
 )
+from respan_instrumentation_anthropic._gateway_link import link_to_gateway_log
 from respan_sdk.utils.data_processing.id_processing import (
     format_span_id,
     format_trace_id,
@@ -580,6 +581,7 @@ def _emit_span(
     span_id: str | None = None,
     end_ns: int | None = None,
     status_code: int = 200,
+    gateway_log_id: str | None = None,
 ) -> None:
     """Build a ReadableSpan and inject it into the OTEL pipeline."""
     try:
@@ -587,6 +589,8 @@ def _emit_span(
             attrs = dict(attrs)
             attrs.setdefault("error.message", error_message)
             attrs.setdefault("status_code", status_code if status_code >= 400 else 500)
+        if gateway_log_id:
+            attrs = link_to_gateway_log(attrs, gateway_log_id)
 
         resolved_trace_id = trace_id
         resolved_parent_id = parent_id
@@ -765,7 +769,12 @@ def _emit_resolved_tool_spans(
         )
 
 
-def _emit_message_spans(kwargs: dict[str, Any], message: Any, start_ns: int) -> None:
+def _emit_message_spans(
+    kwargs: dict[str, Any],
+    message: Any,
+    start_ns: int,
+    gateway_log_id: str | None = None,
+) -> None:
     """Emit chat spans and resolve tool spans once tool_result content is available."""
     normalized_tools = _format_tools(tools=kwargs.get(TOOLS_KEY))
     tool_calls = _extract_tool_calls(message=message)
@@ -780,6 +789,7 @@ def _emit_message_spans(kwargs: dict[str, Any], message: Any, start_ns: int) -> 
         trace_id=trace_id,
         parent_id=parent_id,
         span_id=chat_span_id,
+        gateway_log_id=gateway_log_id,
     )
 
     _emit_resolved_tool_spans(

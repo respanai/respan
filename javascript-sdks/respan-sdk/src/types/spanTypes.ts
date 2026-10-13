@@ -48,6 +48,9 @@ export enum RespanSpanAttributes {
     RESPAN_LOG_PARENT_ID = "respan.entity.log_parent_id",
     RESPAN_LOG_ROOT_ID = "respan.entity.log_root_id",
     RESPAN_LOG_SOURCE = "respan.entity.log_source",
+    // The Respan gateway's log row for this call (X-Respan-Log-Id): the span is
+    // a link only and reports no usage or content of its own.
+    RESPAN_GATEWAY_LOG_ID = "respan.gateway.log_id",
 
     // Respan metadata attributes (agent-specific)
     RESPAN_METADATA_AGENT_NAME = "respan.metadata.agent_name",

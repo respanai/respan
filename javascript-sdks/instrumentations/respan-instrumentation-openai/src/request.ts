@@ -23,6 +23,22 @@ import { RespanSpanAttributes } from "@respan/respan-sdk";
 
 export type Operation = "chat" | "text" | "responses" | "embedding";
 
+// The Respan gateway returns the unique_id of the log row it wrote for a call in
+// this response header. That row already carries the call's usage, cost and
+// content, so the span carries the id instead (a link only): reporting usage or
+// content here too would count the call twice (the server estimates tokens from
+// content when usage is absent). Mirrors respan_sdk RESPAN_GATEWAY_LOG_ID.
+export const RESPAN_LOG_ID_RESPONSE_HEADER = "x-respan-log-id";
+export const RESPAN_GATEWAY_LOG_ID = "respan.gateway.log_id";
+
+function headerLogId(headers: any): string | undefined {
+  const value =
+    typeof headers?.get === "function"
+      ? headers.get(RESPAN_LOG_ID_RESPONSE_HEADER)
+      : headers?.[RESPAN_LOG_ID_RESPONSE_HEADER];
+  return typeof value === "string" && value ? value : undefined;
+}
+
 export function observeRequest(
   original: any,
   receiver: any,
@@ -59,6 +75,7 @@ export function observeRequest(
   let ended = false;
   let removeAbortListener: (() => void) | undefined;
   const accumulator = new StreamAccumulator(operation);
+  let gatewayLogId: string | undefined;
   const safely = (callback: () => void) => {
     try {
       callback();
@@ -71,7 +88,17 @@ export function observeRequest(
     ended = true;
     removeAbortListener?.();
     safely(() => {
-      if (result !== undefined) {
+      if (error !== undefined && !gatewayLogId) {
+        gatewayLogId = headerLogId((error as { headers?: unknown })?.headers);
+      }
+      if (gatewayLogId) {
+        span.setAttribute(RESPAN_GATEWAY_LOG_ID, gatewayLogId);
+      } else {
+        // Request attributes are set here, not eagerly: a linked span must not
+        // carry the prompt.
+        setRequest(span, operation, params, Boolean(content));
+      }
+      if (result !== undefined && !gatewayLogId) {
         if (
           typeof params.model !== "string" &&
           typeof result.model === "string"
@@ -99,7 +126,6 @@ export function observeRequest(
     });
     span.end();
   };
-  safely(() => setRequest(span, operation, params, Boolean(content)));
 
   const seenStreams = new WeakSet<object>();
   const onResult = (result: any) => {
@@ -190,6 +216,15 @@ export function observeRequest(
       apiPromise._thenUnwrap = function (transform: any) {
         return decorate(unwrap.call(this, transform));
       };
+      // Read the gateway's log id as soon as headers arrive: this handler is
+      // registered before parse()'s, so it runs before the span finishes.
+      apiPromise.responsePromise.then(
+        (props: any) =>
+          safely(() => {
+            gatewayLogId ??= headerLogId(props?.response?.headers);
+          }),
+        () => undefined,
+      );
       // Observe transport rejection even when callers only use a derived parsing helper.
       apiPromise.responsePromise.catch((error: unknown) =>
         finish(undefined, error),
