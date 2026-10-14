@@ -22,7 +22,11 @@ test.after(async () => {
   await defaultProvider.shutdown();
 });
 const metadata = (span) =>
-  JSON.parse(span.attributes["respan.metadata"] ?? "{}");
+  Object.fromEntries(
+    Object.entries(span.attributes)
+      .filter(([key]) => key.startsWith("respan.metadata."))
+      .map(([key, value]) => [key.slice("respan.metadata.".length), value]),
+  );
 const byType = (spans, type) =>
   spans.filter((span) => span.attributes["respan.entity.log_type"] === type);
 const noContent = (span) => {
@@ -31,6 +35,7 @@ const noContent = (span) => {
   assert.equal(attrs["traceloop.entity.output"], undefined);
   assert.equal(attrs["llm.request.functions"], undefined);
   assert.equal(attrs["respan.metadata"], undefined);
+  assert.ok(!Object.keys(attrs).some((key) => key.startsWith("respan.metadata.")));
   assert.equal(attrs["error.message"], undefined);
   assert.ok(
     !Object.keys(attrs).some((key) =>
@@ -99,11 +104,7 @@ for (const extension of [false, true])
       JSON.parse(chat.attributes["traceloop.entity.output"]).content,
       result.output,
     );
-    assert.ok(
-      Object.keys(chat.attributes).every(
-        (key) => !key.startsWith("respan.metadata."),
-      ),
-    );
+    assert.equal(chat.attributes["respan.metadata"], undefined);
   });
 
 test("native tool execution retains full schema, 75-message history, current calls and full 5001-vector structured result", async () => {

@@ -1,0 +1,6 @@
+{
+  "summary": "pi: custom metadata, thread id and trace group reach the dashboard again (regressed in 0.2.0). Metadata is exported as flat `respan.metadata.<key>` attributes, the shape ingestion reads, instead of one JSON string it dropped. The pi SDK classes now load on first use instead of at import, where requiring pi's ES module mid-load threw ERR_REQUIRE_CYCLE_MODULE and left the session id unreadable, so spans had no thread or trace group and every run started a new trace.",
+  "packages": {
+    "@respan/instrumentation-pi": "patch"
+  }
+}

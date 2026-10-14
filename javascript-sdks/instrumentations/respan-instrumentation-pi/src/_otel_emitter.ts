@@ -1570,7 +1570,7 @@ export class PiSessionTracer {
     ) {
       merged[RespanSpanAttributes.RESPAN_THREADS_ID] = sessionId;
     }
-    canonicalMetadata(merged);
+    flatMetadata(merged);
     if (policy.sampledContext)
       Object.assign(span, { spanContext: () => policy.sampledContext });
     policy.guard(span);
@@ -2131,22 +2131,24 @@ const EVENT_FIELDS = [
   "level",
 ] as const;
 
-function canonicalMetadata(attributes: Attrs): void {
+/**
+ * Metadata goes on the wire as flat `respan.metadata.<key>` attributes: that is
+ * the only shape Respan ingestion collects. A bare JSON-string
+ * `respan.metadata` (e.g. propagated) is unpacked into flat keys; flat keys win.
+ */
+function flatMetadata(attributes: Attrs): void {
   const key = RespanSpanAttributes.RESPAN_METADATA;
-  let metadata: RecordValue = {};
   const current = attributes[key];
-  if (typeof current === "string") {
-    try {
-      const parsed = JSON.parse(current);
-      if (isRecord(parsed)) metadata = parsed;
-    } catch {
-      /* malformed metadata is omitted */
-    }
+  delete attributes[key];
+  if (typeof current !== "string") return;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(current);
+  } catch {
+    return; /* malformed metadata is omitted */
   }
-  for (const field of Object.keys(attributes)) {
-    if (!field.startsWith(`${key}.`)) continue;
-    metadata[field.slice(key.length + 1)] = attributes[field];
-    delete attributes[field];
-  }
-  if (Object.keys(metadata).length > 0) attributes[key] = safeJson(metadata);
+  if (!isRecord(parsed)) return;
+  for (const [field, value] of Object.entries(parsed))
+    if (attributes[metadataKey(field)] === undefined)
+      setMetadata(attributes, field, value);
 }

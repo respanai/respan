@@ -879,21 +879,33 @@ const nativeContextGetters = new WeakSet<Function>();
 const contextOwners = new Set<PiInstrumentor>();
 let contextPatch:
   { descriptor: PropertyDescriptor; wrapped: Function } | undefined;
-try {
+let nativeLoaded: boolean | undefined;
+/**
+ * Load the native SDK classes on first use, never at import: requiring pi's ES
+ * module while pi (or an app importing pi and this package) is still loading
+ * throws ERR_REQUIRE_CYCLE_MODULE, which used to leave every getter, including
+ * the session id, unreadable. Each module loads independently.
+ */
+function loadNative(): boolean {
+  if (nativeLoaded !== undefined) return nativeLoaded;
   const require = createRequire(import.meta.url);
   for (const moduleName of [
     "@earendil-works/pi-coding-agent",
     "@earendil-works/pi-agent-core",
   ]) {
-    const module = require(fileURLToPath(import.meta.resolve(moduleName)));
-    if (module.ExtensionRunner?.prototype)
-      nativeRunnerPrototype = module.ExtensionRunner.prototype;
-    for (const name of ["AgentSession", "Agent", "SessionManager"])
-      if (module[name]?.prototype)
-        nativePrototypes.push(module[name].prototype);
+    try {
+      const module = require(fileURLToPath(import.meta.resolve(moduleName)));
+      if (module.ExtensionRunner?.prototype)
+        nativeRunnerPrototype = module.ExtensionRunner.prototype;
+      for (const name of ["AgentSession", "Agent", "SessionManager"])
+        if (module[name]?.prototype)
+          nativePrototypes.push(module[name].prototype);
+    } catch {
+      /* The CLI extension can load without an installed SDK peer. */
+    }
   }
-} catch {
-  /* The CLI extension can load without an installed SDK peer. */
+  nativeLoaded = nativePrototypes.length > 0;
+  return nativeLoaded;
 }
 function sdkProperty(value: any, key: string): any {
   if (
@@ -911,9 +923,13 @@ function sdkProperty(value: any, key: string): any {
       const descriptor = Object.getOwnPropertyDescriptor(current, key);
       if (!descriptor) continue;
       if ("value" in descriptor) return descriptor.value;
+      // Without the native classes (no peer, or a Node that cannot require
+      // pi's ES module) native and customer getters are indistinguishable;
+      // read them rather than lose the session identity.
       if (
         descriptor.get &&
-        (nativeContextGetters.has(descriptor.get) ||
+        (!loadNative() ||
+          nativeContextGetters.has(descriptor.get) ||
           nativePrototypes.some(
             (prototype) =>
               Object.getOwnPropertyDescriptor(prototype, key)?.get ===
@@ -930,7 +946,7 @@ function sdkProperty(value: any, key: string): any {
 
 function observeNativeContexts(owner: PiInstrumentor): void {
   contextOwners.add(owner);
-  if (contextPatch || !nativeRunnerPrototype) return;
+  if (contextPatch || !loadNative() || !nativeRunnerPrototype) return;
   const descriptor = Object.getOwnPropertyDescriptor(
     nativeRunnerPrototype,
     "createContext",
