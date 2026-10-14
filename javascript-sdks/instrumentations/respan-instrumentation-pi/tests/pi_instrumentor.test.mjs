@@ -25,7 +25,11 @@ import {
 
 const captureState = { spans: [] };
 const metadata = (span) =>
-  JSON.parse(span.attributes["respan.metadata"] ?? "{}");
+  Object.fromEntries(
+    Object.entries(span.attributes)
+      .filter(([key]) => key.startsWith("respan.metadata."))
+      .map(([key, value]) => [key.slice("respan.metadata.".length), value]),
+  );
 const originalGetTracerProvider = trace.getTracerProvider.bind(trace);
 
 const nativeProvider = new BasicTracerProvider();

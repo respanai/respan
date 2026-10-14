@@ -36,7 +36,7 @@ Every owned span consults the configured OpenTelemetry SDK sampler before captur
 
 For extensions, a shared observer on the official `ExtensionRunner.createContext` records exact SDK getter identities and returns the native context unchanged. The last deactivation restores its method if it still owns the patch. This allows native lazy contexts while leaving customer-defined accessors passive.
 
-Metadata is exported in the canonical JSON attribute `respan.metadata`. References such as `respan.metadata.turn_number` below describe fields inside that object, not separate dotted attributes.
+Metadata is exported as flat attributes, one per key (`respan.metadata.turn_number`, `respan.metadata.agent_id`, ...), which is the shape Respan ingestion reads.
 
 ## Trace shape
 
@@ -149,7 +149,7 @@ no base URL is configured. Base URLs are normalized to end with `/api`.
 | `trace_scope`   | `"session"` \| `"run"` | One multi-root trace per pi session (default) or one trace per agent run — see [below](#one-trace-per-run-vs-one-trace-per-session) |
 | `customer_id`   | string                 | `respan.customer_params.customer_identifier` on every span                                                                          |
 | `project_id`    | string                 | Recorded as `respan.metadata.project_id`                                                                                            |
-| `metadata`      | object of strings      | Fields in the `respan.metadata` JSON object on every span                                                                           |
+| `metadata`      | object of strings      | Recorded as `respan.metadata.<key>` on every span                                                                                   |
 
 Example `~/.pi/agent/respan.json`:
 
