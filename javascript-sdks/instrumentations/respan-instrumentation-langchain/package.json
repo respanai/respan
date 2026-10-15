@@ -1,7 +1,7 @@
 {
   "name": "@respan/instrumentation-langchain",
   "type": "module",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Respan instrumentation plugin for LangChain, LangGraph, and Langflow",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

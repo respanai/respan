@@ -1,7 +1,7 @@
 {
   "name": "@respan/instrumentation-llama-index",
   "type": "module",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Respan instrumentation plugin for LlamaIndex TypeScript",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
