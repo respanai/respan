@@ -23,10 +23,11 @@ import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
-from functools import partial, wraps
+from functools import cache, partial, wraps
 from typing import Any
 
 from opentelemetry import context, trace
+from opentelemetry.semconv.attributes.exception_attributes import EXCEPTION_TYPE
 from opentelemetry.semconv_ai import (
     SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY,
     SpanAttributes,
@@ -49,12 +50,14 @@ from respan_tracing.core.tracer import RespanTracer
 from respan_instrumentation_browser_use._constants import (
     AGENT_MODULE,
     AGENT_NAME_DETAIL,
+    ANTHROPIC_USAGE_MODULES,
     ATTR_ACTION_NAME,
     ATTR_AGENT_ID,
     ATTR_PAGE_TITLE,
     ATTR_PAGE_URL,
     ATTR_SESSION_ID,
     ATTR_STEP_NUMBER,
+    EXCEPTION_EVENT,
     INSTRUMENTATION_NAME,
     PATCH_MARKER,
     SPAN_ACTION,
@@ -108,9 +111,13 @@ def _non_negative_int(value: Any) -> int | None:
     return None
 
 
-def _record_error(span: Any, error: BaseException) -> None:
+def _record_error(span: Any, error: BaseException, *, with_message: bool) -> None:
     span.set_status(Status(StatusCode.ERROR, type(error).__name__))
-    span.record_exception(error)
+    if with_message:
+        span.record_exception(error)
+    else:
+        # Provider and validation errors echo prompts and raw model output.
+        span.add_event(EXCEPTION_EVENT, {EXCEPTION_TYPE: type(error).__name__})
 
 
 class _Runtime:
@@ -162,7 +169,9 @@ class _Runtime:
         try:
             yield span
         except BaseException as error:
-            _safe(partial(_record_error, span, error))
+            _safe(
+                partial(_record_error, span, error, with_message=_content_allowed(self))
+            )
             raise
         finally:
             context.detach(token)
@@ -251,15 +260,15 @@ class _Runtime:
             return  # the step failed before browser-use recorded it
         item = items[-1]
         state = item.state
-        if state.url:
-            span.set_attribute(ATTR_PAGE_URL, state.url)
-        if state.title:
-            span.set_attribute(ATTR_PAGE_TITLE, state.title)
         # browser-use catches step failures and records them as result errors.
         if item.result and all(result.error for result in item.result):
             span.set_status(Status(StatusCode.ERROR, "step failed"))
         if not _content_allowed(self):
-            return
+            return  # URLs carry magic-link tokens and session ids in query strings
+        if state.url:
+            span.set_attribute(ATTR_PAGE_URL, state.url)
+        if state.title:
+            span.set_attribute(ATTR_PAGE_TITLE, state.title)
         span.set_attribute(
             SpanAttributes.TRACELOOP_ENTITY_INPUT,
             json_string({"url": state.url, "title": state.title}),
@@ -332,9 +341,34 @@ class _Runtime:
         def register_llm(service: Any, llm: Any, *args: Any, **kwargs: Any) -> Any:
             if runtime.active and llm is not None:
                 _safe(lambda: runtime.patch_llm_class(type(llm)))
-            return original(service, llm, *args, **kwargs)
+            result = original(service, llm, *args, **kwargs)
+            if runtime.active and llm is not None:
+                _safe(lambda: runtime.wrap_llm_instance(llm))
+            return result
 
         return register_llm
+
+    def wrap_llm_instance(self, llm: Any) -> None:
+        """Trace calls through the ainvoke browser-use stored on the instance.
+
+        TokenCost replaces ``llm.ainvoke`` with a closure over whatever bound method
+        existed when the model was first registered. A model registered before
+        activation (or before a deactivate/reactivate) therefore never reaches the
+        class patch; wrapping the instance attribute covers it, and _IN_LLM keeps
+        the class patch from opening a second span when both are on the path.
+        """
+        current = llm.__dict__.get("ainvoke")
+        if current is None or getattr(current, PATCH_MARKER, None) is self:
+            return
+        runtime = self
+
+        @wraps(current)
+        async def ainvoke(messages: Any, *args: Any, **kwargs: Any) -> Any:
+            return await runtime.traced_llm_call(llm, current, messages, args, kwargs)
+
+        setattr(ainvoke, PATCH_MARKER, self)
+        # Pydantic-backed models reject plain setattr; browser-use patches the same way.
+        object.__setattr__(llm, "ainvoke", ainvoke)
 
     def patch_llm_class(self, cls: type) -> None:
         # Patch the class that defines ainvoke, so subclasses share one wrapper.
@@ -349,20 +383,27 @@ class _Runtime:
 
         @wraps(original)
         async def ainvoke(llm: Any, messages: Any, *args: Any, **kwargs: Any) -> Any:
-            if not runtime.active or _IN_LLM.get():
-                return await original(llm, messages, *args, **kwargs)
-            with runtime.span(SPAN_LLM, LOG_TYPE_CHAT) as span:
-                _safe(lambda: runtime._llm_start(span, llm, messages))
-                in_llm = _IN_LLM.set(True)
-                try:
-                    with _suppress_provider_llm_spans():
-                        response = await original(llm, messages, *args, **kwargs)
-                finally:
-                    _IN_LLM.reset(in_llm)
-                _safe(lambda: runtime._llm_end(span, response))
-                return response
+            return await runtime.traced_llm_call(
+                llm, partial(original, llm), messages, args, kwargs
+            )
 
         return ainvoke
+
+    async def traced_llm_call(
+        self, llm: Any, call: Any, messages: Any, args: tuple, kwargs: dict
+    ) -> Any:
+        if not self.active or _IN_LLM.get():
+            return await call(messages, *args, **kwargs)
+        with self.span(SPAN_LLM, LOG_TYPE_CHAT) as span:
+            _safe(lambda: self._llm_start(span, llm, messages))
+            in_llm = _IN_LLM.set(True)
+            try:
+                with _suppress_provider_llm_spans():
+                    response = await call(messages, *args, **kwargs)
+            finally:
+                _IN_LLM.reset(in_llm)
+            _safe(lambda: self._llm_end(span, llm, response))
+            return response
 
     def _llm_start(self, span: Any, llm: Any, messages: Any) -> None:
         span.set_attribute(SpanAttributes.LLM_REQUEST_TYPE, "chat")
@@ -382,13 +423,21 @@ class _Runtime:
             if tool_calls := message.get("tool_calls"):
                 span.set_attribute(f"{prefix}.tool_calls", json_string(tool_calls))
 
-    def _llm_end(self, span: Any, response: Any) -> None:
+    def _llm_end(self, span: Any, llm: Any, response: Any) -> None:
         usage = getattr(response, "usage", None)
         if usage is not None:
+            prompt_tokens, total_tokens = usage.prompt_tokens, usage.total_tokens
+            if _reports_anthropic_usage(llm):
+                # browser-use's native Anthropic clients leave cache writes out of
+                # prompt_tokens (and all cache tokens out of total_tokens). Respan
+                # prices prompt_tokens as the full prompt minus both cache counts,
+                # so without this cache-write calls are under-billed.
+                prompt_tokens += usage.prompt_cache_creation_tokens or 0
+                total_tokens = prompt_tokens + usage.completion_tokens
             for value, key in (
-                (usage.prompt_tokens, SpanAttributes.LLM_USAGE_PROMPT_TOKENS),
+                (prompt_tokens, SpanAttributes.LLM_USAGE_PROMPT_TOKENS),
                 (usage.completion_tokens, SpanAttributes.LLM_USAGE_COMPLETION_TOKENS),
-                (usage.total_tokens, SpanAttributes.LLM_USAGE_TOTAL_TOKENS),
+                (total_tokens, SpanAttributes.LLM_USAGE_TOTAL_TOKENS),
                 (
                     usage.prompt_cached_tokens,
                     SpanAttributes.LLM_USAGE_CACHE_READ_INPUT_TOKENS,
@@ -411,6 +460,24 @@ class _Runtime:
         )
 
 
+@cache
+def _openai_suppressor() -> Callable[[], Any]:
+    # Optional dependency, resolved once: a failed import is not cached by Python.
+    try:
+        from respan_instrumentation_openai._instrumentation import (
+            suppress_openai_instrumentation,
+        )
+    except ImportError:
+        return nullcontext
+    return suppress_openai_instrumentation
+
+
+def _reports_anthropic_usage(llm: Any) -> bool:
+    return any(
+        owner.__module__ in ANTHROPIC_USAGE_MODULES for owner in type(llm).__mro__
+    )
+
+
 @contextmanager
 def _suppress_provider_llm_spans() -> Iterator[None]:
     """Provider SDK instrumentations would log the call this span already carries.
@@ -419,12 +486,7 @@ def _suppress_provider_llm_spans() -> Iterator[None]:
     instrumentation (used by browser-use's OpenAI, Azure and OpenRouter clients)
     has its own switch, entered the same way the LiteLLM instrumentation does.
     """
-    try:
-        from respan_instrumentation_openai._instrumentation import (
-            suppress_openai_instrumentation,
-        )
-    except ImportError:
-        suppress_openai_instrumentation = nullcontext
+    suppress_openai_instrumentation = _openai_suppressor()
     token = context.attach(
         context.set_value(SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY, True)
     )

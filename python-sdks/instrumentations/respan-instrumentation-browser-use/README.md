@@ -40,6 +40,10 @@ browser_use.agent          agent   task in; final result, success, steps, usage 
   call twice.
 - **Action failures.** browser-use returns action errors instead of raising them;
   those `tool` spans are marked as errors.
+- **Anthropic cache tokens.** browser-use's native Anthropic clients leave cache
+  writes out of `prompt_tokens`; they are added back so Respan prices the full prompt.
+- **Activation order.** Models registered by an Agent built before activation are
+  still traced.
 - **Secrets.** Action parameters are captured before browser-use substitutes
   `sensitive_data`, so secrets stay as their `<secret>name</secret>` placeholders.
 
@@ -47,7 +51,7 @@ browser_use.agent          agent   task in; final result, success, steps, usage 
 
 | Option | Default | Effect |
 |---|---|---|
-| `capture_content` | `True` | `False` keeps span structure, timings, URLs and token counts but drops the task, prompts, completions, action params and results. `TRACELOOP_TRACE_CONTENT=false` does the same. |
+| `capture_content` | `True` | `False` keeps span structure, timings, models, action names and token counts but drops the task, prompts, completions, action params and results, page URLs and titles, and exception messages (only the exception type is kept). `TRACELOOP_TRACE_CONTENT=false` does the same. |
 | `capture_screenshots` | `True` | `False` drops step screenshots and replaces inline images in prompts with a size placeholder. |
 
 ## Not yet covered

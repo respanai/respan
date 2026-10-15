@@ -25,6 +25,15 @@ ATTR_PAGE_URL = "browser_use.page.url"
 ATTR_PAGE_TITLE = "browser_use.page.title"
 ATTR_ACTION_NAME = "browser_use.action.name"
 
+# browser-use chat clients whose ChatInvokeUsage.prompt_tokens omits cache writes.
+# Matched by module, not provider name: ChatLiteLLM can also report "anthropic"
+# but LiteLLM's prompt_tokens already includes cache writes.
+ANTHROPIC_USAGE_MODULES = frozenset(
+    {"browser_use.llm.anthropic.chat", "browser_use.llm.aws.chat_anthropic"}
+)
+
+EXCEPTION_EVENT = "exception"
+
 # Placeholder for inline media dropped from captured content.
 IMAGE_PLACEHOLDER = "[image omitted: {media_type}, {size} base64 chars]"
 DATA_URL_PREFIX = "data:"

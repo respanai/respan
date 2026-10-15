@@ -12,10 +12,11 @@ packages = [
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
 browser-use = ">=0.13.0,<0.14.0"
-respan-tracing = "^2.17.0"
-respan-sdk = ">=2.6.26"
+respan-tracing = ">=2.20.0,<3.0.0"
+respan-sdk = ">=2.7.6"
 opentelemetry-api = ">=1.38.0,<2.0.0"
 opentelemetry-semantic-conventions-ai = ">=0.4.1"
+opentelemetry-semantic-conventions = ">=0.59b0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=8.0.0"

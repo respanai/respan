@@ -19,6 +19,7 @@ from browser_use.llm.messages import (
     SystemMessage,
     UserMessage,
 )
+from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
 from browser_use.tokens.service import TokenCost
 from browser_use.tools.service import Tools
 from opentelemetry import context
@@ -38,6 +39,7 @@ from respan_instrumentation_browser_use._constants import (
     ATTR_PAGE_URL,
     ATTR_STEP_NUMBER,
 )
+from respan_instrumentation_browser_use._instrumentation import _openai_suppressor
 
 from .conftest import ScriptedLLM
 
@@ -163,12 +165,106 @@ async def test_respan_openai_instrumentation_is_suppressed(
         "respan_instrumentation_openai",
         types.ModuleType("respan_instrumentation_openai"),
     )
+    _openai_suppressor.cache_clear()  # resolved once per process by design
     llm = ScriptedLLM(["ok"])
     TokenCost().register_llm(llm)
-
-    await llm.ainvoke(_MESSAGES)
+    try:
+        await llm.ainvoke(_MESSAGES)
+    finally:
+        _openai_suppressor.cache_clear()
 
     assert entered == [True]
+
+
+async def test_native_anthropic_usage_counts_cache_writes_as_prompt(
+    exporter, instrumentor
+):
+    class AnthropicShaped(ScriptedLLM):
+        async def ainvoke(self, messages, output_format=None, **kwargs):
+            # Mirrors browser_use.llm.anthropic.chat: prompt = input + cache_read.
+            return ChatInvokeCompletion(
+                completion="ok",
+                usage=ChatInvokeUsage(
+                    prompt_tokens=100 + 20,
+                    prompt_cached_tokens=20,
+                    prompt_cache_creation_tokens=500,
+                    prompt_image_tokens=None,
+                    completion_tokens=30,
+                    total_tokens=100 + 30,
+                ),
+            )
+
+    AnthropicShaped.__module__ = "browser_use.llm.anthropic.chat"
+    llm = AnthropicShaped([])
+    TokenCost().register_llm(llm)
+    await llm.ainvoke(_MESSAGES)
+
+    (span,) = _by_name(exporter, "browser_use.llm")
+    assert span.attributes[SpanAttributes.LLM_USAGE_PROMPT_TOKENS] == 620
+    assert span.attributes[SpanAttributes.LLM_USAGE_TOTAL_TOKENS] == 650
+    assert span.attributes[SpanAttributes.LLM_USAGE_CACHE_CREATION_INPUT_TOKENS] == 500
+
+
+async def test_other_clients_usage_is_passed_through(exporter, instrumentor):
+    # LiteLLM-style usage already includes cache writes in prompt_tokens.
+    class LiteLLMShaped(ScriptedLLM):
+        async def ainvoke(self, messages, output_format=None, **kwargs):
+            return ChatInvokeCompletion(
+                completion="ok",
+                usage=ChatInvokeUsage(
+                    prompt_tokens=620,
+                    prompt_cached_tokens=20,
+                    prompt_cache_creation_tokens=500,
+                    prompt_image_tokens=None,
+                    completion_tokens=30,
+                    total_tokens=650,
+                ),
+            )
+
+    llm = LiteLLMShaped([])
+    TokenCost().register_llm(llm)
+    await llm.ainvoke(_MESSAGES)
+
+    (span,) = _by_name(exporter, "browser_use.llm")
+    assert span.attributes[SpanAttributes.LLM_USAGE_PROMPT_TOKENS] == 620
+
+
+async def test_content_off_records_exception_type_only(exporter):
+    class Leaky(ScriptedLLM):
+        async def ainvoke(self, messages, output_format=None, **kwargs):
+            raise ValueError("model echoed: my-secret-prompt")
+
+    instrumentor = BrowserUseInstrumentor(capture_content=False)
+    instrumentor.activate()
+    try:
+        llm = Leaky([])
+        TokenCost().register_llm(llm)
+        with pytest.raises(ValueError):
+            await llm.ainvoke(_MESSAGES)
+    finally:
+        instrumentor.deactivate()
+    (span,) = _by_name(exporter, "browser_use.llm")
+    assert span.status.status_code is StatusCode.ERROR
+    (event,) = span.events
+    assert dict(event.attributes) == {"exception.type": "ValueError"}
+    assert "my-secret-prompt" not in repr(span.to_json())
+
+
+async def test_llm_registered_before_activation_is_traced(exporter):
+    llm = ScriptedLLM(["early", "late"])
+    TokenCost().register_llm(llm)  # an Agent built before instrumentation
+    instrumentor = BrowserUseInstrumentor()
+    instrumentor.activate()
+    try:
+        TokenCost().register_llm(llm)
+        await llm.ainvoke(_MESSAGES)
+        instrumentor.deactivate()
+        instrumentor.activate()  # reactivation must still trace the same model
+        TokenCost().register_llm(llm)
+        await llm.ainvoke(_MESSAGES)
+    finally:
+        instrumentor.deactivate()
+    assert len(_by_name(exporter, "browser_use.llm")) == 2
 
 
 async def test_llm_error_marks_span_and_propagates(exporter, instrumentor):

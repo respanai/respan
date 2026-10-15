@@ -29,11 +29,19 @@ wraps the same seams directly.
 
 ## Phase 2 design sketch (session replay)
 
-1. **SDK capture.** On `BrowserSession` start, use the existing CDP session
-   (`browser_session.cdp_client`) to `Page.addScriptToEvaluateOnNewDocument`
-   the rrweb recorder plus a binding (`Runtime.addBinding`) that receives event
-   batches. Tag each batch with the current trace id / step span id (read from
-   the OTel context at flush time). Mask inputs by default (`maskAllInputs`).
+1. **SDK capture (verified feasible against browser-use 0.13.11).** browser-use
+   already exposes `BrowserSession._cdp_add_init_script()`
+   (`Page.addScriptToEvaluateOnNewDocument`, `runImmediately`) and per-target
+   CDP sessions (`get_or_create_cdp_session`). Plan:
+   - inject a **vendored** rrweb `record` bundle (no CDN: page CSPs would block
+     it) that buffers events in page memory, inputs masked (`maskAllInputs`);
+   - **drain at step end** inside the existing `Agent.step` wrapper
+     (`Runtime.evaluate` of a drain function on the focused target). This
+     pull model avoids a `Runtime.addBinding` push channel, and every chunk is
+     naturally keyed to the step span that produced it: that is the timeline
+     sync Laminar shows;
+   - re-inject on `TabCreatedEvent` so new tabs are recorded; cap the buffer in
+     page so a long step cannot grow it unbounded.
 2. **Transport.** Batched, gzipped NDJSON POSTs to a new endpoint, e.g.
    `POST /api/v1/traces/{trace_id}/recordings` (auth: same API key). Must fail
    open and never block the agent loop.
@@ -61,6 +69,17 @@ detail (scrolls, typing, hovers).
 | G9 | `respan-tracing` names task spans by bare kind (only agent/tool/llm/handoff get a `.detail` suffix), so every step shows as `task` in the span list. The step number is in metadata (`browser_use.step.number`). | steps are hard to tell apart in the tree | exporter or frontend: show `traceloop.entity.name` / step number for task spans |
 | G10 | **Off-scope, staging infra (root cause confirmed):** the presigned media URL for a lifted screenshot (`kwaistagingblob.blob.core.windows.net/files/media/...`) returns `AuthorizationFailure` from a public client inside its validity window. Cause: backend `iac/azure/storage.py:80-83` sets the AKS-staging storage account to `network_rule_set default_action=DENY` (VNet + private endpoint only). The backend hands browsers user-delegation SAS URLs (`clickhouse/views/logs.py` `_serve_log_media`), which can never load from outside the VNet. That affects **every** log-media image/audio on staging, not just screenshots. Prod uses S3 and is not affected. | screenshots (and all log media) do not render in the staging UI | infra decision: allow public network access with SAS-only auth (keep shared keys and anonymous access off), or proxy media through the API. Handed off, not changed here |
 | G8 | Version pin `browser-use >=0.13,<0.14`. The hooks (`Agent.run/step`, `Tools.act`, `TokenCost.register_llm`) have been stable since 0.6, but private-ish seams can move. | breakage on 0.14 | widen the pin after testing each minor |
+
+## Review (2026-10-15, independent adversarial pass)
+
+Fixed in this PR: Anthropic `prompt_tokens` omitting cache writes (under-billing;
+scoped to browser-use's native Anthropic classes, since LiteLLM already includes
+them), exception messages/tracebacks exported with content capture off, page
+URL/title exported with content capture off, models registered before
+activation (or across a reactivation) never traced, a failed optional import
+retried on every LLM call, and dependency floors too low for the span-name hint.
+Ruled out by the reviewer: parentage under parallel agents, `_IN_LLM` hiding the
+extract action's LLM span, cancellation handling, sensitive-data placeholders.
 
 ## Verification log
 
