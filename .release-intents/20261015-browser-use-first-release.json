@@ -1,0 +1,6 @@
+{
+  "summary": "First PyPI release of respan-instrumentation-browser-use (0.1.0) and a runnable example",
+  "packages": {
+    "respan-instrumentation-browser-use": "new"
+  }
+}
