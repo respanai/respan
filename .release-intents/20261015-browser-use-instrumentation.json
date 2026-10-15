@@ -1,0 +1,7 @@
+{
+  "summary": "Add browser-use agent instrumentation (agent/step/LLM/action spans with step screenshots) without publishing",
+  "packages": {
+    "respan-instrumentation-browser-use": "none",
+    "respan-ai": "none"
+  }
+}
