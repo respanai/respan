@@ -1,0 +1,6 @@
+{
+  "summary": "browser-use: export screenshots as compact JPEG (~3x smaller) so span batches stop timing out; first release",
+  "packages": {
+    "respan-instrumentation-browser-use": "new"
+  }
+}
