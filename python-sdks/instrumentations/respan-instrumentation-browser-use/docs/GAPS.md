@@ -83,7 +83,7 @@ extract action's LLM span, cancellation handling, sensitive-data placeholders.
 
 ## Verification log
 
-- Unit + e2e tests: `pytest tests` (9 tests; the e2e test drives a real headless
+- Unit + e2e tests: `pytest tests` (14 tests; the e2e test drives a real headless
   Chrome with a scripted LLM and a local HTTP page).
 - Staging soak (2026-10-15): real `azure/gpt-4.1-mini` through the staging
   gateway, real sites, spans exported to `staging-api.respan.ai`.
