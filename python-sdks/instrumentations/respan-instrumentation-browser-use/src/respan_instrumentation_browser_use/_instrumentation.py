@@ -21,7 +21,7 @@ import logging
 import os
 import threading
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from functools import partial, wraps
 from typing import Any
@@ -354,15 +354,10 @@ class _Runtime:
             with runtime.span(SPAN_LLM, LOG_TYPE_CHAT) as span:
                 _safe(lambda: runtime._llm_start(span, llm, messages))
                 in_llm = _IN_LLM.set(True)
-                # Provider SDK instrumentations (OpenAI, Anthropic, ...) would log
-                # the same call a second time; this span already carries it.
-                suppressed = context.attach(
-                    context.set_value(SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY, True)
-                )
                 try:
-                    response = await original(llm, messages, *args, **kwargs)
+                    with _suppress_provider_llm_spans():
+                        response = await original(llm, messages, *args, **kwargs)
                 finally:
-                    context.detach(suppressed)
                     _IN_LLM.reset(in_llm)
                 _safe(lambda: runtime._llm_end(span, response))
                 return response
@@ -414,6 +409,30 @@ class _Runtime:
             f"{prefix}.content",
             completion if isinstance(completion, str) else json_string(completion),
         )
+
+
+@contextmanager
+def _suppress_provider_llm_spans() -> Iterator[None]:
+    """Provider SDK instrumentations would log the call this span already carries.
+
+    Most honour OTel's language-model suppression key; Respan's OpenAI
+    instrumentation (used by browser-use's OpenAI, Azure and OpenRouter clients)
+    has its own switch, entered the same way the LiteLLM instrumentation does.
+    """
+    try:
+        from respan_instrumentation_openai._instrumentation import (
+            suppress_openai_instrumentation,
+        )
+    except ImportError:
+        suppress_openai_instrumentation = nullcontext
+    token = context.attach(
+        context.set_value(SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY, True)
+    )
+    try:
+        with suppress_openai_instrumentation():
+            yield
+    finally:
+        context.detach(token)
 
 
 def _action_call(action: Any) -> tuple[str | None, Any]:

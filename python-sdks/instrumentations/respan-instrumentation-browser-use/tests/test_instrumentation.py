@@ -3,7 +3,10 @@ from __future__ import annotations
 import functools
 import json
 import shutil
+import sys
 import threading
+import types
+from contextlib import contextmanager
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -140,6 +143,32 @@ async def test_inner_provider_calls_are_suppressed_and_not_nested(
 
     assert seen["suppressed"] is True
     assert len(_by_name(exporter, "browser_use.llm")) == 1
+
+
+async def test_respan_openai_instrumentation_is_suppressed(
+    exporter, instrumentor, monkeypatch
+):
+    entered = []
+
+    @contextmanager
+    def suppress_openai_instrumentation():
+        entered.append(True)
+        yield
+
+    fake = types.ModuleType("respan_instrumentation_openai._instrumentation")
+    fake.suppress_openai_instrumentation = suppress_openai_instrumentation
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    monkeypatch.setitem(
+        sys.modules,
+        "respan_instrumentation_openai",
+        types.ModuleType("respan_instrumentation_openai"),
+    )
+    llm = ScriptedLLM(["ok"])
+    TokenCost().register_llm(llm)
+
+    await llm.ainvoke(_MESSAGES)
+
+    assert entered == [True]
 
 
 async def test_llm_error_marks_span_and_propagates(exporter, instrumentor):
