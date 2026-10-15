@@ -1,0 +1,6 @@
+{
+  "summary": "Complete the interrupted Superagent npm release after trusted publisher validation",
+  "packages": {
+    "@respan/instrumentation-superagent": "minor"
+  }
+}
