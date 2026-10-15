@@ -46,6 +46,16 @@ browser_use.agent          agent   task in; final result, success, steps, usage 
   still traced.
 - **Secrets.** Action parameters are captured before browser-use substitutes
   `sensitive_data`, so secrets stay as their `<secret>name</secret>` placeholders.
+  Any value that comes back with a real secret in it (a page URL, an error such as
+  "Navigation to https://...?token=... blocked") is masked the same way before export.
+- **Grouping.** Every span of a run carries the Agent's session id as its thread,
+  session and trace-group identifier, so follow-up tasks on the same `Agent`
+  (`add_new_task` + `run()`) group together. Values set through
+  `respan.propagate_attributes(thread_identifier=..., group_identifier=...)` win.
+- **Replays.** `Agent.rerun_history()` is its own trace under a
+  `browser_use.rerun` agent span, in the same thread as the original run.
+- **Customer context.** `customer_identifier`, `metadata` and the other fields
+  set on `Respan(...)` or `propagate_attributes(...)` reach every span.
 
 ## Options
 

@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import functools
+import shutil
+import threading
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -68,3 +73,27 @@ class ScriptedLLM:
             output_format.model_validate(payload) if output_format else str(payload)
         )
         return ChatInvokeCompletion(completion=completion, usage=usage())
+
+
+def chrome_path() -> str | None:
+    mac = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+    if mac.exists():
+        return str(mac)
+    for name in ("google-chrome", "chromium", "chromium-browser", "chrome"):
+        if found := shutil.which(name):
+            return found
+    return None
+
+
+@pytest.fixture
+def test_page(tmp_path):
+    # browser-use only screenshots http(s) pages, so serve the page for real.
+    (tmp_path / "index.html").write_text(
+        "<title>Respan Test</title><h1>Hello browser agent</h1>"
+    )
+    handler = functools.partial(SimpleHTTPRequestHandler, directory=str(tmp_path))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_address[1]}/index.html"
+    server.shutdown()

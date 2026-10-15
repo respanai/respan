@@ -20,14 +20,20 @@ import inspect
 import logging
 import os
 import threading
-from collections.abc import Callable, Iterator
+import traceback
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from functools import cache, partial, wraps
 from typing import Any
+from urllib.parse import quote, quote_plus
 
 from opentelemetry import context, trace
-from opentelemetry.semconv.attributes.exception_attributes import EXCEPTION_TYPE
+from opentelemetry.semconv.attributes.exception_attributes import (
+    EXCEPTION_MESSAGE,
+    EXCEPTION_STACKTRACE,
+    EXCEPTION_TYPE,
+)
 from opentelemetry.semconv_ai import (
     SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY,
     SpanAttributes,
@@ -43,6 +49,9 @@ from respan_sdk.constants.llm_logging import (
 from respan_sdk.constants.span_attributes import (
     RESPAN_INTERNAL_SPAN_NAME_DETAIL,
     RESPAN_LOG_TYPE,
+    RESPAN_SESSION_ID,
+    RESPAN_THREADS_ID,
+    RESPAN_TRACE_GROUP_ID,
 )
 from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
 from respan_tracing.core.tracer import RespanTracer
@@ -60,9 +69,11 @@ from respan_instrumentation_browser_use._constants import (
     EXCEPTION_EVENT,
     INSTRUMENTATION_NAME,
     PATCH_MARKER,
+    RERUN_NAME_DETAIL,
     SPAN_ACTION,
     SPAN_AGENT,
     SPAN_LLM,
+    SPAN_RERUN,
     SPAN_STEP,
     TOKENS_MODULE,
     TOOLS_MODULE,
@@ -80,6 +91,18 @@ _LOCK = threading.RLock()
 _RUNTIME: _Runtime | None = None
 # Fallback / wrapper models call an inner model's ainvoke; only the outer call is a span.
 _IN_LLM: ContextVar[bool] = ContextVar("respan_browser_use_in_llm", default=False)
+# The running Agent's session id. Every span of a run, and of the follow-up runs
+# of the same Agent, defaults to it as thread, session and trace group.
+_AGENT_SESSION: ContextVar[str | None] = ContextVar(
+    "respan_browser_use_agent_session", default=None
+)
+_GROUPING_ATTRIBUTES = (RESPAN_THREADS_ID, RESPAN_SESSION_ID, RESPAN_TRACE_GROUP_ID)
+# (secret value, "<secret>name</secret>") pairs of the running Agent's sensitive_data.
+# browser-use masks secrets only in what it sends the model; its action results and
+# errors (e.g. "Navigation to https://...?token=<real value> blocked") carry them.
+_SECRETS: ContextVar[tuple[tuple[str, str], ...]] = ContextVar(
+    "respan_browser_use_secrets", default=()
+)
 _FALSE_VALUES = {"0", "false", "no", "off"}
 # Chat spans carry llm.request.type instead of a span kind.
 _SPAN_KINDS = {
@@ -105,15 +128,79 @@ def _safe(operation: Callable[[], Any]) -> None:
         logger.debug("browser-use telemetry failed open", exc_info=True)
 
 
+def _default_grouping(span: Any) -> None:
+    # Respan's span processor has already copied the customer's propagated
+    # thread/session/trace group onto the span in start_span; those win.
+    agent_session = _AGENT_SESSION.get()
+    if agent_session is None:
+        return
+    for key in _GROUPING_ATTRIBUTES:
+        if not span.attributes.get(key):
+            span.set_attribute(key, agent_session)
+
+
 def _non_negative_int(value: Any) -> int | None:
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return value
     return None
 
 
+@contextmanager
+def _agent_scope(agent: Any) -> Iterator[None]:
+    """Grouping ids and secrets of `agent`, for every span inside its run."""
+    session = _AGENT_SESSION.set(str(agent.session_id))
+    secrets = _SECRETS.set(_secret_replacements(getattr(agent, "sensitive_data", None)))
+    try:
+        yield
+    finally:
+        _SECRETS.reset(secrets)
+        _AGENT_SESSION.reset(session)
+
+
+def _secret_replacements(sensitive_data: Any) -> tuple[tuple[str, str], ...]:
+    """sensitive_data is {name: value} or {domain: {name: value}}."""
+    replacements: dict[str, str] = {}
+    for key, value in (sensitive_data or {}).items():
+        items = value.items() if isinstance(value, Mapping) else [(key, value)]
+        for name, secret in items:
+            if not isinstance(secret, str) or not secret:
+                continue
+            placeholder = f"<secret>{name}</secret>"
+            # A secret typed into a URL is percent-encoded there.
+            for variant in (secret, quote(secret, safe=""), quote_plus(secret)):
+                replacements[variant] = placeholder
+    # Longest first, so a secret containing another is replaced whole.
+    return tuple(sorted(replacements.items(), key=lambda pair: -len(pair[0])))
+
+
+def _masked(text: str) -> str:
+    for secret, placeholder in _SECRETS.get():
+        text = text.replace(secret, placeholder)
+    return text
+
+
+def _mask_secrets(span: Any) -> None:
+    if not _SECRETS.get():
+        return
+    for key, value in list((span.attributes or {}).items()):
+        if isinstance(value, str) and (masked := _masked(value)) != value:
+            span.set_attribute(key, masked)
+
+
 def _record_error(span: Any, error: BaseException, *, with_message: bool) -> None:
     span.set_status(Status(StatusCode.ERROR, type(error).__name__))
-    if with_message:
+    if with_message and _SECRETS.get():
+        span.add_event(
+            EXCEPTION_EVENT,
+            {
+                EXCEPTION_TYPE: type(error).__name__,
+                EXCEPTION_MESSAGE: _masked(str(error)),
+                EXCEPTION_STACKTRACE: _masked(
+                    "".join(traceback.format_exception(error))
+                ),
+            },
+        )
+    elif with_message:
         span.record_exception(error)
     else:
         # Provider and validation errors echo prompts and raw model output.
@@ -165,6 +252,7 @@ class _Runtime:
             # type; without this the agent/step/action spans never leave the process.
             attributes[SpanAttributes.TRACELOOP_SPAN_KIND] = span_kind
         span = self.tracer.start_span(name, attributes=attributes)
+        _safe(partial(_default_grouping, span))
         token = context.attach(trace.set_span_in_context(span))
         try:
             yield span
@@ -175,6 +263,7 @@ class _Runtime:
             raise
         finally:
             context.detach(token)
+            _safe(partial(_mask_secrets, span))
             span.end()
 
     # -- agent ---------------------------------------------------------------
@@ -186,15 +275,52 @@ class _Runtime:
         async def run(agent: Any, *args: Any, **kwargs: Any) -> Any:
             if not runtime.active:
                 return await original(agent, *args, **kwargs)
-            with runtime.span(
-                SPAN_AGENT, LOG_TYPE_AGENT, detail=AGENT_NAME_DETAIL
-            ) as span:
+            with (
+                _agent_scope(agent),
+                runtime.span(SPAN_AGENT, LOG_TYPE_AGENT, detail=AGENT_NAME_DETAIL) as span,
+            ):
                 _safe(lambda: runtime._agent_start(span, agent))
                 history = await original(agent, *args, **kwargs)
                 _safe(lambda: runtime._agent_end(span, history))
                 return history
 
         return run
+
+    def wrap_rerun(self, original: Any) -> Any:
+        runtime = self
+
+        @wraps(original)
+        async def rerun_history(agent: Any, history: Any, *args: Any, **kwargs: Any) -> Any:
+            if not runtime.active:
+                return await original(agent, history, *args, **kwargs)
+            # A replay executes the recorded actions directly; without its own
+            # root span each action would export as a separate one-span trace.
+            with (
+                _agent_scope(agent),
+                runtime.span(SPAN_RERUN, LOG_TYPE_AGENT, detail=RERUN_NAME_DETAIL) as span,
+            ):
+                _safe(lambda: runtime._rerun_start(span, agent, history))
+                results = await original(agent, history, *args, **kwargs)
+                _safe(lambda: runtime._rerun_end(span, results))
+                return results
+
+        return rerun_history
+
+    def _rerun_start(self, span: Any, agent: Any, history: Any) -> None:
+        span.set_attribute(ATTR_AGENT_ID, str(agent.id))
+        span.set_attribute(ATTR_SESSION_ID, str(agent.session_id))
+        replayed = {"steps": len(getattr(history, "history", ()) or ())}
+        if _content_allowed(self):
+            replayed["task"] = agent.task
+        span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_INPUT, json_string(replayed))
+
+    def _rerun_end(self, span: Any, results: Any) -> None:
+        results = list(results or ())
+        errors = [r.error for r in results if getattr(r, "error", None)]
+        output: dict[str, Any] = {"actions": len(results), "failed_actions": len(errors)}
+        if _content_allowed(self) and errors:
+            output["errors"] = errors
+        span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_OUTPUT, json_string(output))
 
     def _agent_start(self, span: Any, agent: Any) -> None:
         span.set_attribute(ATTR_AGENT_ID, str(agent.id))
@@ -560,6 +686,7 @@ class BrowserUseInstrumentor:
             )
             try:
                 runtime.patch(agent_module.Agent, "run", runtime.wrap_run)
+                runtime.patch(agent_module.Agent, "rerun_history", runtime.wrap_rerun)
                 runtime.patch(agent_module.Agent, "step", runtime.wrap_step)
                 runtime.patch(tools_module.Tools, "act", runtime.wrap_act)
                 runtime.patch(

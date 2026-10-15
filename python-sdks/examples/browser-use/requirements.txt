@@ -3,3 +3,4 @@ respan-ai>=4.2.4
 respan-instrumentation-browser-use>=0.1.0
 browser-use>=0.13.11,<0.14
 python-dotenv>=1.0.0
+httpx>=0.27.0                                # run_all.py reads traces back from Respan

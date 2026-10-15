@@ -11,7 +11,7 @@ browser action.
 cd python-sdks/examples/browser-use
 python3 -m venv .venv && source .venv/bin/activate     # Python 3.11-3.13
 pip install -r requirements.txt
-cp .env.example .env                                   # then set RESPAN_API_KEY
+cp .env.example .env                                   # then set RESPAN_API_KEY (+ staging URLs)
 ```
 
 browser-use drives an installed Google Chrome or Chromium; `browser-use --doctor`
@@ -23,22 +23,62 @@ Working on the instrumentation itself? Install it from this repo instead:
 ## Run
 
 ```bash
-python hello_world.py                  # watch Chrome read Hacker News
-python feature_tour.py                 # list scenarios
-python feature_tour.py structured      # one scenario
-python feature_tour.py all --headless  # everything, no window
+python hello_world.py                         # one agent, watch Chrome read Hacker News
+python scenarios/11_sensitive_data.py         # any single scenario, then its live check
+python run_all.py --list                      # all scenarios
+python run_all.py                             # run them all, check every trace in Respan
+python run_all.py judge custom_tools --headless
 ```
 
-| Scenario | What it shows in Respan |
-|---|---|
-| `structured` | `output_model_schema`: the `done` tool span carries a typed result |
-| `custom-tool` | your own `@tools.action` function as its own `tool` span |
-| `secrets` | `sensitive_data`: spans show `<secret>demo_pass</secret>`, never the password |
-| `failure` | an action that fails (`navigate` to a dead domain) is an error span |
+Every scenario runs under customer `browser-use-scenarios` with
+`metadata.scenario=<name>` and `metadata.run_id=<run>`, so you can filter for it in
+Respan. After the runs, `run_all.py` reads each trace back from the Respan logs API
+and checks it, printing PASS/FAIL with a link to each agent span. It also writes
+`runs/<run id>.md`. Flags: `--headless`, `--no-content`
+(`capture_content=False`), `--no-screenshots` (`capture_screenshots=False`).
 
-Flags for any scenario: `--no-content` (`capture_content=False`: keeps the span
-tree, timings, models and tokens, drops prompts, results, URLs and error messages)
-and `--no-screenshots` (`capture_screenshots=False`). Each run prints its trace id.
+Every trace must have: one root span; the customer id and both metadata keys on
+every span; every span's thread id equal to its agent's browser-use session id;
+tokens and cost on every successful LLM span; and error spans only where the
+scenario expects them. Scenarios add their own checks, listed below.
+
+| # | Scenario | Mirrors browser-use's | What to look for in Respan |
+|---|---|---|---|
+| 01 | `basic_search` | getting_started/01_basic_search | agent -> steps -> LLM call + search/navigate; a screenshot on every step |
+| 02 | `form_filling` | getting_started/02_form_filling | `tool.input` spans with typed values, `tool.click` submits |
+| 03 | `data_extraction` | getting_started/03, features/custom_output | `tool.done` carries the typed `output_model_schema` object |
+| 04 | `multi_step` | getting_started/04_multi_step_task | several steps, page URL/title + screenshot per step |
+| 05 | `fast_agent` | getting_started/05_fast_agent | `flash_mode`: shorter prompts/completions |
+| 06 | `custom_system_prompt` | features/custom_system_prompt | the extra rule at the end of every system message |
+| 07 | `initial_actions` | features/initial_actions | `tool.navigate` under the agent, before step 1 (no LLM) |
+| 08 | `follow_up_tasks` | features/follow_up_tasks | 2 traces, same thread id: the Threads view groups them |
+| 09 | `multi_tab` | features/multi_tab | `navigate` with `new_tab`, `switch`; step URLs show the active tab |
+| 10 | `parallel_agents` | features/parallel_agents | 2 traces, each with its own thread id, no cross-over |
+| 11 | `sensitive_data` | features/sensitive_data | params show `<secret>demo_pass</secret>`; the password is in no span |
+| 12 | `restrict_urls` | features/restrict_urls | the blocked `tool.navigate` is an error span |
+| 13 | `blocked_domains` | features/blocked_domains | same, with `prohibited_domains` |
+| 14 | `fallback_model` | features/fallback_model | the primary model's call fails, the fallback model's call follows |
+| 15 | `extraction_model` | features/small_model_for_extraction | `tool.extract` holds an LLM span on the small model |
+| 16 | `judge` | features/judge_trace | the judge's LLM span after the steps; `judge_verdict` on the agent |
+| 17 | `custom_tools` | custom-functions/ | your `@tools.action` functions as `tool.save_note`, `tool.current_page_title` |
+| 18 | `action_filters` | custom-functions/action_filters | a tool offered only on matching domains |
+| 19 | `file_system` | file_system/file_system | `tool.write_file` / `tool.read_file` |
+| 20 | `save_as_pdf` | features/save_as_pdf | `tool.save_as_pdf` |
+| 21 | `scrolling` | features/scrolling_page | `tool.scroll`; screenshots move down the page |
+| 22 | `hooks` | `run(on_step_start=, on_step_end=)` | hook code runs inside the agent span |
+| 23 | `stop_externally` | features/stop_externally | the run stops after 2 steps and the agent span still closes |
+| 24 | `max_steps` | `run(max_steps=2)` | ends unfinished, `is_done: false` |
+| 25 | `no_vision` | `use_vision=False` | no image parts in any LLM prompt |
+| 26 | `rerun_history` | features/rerun_history | the replay is its own trace with the same tool spans |
+| 27 | `action_failure` | (failure handling) | `tool.navigate` to a dead domain is an error span |
+
+Not covered here, because they need accounts or setup this example can't assume:
+- Browser Use Cloud: cloud browser, sandbox, skills, `ChatBrowserUse`.
+- Your own Chrome profile: `real_browser`, `save_cookies`, CDP and Playwright attach.
+- Third-party services: 2FA, Gmail, Slack, Discord, AgentMail, CAPTCHAs, shopping and job applications.
+- `browser_use.beta`: needs the Browser Use terminal binary.
+- Other model providers: the instrumentation traces all of browser-use's model
+  classes the same way, but this example only has the Respan gateway.
 
 ## What a trace looks like
 
@@ -93,8 +133,8 @@ logged-in profile), `cdp_url` (attach to a Chrome that is already running),
 `is_done()`, `judgement()`, `errors()`, `urls()`, `action_names()`,
 `number_of_steps()`, `total_duration_seconds()`, `screenshot_paths()`.
 
-Hooks: `agent.run(on_step_start=fn, on_step_end=fn)` get the `Agent` each step;
-`feature_tour.py` uses one to print the trace id.
+Hooks: `agent.run(on_step_start=fn, on_step_end=fn)` get the `Agent` each step
+(scenario 22).
 
 ## Enabling the instrumentation
 

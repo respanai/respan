@@ -92,3 +92,25 @@ class JavaScriptPublicationOrderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PythonTestFlagTests(unittest.TestCase):
+    def entry(self, **extra: object) -> dict:
+        return {
+            "ecosystem": "python",
+            "name": "respan-instrumentation-example",
+            "path": "python-sdks/instrumentations/respan-instrumentation-example",
+            "registry": "pypi",
+            **extra,
+        }
+
+    def manifest(self) -> dict:
+        return {"tool": {"poetry": {"name": "respan-instrumentation-example", "version": "0.1.0"}}}
+
+    def test_python_tests_are_opt_in(self) -> None:
+        record = release_inventory.build_record(self.entry(), self.manifest())
+        self.assertFalse(record["has_test"])
+
+    def test_python_tests_flag_enables_package_tests(self) -> None:
+        record = release_inventory.build_record(self.entry(python_tests=True), self.manifest())
+        self.assertTrue(record["has_test"])

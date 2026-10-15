@@ -1,14 +1,9 @@
 from __future__ import annotations
 
-import functools
 import json
-import shutil
 import sys
-import threading
 import types
 from contextlib import contextmanager
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 
 import pytest
 from browser_use import Agent, BrowserProfile, BrowserSession
@@ -41,7 +36,7 @@ from respan_instrumentation_browser_use._constants import (
 )
 from respan_instrumentation_browser_use._instrumentation import _openai_suppressor
 
-from .conftest import ScriptedLLM
+from .conftest import ScriptedLLM, chrome_path
 
 _PIXEL = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
 _MESSAGES = [
@@ -319,32 +314,8 @@ def test_conflicting_settings_are_rejected(exporter, instrumentor):
         BrowserUseInstrumentor(capture_content=False).activate()
 
 
-def _chrome() -> str | None:
-    mac = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
-    if mac.exists():
-        return str(mac)
-    for name in ("google-chrome", "chromium", "chromium-browser", "chrome"):
-        if found := shutil.which(name):
-            return found
-    return None
-
-
-@pytest.fixture
-def test_page(tmp_path):
-    # browser-use only screenshots http(s) pages, so serve the page for real.
-    (tmp_path / "index.html").write_text(
-        "<title>Respan Test</title><h1>Hello browser agent</h1>"
-    )
-    handler = functools.partial(SimpleHTTPRequestHandler, directory=str(tmp_path))
-    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    yield f"http://127.0.0.1:{server.server_address[1]}/index.html"
-    server.shutdown()
-
-
 @pytest.mark.integration
-@pytest.mark.skipif(_chrome() is None, reason="needs a local Chrome/Chromium")
+@pytest.mark.skipif(chrome_path() is None, reason="needs a local Chrome/Chromium")
 async def test_real_agent_run_produces_full_span_tree(
     exporter, instrumentor, tmp_path, test_page
 ):
@@ -370,7 +341,7 @@ async def test_real_agent_run_produces_full_span_tree(
     session = BrowserSession(
         browser_profile=BrowserProfile(
             headless=True,
-            executable_path=_chrome(),
+            executable_path=chrome_path(),
             user_data_dir=str(tmp_path / "profile"),
         )
     )

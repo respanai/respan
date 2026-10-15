@@ -1,0 +1,6 @@
+{
+  "summary": "browser-use: baseline wire-contract tests in CI, default thread/session/trace group, mask sensitive_data in every exported span; first release",
+  "packages": {
+    "respan-instrumentation-browser-use": "new"
+  }
+}
