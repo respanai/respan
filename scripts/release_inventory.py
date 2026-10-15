@@ -471,6 +471,8 @@ def build_record(entry: dict, manifest: dict) -> dict:
     else:
         record["import_name"] = python_import_name(manifest)
         record["python_version"] = entry.get("python_version", "3.11")
+        # Opt-in: most Python packages' tests need live credentials.
+        record["has_test"] = bool(entry.get("python_tests", False))
     return record
 
 

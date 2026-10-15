@@ -194,6 +194,19 @@ jobs:
               raise ModuleNotFoundError(os.environ["IMPORT_NAME"])
           importlib.metadata.version(os.environ["DIST_NAME"])
           PY
+      - name: Package tests
+        if: ${{ matrix.has_test }}
+        working-directory: ${{ matrix.path }}
+        run: |
+          python3 -m venv .ci-test-venv
+          . .ci-test-venv/bin/activate
+          python -m pip install --upgrade pip
+          # Local respan-sdk / respan-tracing, so a change there is tested against
+          # this package. respan-ai --no-deps: its bundled instrumentor floors may
+          # be unpublished (see the respan-ai smoke check below).
+          python -m pip install ../../respan-sdk ../../respan-tracing . pytest pytest-asyncio
+          python -m pip install --no-deps ../../respan
+          python -m pytest tests -q
 
       # A1: respan-ai bundles the native respan-instrumentation-* plugins so a bare
       # Respan() auto-traces the direct LLM SDKs. The provider SDKs are optional

@@ -635,7 +635,8 @@
       "ecosystem": "python",
       "name": "respan-instrumentation-browser-use",
       "path": "python-sdks/instrumentations/respan-instrumentation-browser-use",
-      "registry": "pypi"
+      "registry": "pypi",
+      "python_tests": true
     },
     {
       "ecosystem": "python",

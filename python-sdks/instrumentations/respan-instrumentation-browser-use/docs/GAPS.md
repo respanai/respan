@@ -64,11 +64,34 @@ detail (scrolls, typing, hovers).
 | G3 | Screenshots are full-page PNG base64 (~50-300 KB each). They count toward the 20 MB per-log limit and go to S3 media storage. Step outputs carry one each; LLM prompts carry the one the model saw. | storage cost on long runs | if it becomes a problem: JPEG re-encode or downscale in the SDK, or `capture_screenshots=False` |
 | G4 | Presigned media URLs only appear on the log detail view, not list views (backend behaviour). | screenshots not visible in list | frontend/backend, not SDK |
 | G5 | `browser_use.beta` agent (separate `run`) is not wrapped. | beta users get LLM/action spans but no agent/step spans | wrap once the beta API settles |
-| G6 | CI for Python packages only builds the wheel and smoke-imports it; it never runs package tests. These tests (including a real headless-Chrome agent run) were run locally. | regressions not caught in CI | add a pytest step to `ci.yml` for packages that have `tests/` |
+| G6 | ~~CI for Python packages only builds the wheel and smoke-imports it.~~ **Fixed for this package:** `"python_tests": true` in `.github/release-packages.json` makes the CI `python` job run `pytest tests` (real headless Chrome on the runner). Other Python packages are not opted in. | - | opt other packages in once their tests run without live credentials |
 | G7 | browser-use's built-in judge runs by default (`use_judge=True`) and makes one extra LLM call per run; it shows as a `browser_use.llm` span directly under the agent span. | expected, but customers may ask about the extra call | documented |
 | G9 | `respan-tracing` names task spans by bare kind (only agent/tool/llm/handoff get a `.detail` suffix), so every step shows as `task` in the span list. The step number is in metadata (`browser_use.step.number`). | steps are hard to tell apart in the tree | exporter or frontend: show `traceloop.entity.name` / step number for task spans |
 | G10 | **Off-scope, staging infra (root cause confirmed):** the presigned media URL for a lifted screenshot (`kwaistagingblob.blob.core.windows.net/files/media/...`) returns `AuthorizationFailure` from a public client inside its validity window. Cause: backend `iac/azure/storage.py:80-83` sets the AKS-staging storage account to `network_rule_set default_action=DENY` (VNet + private endpoint only). The backend hands browsers user-delegation SAS URLs (`clickhouse/views/logs.py` `_serve_log_media`), which can never load from outside the VNet. That affects **every** log-media image/audio on staging, not just screenshots. Prod uses S3 and is not affected. | screenshots (and all log media) do not render in the staging UI | infra decision: allow public network access with SAS-only auth (keep shared keys and anonymous access off), or proxy media through the API. Handed off, not changed here |
 | G8 | Version pin `browser-use >=0.13,<0.14`. The hooks (`Agent.run/step`, `Tools.act`, `TokenCost.register_llm`) have been stable since 0.6, but private-ish seams can move. | breakage on 0.14 | widen the pin after testing each minor |
+
+## Baseline (2026-10-15)
+
+`tests/test_baseline.py` is the wire contract, the same idea as instrumentation-pi's
+`pi_baseline.test.mjs`. It runs a real headless Chrome agent through `Respan(...)`
+and checks every exported span for:
+- customer metadata as flat `respan.metadata.<key>` (never a JSON blob);
+- `customer_identifier`, with the per-request value winning over the constructor;
+- thread, session and trace group set to the Agent's session id, with customer values winning;
+- follow-up tasks: a new trace in the same thread;
+- parallel agents: no shared trace or identifiers;
+- content off: identifiers kept, content dropped;
+- `sensitive_data`: never exported, on both the successful-navigation path and the blocked-navigation path.
+
+Writing it found two bugs, both fixed in the same PR, and three tests failed with
+those fixes stashed:
+- Spans had no thread, session or trace group, so follow-up runs did not group together.
+- Secrets leaked: browser-use masks secrets only in what it sends the model. Its
+  action results and errors, and the page URL, carried the real value.
+
+The live half is `examples/browser-use/run_all.py`: 27 scenarios that mirror
+browser-use's own examples. Each trace is read back from the Respan logs API and
+checked the same way.
 
 ## Review (2026-10-15, independent adversarial pass)
 
@@ -83,7 +106,7 @@ extract action's LLM span, cancellation handling, sensitive-data placeholders.
 
 ## Verification log
 
-- Unit + e2e tests: `pytest tests` (14 tests; the e2e test drives a real headless
+- Unit + e2e + baseline tests: `pytest tests` (23 tests; the e2e test drives a real headless
   Chrome with a scripted LLM and a local HTTP page).
 - Staging soak (2026-10-15): real `azure/gpt-4.1-mini` through the staging
   gateway, real sites, spans exported to `staging-api.respan.ai`.
