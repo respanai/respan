@@ -69,9 +69,11 @@ from respan_instrumentation_browser_use._constants import (
     EXCEPTION_EVENT,
     INSTRUMENTATION_NAME,
     PATCH_MARKER,
+    RERUN_NAME_DETAIL,
     SPAN_ACTION,
     SPAN_AGENT,
     SPAN_LLM,
+    SPAN_RERUN,
     SPAN_STEP,
     TOKENS_MODULE,
     TOOLS_MODULE,
@@ -141,6 +143,18 @@ def _non_negative_int(value: Any) -> int | None:
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return value
     return None
+
+
+@contextmanager
+def _agent_scope(agent: Any) -> Iterator[None]:
+    """Grouping ids and secrets of `agent`, for every span inside its run."""
+    session = _AGENT_SESSION.set(str(agent.session_id))
+    secrets = _SECRETS.set(_secret_replacements(getattr(agent, "sensitive_data", None)))
+    try:
+        yield
+    finally:
+        _SECRETS.reset(secrets)
+        _AGENT_SESSION.reset(session)
 
 
 def _secret_replacements(sensitive_data: Any) -> tuple[tuple[str, str], ...]:
@@ -261,23 +275,52 @@ class _Runtime:
         async def run(agent: Any, *args: Any, **kwargs: Any) -> Any:
             if not runtime.active:
                 return await original(agent, *args, **kwargs)
-            session = _AGENT_SESSION.set(str(agent.session_id))
-            secrets = _SECRETS.set(
-                _secret_replacements(getattr(agent, "sensitive_data", None))
-            )
-            try:
-                with runtime.span(
-                    SPAN_AGENT, LOG_TYPE_AGENT, detail=AGENT_NAME_DETAIL
-                ) as span:
-                    _safe(lambda: runtime._agent_start(span, agent))
-                    history = await original(agent, *args, **kwargs)
-                    _safe(lambda: runtime._agent_end(span, history))
-                    return history
-            finally:
-                _SECRETS.reset(secrets)
-                _AGENT_SESSION.reset(session)
+            with (
+                _agent_scope(agent),
+                runtime.span(SPAN_AGENT, LOG_TYPE_AGENT, detail=AGENT_NAME_DETAIL) as span,
+            ):
+                _safe(lambda: runtime._agent_start(span, agent))
+                history = await original(agent, *args, **kwargs)
+                _safe(lambda: runtime._agent_end(span, history))
+                return history
 
         return run
+
+    def wrap_rerun(self, original: Any) -> Any:
+        runtime = self
+
+        @wraps(original)
+        async def rerun_history(agent: Any, history: Any, *args: Any, **kwargs: Any) -> Any:
+            if not runtime.active:
+                return await original(agent, history, *args, **kwargs)
+            # A replay executes the recorded actions directly; without its own
+            # root span each action would export as a separate one-span trace.
+            with (
+                _agent_scope(agent),
+                runtime.span(SPAN_RERUN, LOG_TYPE_AGENT, detail=RERUN_NAME_DETAIL) as span,
+            ):
+                _safe(lambda: runtime._rerun_start(span, agent, history))
+                results = await original(agent, history, *args, **kwargs)
+                _safe(lambda: runtime._rerun_end(span, results))
+                return results
+
+        return rerun_history
+
+    def _rerun_start(self, span: Any, agent: Any, history: Any) -> None:
+        span.set_attribute(ATTR_AGENT_ID, str(agent.id))
+        span.set_attribute(ATTR_SESSION_ID, str(agent.session_id))
+        replayed = {"steps": len(getattr(history, "history", ()) or ())}
+        if _content_allowed(self):
+            replayed["task"] = agent.task
+        span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_INPUT, json_string(replayed))
+
+    def _rerun_end(self, span: Any, results: Any) -> None:
+        results = list(results or ())
+        errors = [r.error for r in results if getattr(r, "error", None)]
+        output: dict[str, Any] = {"actions": len(results), "failed_actions": len(errors)}
+        if _content_allowed(self) and errors:
+            output["errors"] = errors
+        span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_OUTPUT, json_string(output))
 
     def _agent_start(self, span: Any, agent: Any) -> None:
         span.set_attribute(ATTR_AGENT_ID, str(agent.id))
@@ -643,6 +686,7 @@ class BrowserUseInstrumentor:
             )
             try:
                 runtime.patch(agent_module.Agent, "run", runtime.wrap_run)
+                runtime.patch(agent_module.Agent, "rerun_history", runtime.wrap_rerun)
                 runtime.patch(agent_module.Agent, "step", runtime.wrap_step)
                 runtime.patch(tools_module.Tools, "act", runtime.wrap_act)
                 runtime.patch(

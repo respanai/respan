@@ -315,3 +315,28 @@ async def test_baseline_sensitive_data_never_reaches_a_span(
         assert secret not in dumped, span.name
     # The real value was replaced, not just absent: the URL still shows where it went.
     assert any("<secret>api_token</secret>" in d for d in dumps)
+
+
+async def test_baseline_rerun_history_is_one_trace_in_the_agent_thread(
+    pipeline, tmp_path, test_page
+):
+    _, spans = pipeline()
+    session = browser(tmp_path, keep_alive=True)
+    agent = Agent(
+        task="Read",
+        llm=ScriptedLLM([*script({"navigate": {"url": test_page}}), *script()]),
+        browser_session=session,
+    )
+    try:
+        history = await agent.run(max_steps=4)
+        first_run = {s.context.span_id for s in spans}
+        await agent.rerun_history(history, delay_between_actions=0)
+    finally:
+        await session.kill()
+
+    replay = [s for s in spans if s.context.span_id not in first_run]
+    roots = [s for s in replay if s.parent is None]
+    assert [s.name for s in roots] == ["browser_use.rerun"]
+    assert {s.context.trace_id for s in replay} == {roots[0].context.trace_id}
+    assert any(s.name == "navigate" for s in replay)
+    assert {s.attributes.get(RESPAN_THREADS_ID) for s in replay} == {str(agent.session_id)}

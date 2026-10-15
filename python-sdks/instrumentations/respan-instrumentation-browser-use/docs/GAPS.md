@@ -68,6 +68,8 @@ detail (scrolls, typing, hovers).
 | G7 | browser-use's built-in judge runs by default (`use_judge=True`) and makes one extra LLM call per run; it shows as a `browser_use.llm` span directly under the agent span. | expected, but customers may ask about the extra call | documented |
 | G9 | `respan-tracing` names task spans by bare kind (only agent/tool/llm/handoff get a `.detail` suffix), so every step shows as `task` in the span list. The step number is in metadata (`browser_use.step.number`). | steps are hard to tell apart in the tree | exporter or frontend: show `traceloop.entity.name` / step number for task spans |
 | G10 | **Off-scope, staging infra (root cause confirmed):** the presigned media URL for a lifted screenshot (`kwaistagingblob.blob.core.windows.net/files/media/...`) returns `AuthorizationFailure` from a public client inside its validity window. Cause: backend `iac/azure/storage.py:80-83` sets the AKS-staging storage account to `network_rule_set default_action=DENY` (VNet + private endpoint only). The backend hands browsers user-delegation SAS URLs (`clickhouse/views/logs.py` `_serve_log_media`), which can never load from outside the VNet. That affects **every** log-media image/audio on staging, not just screenshots. Prod uses S3 and is not affected. | screenshots (and all log media) do not render in the staging UI | infra decision: allow public network access with SAS-only auth (keep shared keys and anonymous access off), or proxy media through the API. Handed off, not changed here |
+| G11 | **Off-scope, gateway:** the Respan gateway answers an invalid API key with **403**. browser-use switches to `fallback_llm` only on 401/402/429/5xx or connection errors, so a browser-use agent whose key is wrong never fails over when it goes through Respan. Found by scenario 14 on staging. | `fallback_llm` silently doesn't trigger on bad keys | backend decision: 401 for an invalid key (the usual meaning), or document it |
+| G12 | ~~`Agent.rerun_history()` exported every replayed action as its own one-span trace.~~ **Fixed:** replays get a `browser_use.rerun` agent root span in the Agent's thread. Covered by the baseline. | - | - |
 | G8 | Version pin `browser-use >=0.13,<0.14`. The hooks (`Agent.run/step`, `Tools.act`, `TokenCost.register_llm`) have been stable since 0.6, but private-ish seams can move. | breakage on 0.14 | widen the pin after testing each minor |
 
 ## Baseline (2026-10-15)
@@ -81,7 +83,8 @@ and checks every exported span for:
 - follow-up tasks: a new trace in the same thread;
 - parallel agents: no shared trace or identifiers;
 - content off: identifiers kept, content dropped;
-- `sensitive_data`: never exported, on both the successful-navigation path and the blocked-navigation path.
+- `sensitive_data`: never exported, on both the successful-navigation path and the blocked-navigation path;
+- `rerun_history`: one trace under a single `browser_use.rerun` root.
 
 Writing it found two bugs, both fixed in the same PR, and three tests failed with
 those fixes stashed:
@@ -106,7 +109,7 @@ extract action's LLM span, cancellation handling, sensitive-data placeholders.
 
 ## Verification log
 
-- Unit + e2e + baseline tests: `pytest tests` (23 tests; the e2e test drives a real headless
+- Unit + e2e + baseline tests: `pytest tests` (24 tests; the e2e test drives a real headless
   Chrome with a scripted LLM and a local HTTP page).
 - Staging soak (2026-10-15): real `azure/gpt-4.1-mini` through the staging
   gateway, real sites, spans exported to `staging-api.respan.ai`.

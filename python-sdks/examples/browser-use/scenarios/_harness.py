@@ -13,13 +13,13 @@ import asyncio
 import json
 import os
 import time
-import urllib.request
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import httpx
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
@@ -89,8 +89,8 @@ class Expect:
     agent_spans: int | None = None  # default: one per trace
     success: bool | None = True  # the agent's own verdict; None = either
     spans_include: tuple[str, ...] = ()  # e.g. "tool.save_note"
-    error_spans: tuple[str, ...] = ()  # spans that must fail; no others may
-    models_include: tuple[str, ...] = ()
+    error_spans: tuple[str, ...] = ()  # spans that must fail
+    models_include: tuple[str, ...] = ()  # as requested; the gateway may report a resolved name
     forbidden: tuple[str, ...] = ()  # strings no span may contain
     prompt_images: bool | None = None  # False: no screenshot reached the model
 
@@ -115,16 +115,15 @@ async def execute(scenario: Scenario) -> None:
 
 
 def fetch_trace(trace_id: str) -> list[dict[str, Any]]:
-    body = json.dumps(
-        {"filters": {"trace_unique_id": {"operator": "", "value": [trace_id]}}}
-    ).encode()
-    request = urllib.request.Request(
-        f"{BASE_URL}/request-logs/list/?page_size=500",
-        data=body,
-        headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
+    response = httpx.post(
+        f"{BASE_URL}/request-logs/list/",
+        params={"page_size": 500},
+        json={"filters": {"trace_unique_id": {"operator": "", "value": [trace_id]}}},
+        headers={"Authorization": f"Bearer {API_KEY}"},
+        timeout=30,
     )
-    with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310 - fixed host
-        payload = json.load(response)
+    response.raise_for_status()
+    payload = response.json()
     return payload.get("results", payload) if isinstance(payload, dict) else payload
 
 
@@ -163,6 +162,9 @@ class Result:
     scenario: Scenario
     traces: dict[str, list[dict[str, Any]]]
     problems: list[str]
+    # Real failures the model ran into on live sites (a blocked search, a bad
+    # selector). The spans are right to be errors; they are listed, not failed.
+    notes: list[str] = field(default_factory=list)
 
     @property
     def agent_rows(self) -> list[dict[str, Any]]:
@@ -219,17 +221,17 @@ async def verify(scenario: Scenario) -> Result:
     for wanted in expect.spans_include:
         check(wanted in names, f"no {wanted} span")
     for model in expect.models_include:
-        check(any(r.get("model") == model for r in rows), f"no call to {model}")
+        check(span_name(model) in names, f"no call to {model}")
     failed = {r.get("span_name") for r in rows if _is_error(r)}
     for wanted in expect.error_spans:
         check(wanted in failed, f"{wanted} should be an error span")
-    allowed = set(expect.error_spans) | ({"agent.browser_use"} if expect.success is not True else set())
-    unexpected = failed - allowed
-    check(not unexpected, f"unexpected error spans: {sorted(unexpected)}")
     if expect.success is not None:
-        verdicts = {_agent_output(r).get("is_successful") for r in agents}
+        runs = [r for r in agents if r.get("span_name") == "agent.browser_use"]
+        verdicts = {_agent_output(r).get("is_successful") for r in runs}
         check(verdicts == {expect.success}, f"agent success {verdicts}, expected {expect.success}")
-    return Result(scenario, traces, problems)
+    incidental = sorted(failed - set(expect.error_spans) - {"task", "agent.browser_use"})
+    notes = [f"model-caused error spans: {incidental}"] if incidental else []
+    return Result(scenario, traces, problems, notes)
 
 
 def print_result(result: Result) -> None:
@@ -238,6 +240,8 @@ def print_result(result: Result) -> None:
     print(f"{status}  {result.scenario.name:<24} {spans:>3} spans  {result.scenario.title}")
     for problem in result.problems:
         print(f"        - {problem}")
+    for note in result.notes:
+        print(f"        ~ {note}")
     for link in result.links:
         print(f"        {link}")
 

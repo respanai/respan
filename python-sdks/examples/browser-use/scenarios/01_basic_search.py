@@ -22,7 +22,8 @@ SCENARIO = Scenario(
     source="getting_started/01_basic_search.py",
     look_for="agent -> steps; the search or navigate tool span, one LLM call per step, a screenshot on every step",
     run=run,
-    expect=Expect(),
+    # Search engines sometimes block automated browsers; the run may fail honestly.
+    expect=Expect(success=None),
 )
 
 if __name__ == "__main__":

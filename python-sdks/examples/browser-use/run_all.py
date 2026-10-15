@@ -68,7 +68,7 @@ def write_report(results, harness) -> Path:
         status = "PASS" if not result.problems else "FAIL"
         spans = sum(len(rows) for rows in result.traces.values())
         links = " ".join(f"[trace {i + 1}]({link})" for i, link in enumerate(result.links))
-        problems = "<br>".join(result.problems)
+        problems = "<br>".join([*result.problems, *(f"note: {n}" for n in result.notes)])
         lines.append(
             f"| {status} | `{result.scenario.name}` {result.scenario.title} | {spans} "
             f"| {result.scenario.look_for} | {links} | {problems} |"
