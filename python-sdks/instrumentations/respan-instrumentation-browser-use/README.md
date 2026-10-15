@@ -31,7 +31,7 @@ browser_use.agent          agent   task in; final result, success, steps, usage 
 ```
 
 - **Screenshots.** Each step's output carries that step's page screenshot as an
-  `image_url` part. Respan stores it as log media and shows it in the log view.
+  `image_url` part, re-encoded as JPEG (max 1280 px wide) to keep exports small. Respan stores it as log media and shows it in the log view.
   LLM prompts keep the screenshot the model actually saw.
 - **Any LLM provider.** Model calls are traced at browser-use's own chat-model
   layer, so OpenAI, Anthropic, Google, Browser Use Cloud, OpenRouter, Ollama and

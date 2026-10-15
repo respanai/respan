@@ -400,5 +400,5 @@ async def test_real_agent_run_produces_full_span_tree(
     assert step_output["next_goal"] == "Finish"
     assert step_output["actions"][0]["done"]["text"] == "Hello browser agent"
     assert step_output["screenshot"]["image_url"]["url"].startswith(
-        "data:image/png;base64,"
+        "data:image/jpeg;base64,"
     )

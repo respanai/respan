@@ -80,6 +80,7 @@ from respan_instrumentation_browser_use._constants import (
     TRACER_NAME,
 )
 from respan_instrumentation_browser_use._serialization import (
+    compact_image,
     content_text,
     json_string,
     jsonable,
@@ -419,7 +420,7 @@ class _Runtime:
             # the log view renders it, so no separate upload API is needed.
             output["screenshot"] = {
                 "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{screenshot}"},
+                "image_url": {"url": compact_image(f"data:image/png;base64,{screenshot}")},
             }
         span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_OUTPUT, json_string(output))
 
