@@ -633,6 +633,12 @@
     },
     {
       "ecosystem": "python",
+      "name": "respan-instrumentation-browser-use",
+      "path": "python-sdks/instrumentations/respan-instrumentation-browser-use",
+      "registry": "pypi"
+    },
+    {
+      "ecosystem": "python",
       "name": "respan-instrumentation-burr",
       "path": "python-sdks/instrumentations/respan-instrumentation-burr",
       "registry": "pypi"

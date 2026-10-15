@@ -442,6 +442,17 @@ AUTO_INSTRUMENTATION_REGISTRY: Tuple[AutoInstrumentationSpec, ...] = (
         auto_disabled_reason=_AGENT_FRAMEWORK_REASON,
     ),
     AutoInstrumentationSpec(
+        id="browser-use",
+        category="agent_framework",
+        provider="browser-use",
+        sdk_package="browser-use",
+        instrumentation_package="respan-instrumentation-browser-use",
+        entry_point="browser-use",
+        import_path="respan_instrumentation_browser_use:BrowserUseInstrumentor",
+        enabled_by_default=False,
+        auto_disabled_reason=_AGENT_FRAMEWORK_REASON,
+    ),
+    AutoInstrumentationSpec(
         id="crewai",
         category="agent_framework",
         provider="CrewAI",
