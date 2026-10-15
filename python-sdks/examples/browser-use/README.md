@@ -17,8 +17,9 @@ cp .env.example .env                                   # then set RESPAN_API_KEY
 browser-use drives an installed Google Chrome or Chromium; `browser-use --doctor`
 checks that it can find and control one.
 
-Working on the instrumentation itself? Install it from this repo instead:
-`pip install -e ../../instrumentations/respan-instrumentation-browser-use`.
+`requirements.txt` installs the instrumentation from this repo (editable), so
+edits under `../../instrumentations/respan-instrumentation-browser-use` take effect
+on the next run. Outside this repo: `pip install respan-instrumentation-browser-use`.
 
 ## Run
 
