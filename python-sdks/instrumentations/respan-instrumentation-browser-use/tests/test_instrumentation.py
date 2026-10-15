@@ -25,6 +25,7 @@ from opentelemetry.semconv_ai import (
 )
 from opentelemetry.trace import StatusCode
 from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
+from respan_tracing.exporters.respan import _export_span_name
 from respan_tracing.utils.preprocessing.span_processing import is_processable_span
 
 from respan_instrumentation_browser_use import BrowserUseInstrumentor
@@ -264,6 +265,15 @@ async def test_real_agent_run_produces_full_span_tree(
     assert {s.name for s in spans} >= {"navigate", "done"}
     # respan-tracing's exporter drops spans it does not recognise; all of ours pass.
     assert all(is_processable_span(s) for s in spans)
+    # ... and names them "<kind>.<detail>" in the Respan UI (task spans carry no
+    # detail by exporter convention; the step number is an attribute).
+    assert {_export_span_name(s) for s in spans} >= {
+        "agent.browser_use",
+        "task",
+        "tool.navigate",
+        "tool.done",
+        "llm.scripted-1",
+    }
 
     assert root.attributes[RESPAN_LOG_TYPE] == "agent"
     assert json.loads(root.attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT]) == {

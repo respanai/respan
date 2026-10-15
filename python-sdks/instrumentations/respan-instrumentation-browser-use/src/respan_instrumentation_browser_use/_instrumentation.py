@@ -39,12 +39,16 @@ from respan_sdk.constants.llm_logging import (
     LOG_TYPE_TASK,
     LOG_TYPE_TOOL,
 )
-from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
+from respan_sdk.constants.span_attributes import (
+    RESPAN_INTERNAL_SPAN_NAME_DETAIL,
+    RESPAN_LOG_TYPE,
+)
 from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
 from respan_tracing.core.tracer import RespanTracer
 
 from respan_instrumentation_browser_use._constants import (
     AGENT_MODULE,
+    AGENT_NAME_DETAIL,
     ATTR_ACTION_NAME,
     ATTR_AGENT_ID,
     ATTR_PAGE_TITLE,
@@ -53,6 +57,7 @@ from respan_instrumentation_browser_use._constants import (
     ATTR_STEP_NUMBER,
     INSTRUMENTATION_NAME,
     PATCH_MARKER,
+    SPAN_ACTION,
     SPAN_AGENT,
     SPAN_LLM,
     SPAN_STEP,
@@ -137,11 +142,17 @@ class _Runtime:
         self.patches.clear()
 
     @contextmanager
-    def span(self, name: str, log_type: str) -> Iterator[Any]:
+    def span(
+        self, name: str, log_type: str, *, detail: str | None = None
+    ) -> Iterator[Any]:
         attributes: dict[str, Any] = {
             RESPAN_LOG_TYPE: log_type,
             SpanAttributes.TRACELOOP_ENTITY_NAME: name,
         }
+        if detail:
+            # The exporter names agent/tool spans "<kind>.<detail>"; without a hint
+            # the agent would show as "agent.browser_use.agent".
+            attributes[RESPAN_INTERNAL_SPAN_NAME_DETAIL] = detail
         if span_kind := _SPAN_KINDS.get(log_type):
             # respan-tracing exports only spans with a span kind or an LLM request
             # type; without this the agent/step/action spans never leave the process.
@@ -166,7 +177,9 @@ class _Runtime:
         async def run(agent: Any, *args: Any, **kwargs: Any) -> Any:
             if not runtime.active:
                 return await original(agent, *args, **kwargs)
-            with runtime.span(SPAN_AGENT, LOG_TYPE_AGENT) as span:
+            with runtime.span(
+                SPAN_AGENT, LOG_TYPE_AGENT, detail=AGENT_NAME_DETAIL
+            ) as span:
                 _safe(lambda: runtime._agent_start(span, agent))
                 history = await original(agent, *args, **kwargs)
                 _safe(lambda: runtime._agent_end(span, history))
@@ -220,9 +233,11 @@ class _Runtime:
                 return await original(agent, *args, **kwargs)
             history = getattr(agent, "history", None)
             before = len(getattr(history, "history", ()) or ())
-            step_number = getattr(getattr(agent, "state", None), "n_steps", None)
+            number = _non_negative_int(
+                getattr(getattr(agent, "state", None), "n_steps", None)
+            )
             with runtime.span(SPAN_STEP, LOG_TYPE_TASK) as span:
-                if (number := _non_negative_int(step_number)) is not None:
+                if number is not None:
                     span.set_attribute(ATTR_STEP_NUMBER, number)
                 result = await original(agent, *args, **kwargs)
                 _safe(lambda: runtime._step_end(span, agent, before))
@@ -283,7 +298,7 @@ class _Runtime:
             if not runtime.active:
                 return await original(tools, action, *args, **kwargs)
             name, params = _action_call(action)
-            with runtime.span(name or "browser_use.action", LOG_TYPE_TOOL) as span:
+            with runtime.span(name or SPAN_ACTION, LOG_TYPE_TOOL) as span:
                 if name:
                     span.set_attribute(ATTR_ACTION_NAME, name)
                 if _content_allowed(runtime):

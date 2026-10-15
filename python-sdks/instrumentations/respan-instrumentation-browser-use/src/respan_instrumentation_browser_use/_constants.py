@@ -11,6 +11,10 @@ TOKENS_MODULE = "browser_use.tokens.service"
 SPAN_AGENT = "browser_use.agent"
 SPAN_STEP = "browser_use.step"
 SPAN_LLM = "browser_use.llm"
+SPAN_ACTION = "browser_use.action"  # only when an ActionModel has no set field
+
+# Display-name detail: Respan shows the run as "agent.browser_use".
+AGENT_NAME_DETAIL = "browser_use"
 
 # Span attributes specific to browser agents. Everything else uses the
 # OpenLLMetry / gen_ai names the Respan backend already parses.

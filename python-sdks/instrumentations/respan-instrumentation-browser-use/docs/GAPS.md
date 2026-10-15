@@ -58,6 +58,8 @@ detail (scrolls, typing, hovers).
 | G5 | `browser_use.beta` agent (separate `run`) is not wrapped. | beta users get LLM/action spans but no agent/step spans | wrap once the beta API settles |
 | G6 | CI for Python packages only builds the wheel and smoke-imports it; it never runs package tests. These tests (including a real headless-Chrome agent run) were run locally. | regressions not caught in CI | add a pytest step to `ci.yml` for packages that have `tests/` |
 | G7 | browser-use's built-in judge runs by default (`use_judge=True`) and makes one extra LLM call per run; it shows as a `browser_use.llm` span directly under the agent span. | expected, but customers may ask about the extra call | documented |
+| G9 | `respan-tracing` names task spans by bare kind (only agent/tool/llm/handoff get a `.detail` suffix), so every step shows as `task` in the span list. The step number is in metadata (`browser_use.step.number`). | steps are hard to tell apart in the tree | exporter or frontend: show `traceloop.entity.name` / step number for task spans |
+| G10 | **Off-scope, staging infra:** the presigned media URL for the lifted screenshot (`kwaistagingblob.blob.core.windows.net/files/media/...`) returned `AuthorizationFailure` from a public client inside its validity window (2026-10-15 10:42Z, SAS valid to 10:52Z). That pattern points at a storage-account network rule, which would block every log-media image on staging in the browser, not just these. | screenshots (and all log media) may not render on staging | infra: check the staging storage account firewall / public network access; not an SDK change |
 | G8 | Version pin `browser-use >=0.13,<0.14`. The hooks (`Agent.run/step`, `Tools.act`, `TokenCost.register_llm`) have been stable since 0.6, but private-ish seams can move. | breakage on 0.14 | widen the pin after testing each minor |
 
 ## Verification log
@@ -65,5 +67,14 @@ detail (scrolls, typing, hovers).
 - Unit + e2e tests: `pytest tests` (9 tests; the e2e test drives a real headless
   Chrome with a scripted LLM and a local HTTP page).
 - Staging soak (2026-10-15): real `azure/gpt-4.1-mini` through the staging
-  gateway, real site (example.com -> "Learn more" -> heading), spans exported to
-  `staging-api.respan.ai`. See the PR description for the trace read-back.
+  gateway, real sites, spans exported to `staging-api.respan.ai`.
+  - First soak exported nothing: agent/step/action spans lacked
+    `traceloop.span.kind` and `respan-tracing` filtered them (G2). Fixed.
+  - Hacker News task (trace `c1c401476a449e890637763422128b78`): 13 spans read
+    back from the logs API: `tool.navigate` (browser-use's pre-step URL open),
+    3 `task` steps each with `llm.azure_gpt-4.1-mini` + action
+    (`tool.click`, `tool.extract`, `tool.done`), the extraction model's own LLM
+    call nested inside `tool.extract`, the judge call under the agent, and the
+    root `agent.browser_use`. Token counts and cost were computed server-side.
+  - Step output's screenshot came back as a media-storage URL (the backend
+    lifted the data URI), see G10 for the access error on staging.
