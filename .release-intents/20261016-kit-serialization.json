@@ -1,0 +1,8 @@
+{
+  "summary": "respan-tracing: jsonable/json_string and suppress_provider_llm_spans join the agent instrumentation kit; browser-use and skyvern use them",
+  "packages": {
+    "respan-tracing": "minor",
+    "respan-instrumentation-browser-use": "patch",
+    "respan-instrumentation-skyvern": "none"
+  }
+}

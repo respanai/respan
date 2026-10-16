@@ -30,9 +30,9 @@ from respan_instrumentation_browser_use._constants import (
     ATTR_PAGE_URL,
     ATTR_STEP_NUMBER,
 )
-from respan_instrumentation_browser_use._instrumentation import _openai_suppressor
 from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
 from respan_tracing.exporters.respan import _export_span_name
+from respan_tracing.utils.agent_instrumentation import openai_suppressor
 from respan_tracing.utils.preprocessing.span_processing import is_processable_span
 
 from .conftest import ScriptedLLM, chrome_path
@@ -159,13 +159,13 @@ async def test_respan_openai_instrumentation_is_suppressed(
         "respan_instrumentation_openai",
         types.ModuleType("respan_instrumentation_openai"),
     )
-    _openai_suppressor.cache_clear()  # resolved once per process by design
+    openai_suppressor.cache_clear()  # resolved once per process by design
     llm = ScriptedLLM(["ok"])
     TokenCost().register_llm(llm)
     try:
         await llm.ainvoke(_MESSAGES)
     finally:
-        _openai_suppressor.cache_clear()
+        openai_suppressor.cache_clear()
 
     assert entered == [True]
 

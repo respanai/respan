@@ -32,7 +32,7 @@ import inspect
 import logging
 import threading
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import cache, partial, wraps
@@ -40,7 +40,6 @@ from typing import Any
 
 from opentelemetry import context, trace
 from opentelemetry.semconv_ai import (
-    SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY,
     SpanAttributes,
 )
 from respan_sdk.constants.llm_logging import (
@@ -58,6 +57,7 @@ from respan_tracing.utils.agent_instrumentation import (
     safely,
     secret_replacements,
     set_error,
+    suppress_provider_llm_spans,
 )
 
 from respan_instrumentation_skyvern._constants import (
@@ -695,7 +695,7 @@ class _Runtime:
             safely(lambda: self._llm_start(span, model, messages, prompt_name, kwargs))
             in_llm = _IN_LLM.set(True)
             try:
-                with _suppress_provider_llm_spans():
+                with suppress_provider_llm_spans():
                     response = await original(*call_args, **kwargs)
             except asyncio.CancelledError as error:
                 # Skyvern cancels its speculative next-step plan when the run ends
@@ -790,35 +790,6 @@ def _action_dict(action: Any) -> dict[str, Any]:
     for key in ACTION_FIELDS_DROPPED:
         data.pop(key, None)
     return data
-
-
-@cache
-def _openai_suppressor() -> Callable[[], Any]:
-    # Optional dependency, resolved once: a failed import is not cached by Python.
-    try:
-        from respan_instrumentation_openai._instrumentation import (
-            suppress_openai_instrumentation,
-        )
-    except ImportError:
-        return nullcontext
-    return suppress_openai_instrumentation
-
-
-@contextmanager
-def _suppress_provider_llm_spans() -> Iterator[None]:
-    """litellm / OpenAI instrumentations would log the call this span already carries.
-
-    The LiteLLM instrumentation honours OTel's language-model suppression key;
-    Respan's OpenAI instrumentation (litellm's OpenAI-compatible path) has its
-    own switch.
-    """
-    suppress_openai_instrumentation = _openai_suppressor()
-    token = context.attach(context.set_value(SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY, True))
-    try:
-        with suppress_openai_instrumentation():
-            yield
-    finally:
-        context.detach(token)
 
 
 def _import(name: str) -> Any:
