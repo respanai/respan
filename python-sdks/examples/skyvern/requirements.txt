@@ -1,0 +1,8 @@
+# Skyvern example - dependencies. Python 3.11-3.13.
+# The instrumentation is installed from this repo (editable), so the example
+# always runs the code next to it - no PyPI release needed.
+-e ../../instrumentations/respan-instrumentation-skyvern
+respan-ai>=4.2.4
+skyvern[local]>=1.0.56,<2
+python-dotenv>=1.0.0
+# then: python -m playwright install chromium

@@ -218,6 +218,9 @@ jobs:
                   print(name if spec == "*" else f"{name}{spec}")
           PY
           python -m pip install -r third-party.txt
+          # Test-only extras (e.g. a framework's optional engine) the package
+          # itself does not depend on.
+          if [ -f tests/requirements.txt ]; then python -m pip install -r tests/requirements.txt; fi
           python -m pytest tests -q
 
       # A1: respan-ai bundles the native respan-instrumentation-* plugins so a bare

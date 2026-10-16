@@ -1,0 +1,5 @@
+# Skyvern writes these into the working directory during tests
+har/
+video/
+temp/
+log/

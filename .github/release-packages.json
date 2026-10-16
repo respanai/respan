@@ -447,6 +447,13 @@
     },
     {
       "ecosystem": "python",
+      "name": "respan-instrumentation-skyvern",
+      "path": "python-sdks/instrumentations/respan-instrumentation-skyvern",
+      "registry": "pypi",
+      "python_tests": true
+    },
+    {
+      "ecosystem": "python",
       "name": "respan-instrumentation-smolagents",
       "path": "python-sdks/instrumentations/respan-instrumentation-smolagents",
       "registry": "pypi"

@@ -1,0 +1,8 @@
+.venv/
+.env
+runs/
+# Skyvern writes these into the working directory
+har/
+video/
+temp/
+log/
