@@ -34,8 +34,6 @@ ANTHROPIC_USAGE_MODULES = frozenset(
     {"browser_use.llm.anthropic.chat", "browser_use.llm.aws.chat_anthropic"}
 )
 
-EXCEPTION_EVENT = "exception"
-
 # Placeholder for inline media dropped from captured content.
 IMAGE_PLACEHOLDER = "[image omitted: {media_type}, {size} base64 chars]"
 DATA_URL_PREFIX = "data:"

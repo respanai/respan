@@ -13,7 +13,7 @@ import asyncio
 import json
 import os
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,12 +41,15 @@ if not API_KEY:
 
 SCENARIO_ATTR = "respan.metadata.scenario"
 _traces: dict[str, set[str]] = defaultdict(set)
+_exported: Counter[str] = Counter()  # spans the SDK exported, per trace id
 _client: Respan | None = None
 
 
 def _remember_trace(span: Any) -> None:
     if scenario := span.attributes.get(SCENARIO_ATTR):
-        _traces[scenario].add(format(span.context.trace_id, "032x"))
+        trace_id = format(span.context.trace_id, "032x")
+        _traces[scenario].add(trace_id)
+        _exported[trace_id] += 1
 
 
 def init(*, capture_content: bool = True, capture_screenshots: bool = True) -> Respan:
@@ -185,11 +188,18 @@ async def structure_problems(rows: list[dict[str, Any]]) -> list[str]:
             1 for k in kids if k.get("log_type") == "task" and "results" in _agent_output(k)
         )
         output = _agent_output(row)
+        if row.get("span_name") == "agent.browser_use" and output.get("is_done"):
+            # browser-use's judge (use_judge=True) grades every finished run; a
+            # missing verdict means its LLM call failed somewhere in the trace.
+            if "judge_verdict" not in output:
+                problems.append("finished run has no judge_verdict (judge call failed)")
         if row.get("span_name") == "agent.browser_use" and "steps" in output:
             recorded = recorded_steps + (1 if "tool" in kinds else 0)
             if recorded != output["steps"]:
                 problems.append(f"agent reports {output['steps']} steps, trace has {recorded}")
-        elif row.get("log_type") == "task" and "results" in output:
+        # A step whose model reply failed validation records one error result
+        # and runs no action, so only steps with actions need tool spans.
+        elif row.get("log_type") == "task" and "actions" in output:
             step = (row.get("metadata") or {}).get("browser_use.step.number")
             if kinds.count("tool") != len(output["results"]):
                 problems.append(
@@ -238,6 +248,10 @@ async def verify(scenario: Scenario) -> Result:
     check(len(trace_ids) == expect.traces, f"{len(trace_ids)} traces, expected {expect.traces}")
     for trace_id, trace_rows in traces.items():
         check(bool(trace_rows), f"trace {trace_id} not found in Respan")
+        check(
+            len(trace_rows) == _exported[trace_id],
+            f"trace {trace_id[:8]}: SDK exported {_exported[trace_id]} spans, Respan has {len(trace_rows)}",
+        )
         roots = [r for r in trace_rows if not r.get("span_parent_id")]
         check(len(roots) == 1, f"trace {trace_id[:8]}: {len(roots)} root spans")
         agents = [r for r in trace_rows if r.get("log_type") == "agent"]

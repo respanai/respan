@@ -1,0 +1,6 @@
+{
+  "summary": "browser-use: error spans carry 'Type: message' (masked) as their error message; shared respan-tracing content policy and SDK exception constant",
+  "packages": {
+    "respan-instrumentation-browser-use": "patch"
+  }
+}

@@ -58,7 +58,7 @@ scenario expects them. Scenarios add their own checks, listed below.
 | 11 | `sensitive_data` | features/sensitive_data | params show `<secret>demo_pass</secret>`; the password is in no span |
 | 12 | `restrict_urls` | features/restrict_urls | the blocked `tool.navigate` is an error span |
 | 13 | `blocked_domains` | features/blocked_domains | same, with `prohibited_domains` |
-| 14 | `fallback_model` | features/fallback_model | the primary model's call fails, the fallback model's call follows |
+| 14 | `fallback_model` | features/fallback_model | the primary model's call fails (`ModelProviderError: Connection error.`), the fallback's call follows. browser-use's judge uses the PRIMARY model and does not fall back, so the scenario sets `judge_llm` |
 | 15 | `extraction_model` | features/small_model_for_extraction | `tool.extract` holds an LLM span on the small model |
 | 16 | `judge` | features/judge_trace | the judge's LLM span after the steps; `judge_verdict` on the agent |
 | 17 | `custom_tools` | custom-functions/ | your `@tools.action` functions as `tool.save_note`, `tool.current_page_title` |

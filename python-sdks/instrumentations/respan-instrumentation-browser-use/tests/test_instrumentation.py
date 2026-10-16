@@ -240,6 +240,7 @@ async def test_content_off_records_exception_type_only(exporter):
         instrumentor.deactivate()
     (span,) = _by_name(exporter, "browser_use.llm")
     assert span.status.status_code is StatusCode.ERROR
+    assert span.status.description == "ValueError"
     (event,) = span.events
     assert dict(event.attributes) == {"exception.type": "ValueError"}
     assert "my-secret-prompt" not in repr(span.to_json())
@@ -273,6 +274,8 @@ async def test_llm_error_marks_span_and_propagates(exporter, instrumentor):
         await llm.ainvoke(_MESSAGES)
     (span,) = _by_name(exporter, "browser_use.llm")
     assert span.status.status_code is StatusCode.ERROR
+    # Respan shows the status description as the span's error message.
+    assert span.status.description == "RuntimeError: provider down"
 
 
 async def test_failed_action_is_an_error_tool_span(exporter, instrumentor):
@@ -292,6 +295,7 @@ async def test_failed_action_is_an_error_tool_span(exporter, instrumentor):
     }
     if result.error:
         assert span.status.status_code is StatusCode.ERROR
+        assert span.status.description.startswith("action error: ")
     else:
         assert span.status.status_code is not StatusCode.ERROR
 
