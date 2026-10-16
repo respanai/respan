@@ -16,7 +16,7 @@ const args = process.argv.slice(2);
 const flags = new Set(args.filter((a) => a.startsWith("--")));
 const screenshotOnIndex = args.indexOf("--screenshot-on");
 const screenshotOn = (screenshotOnIndex >= 0 ? args[screenshotOnIndex + 1] : "never") as "never" | "navigation" | "action";
-const names = args.filter((a, i) => !a.startsWith("--") && i !== screenshotOnIndex + 1);
+const names = args.filter((a, i) => !a.startsWith("--") && !(screenshotOnIndex >= 0 && i === screenshotOnIndex + 1));
 if (flags.has("--headed")) process.env.HEADED = "1";
 
 const harness = await import("./harness.js");
