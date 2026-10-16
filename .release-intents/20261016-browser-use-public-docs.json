@@ -1,0 +1,6 @@
+{
+  "summary": "browser-use: GAPS.md rewritten as public coverage + known limitations",
+  "packages": {
+    "respan-instrumentation-browser-use": "none"
+  }
+}

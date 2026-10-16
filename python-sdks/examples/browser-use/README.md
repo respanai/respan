@@ -11,7 +11,7 @@ browser action.
 cd python-sdks/examples/browser-use
 python3 -m venv .venv && source .venv/bin/activate     # Python 3.11-3.13
 pip install -r requirements.txt
-cp .env.example .env                                   # then set RESPAN_API_KEY (+ staging URLs)
+cp .env.example .env                                   # then set RESPAN_API_KEY
 ```
 
 browser-use drives an installed Google Chrome or Chromium; `browser-use --doctor`
