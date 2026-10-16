@@ -6,7 +6,7 @@ from typing import Any
 from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor
 from opentelemetry.semconv_ai import SpanAttributes
 from respan_sdk.utils.data_processing.id_processing import format_span_id
-from respan_tracing.decorators.base import _should_send_prompts
+from respan_tracing.utils.context import is_content_tracing_enabled
 
 from ._compat import apply_embedding_capture
 from ._constants import (
@@ -242,7 +242,7 @@ class _HaystackParentSpanProcessor(SpanProcessor):
         if trace_id is not None:
             self._span_ids_by_trace.setdefault(trace_id, set()).add(span_id)
             self._active_by_trace[trace_id] = self._active_by_trace.get(trace_id, 0) + 1
-        self._content_allowed_by_span[span_id] = _should_send_prompts()
+        self._content_allowed_by_span[span_id] = is_content_tracing_enabled()
         self._parent_by_span_id[span_id] = _get_parent_span_id(span)
         self._context_by_span_id[span_id] = span.get_span_context()
         if _is_haystack_native_span(span):
@@ -266,7 +266,7 @@ class _HaystackParentSpanProcessor(SpanProcessor):
             scope = getattr(getattr(span, "instrumentation_scope", None), "name", "")
             allowed = self._content_allowed_by_span.get(_get_span_id(span), True)
             if scope == "openinference.instrumentation.haystack" and (
-                not allowed or not _should_send_prompts()
+                not allowed or not is_content_tracing_enabled()
             ):
                 span._attributes = without_content(dict(span.attributes or {}))
         finally:

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import math
-import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -25,7 +24,6 @@ from agents.tracing.span_data import (
 )
 from agents.tracing.spans import Span, SpanImpl
 from agents.tracing.traces import Trace
-from opentelemetry import context as context_api
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import (
     GEN_AI_USAGE_INPUT_TOKENS,
     GEN_AI_USAGE_OUTPUT_TOKENS,
@@ -55,7 +53,7 @@ from respan_sdk.constants.span_attributes import (
     RESPAN_METADATA_TRIGGERED,
     RESPAN_TRACE_GROUP_ID,
 )
-from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+from respan_tracing.utils.context import is_content_tracing_enabled
 from respan_tracing.utils.span_factory import build_readable_span, inject_span
 
 from respan_instrumentation_openai_agents._serialization import (
@@ -333,11 +331,7 @@ def _is_streaming(
 
 
 def _apply_content_privacy(attributes: dict[str, Any]) -> None:
-    enabled = os.getenv("TRACELOOP_TRACE_CONTENT", "true").strip().lower()
-    if (
-        enabled not in {"0", "false", "no", "off"}
-        and context_api.get_value(ENABLE_CONTENT_TRACING_KEY) is not False
-    ):
+    if is_content_tracing_enabled():
         return
     for key in tuple(attributes):
         if key in {

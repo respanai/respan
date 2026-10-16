@@ -2,7 +2,6 @@
 
 import importlib
 import logging
-import os
 from threading import RLock
 from typing import Any, ClassVar
 
@@ -10,6 +9,7 @@ from opentelemetry import context, trace
 from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor
 from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
 from respan_tracing.core.tracer import RespanTracer
+from respan_tracing.utils.context import is_content_tracing_enabled
 from respan_tracing.utils.span_factory import read_propagated_attributes
 
 from respan_instrumentation_guardrails._translation import normalize
@@ -26,10 +26,8 @@ def _runtime_disabled(parent_context=None) -> bool:
 
 
 def _capture_content(parent_context=None) -> bool:
-    if _runtime_disabled(parent_context):
-        return False
-    return os.getenv("TRACELOOP_TRACE_CONTENT", "true").lower() == "true" or bool(
-        context.get_value("override_enable_content_tracing", parent_context)
+    return not _runtime_disabled(parent_context) and is_content_tracing_enabled(
+        parent_context
     )
 
 

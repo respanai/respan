@@ -22,7 +22,7 @@ from openinference.semconv.trace import (
 from opentelemetry import trace
 from opentelemetry.semconv._incubating.attributes import gen_ai_attributes
 from opentelemetry.semconv_ai import SpanAttributes
-from respan_tracing.decorators.base import _should_send_prompts
+from respan_tracing.utils.context import is_content_tracing_enabled
 
 from ._content import without_content
 
@@ -193,7 +193,11 @@ def install_compatibility(delegate: Any) -> list[tuple[Any, str, Any, Any]]:
                         if hasattr(tool, "parameters")
                     ]
                 )
-            return attributes if _should_send_prompts() else without_content(attributes)
+            return (
+                attributes
+                if is_content_tracing_enabled()
+                else without_content(attributes)
+            )
 
         def response(bound_arguments, component_type, result, instance):
             attributes = original_response(
@@ -250,7 +254,11 @@ def install_compatibility(delegate: Any) -> list[tuple[Any, str, Any, Any]]:
                     captured[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = _json(vectors)
                 current_span = trace.get_current_span()
                 context = current_span.get_span_context()
-                if current_span.is_recording() and captured and _should_send_prompts():
+                if (
+                    current_span.is_recording()
+                    and captured
+                    and is_content_tracing_enabled()
+                ):
                     _EMBEDDINGS[(context.trace_id, context.span_id)] = captured
                 metadata = result.get("meta")
                 usage = metadata.get("usage", {}) if isinstance(metadata, dict) else {}
@@ -268,7 +276,11 @@ def install_compatibility(delegate: Any) -> list[tuple[Any, str, Any, Any]]:
                         and value >= 0
                     ):
                         attributes[key] = value
-            return attributes if _should_send_prompts() else without_content(attributes)
+            return (
+                attributes
+                if is_content_tracing_enabled()
+                else without_content(attributes)
+            )
 
         patch(wrappers, "_set_component_runner_request_attributes", request)
         patch(wrappers, "_set_component_runner_response_attributes", response)
@@ -328,7 +340,7 @@ def install_compatibility(delegate: Any) -> list[tuple[Any, str, Any, Any]]:
                     {"name": tool_call.tool_name, "arguments": tool_call.arguments}
                 ),
             }
-            if not _should_send_prompts():
+            if not is_content_tracing_enabled():
                 attributes = without_content(attributes)
             if tool_call.id is not None:
                 attributes[gen_ai_attributes.GEN_AI_TOOL_CALL_ID] = tool_call.id
@@ -339,7 +351,7 @@ def install_compatibility(delegate: Any) -> list[tuple[Any, str, Any, Any]]:
                 class ToolSpan:
                     def set_content_tag(self, key, value):
                         if key.endswith(".output"):
-                            if _should_send_prompts():
+                            if is_content_tracing_enabled():
                                 span.set_attribute(
                                     OIAttributes.OUTPUT_VALUE, _json(value)
                                 )

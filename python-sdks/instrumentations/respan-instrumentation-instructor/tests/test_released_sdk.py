@@ -553,7 +553,7 @@ def test_hostile_error_string_does_not_mask_native_exception(spans):
 
 def test_policy_failure_on_scope_exit_preserves_result_and_context(spans, monkeypatch):
     provider, exporter, _ = spans
-    original_policy = module._content_allowed
+    original_policy = module.is_content_tracing_enabled
     switched = []
 
     def policy():
@@ -565,7 +565,7 @@ def test_policy_failure_on_scope_exit_preserves_result_and_context(spans, monkey
         switched.append(True)
         return User(name="Ada", age=36)
 
-    monkeypatch.setattr(module, "_content_allowed", policy)
+    monkeypatch.setattr(module, "is_content_tracing_enabled", policy)
     client = instructor.Instructor(client=None, create=native)
     with provider.get_tracer("caller").start_as_current_span("parent") as parent:
         assert call(client).age == 36

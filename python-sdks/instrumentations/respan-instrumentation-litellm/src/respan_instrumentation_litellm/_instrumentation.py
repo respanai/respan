@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import inspect
 import logging
-import os
 import threading
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -25,8 +24,9 @@ from opentelemetry.semconv._incubating.attributes.http_attributes import (
     HTTP_RESPONSE_STATUS_CODE,
 )
 from opentelemetry.semconv_ai import SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY
-from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+from respan_sdk.constants.otlp_constants import OTEL_EXCEPTION_EVENT_NAME
 from respan_tracing.core.tracer import RespanTracer
+from respan_tracing.utils.context import is_content_tracing_enabled
 
 from ._callback import RespanLiteLLMCallback
 from ._serialization import redact_text
@@ -54,9 +54,7 @@ def allowed(parent_context=None):
     return (
         _BOUND.get()
         and get(litellm, "turn_off_message_logging") is not True
-        and os.getenv("TRACELOOP_TRACE_CONTENT", "true").strip().lower()
-        not in {"0", "false", "no", "off"}
-        and context.get_value(ENABLE_CONTENT_TRACING_KEY, parent_context) is not False
+        and is_content_tracing_enabled(parent_context)
     )
 
 
@@ -434,7 +432,7 @@ class _Call:
                             text = redact_text(args[0])
                             self.span.set_attribute(ERROR_MESSAGE, text)
                             event[EXCEPTION_MESSAGE] = text
-                        self.span.add_event("exception", event)
+                        self.span.add_event(OTEL_EXCEPTION_EVENT_NAME, event)
         finally:
             self.kwargs.clear()
             self.chunks.clear()

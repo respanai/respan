@@ -1,12 +1,11 @@
 """Shared, reversible native telemetry policy for Agent Framework."""
 
-import os
 from functools import wraps
 from threading import RLock
 
-from opentelemetry import context, trace
+from opentelemetry import trace
 from opentelemetry.instrumentation.utils import is_instrumentation_enabled
-from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+from respan_tracing.utils.context import is_content_tracing_enabled
 
 _lock = RLock()
 _users = 0
@@ -19,19 +18,11 @@ _patches = []
 
 
 def capture_content(parent_context=None):
-    if not _capture:
-        return False
-    if (
-        context.get_value(ENABLE_CONTENT_TRACING_KEY) is False
-        or context.get_value(ENABLE_CONTENT_TRACING_KEY, parent_context) is False
-    ):
-        return False
-    return os.getenv("TRACELOOP_TRACE_CONTENT", "true").strip().lower() not in {
-        "false",
-        "0",
-        "no",
-        "off",
-    }
+    return (
+        _capture
+        and is_content_tracing_enabled()
+        and is_content_tracing_enabled(parent_context)
+    )
 
 
 def _restore():

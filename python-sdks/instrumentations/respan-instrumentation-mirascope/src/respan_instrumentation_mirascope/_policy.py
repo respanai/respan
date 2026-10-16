@@ -2,23 +2,20 @@
 
 from __future__ import annotations
 
-import os
 import threading
 
 from opentelemetry import context, trace
 from opentelemetry.context import _SUPPRESS_INSTRUMENTATION_KEY
 from opentelemetry.sdk.trace import SpanProcessor
 from opentelemetry.semconv_ai import SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY
-from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+from respan_tracing.utils.context import is_content_tracing_enabled
 
 
 def allowed(capture=True, parent_context=None):
     return (
         capture
-        and os.getenv("TRACELOOP_TRACE_CONTENT", "true").strip().lower()
-        not in {"false", "0", "off", "no"}
-        and context.get_value(ENABLE_CONTENT_TRACING_KEY) is not False
-        and context.get_value(ENABLE_CONTENT_TRACING_KEY, parent_context) is not False
+        and is_content_tracing_enabled()
+        and is_content_tracing_enabled(parent_context)
     )
 
 

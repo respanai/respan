@@ -5,7 +5,6 @@ from __future__ import annotations
 import functools
 import json
 import logging
-import os
 from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -41,13 +40,14 @@ from respan_sdk.constants.llm_logging import (
     LOG_TYPE_TOOL,
     LOG_TYPE_WORKFLOW,
 )
+from respan_sdk.constants.otlp_constants import OTEL_EXCEPTION_EVENT_NAME
 from respan_sdk.constants.span_attributes import (
     RESPAN_LOG_TYPE,
     RESPAN_METADATA,
     RESPAN_SPAN_ATTRIBUTES_MAP,
 )
-from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
 from respan_tracing.core.tracer import RespanTracer
+from respan_tracing.utils.context import is_content_tracing_enabled
 
 from ._constants import (
     LANGCHAIN_FRAMEWORK_ATTR,
@@ -90,12 +90,7 @@ def _key(value: Any) -> str:
 
 
 def _content_enabled(handler) -> bool:
-    return (
-        handler.include_content
-        and context.get_value(ENABLE_CONTENT_TRACING_KEY) is not False
-        and os.getenv("TRACELOOP_TRACE_CONTENT", "true").strip().lower()
-        not in {"0", "false", "off", "no"}
-    )
+    return handler.include_content and is_content_tracing_enabled()
 
 
 def _suppressed() -> bool:
@@ -538,7 +533,7 @@ class RespanCallbackHandler(BaseCallbackHandler):
                     if message:
                         event[EXCEPTION_MESSAGE] = message
                         run.span.set_status(Status(StatusCode.ERROR, message))
-                run.span.add_event("exception", event)
+                run.span.add_event(OTEL_EXCEPTION_EVENT_NAME, event)
             if run.capture:
                 if run.input is not None:
                     run.span.set_attribute(

@@ -20,7 +20,8 @@ from respan_sdk.constants.span_attributes import (
     RESPAN_LOG_TYPE,
     RESPAN_METADATA,
 )
-from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+from respan_tracing.constants.generic_constants import TRACE_CONTENT_OFF_VALUES
+from respan_tracing.utils.context import is_content_tracing_enabled
 
 
 def suppressed(ctx=None):
@@ -53,20 +54,20 @@ def content_allowed(setting=True, ctx=None):
         ]
         if any(getattr(p, "_allow_pii", True) is False for p in native):
             return False
-        if not native and os.getenv(
-            "LIVEKIT_TELEMETRY_ALLOW_PII", "true"
-        ).strip().lower() in {"false", "0", "off", "no"}:
+        if (
+            not native
+            and os.getenv("LIVEKIT_TELEMETRY_ALLOW_PII", "true").strip().lower()
+            in TRACE_CONTENT_OFF_VALUES
+        ):
             return False
         return bool(
             setting
-            and context.get_value(ENABLE_CONTENT_TRACING_KEY) is not False
-            and context.get_value(ENABLE_CONTENT_TRACING_KEY, ctx) is not False
-            and os.getenv("TRACELOOP_TRACE_CONTENT", "true").strip().lower()
-            not in {"false", "0", "off", "no"}
+            and is_content_tracing_enabled()
+            and is_content_tracing_enabled(ctx)
             and os.getenv("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "true")
             .strip()
             .lower()
-            not in {"false", "0", "off", "no"}
+            not in TRACE_CONTENT_OFF_VALUES
             and not suppressed()
             and not suppressed(ctx)
         )

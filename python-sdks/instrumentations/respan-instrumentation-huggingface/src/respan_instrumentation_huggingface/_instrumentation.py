@@ -21,9 +21,10 @@ from opentelemetry.semconv_ai import SpanAttributes as AI
 from opentelemetry.trace import Status, StatusCode
 from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE, RESPAN_METADATA
 from respan_tracing.core.tracer import RespanTracer
+from respan_tracing.utils.context import is_content_tracing_enabled
 
 from ._constants import TRANSFORMERS_SCOPE_NAME, TRANSFORMERS_TEXT_GENERATION_SPAN_NAME
-from ._policy import CapturePolicy, PrivacyObserver, explicit_capture
+from ._policy import CapturePolicy, PrivacyObserver
 from ._serialization import (
     json_string,
     json_value,
@@ -770,7 +771,7 @@ class HuggingFaceInstrumentor:
 
                 def detach(*args, **kwargs):
                     try:
-                        if manager.enabled and not explicit_capture():
+                        if manager.enabled and not is_content_tracing_enabled():
                             manager.observer.notice()
                     except Exception:  # noqa: BLE001
                         logger.debug("Transformers context observer failed")

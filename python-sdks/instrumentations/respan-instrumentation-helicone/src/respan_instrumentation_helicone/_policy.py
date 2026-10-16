@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
@@ -11,6 +10,10 @@ from opentelemetry import context, trace
 from opentelemetry.context import _SUPPRESS_INSTRUMENTATION_KEY
 from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
 from respan_tracing.core.tracer import RespanTracer
+from respan_tracing.utils.context import is_content_tracing_enabled
+
+_ALLOW_TRACE_CONTENT_KEY = "allow_trace_content"
+_CONTENT_ATTRIBUTE_KEYS = (_ALLOW_TRACE_CONTENT_KEY, ENABLE_CONTENT_TRACING_KEY)
 
 
 @dataclass
@@ -33,18 +36,9 @@ def runtime_enabled() -> bool:
 
 
 def _content_enabled() -> bool:
-    if any(
-        context.get_value(key) is False
-        for key in (
-            ENABLE_CONTENT_TRACING_KEY,
-            "override_enable_content_tracing",
-            "allow_trace_content",
-        )
-    ):
-        return False
-    return all(
-        os.getenv(name, "true").strip().lower() not in {"0", "false", "no", "off"}
-        for name in ("TRACELOOP_TRACE_CONTENT", "RESPAN_TRACE_CONTENT")
+    return (
+        context.get_value(_ALLOW_TRACE_CONTENT_KEY) is not False
+        and is_content_tracing_enabled()
     )
 
 
@@ -53,8 +47,7 @@ def observe_policy(policy: CapturePolicy) -> None:
     enabled = runtime_enabled() and not context.get_value(_SUPPRESS_INSTRUMENTATION_KEY)
     current_attributes = getattr(trace.get_current_span(), "attributes", None) or {}
     content = _content_enabled() and all(
-        current_attributes.get(key) is not False
-        for key in ("allow_trace_content", ENABLE_CONTENT_TRACING_KEY)
+        current_attributes.get(key) is not False for key in _CONTENT_ATTRIBUTE_KEYS
     )
     lineage = []
     current = policy
@@ -71,10 +64,7 @@ def observe_policy(policy: CapturePolicy) -> None:
         content = (
             content
             and current.capture_content
-            and all(
-                attributes.get(key) is not False
-                for key in ("allow_trace_content", ENABLE_CONTENT_TRACING_KEY)
-            )
+            and all(attributes.get(key) is not False for key in _CONTENT_ATTRIBUTE_KEYS)
         )
         current = current.parent
     for item in lineage:
