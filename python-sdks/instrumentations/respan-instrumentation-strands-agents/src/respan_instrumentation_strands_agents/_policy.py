@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from opentelemetry import context as context_api
@@ -11,15 +10,8 @@ from opentelemetry.semconv_ai import (
     SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY,
     SpanAttributes,
 )
-from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
 
 from respan_instrumentation_strands_agents._serialization import payload_text, safe_text
-
-
-def content_enabled() -> bool:
-    return context_api.get_value(ENABLE_CONTENT_TRACING_KEY) is not False and os.getenv(
-        "TRACELOOP_TRACE_CONTENT", "true"
-    ).strip().lower() not in {"false", "0", "off", "no"}
 
 
 def suppressed() -> bool:

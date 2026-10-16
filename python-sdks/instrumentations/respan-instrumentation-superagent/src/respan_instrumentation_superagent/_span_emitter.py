@@ -18,8 +18,8 @@ from respan_sdk.constants.span_attributes import (
     RESPAN_METADATA_GUARDRAIL_NAME,
     RESPAN_METADATA_TRIGGERED,
 )
+from respan_tracing import is_content_tracing_enabled
 from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
-from respan_tracing.decorators.base import _should_send_prompts
 from respan_tracing.utils.span_factory import read_propagated_attributes
 
 from ._constants import (
@@ -163,7 +163,7 @@ def start_superagent_span(
     if context.get_value(context._SUPPRESS_INSTRUMENTATION_KEY):
         return None
     try:
-        capture = _should_send_prompts()
+        capture = is_content_tracing_enabled()
         attrs = build_superagent_span_attributes(
             method_name=method_name,
             args=args,
@@ -197,7 +197,7 @@ def finish_superagent_span(
         return
     span = call.span
     try:
-        capture = call.capture and _should_send_prompts()
+        capture = call.capture and is_content_tracing_enabled()
         if not capture:
             # A later content veto removes the already captured request too.
             attributes = getattr(span, "_attributes", None)

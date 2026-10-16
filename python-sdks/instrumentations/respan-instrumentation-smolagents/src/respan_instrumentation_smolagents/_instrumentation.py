@@ -5,7 +5,6 @@ from __future__ import annotations
 import inspect
 import json
 import logging
-import os
 import threading
 from collections.abc import Generator, Iterator, Mapping
 from contextvars import ContextVar, copy_context
@@ -26,8 +25,9 @@ from respan_sdk.constants.llm_logging import (
     LOG_TYPE_TASK,
     LOG_TYPE_TOOL,
 )
+from respan_sdk.constants.otlp_constants import OTEL_EXCEPTION_EVENT_NAME
 from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
-from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+from respan_tracing import is_content_tracing_enabled
 from respan_tracing.core.tracer import RespanTracer
 
 from respan_instrumentation_smolagents._serialization import json_string, redact_text
@@ -59,12 +59,9 @@ def _content_allowed(options: dict | None = None) -> bool:
         )
     ):
         return False
-    return (
-        context.get_value(ENABLE_CONTENT_TRACING_KEY) is not False
-        and context.get_value(_CONTENT_BOUND) is not False
-        and os.getenv("TRACELOOP_TRACE_CONTENT", "true").strip().lower()
-        not in {"0", "false", "no", "off"}
-    )
+    if context.get_value(_CONTENT_BOUND) is False:
+        return False
+    return is_content_tracing_enabled()
 
 
 def _get(value: Any, key: str, default: Any = None) -> Any:
@@ -486,7 +483,7 @@ class _Call:
                         else json_string(args)
                     )
                     self.span.add_event(
-                        "exception",
+                        OTEL_EXCEPTION_EVENT_NAME,
                         {
                             EXCEPTION_TYPE: type(error).__name__,
                             EXCEPTION_MESSAGE: message or "",
@@ -494,7 +491,8 @@ class _Call:
                     )
                 else:
                     self.span.add_event(
-                        "exception", {EXCEPTION_TYPE: type(error).__name__}
+                        OTEL_EXCEPTION_EVENT_NAME,
+                        {EXCEPTION_TYPE: type(error).__name__},
                     )
             if self.kind == LOG_TYPE_CHAT and self.span.is_recording():
                 metadata = {}
