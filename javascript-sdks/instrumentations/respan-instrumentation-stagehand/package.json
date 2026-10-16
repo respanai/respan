@@ -1,0 +1,64 @@
+{
+  "name": "@respan/instrumentation-stagehand",
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Respan instrumentation plugin for Stagehand v4 browser agents (@browserbasehq/stagehand)",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "author": "Respan <team@respan.ai>",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/respanai/respan",
+    "directory": "javascript-sdks/instrumentations/respan-instrumentation-stagehand"
+  },
+  "keywords": [
+    "respan",
+    "stagehand",
+    "browserbase",
+    "browser-agent",
+    "tracing",
+    "observability",
+    "llm"
+  ],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc -p tsconfig.json && node --test tests/*.test.mjs",
+    "publish:package": "yarn npm publish",
+    "release": "yarn build && yarn version patch && yarn publish:package"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/core": "^2.10.0",
+    "@respan/respan-sdk": "^1.4.0",
+    "@traceloop/ai-semantic-conventions": "^0.13.0"
+  },
+  "peerDependencies": {
+    "@browserbasehq/stagehand": ">=4.2.0 <5"
+  },
+  "devDependencies": {
+    "@browserbasehq/stagehand": "4.2.1",
+    "@opentelemetry/sdk-trace-base": "^2.10.0",
+    "@respan/tracing": "^1.6.1",
+    "@types/node": "^22.15.29",
+    "typescript": "^5.7.3",
+    "zod": "4.4.3"
+  }
+}

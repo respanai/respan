@@ -1,0 +1,26 @@
+{
+  "name": "respan-stagehand-examples",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "hello": "tsx hello_world.ts",
+    "scenarios": "tsx run_all.ts"
+  },
+  "dependencies": {
+    "@browserbasehq/stagehand": "4.2.1",
+    "@respan/instrumentation-stagehand": "file:../../instrumentations/respan-instrumentation-stagehand",
+    "@respan/respan": "^2.5.0",
+    "@respan/tracing": "^1.6.1",
+    "dotenv": "^16.4.7",
+    "openai": "^7.0.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.29",
+    "tsx": "^4.20.0",
+    "typescript": "^5.7.3"
+  }
+}
