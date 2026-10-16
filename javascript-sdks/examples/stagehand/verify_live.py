@@ -120,7 +120,9 @@ def check(scenario: dict[str, Any], run: dict[str, Any], *, metadata: bool) -> t
         if wanted not in failed:
             problems.append(f"{wanted} should be an error span")
     for model in expect.get("models", ()):
-        if not any(r.get("model") == model for r in all_rows if r.get("log_type") == "chat"):
+        # Respan may store the provider-resolved name (e.g. "azure/<model>").
+        stored = {r.get("model") or "" for r in all_rows if r.get("log_type") == "chat"}
+        if not any(m == model or m.endswith(f"/{model}") for m in stored):
             problems.append(f"no call to {model}")
     if "promptImages" in expect:
         has_image = any(
