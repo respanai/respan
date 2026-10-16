@@ -219,6 +219,9 @@ async def test_baseline_follow_up_task_is_a_new_trace_in_the_same_thread(
     runs = agent_spans(spans)
     assert len(runs) == 2
     assert len({s.context.trace_id for s in runs}) == 2
+    # Each run reports its own steps, not the history it shares with the other.
+    steps = [json.loads(s.attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT])["steps"] for s in runs]
+    assert sorted(steps) == [1, 2]
     assert {s.attributes.get(RESPAN_THREADS_ID) for s in spans} == {str(agent.session_id)}
     assert {s.attributes.get(RESPAN_TRACE_GROUP_ID) for s in spans} == {
         str(agent.session_id)
