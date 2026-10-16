@@ -9,20 +9,28 @@ its baseline wire-contract tests:
   status and secret masking applied;
 - ``set_error`` / ``record_error``: an error message Respan can show;
 - ``MethodPatcher``: patch framework methods once, restore them exactly;
-- ``compact_image_data_url``: shrink inline screenshots before export.
+- ``compact_image_data_url``: shrink inline screenshots before export;
+- ``jsonable`` / ``json_string``: framework objects as the JSON Respan renders;
+- ``suppress_provider_llm_spans``: keep provider SDK instrumentations from
+  logging an LLM call the agent span already carries.
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
+import dataclasses
+import enum
 import io
+import json
 import logging
+import math
 import traceback
-from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
-from functools import partial
+from datetime import date, datetime
+from functools import cache, partial
 from typing import Any, Optional
 from urllib.parse import quote, quote_plus
 
@@ -33,7 +41,11 @@ from opentelemetry.semconv.attributes.exception_attributes import (
     EXCEPTION_STACKTRACE,
     EXCEPTION_TYPE,
 )
-from opentelemetry.semconv_ai import SpanAttributes, TraceloopSpanKindValues
+from opentelemetry.semconv_ai import (
+    SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY,
+    SpanAttributes,
+    TraceloopSpanKindValues,
+)
 from opentelemetry.trace import Status, StatusCode
 from respan_sdk.constants.llm_logging import (
     LOG_TYPE_AGENT,
@@ -56,6 +68,7 @@ SCREENSHOT_MAX_WIDTH = 1280
 SCREENSHOT_JPEG_QUALITY = 70
 DATA_URL_PREFIX = "data:"
 PATCH_MARKER = "__respan_patched__"
+JSON_MAX_DEPTH = 32
 
 _GROUPING_ATTRIBUTES = (RESPAN_THREADS_ID, RESPAN_SESSION_ID, RESPAN_TRACE_GROUP_ID)
 # Chat spans carry llm.request.type instead of a span kind.
@@ -262,3 +275,74 @@ def compact_image_data_url(
         return data_url
     compact = f"data:image/jpeg;base64,{base64.b64encode(out.getvalue()).decode()}"
     return compact if len(compact) < len(data_url) else data_url
+
+
+def jsonable(value: Any, *, depth: int = 0) -> Any:
+    """A JSON-safe copy: pydantic models and dataclasses are dumped, bytes summarised.
+
+    Unknown objects become ``{"type": <class name>}`` instead of ``str()`` or
+    ``__dict__``: framework objects (browser sessions, clients) are large and
+    can hold credentials.
+    """
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, enum.Enum):
+        return jsonable(value.value, depth=depth)
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, (bytes, bytearray)):
+        return {"type": "bytes", "length": len(value)}
+    if depth >= JSON_MAX_DEPTH:
+        return {"type": type(value).__name__, "truncated": True}
+    dump = getattr(value, "model_dump", None)
+    if callable(dump):
+        try:
+            return jsonable(dump(mode="json", exclude_none=True), depth=depth + 1)
+        except Exception:  # telemetry must fail open
+            return {"type": type(value).__name__, "serialization_error": True}
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        fields = {f.name: getattr(value, f.name) for f in dataclasses.fields(value)}
+        return jsonable({k: v for k, v in fields.items() if v is not None}, depth=depth + 1)
+    if isinstance(value, Mapping):
+        return {str(k): jsonable(v, depth=depth + 1) for k, v in value.items()}
+    if isinstance(value, Sequence):
+        return [jsonable(v, depth=depth + 1) for v in value]
+    return {"type": type(value).__name__}
+
+
+def json_string(value: Any) -> str:
+    return json.dumps(jsonable(value), ensure_ascii=False, default=str)
+
+
+@cache
+def openai_suppressor() -> Callable[[], Any]:
+    """Respan's OpenAI instrumentation switch, or a no-op when it isn't installed.
+
+    Resolved once: Python does not cache a failed import.
+    """
+    try:
+        from respan_instrumentation_openai._instrumentation import (
+            suppress_openai_instrumentation,
+        )
+    except ImportError:
+        return nullcontext
+    return suppress_openai_instrumentation
+
+
+@contextmanager
+def suppress_provider_llm_spans() -> Iterator[None]:
+    """Provider SDK instrumentations would log the call the agent's LLM span carries.
+
+    Most honour OTel's language-model suppression key; Respan's OpenAI
+    instrumentation has its own switch.
+    """
+    token = context_api.attach(
+        context_api.set_value(SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY, True)
+    )
+    try:
+        with openai_suppressor()():
+            yield
+    finally:
+        context_api.detach(token)

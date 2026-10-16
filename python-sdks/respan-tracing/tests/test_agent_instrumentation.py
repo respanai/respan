@@ -111,3 +111,42 @@ def test_method_patcher_patches_once_and_restores():
     assert Target().run() == "patched:original"
     patcher.restore()
     assert Target().run() == "original"
+
+
+def test_jsonable_handles_framework_values_without_dumping_unknown_objects():
+    import dataclasses
+    import datetime
+    import enum
+
+    from respan_tracing.utils.agent_instrumentation import jsonable
+
+    class Color(enum.Enum):
+        RED = "red"
+
+    @dataclasses.dataclass
+    class Step:
+        n: int
+        note: object = None
+
+    class Session:  # e.g. a browser session holding credentials
+        token = "do-not-export"
+
+    assert jsonable([Color.RED, Step(1), datetime.date(2026, 1, 2), b"ab", float("inf")]) == [
+        "red",
+        {"n": 1},
+        "2026-01-02",
+        {"type": "bytes", "length": 2},
+        "inf",
+    ]
+    assert jsonable(Session()) == {"type": "Session"}
+
+
+def test_suppress_provider_llm_spans_sets_the_otel_suppression_key():
+    from opentelemetry import context
+    from opentelemetry.semconv_ai import SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY
+
+    from respan_tracing.utils.agent_instrumentation import suppress_provider_llm_spans
+
+    with suppress_provider_llm_spans():
+        assert context.get_value(SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY) is True
+    assert context.get_value(SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY) is None

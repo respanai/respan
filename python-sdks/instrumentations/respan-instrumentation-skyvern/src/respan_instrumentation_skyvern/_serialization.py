@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 import base64
-import dataclasses
-import enum
 import json
-import math
-from collections.abc import Mapping, Sequence
-from datetime import date, datetime
+from collections.abc import Mapping
 from typing import Any
 
-from respan_tracing.utils.agent_instrumentation import (
+from respan_tracing.utils.agent_instrumentation import (  # noqa: F401 - re-exported
     DATA_URL_PREFIX,
     compact_image_data_url,
+    json_string,
+    jsonable,
 )
 
 from respan_instrumentation_skyvern._constants import (
@@ -23,40 +21,6 @@ from respan_instrumentation_skyvern._constants import (
 
 _MAX_DEPTH = 32
 _IMAGE_PART = "image_url"
-
-
-def jsonable(value: Any, *, depth: int = 0) -> Any:
-    """A JSON-safe copy: pydantic models and dataclasses are dumped, bytes summarised."""
-    if value is None or isinstance(value, bool | int | str):
-        return value
-    if isinstance(value, enum.Enum):
-        return jsonable(value.value, depth=depth)
-    if isinstance(value, float):
-        return value if math.isfinite(value) else str(value)
-    if isinstance(value, datetime | date):
-        return value.isoformat()
-    if isinstance(value, bytes | bytearray):
-        return {"type": "bytes", "length": len(value)}
-    if depth >= _MAX_DEPTH:
-        return {"type": type(value).__name__, "truncated": True}
-    dump = getattr(value, "model_dump", None)
-    if callable(dump):
-        try:
-            return jsonable(dump(mode="json", exclude_none=True), depth=depth + 1)
-        except Exception:  # noqa: BLE001 - telemetry must fail open
-            return {"type": type(value).__name__, "serialization_error": True}
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        fields = {f.name: getattr(value, f.name) for f in dataclasses.fields(value)}
-        return jsonable({k: v for k, v in fields.items() if v is not None}, depth=depth + 1)
-    if isinstance(value, Mapping):
-        return {str(k): jsonable(v, depth=depth + 1) for k, v in value.items()}
-    if isinstance(value, Sequence):
-        return [jsonable(v, depth=depth + 1) for v in value]
-    return {"type": type(value).__name__}
-
-
-def json_string(value: Any) -> str:
-    return json.dumps(jsonable(value), ensure_ascii=False, default=str)
 
 
 def screenshot_part(png: bytes) -> dict[str, Any]:

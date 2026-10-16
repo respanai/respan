@@ -19,15 +19,12 @@ import importlib
 import inspect
 import logging
 import threading
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
-from functools import cache, partial, wraps
+from functools import partial, wraps
 from typing import Any
 
-from opentelemetry import context, trace
+from opentelemetry import trace
 from opentelemetry.semconv_ai import (
-    SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY,
     SpanAttributes,
 )
 from opentelemetry.trace import Status, StatusCode
@@ -47,6 +44,7 @@ from respan_tracing.utils.agent_instrumentation import (
     compact_image_data_url,
     safely,
     set_error,
+    suppress_provider_llm_spans,
 )
 
 from respan_instrumentation_browser_use._constants import (
@@ -397,7 +395,7 @@ class _Runtime:
             safely(lambda: self._llm_start(span, llm, messages))
             in_llm = _IN_LLM.set(True)
             try:
-                with _suppress_provider_llm_spans():
+                with suppress_provider_llm_spans():
                     response = await call(messages, *args, **kwargs)
             finally:
                 _IN_LLM.reset(in_llm)
@@ -459,41 +457,10 @@ class _Runtime:
         )
 
 
-@cache
-def _openai_suppressor() -> Callable[[], Any]:
-    # Optional dependency, resolved once: a failed import is not cached by Python.
-    try:
-        from respan_instrumentation_openai._instrumentation import (
-            suppress_openai_instrumentation,
-        )
-    except ImportError:
-        return nullcontext
-    return suppress_openai_instrumentation
-
-
 def _reports_anthropic_usage(llm: Any) -> bool:
     return any(
         owner.__module__ in ANTHROPIC_USAGE_MODULES for owner in type(llm).__mro__
     )
-
-
-@contextmanager
-def _suppress_provider_llm_spans() -> Iterator[None]:
-    """Provider SDK instrumentations would log the call this span already carries.
-
-    Most honour OTel's language-model suppression key; Respan's OpenAI
-    instrumentation (used by browser-use's OpenAI, Azure and OpenRouter clients)
-    has its own switch, entered the same way the LiteLLM instrumentation does.
-    """
-    suppress_openai_instrumentation = _openai_suppressor()
-    token = context.attach(
-        context.set_value(SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY, True)
-    )
-    try:
-        with suppress_openai_instrumentation():
-            yield
-    finally:
-        context.detach(token)
 
 
 def _action_call(action: Any) -> tuple[str | None, Any]:
