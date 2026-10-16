@@ -1,0 +1,71 @@
+{
+  "name": "@respan/instrumentation-puppeteer",
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Respan instrumentation plugin for Puppeteer (puppeteer, puppeteer-core)",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "author": "Respan <team@respan.ai>",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/respanai/respan",
+    "directory": "javascript-sdks/instrumentations/respan-instrumentation-puppeteer"
+  },
+  "keywords": [
+    "respan",
+    "puppeteer",
+    "browser-automation",
+    "browser-agent",
+    "tracing",
+    "observability",
+    "llm"
+  ],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc -p tsconfig.json && node --test tests/*.test.mjs",
+    "publish:package": "yarn npm publish",
+    "release": "yarn build && yarn version patch && yarn publish:package"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.0",
+    "@respan/respan-sdk": "^1.4.0",
+    "@traceloop/ai-semantic-conventions": "^0.13.0",
+    "jpeg-js": "^0.4.4",
+    "pngjs": "^7.0.0"
+  },
+  "peerDependencies": {
+    "@respan/tracing": ">=1.5.0",
+    "puppeteer-core": ">=25.0.2 <26.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@respan/tracing": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@opentelemetry/sdk-trace-base": "^2.10.0",
+    "@respan/tracing": "^1.6.1",
+    "@types/node": "^22.15.29",
+    "@types/pngjs": "^6.0.5",
+    "puppeteer-core": "25.14.0",
+    "typescript": "^5.7.3"
+  }
+}

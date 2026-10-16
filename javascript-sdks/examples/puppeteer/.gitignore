@@ -1,0 +1,6 @@
+node_modules/
+.env
+runs/
+artifacts/
+.venv/
+package-lock.json
