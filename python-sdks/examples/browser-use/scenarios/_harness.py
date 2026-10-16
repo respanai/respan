@@ -153,6 +153,50 @@ def _agent_output(row: dict[str, Any]) -> dict[str, Any]:
     return output if isinstance(output, dict) else {}
 
 
+def _span_id(row: dict[str, Any]) -> str | None:
+    """The list API omits a row's own span id; the detail endpoint has it."""
+    response = httpx.get(
+        f"{BASE_URL}/request-logs/{row['unique_id']}/",
+        headers={"Authorization": f"Bearer {API_KEY}"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json().get("span_unique_id")
+
+
+async def structure_problems(rows: list[dict[str, Any]]) -> list[str]:
+    """Spans missing from the tree, judged against browser-use's own record.
+
+    - an agent's task spans (+1 when actions ran before step 1, which
+      browser-use records as history step 0) == the `steps` it reports;
+    - each step has one tool span per action result and at least one LLM call.
+    """
+    parents = [r for r in rows if r.get("log_type") in ("agent", "task")]
+    ids = await asyncio.gather(*(asyncio.to_thread(_span_id, r) for r in parents))
+    children: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        children[row.get("span_parent_id") or ""].append(row)
+    problems = []
+    for row, span_id in zip(parents, ids, strict=True):
+        kids = children.get(span_id or "", [])
+        kinds = [k.get("log_type") for k in kids]
+        output = _agent_output(row)
+        if row.get("span_name") == "agent.browser_use" and "steps" in output:
+            recorded = kinds.count("task") + (1 if "tool" in kinds else 0)
+            if recorded != output["steps"]:
+                problems.append(f"agent reports {output['steps']} steps, trace has {recorded}")
+        elif row.get("log_type") == "task" and "results" in output:
+            step = (row.get("metadata") or {}).get("browser_use.step.number")
+            if kinds.count("tool") != len(output["results"]):
+                problems.append(
+                    f"step {step}: {len(output['results'])} action results, "
+                    f"{kinds.count('tool')} tool spans"
+                )
+            if "chat" not in kinds:
+                problems.append(f"step {step}: no LLM span")
+    return problems
+
+
 def _has_prompt_image(row: dict[str, Any]) -> bool:
     return "image_url" in json.dumps(row.get("prompt_messages") or row.get("input") or "")
 
@@ -198,6 +242,7 @@ async def verify(scenario: Scenario) -> Result:
             threads = {r.get("thread_identifier") for r in trace_rows}
             check(threads == {session}, f"trace {trace_id[:8]}: thread ids {threads} != agent session")
 
+    problems.extend(await structure_problems(rows))
     agents = [r for r in rows if r.get("log_type") == "agent"]
     want_agents = expect.traces if expect.agent_spans is None else expect.agent_spans
     check(len(agents) == want_agents, f"{len(agents)} agent spans, expected {want_agents}")
