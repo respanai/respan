@@ -1,0 +1,10 @@
+<!doctype html>
+<title>Products</title>
+<h1>Products</h1>
+<ul id="products"></ul>
+<script>
+  fetch("/api/products.json").then(r => r.json()).then(items => {
+    document.getElementById("products").innerHTML =
+      items.map(i => `<li class="product">${i.name}: $${i.price}</li>`).join("");
+  });
+</script>

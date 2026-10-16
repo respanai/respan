@@ -1,0 +1,34 @@
+[tool.poetry]
+name = "respan-instrumentation-playwright"
+version = "0.1.0"
+description = "Respan instrumentation plugin for Playwright (sync and async APIs)"
+authors = ["Respan <team@respan.ai>"]
+license = "Apache 2.0"
+readme = "README.md"
+packages = [
+    { include = "respan_instrumentation_playwright", from = "./src" },
+]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.14"
+playwright = ">=1.50.0,<1.65.0"
+respan-tracing = ">=2.22.0,<3.0.0"
+respan-sdk = ">=2.7.6"
+opentelemetry-api = ">=1.38.0,<2.0.0"
+opentelemetry-semantic-conventions-ai = ">=0.4.1"
+# Re-encodes screenshots as compact JPEGs before export.
+pillow = ">=10.0.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.0.0"
+pytest-asyncio = ">=0.23.0"
+
+[tool.poetry.plugins."respan.instrumentations"]
+playwright = "respan_instrumentation_playwright:PlaywrightInstrumentor"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

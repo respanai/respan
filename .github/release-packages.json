@@ -326,6 +326,13 @@
     },
     {
       "ecosystem": "python",
+      "name": "respan-instrumentation-playwright",
+      "path": "python-sdks/instrumentations/respan-instrumentation-playwright",
+      "registry": "pypi",
+      "python_tests": true
+    },
+    {
+      "ecosystem": "python",
       "name": "respan-instrumentation-pydantic-ai",
       "path": "python-sdks/instrumentations/respan-instrumentation-pydantic-ai",
       "registry": "pypi"

@@ -1,0 +1,6 @@
+{
+  "summary": "New respan-instrumentation-playwright: one span per Playwright API call (sync and async) under the active span, page URL/title, screenshots, password masking",
+  "packages": {
+    "respan-instrumentation-playwright": "none"
+  }
+}
