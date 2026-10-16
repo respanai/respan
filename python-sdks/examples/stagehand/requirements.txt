@@ -1,0 +1,8 @@
+# Stagehand example - dependencies. Python 3.11-3.13.
+# The instrumentation is installed from this repo (editable), so the example
+# always runs the code next to it - no PyPI release needed.
+-e ../../instrumentations/respan-instrumentation-stagehand
+respan-ai>=4.2.4
+stagehand>=4.2.1,<5
+openai>=1.40
+python-dotenv>=1.0.0

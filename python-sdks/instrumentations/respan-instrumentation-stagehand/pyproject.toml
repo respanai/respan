@@ -1,0 +1,33 @@
+[tool.poetry]
+name = "respan-instrumentation-stagehand"
+version = "0.1.0"
+description = "Respan instrumentation plugin for Stagehand v4 browser agents"
+authors = ["Respan <team@respan.ai>"]
+license = "Apache 2.0"
+readme = "README.md"
+packages = [
+    { include = "respan_instrumentation_stagehand", from = "./src" },
+]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.14"
+stagehand = ">=4.2.0,<5.0.0"
+respan-tracing = ">=2.23.0,<3.0.0"
+respan-sdk = ">=2.7.6"
+opentelemetry-api = ">=1.38.0,<2.0.0"
+opentelemetry-semantic-conventions-ai = ">=0.4.1"
+opentelemetry-semantic-conventions = ">=0.59b0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.0.0"
+pytest-asyncio = ">=0.23.0"
+
+[tool.poetry.plugins."respan.instrumentations"]
+stagehand = "respan_instrumentation_stagehand:StagehandInstrumentor"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
