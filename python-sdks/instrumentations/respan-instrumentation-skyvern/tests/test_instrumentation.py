@@ -5,10 +5,12 @@ fake Skyvern server, and the workflow-block wrapper on Skyvern's real `BlockResu
 
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 
 import httpx
+import pytest
 from opentelemetry.semconv_ai import SpanAttributes
 from respan_instrumentation_skyvern import SkyvernInstrumentor, _instrumentation
 from respan_instrumentation_skyvern._constants import ATTR_BLOCK_LABEL, ATTR_BLOCK_TYPE
@@ -114,3 +116,26 @@ async def test_page_ai_action_is_one_agent_span_per_call(pipeline):
     assert span.attributes[RESPAN_THREADS_ID] == "wr_sdk_1"
     assert json.loads(span.attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT]) == {"result": True}
     assert "The page lists books" in span.attributes[SpanAttributes.TRACELOOP_ENTITY_INPUT]
+
+
+async def test_cancelled_model_call_is_not_an_error(pipeline):
+    """Skyvern cancels its speculative next-step plan when the run ends first."""
+    _, spans = pipeline()
+    runtime = _instrumentation._RUNTIME
+
+    async def never_answers(*args, **kwargs):
+        await asyncio.sleep(60)
+
+    async def call() -> None:
+        with runtime.span("skyvern.step", "task"):
+            await runtime.traced_llm_call(never_answers, None, (), {"model": "openai/m"})
+
+    task = asyncio.ensure_future(call())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    chat = next(s for s in spans if s.attributes.get(RESPAN_LOG_TYPE) == "chat")
+    assert chat.attributes["skyvern.llm.cancelled"] is True
+    assert chat.status.status_code.name != "ERROR"

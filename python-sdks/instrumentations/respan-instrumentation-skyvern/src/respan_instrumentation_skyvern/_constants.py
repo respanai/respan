@@ -55,6 +55,7 @@ ATTR_ACTION_TYPE = "skyvern.action.type"
 ATTR_BLOCK_TYPE = "skyvern.block.type"
 ATTR_BLOCK_LABEL = "skyvern.block.label"
 ATTR_PROMPT_NAME = "skyvern.llm.prompt_name"
+ATTR_LLM_CANCELLED = "skyvern.llm.cancelled"
 ATTR_RECORDING_URL = "skyvern.run.recording_url"
 ATTR_APP_URL = "skyvern.run.app_url"
 

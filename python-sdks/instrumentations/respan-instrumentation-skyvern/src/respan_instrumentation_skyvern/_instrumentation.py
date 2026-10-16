@@ -26,6 +26,7 @@ nearest *Respan* span instead of the current OTel span.
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import inspect
 import logging
@@ -69,6 +70,7 @@ from respan_instrumentation_skyvern._constants import (
     ATTR_BLOCK_LABEL,
     ATTR_BLOCK_TYPE,
     ATTR_ENGINE,
+    ATTR_LLM_CANCELLED,
     ATTR_PAGE_URL,
     ATTR_PROMPT_NAME,
     ATTR_RECORDING_URL,
@@ -688,16 +690,25 @@ class _Runtime:
         ) or _PROMPT_NAME.get()
         model = kwargs.get("model", args[0] if args else None)
         messages = kwargs.get("messages", args[1] if len(args) > 1 else None)
+        cancelled: asyncio.CancelledError | None = None
         with self.span(SPAN_LLM, LOG_TYPE_CHAT) as span:
             safely(lambda: self._llm_start(span, model, messages, prompt_name, kwargs))
             in_llm = _IN_LLM.set(True)
             try:
                 with _suppress_provider_llm_spans():
                     response = await original(*call_args, **kwargs)
+            except asyncio.CancelledError as error:
+                # Skyvern cancels its speculative next-step plan when the run ends
+                # first: the call was abandoned, not failed.
+                span.set_attribute(ATTR_LLM_CANCELLED, True)
+                cancelled = error
             finally:
                 _IN_LLM.reset(in_llm)
-            safely(lambda: self._llm_end(span, response))
-            return response
+            if cancelled is None:
+                safely(lambda: self._llm_end(span, response))
+        if cancelled is not None:
+            raise cancelled
+        return response
 
     def _llm_start(
         self, span: Any, model: Any, messages: Any, prompt_name: Any, kwargs: dict
