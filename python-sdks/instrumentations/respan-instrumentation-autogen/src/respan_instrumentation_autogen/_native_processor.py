@@ -12,6 +12,7 @@ from openinference.semconv.trace import (
 )
 from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor
 from opentelemetry.semconv_ai import SpanAttributes as TLSpanAttributes
+from respan_tracing import is_content_tracing_enabled
 
 AUTOGEN_CORE_SCOPE_NAME = "autogen-core"
 AUTOGEN_RUNTIME_SCOPE_PREFIX = "autogen "
@@ -185,10 +186,10 @@ class AutoGenPrivacyProcessor(SpanProcessor):
             "openinference.instrumentation.ag2",
         ):
             return
-        from respan_instrumentation_autogen._modern import capture_content
-
         with self._lock:
-            self._content[_get_span_id(span)] = capture_content(parent_context)
+            self._content[_get_span_id(span)] = is_content_tracing_enabled(
+                parent_context
+            )
 
     def on_end(self, span):
         with self._lock:

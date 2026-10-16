@@ -17,7 +17,7 @@ opentelemetry-sdk = ">=1.38.0,<2.0.0"
 opentelemetry-semantic-conventions-ai = ">=0.5.1,<0.6.0"
 opentelemetry-semantic-conventions = ">=0.59b0"
 respan-sdk = ">=2.7.6"
-respan-tracing = "^2.17.0"
+respan-tracing = "^2.21.1"
 
 [tool.poetry.plugins."respan.instrumentations"]
 agentops = "respan_instrumentation_agentops:AgentOpsInstrumentor"

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
 from threading import RLock
 from typing import Any, ClassVar
@@ -32,8 +31,9 @@ from respan_sdk.constants.llm_logging import (
     LOG_TYPE_TOOL,
     LOG_TYPE_WORKFLOW,
 )
+from respan_sdk.constants.otlp_constants import OTEL_EXCEPTION_EVENT_NAME
 from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
-from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+from respan_tracing import is_content_tracing_enabled
 from respan_tracing.core.tracer import RespanTracer
 
 from respan_instrumentation_beeai._serialization import (
@@ -61,16 +61,7 @@ class _Run:
 
 
 def _content_enabled(options: dict[str, Any]) -> bool:
-    if context.get_value(ENABLE_CONTENT_TRACING_KEY) is False:
-        return False
-    if options.get("trace_content") is False:
-        return False
-    if os.getenv("TRACELOOP_TRACE_CONTENT", "true").strip().lower() in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }:
+    if not is_content_tracing_enabled() or options.get("trace_content") is False:
         return False
     config = options.get("config")
     return not any(
@@ -399,7 +390,7 @@ class _Listener:
             args = BaseException.args.__get__(error)
             message = "; ".join(text(value) for value in args if isinstance(value, str))
             attrs[EXCEPTION_MESSAGE] = message or type(error).__name__
-        run.span.add_event("exception", attrs)
+        run.span.add_event(OTEL_EXCEPTION_EVENT_NAME, attrs)
         run.span.set_status(Status(StatusCode.ERROR, attrs.get(EXCEPTION_MESSAGE)))
         run.output = None
         run.completions = None

@@ -6,14 +6,13 @@ import importlib
 import inspect
 import json
 import logging
-import os
 from collections.abc import Mapping
 from functools import wraps
 from typing import Any, Self
 
 from opentelemetry import context as context_api
 from opentelemetry.context import _SUPPRESS_INSTRUMENTATION_KEY
-from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+from respan_tracing import is_content_tracing_enabled
 from respan_tracing.core.tracer import RespanTracer
 
 from respan_instrumentation_dify._constants import (
@@ -39,12 +38,7 @@ _PATCH_EPOCH = 0
 
 
 def _content_policy() -> bool:
-    return (
-        _INCLUDE_CONTENT
-        and context_api.get_value(ENABLE_CONTENT_TRACING_KEY) is not False
-        and os.getenv("TRACELOOP_TRACE_CONTENT", "true").strip().lower()
-        not in {"false", "0", "no", "off"}
-    )
+    return _INCLUDE_CONTENT and is_content_tracing_enabled()
 
 
 def _arg(

@@ -1,0 +1,26 @@
+{
+  "summary": "Instrumentations use respan-tracing's shared is_content_tracing_enabled (batch 1)",
+  "packages": {
+    "respan-instrumentation-agentops": "none",
+    "respan-instrumentation-agentscope": "none",
+    "respan-instrumentation-agentspec": "none",
+    "respan-instrumentation-aleph-alpha": "none",
+    "respan-instrumentation-anthropic": "none",
+    "respan-instrumentation-arize": "none",
+    "respan-instrumentation-autogen": "none",
+    "respan-instrumentation-aws-bedrock": "none",
+    "respan-instrumentation-beeai": "none",
+    "respan-instrumentation-braintrust": "none",
+    "respan-instrumentation-burr": "none",
+    "respan-instrumentation-chroma": "none",
+    "respan-instrumentation-cohere": "none",
+    "respan-instrumentation-crewai": "none",
+    "respan-instrumentation-cursor-sdk": "none",
+    "respan-instrumentation-dify": "none",
+    "respan-instrumentation-dspy": "none",
+    "respan-instrumentation-elasticsearch": "none",
+    "respan-instrumentation-google-adk": "none",
+    "respan-instrumentation-google-genai": "none",
+    "respan-instrumentation-groq": "none"
+  }
+}

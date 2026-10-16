@@ -15,6 +15,7 @@ from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import (
 from opentelemetry.semconv_ai import LLMRequestTypeValues, SpanAttributes
 from respan_sdk.constants.llm_logging import LOG_TYPE_EMBEDDING
 from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
+from respan_tracing import is_content_tracing_enabled
 from respan_tracing.utils.span_factory import build_readable_span, inject_span
 
 from respan_instrumentation_google_genai._constants import GOOGLE_GENAI_SYSTEM_NAME
@@ -22,7 +23,6 @@ from respan_instrumentation_google_genai._otel_emitter import _current_trace_par
 from respan_instrumentation_google_genai._translator import (
     _dump_value,
     _field,
-    capture_content,
     safe_json,
 )
 
@@ -59,7 +59,7 @@ def build_embed_content_attrs(
         SpanAttributes.TRACELOOP_ENTITY_NAME: _EMBEDDING_SPAN_NAME,
         SpanAttributes.TRACELOOP_ENTITY_PATH: _EMBEDDING_SPAN_NAME,
     }
-    include_content = capture_content()
+    include_content = is_content_tracing_enabled()
     if include_content:
         attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = safe_json(
             _dump_value(request_kwargs.get("contents"))

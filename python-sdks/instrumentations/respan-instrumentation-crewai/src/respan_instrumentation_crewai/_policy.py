@@ -5,7 +5,7 @@ from typing import Any
 
 from opentelemetry.instrumentation.utils import is_instrumentation_enabled
 from opentelemetry.semconv_ai import SpanAttributes
-from respan_tracing.decorators.base import _should_send_prompts
+from respan_tracing import is_content_tracing_enabled
 
 CONTENT_POLICY_ATTRIBUTE = "_respan_crewai_content_allowed"
 TOOL_CALL_ID_ATTRIBUTE = "_respan_crewai_tool_call_id"
@@ -16,7 +16,7 @@ EVENT_CONTENT: ContextVar[bool] = ContextVar(
 
 
 def content_allowed() -> bool:
-    return EVENT_CONTENT.get() and _should_send_prompts()
+    return EVENT_CONTENT.get() and is_content_tracing_enabled()
 
 
 def event_enabled(event: Any) -> bool:

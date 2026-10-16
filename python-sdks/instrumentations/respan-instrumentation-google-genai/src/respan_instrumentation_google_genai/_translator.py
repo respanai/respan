@@ -5,11 +5,9 @@ from __future__ import annotations
 import inspect
 import json
 import logging
-import os
 from collections.abc import Iterable
 from typing import Any
 
-from opentelemetry import context as context_api
 from respan_sdk.utils.serialization import serialize_value
 
 from respan_instrumentation_google_genai._constants import (
@@ -50,12 +48,6 @@ from respan_instrumentation_google_genai._constants import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def capture_content() -> bool:
-    return (os.getenv("TRACELOOP_TRACE_CONTENT") or "true").lower() == "true" or bool(
-        context_api.get_value("override_enable_content_tracing")
-    )
 
 
 def contents_with_history(contents: Any, response_or_chunks: Any) -> Any:

@@ -12,15 +12,12 @@ from typing import Any
 
 from opentelemetry import context as context_api
 from opentelemetry import trace
+from respan_tracing import is_content_tracing_enabled
 
 from respan_instrumentation_anthropic import _gateway_link
 from respan_instrumentation_anthropic._gateway_link import GATEWAY_LOG_ID_SLOT
 from respan_instrumentation_anthropic._messages import CallState
-from respan_instrumentation_anthropic._privacy import (
-    PrivacyObserver,
-    explicit_capture,
-    suppressed,
-)
+from respan_instrumentation_anthropic._privacy import PrivacyObserver, suppressed
 
 logger = logging.getLogger(__name__)
 _LOCK = RLock()
@@ -35,7 +32,7 @@ def _detach_wrapper(original: Any, instrumentor: Any) -> Any:
     def detach(*args: Any, **kwargs: Any) -> Any:
         # Export processors temporarily suppress themselves. That scope must
         # not revoke a pending sibling request's capture policy.
-        if instrumentor._patches_active and not explicit_capture():
+        if instrumentor._patches_active and not is_content_tracing_enabled():
             try:
                 instrumentor._observer.notice()
             except Exception:  # noqa: BLE001, S110

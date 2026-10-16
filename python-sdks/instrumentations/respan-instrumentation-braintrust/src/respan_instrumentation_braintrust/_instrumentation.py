@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import inspect
 import logging
-import os
 import threading
 from collections import OrderedDict
 from contextvars import ContextVar
@@ -23,8 +22,9 @@ from opentelemetry.semconv_ai import (
     SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY,
     SpanAttributes,
 )
+from respan_sdk.constants.otlp_constants import OTEL_EXCEPTION_EVENT_NAME
 from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
-from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+from respan_tracing import is_content_tracing_enabled
 from respan_tracing.core.tracer import RespanTracer
 
 from ._constants import BRAINTRUST_SPAN_TYPE_TO_LOG_TYPE
@@ -43,10 +43,7 @@ _MISSING = object()
 
 def _allowed():
     return (
-        context.get_value(ENABLE_CONTENT_TRACING_KEY) is not False
-        and context.get_value(_CONTENT_BOUND) is not False
-        and os.getenv("TRACELOOP_TRACE_CONTENT", "true").strip().lower()
-        not in {"0", "false", "off", "no"}
+        context.get_value(_CONTENT_BOUND) is not False and is_content_tracing_enabled()
     )
 
 
@@ -494,7 +491,7 @@ class _Runtime:
                 if state.capture and isinstance(message, str):
                     event[EXCEPTION_MESSAGE] = redact_text(message)
                     state.span.set_attribute(ERROR_MESSAGE, event[EXCEPTION_MESSAGE])
-                state.span.add_event("exception", event)
+                state.span.add_event(OTEL_EXCEPTION_EVENT_NAME, event)
             if state.source_id:
                 self.parents[state.source_id] = (
                     state.span.get_span_context(),

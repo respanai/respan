@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -21,8 +20,9 @@ from opentelemetry.semconv_ai import (
     SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY,
     SpanAttributes,
 )
+from respan_sdk.constants.otlp_constants import OTEL_EXCEPTION_EVENT_NAME
 from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
-from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+from respan_tracing import is_content_tracing_enabled
 
 from respan_instrumentation_dspy._serialization import redact_text
 from respan_instrumentation_dspy._utils import (
@@ -44,10 +44,7 @@ _TOOL_CALLS = ContextVar("respan_dspy_tool_calls", default=())
 
 def allowed() -> bool:
     return (
-        context.get_value(ENABLE_CONTENT_TRACING_KEY) is not False
-        and context.get_value(_CONTENT_BOUND) is not False
-        and os.getenv("TRACELOOP_TRACE_CONTENT", "true").strip().lower()
-        not in {"false", "0", "no", "off"}
+        context.get_value(_CONTENT_BOUND) is not False and is_content_tracing_enabled()
     )
 
 
@@ -226,7 +223,7 @@ class DSPyInstrumentationCallback(BaseCallback):
                         if len(args) == 1 and isinstance(args[0], str)
                         else safe_json(args)
                     )
-                state.span.add_event("exception", attrs)
+                state.span.add_event(OTEL_EXCEPTION_EVENT_NAME, attrs)
             if state.kind == "chat":
                 self._finish_lm(state, outputs, exception)
             elif state.capture and exception is None and outputs is not None:

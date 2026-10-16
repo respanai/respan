@@ -22,7 +22,7 @@ from opentelemetry.semconv.attributes.error_attributes import ERROR_TYPE
 from opentelemetry.semconv.attributes.http_attributes import HTTP_RESPONSE_STATUS_CODE
 from opentelemetry.semconv_ai import SpanAttributes
 from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
-from respan_tracing.decorators.base import _should_send_prompts
+from respan_tracing import is_content_tracing_enabled
 from respan_tracing.utils.span_factory import read_propagated_attributes
 
 from ._callbacks import _CAPTURE
@@ -93,7 +93,7 @@ def make_processor(base, *, provider, **kwargs):
                 "parent": getattr(parent, "id", None),
                 "capture": allowed
                 and not self.mask_sensitive_information
-                and _should_send_prompts()
+                and is_content_tracing_enabled()
                 and (parent_policy is None or parent_policy["capture"]),
                 "extra": {},
                 "propagated": read_propagated_attributes() if allowed else {},
@@ -246,7 +246,7 @@ def make_processor(base, *, provider, **kwargs):
             self._close_children(span.id)
             policy = self._policies.get(span.id)
             if policy is not None:
-                policy["capture"] = policy["capture"] and _should_send_prompts()
+                policy["capture"] = policy["capture"] and is_content_tracing_enabled()
                 if isinstance(sys.exception(), (Exception, CancelledError)) and not any(
                     type(event).__name__
                     in {

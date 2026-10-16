@@ -4,15 +4,14 @@ import importlib
 import json
 import logging
 import math
-import os
 import threading
 from collections.abc import Mapping, Sequence
 from functools import lru_cache
 from typing import Any
 
-from opentelemetry import context as context_api
 from opentelemetry import trace
 from opentelemetry.semconv_ai import LLMRequestTypeValues, SpanAttributes
+from respan_tracing import is_content_tracing_enabled
 from respan_tracing.core.tracer import RespanTracer
 
 from respan_instrumentation_cohere._processor import (
@@ -34,13 +33,6 @@ _CONTENT_PATCH_LOCK = threading.RLock()
 _CONTENT_PATCH_USERS = 0
 _CONTENT_PATCH_ORIGINALS: dict[str, Any] = {}
 _INSTRUMENTATION_USERS: dict[Any, tuple[int, bool]] = {}
-
-
-def _capture_content() -> bool:
-    # Match the upstream content switch, including its per-context override.
-    return (os.getenv("TRACELOOP_TRACE_CONTENT") or "true").lower() == "true" or bool(
-        context_api.get_value("override_enable_content_tracing")
-    )
 
 
 def _load_otel_cohere_module() -> Any:
@@ -180,7 +172,7 @@ def _install_content_patch(cohere_module: Any) -> bool:
 
         def set_input_content_attributes(span, llm_request_type, kwargs):
             original_input(span, llm_request_type, kwargs)
-            if not span.is_recording() or not _capture_content():
+            if not span.is_recording() or not is_content_tracing_enabled():
                 return
             if llm_request_type == LLMRequestTypeValues.EMBEDDING:
                 payload = {
@@ -206,7 +198,7 @@ def _install_content_patch(cohere_module: Any) -> bool:
             original_response(span, llm_request_type, response)
             if span.is_recording():
                 _set_reported_usage(span, response)
-            if not span.is_recording() or not _capture_content():
+            if not span.is_recording() or not is_content_tracing_enabled():
                 return
             if llm_request_type == LLMRequestTypeValues.EMBEDDING:
                 embeddings = getattr(response, "embeddings", None)
