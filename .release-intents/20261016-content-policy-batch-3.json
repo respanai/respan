@@ -1,0 +1,25 @@
+{
+  "summary": "Instrumentations use respan-tracing's shared is_content_tracing_enabled (batch 3)",
+  "packages": {
+    "respan-instrumentation-pipecat": "none",
+    "respan-instrumentation-portkey": "none",
+    "respan-instrumentation-pytest": "none",
+    "respan-instrumentation-qdrant": "none",
+    "respan-instrumentation-ragas": "none",
+    "respan-instrumentation-replicate": "none",
+    "respan-instrumentation-restate": "none",
+    "respan-instrumentation-sagemaker": "none",
+    "respan-instrumentation-semantic-kernel": "none",
+    "respan-instrumentation-smolagents": "none",
+    "respan-instrumentation-strands-agents": "none",
+    "respan-instrumentation-superagent": "none",
+    "respan-instrumentation-temporal": "none",
+    "respan-instrumentation-together": "none",
+    "respan-instrumentation-vercel": "none",
+    "respan-instrumentation-vertexai": "none",
+    "respan-instrumentation-watson-orchestrate-adk": "none",
+    "respan-instrumentation-watsonx": "none",
+    "respan-instrumentation-weaviate": "none",
+    "respan-instrumentation-writer": "none"
+  }
+}

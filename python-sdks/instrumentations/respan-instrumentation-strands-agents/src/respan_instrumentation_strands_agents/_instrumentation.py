@@ -10,12 +10,12 @@ from typing import Any, ClassVar
 
 from opentelemetry import trace
 from opentelemetry.semconv_ai import SpanAttributes
+from respan_tracing import is_content_tracing_enabled
 
 from respan_instrumentation_strands_agents._constants import (
     STRANDS_SEMCONV_TOOL_DEFINITIONS_OPT_IN,
 )
 from respan_instrumentation_strands_agents._policy import (
-    content_enabled,
     filter_attributes,
     suppressed,
 )
@@ -177,7 +177,7 @@ class StrandsAgentsInstrumentor:
                 return originals["_start_span"](instance, *args, **kwargs)
             if suppressed():
                 return trace.INVALID_SPAN
-            allowed = content_enabled()
+            allowed = is_content_tracing_enabled()
             positional = list(args)
             attributes = kwargs.get("attributes")
             if attributes is None and len(positional) > 2:
@@ -208,7 +208,7 @@ class StrandsAgentsInstrumentor:
                 )
             if span is None or not span.is_recording():
                 return None
-            allowed = processor.content_allowed(span) and content_enabled()
+            allowed = processor.content_allowed(span) and is_content_tracing_enabled()
             if not allowed:
                 return None
             bounded = {

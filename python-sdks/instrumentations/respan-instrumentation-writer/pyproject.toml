@@ -11,7 +11,7 @@ packages = [
 
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
-respan-tracing = "^2.17.0"
+respan-tracing = "^2.21.1"
 respan-sdk = ">=2.6.26"
 writerai = ">=4.0.1,<5"
 # The alias above does not constrain the native SDK. Direct tools start at 2.3.0.

@@ -10,23 +10,20 @@ from opentelemetry.sdk.util import BoundedList
 from opentelemetry.semconv._incubating.attributes.error_attributes import ERROR_MESSAGE
 from opentelemetry.semconv_ai import SpanAttributes
 from opentelemetry.trace import Status
-from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+from respan_tracing import is_content_tracing_enabled
+from respan_tracing.constants.generic_constants import TRACE_CONTENT_OFF_VALUES
+
+from ._constants import ENV_CAPTURE_CONTENT
 
 
 def permitted(ctx=None):
     return (
         not suppressed()
         and not suppressed(ctx)
-        and context.get_value(ENABLE_CONTENT_TRACING_KEY) is not False
-        and context.get_value(ENABLE_CONTENT_TRACING_KEY, ctx) is not False
-        and all(
-            os.getenv(k, "true").strip().lower() not in {"false", "0", "off", "no"}
-            for k in [
-                "TRACELOOP_TRACE_CONTENT",
-                "RESPAN_TRACE_CONTENT",
-                "RESPAN_PYTEST_CAPTURE_CONTENT",
-            ]
-        )
+        and is_content_tracing_enabled()
+        and is_content_tracing_enabled(ctx)
+        and os.getenv(ENV_CAPTURE_CONTENT, "true").strip().lower()
+        not in TRACE_CONTENT_OFF_VALUES
     )
 
 

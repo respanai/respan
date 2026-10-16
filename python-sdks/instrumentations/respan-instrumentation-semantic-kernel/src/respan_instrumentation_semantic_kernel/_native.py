@@ -17,7 +17,7 @@ from opentelemetry.semconv._incubating.attributes import gen_ai_attributes
 from opentelemetry.semconv_ai import SpanAttributes
 from respan_sdk.constants.llm_logging import LOG_TYPE_TASK, LOG_TYPE_TOOL
 from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
-from respan_tracing.decorators.base import _should_send_prompts
+from respan_tracing import is_content_tracing_enabled
 from wrapt import FunctionWrapper
 
 from ._constants import (
@@ -44,7 +44,7 @@ def suppressed() -> bool:
 
 def capture_content(enabled: bool) -> bool:
     snapshot = getattr(trace.get_current_span(), SK_CONTENT_CAPTURE_ATTRIBUTE, True)
-    return enabled and snapshot and _should_send_prompts() and not suppressed()
+    return enabled and snapshot and is_content_tracing_enabled() and not suppressed()
 
 
 def _usage(span: Any, value: Any) -> None:

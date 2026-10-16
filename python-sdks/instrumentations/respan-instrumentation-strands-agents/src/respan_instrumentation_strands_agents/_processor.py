@@ -26,6 +26,7 @@ from respan_sdk.constants.span_attributes import (
     RESPAN_SPAN_TOOL_CALLS,
     RESPAN_SPAN_TOOLS,
 )
+from respan_tracing import is_content_tracing_enabled
 
 from respan_instrumentation_strands_agents._constants import (
     STRANDS_EVENT_CHOICE,
@@ -47,7 +48,6 @@ from respan_instrumentation_strands_agents._constants import (
     STRANDS_TOP_LEVEL_ALIAS_ATTRS_TO_STRIP,
 )
 from respan_instrumentation_strands_agents._policy import (
-    content_enabled,
     filter_attributes,
 )
 from respan_instrumentation_strands_agents._serialization import (
@@ -872,7 +872,7 @@ def enrich_strands_agents_span(
         return
 
     attrs = dict(original_attrs)
-    allowed = capture_content and content_enabled()
+    allowed = capture_content and is_content_tracing_enabled()
     if not is_strands_agents_span(span=span, attrs=attrs):
         return
 

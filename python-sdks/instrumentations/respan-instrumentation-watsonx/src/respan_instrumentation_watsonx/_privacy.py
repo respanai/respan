@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import json
 import math
-import os
 import re
 import threading
 from collections import OrderedDict
@@ -16,11 +15,11 @@ from opentelemetry import context, trace
 from opentelemetry.instrumentation.utils import _SUPPRESS_INSTRUMENTATION_KEY
 from opentelemetry.sdk.trace import SpanProcessor
 from opentelemetry.semconv_ai import SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY
+from respan_tracing import is_content_tracing_enabled
 from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
 
 _STARTING = ContextVar("respan_watsonx_starting", default=None)
 
-_TRACELOOP_CONTENT_KEY = "override_enable_content_tracing"
 _POLICY_ATTR = "traceloop.enable_content_tracing"
 _SECRET = re.compile(
     r"(?:api[_-]?key|access[_-]?key|secret[_-]?key|private[_-]?key|secret|password|passwd|authorization|credentials?|token|cookies?)$",
@@ -191,14 +190,7 @@ def suppressed(ctx=None) -> bool:
 
 def content_allowed(ctx=None) -> bool:
     """Latch explicit content policy; SDK export suppression is transient."""
-    return all(
-        context.get_value(ENABLE_CONTENT_TRACING_KEY, candidate) is not False
-        and context.get_value(_TRACELOOP_CONTENT_KEY, candidate) is not False
-        for candidate in (ctx, context.get_current())
-    ) and all(
-        os.getenv(name, "true").strip().lower() not in ("false", "0", "no", "off")
-        for name in ("TRACELOOP_TRACE_CONTENT", "RESPAN_TRACE_CONTENT")
-    )
+    return is_content_tracing_enabled(ctx) and is_content_tracing_enabled()
 
 
 class PolicyObserver(SpanProcessor):

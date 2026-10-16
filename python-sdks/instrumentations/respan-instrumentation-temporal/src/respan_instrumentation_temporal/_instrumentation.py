@@ -5,7 +5,6 @@ from __future__ import annotations
 import importlib
 import importlib.metadata
 import logging
-import os
 import re
 from collections import OrderedDict
 from collections.abc import Mapping
@@ -25,6 +24,7 @@ from opentelemetry.semconv_ai import (
 )
 from opentelemetry.trace import Status, StatusCode
 from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE, RESPAN_TRACE_GROUP_ID
+from respan_tracing import is_content_tracing_enabled
 from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
 from respan_tracing.core.tracer import RespanTracer
 from respan_tracing.utils.span_factory import read_propagated_attributes
@@ -256,11 +256,9 @@ def _observe_provider() -> None:
 
 def _context_allows(context: Any) -> bool:
     return (
-        otel_context.get_value(ENABLE_CONTENT_TRACING_KEY, context=context) is not False
+        is_content_tracing_enabled(context)
         and baggage.get_baggage(ENABLE_CONTENT_TRACING_KEY, context=context) != "false"
         and not _suppressed(context)
-        and os.getenv("TRACELOOP_TRACE_CONTENT", "true").strip().lower()
-        not in {"false", "0", "off", "no"}
     )
 
 
@@ -564,12 +562,7 @@ class _CanonicalTracer:
         supplied = kwargs.get("context", args[0] if args else None)
         contexts = (otel_context.get_current(), supplied)
         allowed, parents = _parent_decisions(contexts)
-        allowed = (
-            allowed
-            and self._capture_content
-            and os.getenv("TRACELOOP_TRACE_CONTENT", "true").strip().lower()
-            not in {"false", "0", "off", "no"}
-        )
+        allowed = allowed and self._capture_content and is_content_tracing_enabled()
         source = kwargs.get("attributes")
         attrs = _attempt(
             lambda: _canonical_attributes(

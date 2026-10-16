@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import threading
 import weakref
 from collections import OrderedDict
@@ -10,12 +9,17 @@ from collections import OrderedDict
 from opentelemetry import context, trace
 from opentelemetry.sdk.trace import SpanProcessor
 from opentelemetry.semconv_ai import SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY
-from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+from respan_tracing import is_content_tracing_enabled
+from respan_tracing.constants.context_constants import (
+    ENABLE_CONTENT_TRACING_KEY,
+    OVERRIDE_ENABLE_CONTENT_TRACING_KEY,
+    TRACE_CONTENT_KEY,
+)
 
 _CAPTURE_KEYS = (
     ENABLE_CONTENT_TRACING_KEY,
-    "trace_content",
-    "override_enable_content_tracing",
+    TRACE_CONTENT_KEY,
+    OVERRIDE_ENABLE_CONTENT_TRACING_KEY,
 )
 
 
@@ -27,13 +31,7 @@ def suppressed(ctx=None):
 
 
 def capture_flags(ctx=None):
-    return all(
-        context.get_value(k) is not False and context.get_value(k, ctx) is not False
-        for k in _CAPTURE_KEYS
-    ) and all(
-        os.getenv(k, "true").strip().lower() not in {"false", "0", "off", "no"}
-        for k in ("TRACELOOP_TRACE_CONTENT", "RESPAN_TRACE_CONTENT")
-    )
+    return is_content_tracing_enabled() and is_content_tracing_enabled(ctx)
 
 
 def permitted(ctx=None):

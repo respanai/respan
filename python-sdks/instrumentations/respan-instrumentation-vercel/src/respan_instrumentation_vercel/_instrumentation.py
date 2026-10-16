@@ -6,7 +6,6 @@ import contextvars
 import functools
 import importlib
 import inspect
-import os
 from collections import OrderedDict
 from threading import RLock
 from types import SimpleNamespace
@@ -26,7 +25,7 @@ from respan_sdk.constants.span_attributes import (
     RESPAN_LOG_TYPE,
     RESPAN_METADATA,
 )
-from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+from respan_tracing import is_content_tracing_enabled
 
 from ._operation_sink import _OperationSink
 from ._translator import json_value, span_attributes, usage_attributes
@@ -42,12 +41,6 @@ _OPERATIONS = (
     ("transcriptions", "transcribe", "transcribe", LOG_TYPE_TASK),
     ("reranking", "rerank", "rerank", LOG_TYPE_TASK),
 )
-
-
-def _content_allowed() -> bool:
-    return context.get_value(ENABLE_CONTENT_TRACING_KEY) is not False and os.getenv(
-        "TRACELOOP_TRACE_CONTENT", "true"
-    ).strip().lower() not in {"0", "false", "no", "off"}
 
 
 _DATA_MODELS = {
@@ -83,7 +76,7 @@ class _SpanView:
 
     def __init__(self, span: Any) -> None:
         self._span = span
-        self.capture_content = _content_allowed()
+        self.capture_content = is_content_tracing_enabled()
 
     @property
     def data(self) -> Any:
@@ -133,7 +126,9 @@ class _Adapter(OtelAdapter):
     def span_attrs(self, span: Any, /) -> dict[str, Any]:
         return span_attributes(
             span,
-            self._is_capturing_content and span.capture_content and _content_allowed(),
+            self._is_capturing_content
+            and span.capture_content
+            and is_content_tracing_enabled(),
         )
 
     async def on_span_end(self, span: Any, /) -> None:
@@ -248,7 +243,7 @@ class VercelInstrumentor:
                 # original callable after the final deactivate.
                 return await (current or original)(*args, **kwargs)
             try:
-                capture = capture_setting and _content_allowed()
+                capture = capture_setting and is_content_tracing_enabled()
                 bound = signature.bind(*args, **kwargs)
                 input_payload = None
                 if capture:
@@ -280,7 +275,7 @@ class VercelInstrumentor:
                         return result
                     finally:
                         await deferred.finish(
-                            capture_content=capture and _content_allowed(),
+                            capture_content=capture and is_content_tracing_enabled(),
                             input_payload=input_payload,
                             result=result,
                         )
@@ -317,14 +312,14 @@ class VercelInstrumentor:
                                     exclude_none=True
                                 )
                             span.set_attribute(RESPAN_METADATA, json_value(metadata))
-                            if capture and _content_allowed():
+                            if capture and is_content_tracing_enabled():
                                 span.set_attribute(
                                     SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
                                     json_value(result.value),
                                 )
                             return result
                         finally:
-                            if capture and _content_allowed():
+                            if capture and is_content_tracing_enabled():
                                 span.set_attribute(
                                     SpanAttributes.TRACELOOP_ENTITY_INPUT, input_payload
                                 )

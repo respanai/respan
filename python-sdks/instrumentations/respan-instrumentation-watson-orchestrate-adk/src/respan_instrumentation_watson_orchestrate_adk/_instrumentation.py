@@ -6,7 +6,6 @@ import functools
 import importlib
 import inspect
 import logging
-import os
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -21,7 +20,7 @@ from respan_sdk.utils.data_processing.id_processing import (
     format_span_id,
     format_trace_id,
 )
-from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+from respan_tracing import is_content_tracing_enabled
 from respan_tracing.core.tracer import RespanTracer
 from respan_tracing.utils.span_factory import (
     build_readable_span,
@@ -156,11 +155,7 @@ def _operation(kind):
         "tool": WATSON_ORCHESTRATE_TOOL_SPAN_NAME,
     }.get(kind, WATSON_ORCHESTRATE_RUN_SPAN_NAME)
     # Snapshot policy and attribution before provider callbacks can change context.
-    include_content = context_api.get_value(
-        ENABLE_CONTENT_TRACING_KEY
-    ) is not False and os.getenv(
-        "TRACELOOP_TRACE_CONTENT", "true"
-    ).strip().lower() not in {"false", "0", "no", "off"}
+    include_content = is_content_tracing_enabled()
     trace_id, parent_id = _current_trace_parent_ids()
     skeleton = build_readable_span(
         name=name,
