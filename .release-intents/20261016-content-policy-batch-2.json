@@ -1,0 +1,26 @@
+{
+  "summary": "Instrumentations use respan-tracing's shared is_content_tracing_enabled (batch 2)",
+  "packages": {
+    "respan-instrumentation-guardrails": "none",
+    "respan-instrumentation-haystack": "none",
+    "respan-instrumentation-helicone": "none",
+    "respan-instrumentation-huggingface": "none",
+    "respan-instrumentation-instructor": "none",
+    "respan-instrumentation-lancedb": "none",
+    "respan-instrumentation-langchain": "none",
+    "respan-instrumentation-litellm": "none",
+    "respan-instrumentation-livekit": "none",
+    "respan-instrumentation-llama-index": "none",
+    "respan-instrumentation-marqo": "none",
+    "respan-instrumentation-mcp": "none",
+    "respan-instrumentation-microsoft-agent-framework": "none",
+    "respan-instrumentation-milvus": "none",
+    "respan-instrumentation-mirascope": "none",
+    "respan-instrumentation-ollama": "none",
+    "respan-instrumentation-openai-agents": "none",
+    "respan-instrumentation-openinference": "none",
+    "respan-instrumentation-openlit": "none",
+    "respan-instrumentation-openrouter": "none",
+    "respan-instrumentation-pgvector": "none"
+  }
+}

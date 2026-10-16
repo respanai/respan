@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from collections import OrderedDict
 from typing import Any
@@ -20,18 +19,16 @@ from opentelemetry.semconv_ai import (
     SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY,
     SpanAttributes,
 )
-from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+from respan_tracing.utils.context import is_content_tracing_enabled
 
 logger = logging.getLogger(__name__)
 
 
 def _allowed(ctx: Any = None) -> bool:
     return (
-        context.get_value(ENABLE_CONTENT_TRACING_KEY, ctx) is not False
+        is_content_tracing_enabled(ctx)
         and not context.get_value(context._SUPPRESS_INSTRUMENTATION_KEY, ctx)
         and not context.get_value(SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY, ctx)
-        and os.getenv("TRACELOOP_TRACE_CONTENT", "true").strip().lower()
-        not in {"0", "false", "off", "no"}
     )
 
 

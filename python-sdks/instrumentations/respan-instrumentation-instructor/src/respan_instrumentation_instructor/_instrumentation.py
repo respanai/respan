@@ -7,7 +7,6 @@ import importlib
 import inspect
 import json
 import logging
-import os
 import threading
 from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import contextmanager
@@ -28,10 +27,11 @@ from opentelemetry.semconv_ai import (
     SpanAttributes,
 )
 from respan_sdk.constants.llm_logging import LOG_TYPE_CHAT
+from respan_sdk.constants.otlp_constants import OTEL_EXCEPTION_EVENT_NAME
 from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE, RESPAN_METADATA
 from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
 from respan_tracing.core.tracer import RespanTracer
-from respan_tracing.decorators.base import _should_send_prompts
+from respan_tracing.utils.context import is_content_tracing_enabled
 from respan_tracing.utils.span_factory import read_propagated_attributes
 
 from ._schema import _response_model_function_schema
@@ -97,12 +97,6 @@ def _count(value):
 
 def _is_respan_tracing_enabled():
     return bool(getattr(getattr(RespanTracer, "_instance", None), "is_enabled", True))
-
-
-def _content_allowed():
-    return _should_send_prompts() and os.getenv(
-        "TRACELOOP_TRACE_CONTENT", "true"
-    ).strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _is_wrapped(fn):
@@ -400,7 +394,7 @@ class _RawAsyncIterator:
 class _Call:
     def __init__(self, runtime, operation, arguments, provider, mode):
         self.runtime = runtime
-        self.capture = runtime.trace_content and _content_allowed()
+        self.capture = runtime.trace_content and is_content_tracing_enabled()
         self.operation = operation
         self.finished = False
         self.items = []
@@ -453,7 +447,7 @@ class _Call:
     def _content(self):
         if not self.span.is_recording():
             return False
-        if self.capture and not _content_allowed():
+        if self.capture and not is_content_tracing_enabled():
             self.capture = False
             self.items.clear()
             self.tool_calls.clear()
@@ -621,7 +615,8 @@ class _Call:
                 if capture:
                     self.span.set_attribute(ERROR_MESSAGE, message)
                 self.span.add_event(
-                    "exception", {EXCEPTION_TYPE: name, EXCEPTION_MESSAGE: message}
+                    OTEL_EXCEPTION_EVENT_NAME,
+                    {EXCEPTION_TYPE: name, EXCEPTION_MESSAGE: message},
                 )
                 status = _error_status(error)
                 if status is not None:

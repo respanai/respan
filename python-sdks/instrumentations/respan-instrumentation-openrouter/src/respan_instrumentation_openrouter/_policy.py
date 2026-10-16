@@ -2,20 +2,11 @@
 
 from __future__ import annotations
 
-import os
 import threading
 from collections import OrderedDict
 
-from opentelemetry import context, trace
-from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
-
-
-def permitted(ctx=None):
-    return context.get_value(
-        ENABLE_CONTENT_TRACING_KEY, ctx
-    ) is not False and os.getenv(
-        "TRACELOOP_TRACE_CONTENT", "true"
-    ).strip().lower() not in {"false", "0", "no", "off"}
+from opentelemetry import trace
+from respan_tracing.utils.context import is_content_tracing_enabled
 
 
 def key(span):
@@ -55,7 +46,7 @@ class Policy:
                 parent = key(trace.get_current_span(parent_context))
                 self.active[k] = (
                     self.capture
-                    and permitted(parent_context)
+                    and is_content_tracing_enabled(parent_context)
                     and self.ancestors_allowed(parent),
                     parent,
                 )
@@ -66,7 +57,7 @@ class Policy:
             return bool(state and state[0] and self.ancestors_allowed(state[1]))
 
     def permitted_now(self, span):
-        return permitted() and self.allowed(span)
+        return is_content_tracing_enabled() and self.allowed(span)
 
     def deny(self, span):
         with self.lock:
@@ -83,7 +74,11 @@ class Policy:
         with self.lock:
             k = key(span)
             initial, parent = self.active.pop(k, (False, None))
-            allowed = initial and permitted() and self.ancestors_allowed(parent)
+            allowed = (
+                initial
+                and is_content_tracing_enabled()
+                and self.ancestors_allowed(parent)
+            )
             if k and not allowed:
                 self.denied[k] = True
                 while len(self.denied) > 4096:

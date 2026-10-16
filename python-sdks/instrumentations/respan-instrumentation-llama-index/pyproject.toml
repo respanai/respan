@@ -11,7 +11,7 @@ packages = [
 
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
-respan-tracing = ">=2.20.0"
+respan-tracing = ">=2.21.1"
 respan-sdk = ">=2.7.6"
 llama-index-core = ">=0.14.23,<1.0"
 llama-index-workflows = ">=2.14.0,<3"

@@ -40,6 +40,7 @@ from respan_sdk.constants.llm_logging import (
     LOG_TYPE_TEXT,
 )
 from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
+from respan_tracing.utils.context import is_content_tracing_enabled
 
 from respan_instrumentation_openrouter._processor import _is_sensitive_key, _redact_text
 
@@ -960,10 +961,13 @@ def install_source_observers(runtime: Any) -> None:
     def detach(token, _original=previous):
         if runtime.active:
             try:
-                from respan_instrumentation_openrouter._policy import key, permitted
+                from respan_instrumentation_openrouter._policy import key
 
                 current = trace.get_current_span()
-                if key(current) in runtime.processor._policy.active and not permitted():
+                if (
+                    key(current) in runtime.processor._policy.active
+                    and not is_content_tracing_enabled()
+                ):
                     runtime.processor._policy.deny(current)
                     call = _SOURCE_CALL.get()
                     if call is not None and call.runtime is runtime:

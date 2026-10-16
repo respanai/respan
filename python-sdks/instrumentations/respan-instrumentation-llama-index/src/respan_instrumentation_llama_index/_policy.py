@@ -1,22 +1,15 @@
 """Private start snapshots with final payload veto and OTel suppression."""
 
-import os
-
 from opentelemetry import context
 from opentelemetry.semconv_ai import (
     SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY,
     SpanAttributes,
 )
-from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+from respan_tracing.utils.context import is_content_tracing_enabled
 
 
 def content_allowed(setting: bool = True) -> bool:
-    return (
-        setting
-        and context.get_value(ENABLE_CONTENT_TRACING_KEY) is not False
-        and os.getenv("TRACELOOP_TRACE_CONTENT", "true").strip().lower()
-        not in {"0", "false", "off", "no"}
-    )
+    return setting and is_content_tracing_enabled()
 
 
 def suppressed() -> bool:

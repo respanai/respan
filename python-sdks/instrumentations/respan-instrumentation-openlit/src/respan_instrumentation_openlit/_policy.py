@@ -4,7 +4,8 @@ import os
 
 from opentelemetry import context
 from opentelemetry.semconv_ai import SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY
-from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+from respan_tracing.constants.generic_constants import TRACE_CONTENT_OFF_VALUES
+from respan_tracing.utils.context import is_content_tracing_enabled
 
 
 def suppressed(parent_context=None):
@@ -21,14 +22,12 @@ def suppressed(parent_context=None):
 def content_allowed(configured=True, parent_context=None):
     return (
         configured
-        and os.getenv("TRACELOOP_TRACE_CONTENT", "true").strip().lower()
-        not in {"false", "0", "off", "no"}
         and os.getenv("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "true")
         .strip()
         .lower()
-        not in {"false", "0", "off", "no"}
-        and context.get_value(ENABLE_CONTENT_TRACING_KEY) is not False
-        and context.get_value(ENABLE_CONTENT_TRACING_KEY, parent_context) is not False
+        not in TRACE_CONTENT_OFF_VALUES
+        and is_content_tracing_enabled()
+        and is_content_tracing_enabled(parent_context)
         and not suppressed(parent_context)
     )
 

@@ -4,12 +4,10 @@ import asyncio
 import importlib
 import json
 import logging
-import os
 from collections.abc import Callable, Mapping, Sequence
 from threading import RLock
 from typing import Any, ClassVar, NamedTuple
 
-from opentelemetry import context as context_api
 from opentelemetry import trace
 from opentelemetry.instrumentation.utils import is_instrumentation_enabled, unwrap
 from opentelemetry.semconv._incubating.attributes.error_attributes import ERROR_MESSAGE
@@ -19,6 +17,7 @@ from respan_instrumentation_openinference import OpenInferenceInstrumentor
 from respan_sdk.constants.llm_logging import LOG_TYPE_TASK, LOG_TYPE_TOOL
 from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
 from respan_tracing.core.tracer import RespanTracer
+from respan_tracing.utils.context import is_content_tracing_enabled
 from wrapt import wrap_function_wrapper
 
 from respan_instrumentation_mcp._native import (
@@ -253,12 +252,6 @@ def _arg_or_kw(
     return None
 
 
-def _capture_content() -> bool:
-    return (os.getenv("TRACELOOP_TRACE_CONTENT") or "true").lower() == "true" or bool(
-        context_api.get_value("override_enable_content_tracing")
-    )
-
-
 def _method_input(
     method_name: str, args: tuple[Any, ...], kwargs: dict[str, Any]
 ) -> dict[str, Any]:
@@ -423,7 +416,7 @@ class MCPInstrumentor:
     ) -> Any:
         if not is_instrumentation_enabled():
             return await wrapped(*args, **kwargs)
-        include_content = _capture_content()
+        include_content = is_content_tracing_enabled()
         config = _CLIENT_METHODS[method_name]
         entity_name = _entity_name(method_name, args, kwargs)
         tracer = trace.get_tracer(__name__)

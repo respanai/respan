@@ -22,9 +22,10 @@ from opentelemetry.semconv_ai import SpanAttributes as AI
 from opentelemetry.trace import Status, StatusCode
 from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE, RESPAN_METADATA
 from respan_tracing.core.tracer import RespanTracer
+from respan_tracing.utils.context import is_content_tracing_enabled
 
 from ._constants import CLIENT_METHODS
-from ._policy import CapturePolicy, PrivacyObserver, explicit_capture, suppressed
+from ._policy import CapturePolicy, PrivacyObserver, suppressed
 from ._serialization import (
     initialize_native_types,
     json_string,
@@ -859,7 +860,7 @@ class MilvusInstrumentor:
                 original_detach = runtime.detach
 
                 def detach(token):
-                    if not explicit_capture():
+                    if not is_content_tracing_enabled():
                         manager.observer.notice()
                     return original_detach(token)
 
