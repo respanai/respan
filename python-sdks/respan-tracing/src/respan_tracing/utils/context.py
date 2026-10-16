@@ -1,5 +1,6 @@
-import contextvars
 import asyncio
+import contextvars
+import os
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -10,6 +11,16 @@ from typing import Awaitable, Callable, Iterator, Optional, ParamSpec, TypeVar
 from opentelemetry import context as context_api
 from opentelemetry.context import Context
 from opentelemetry.semconv_ai import SpanAttributes
+
+from respan_tracing.constants.context_constants import (
+    ENABLE_CONTENT_TRACING_KEY,
+    OVERRIDE_ENABLE_CONTENT_TRACING_KEY,
+    TRACE_CONTENT_KEY,
+)
+from respan_tracing.constants.generic_constants import (
+    TRACE_CONTENT_ENV_VARS,
+    TRACE_CONTENT_OFF_VALUES,
+)
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -256,3 +267,30 @@ def get_entity_path(ctx: Optional[Context] = None) -> Optional[str]:
         SpanAttributes.TRACELOOP_ENTITY_NAME, context=ctx
     )
     return workflow_name
+
+
+def is_content_tracing_enabled(ctx: Optional[Context] = None) -> bool:
+    """Whether spans may carry content (prompts, completions, inputs, outputs).
+
+    The one policy every Respan instrumentation shares:
+
+    - OpenLLMetry's ``override_enable_content_tracing`` set to True forces it on;
+    - any content context key set to False turns it off;
+    - otherwise ``TRACELOOP_TRACE_CONTENT`` / ``RESPAN_TRACE_CONTENT`` set to
+      ``0``/``false``/``no``/``off`` turns it off. Unset means on.
+    """
+    if ctx is None:
+        ctx = context_api.get_current()
+    if context_api.get_value(OVERRIDE_ENABLE_CONTENT_TRACING_KEY, ctx) is True:
+        return True
+    for key in (
+        ENABLE_CONTENT_TRACING_KEY,
+        TRACE_CONTENT_KEY,
+        OVERRIDE_ENABLE_CONTENT_TRACING_KEY,
+    ):
+        if context_api.get_value(key, ctx) is False:
+            return False
+    return all(
+        os.getenv(name, "true").strip().lower() not in TRACE_CONTENT_OFF_VALUES
+        for name in TRACE_CONTENT_ENV_VARS
+    )

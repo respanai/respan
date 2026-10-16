@@ -1,21 +1,19 @@
 import inspect
 import json
-import os
 from functools import wraps
 from typing import Any, Awaitable, Callable, Optional, ParamSpec, TypeVar
 
-from opentelemetry import context as context_api
 from opentelemetry.semconv_ai import SpanAttributes
 from opentelemetry.trace.status import Status, StatusCode
 from respan_sdk import FilterParamDict
 from respan_sdk.utils.serialization import serialize_value
 
-from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
 from respan_tracing.constants.generic_constants import LOGGER_NAME_DECORATORS
 from respan_tracing.utils.auto_flush import (
     flush_after_span,
     has_recording_parent_span,
 )
+from respan_tracing.utils.context import is_content_tracing_enabled
 from respan_tracing.utils.logging import get_respan_logger
 from respan_tracing.utils.span_setup import LinksParam, cleanup_span, setup_span
 
@@ -32,15 +30,9 @@ def _is_json_size_valid(json_str: str) -> bool:
     return len(json_str) < 1_000_000
 
 
-def _should_send_prompts() -> bool:
-    """Check if we should send prompt content in traces"""
-    if context_api.get_value(ENABLE_CONTENT_TRACING_KEY) is False:
-        return False
-
-    trace_content = os.getenv("TRACELOOP_TRACE_CONTENT")
-    if trace_content is None:
-        return True
-    return trace_content.strip().lower() not in {"0", "false", "no", "off"}
+# Published instrumentations (crewai, agentspec, haystack <= their current
+# releases) import this private name; keep it as an alias.
+_should_send_prompts = is_content_tracing_enabled
 
 
 def _is_async_method(fn):
@@ -82,7 +74,7 @@ def _setup_span(
 def _handle_span_input(span, args, kwargs):
     """Handle entity input logging"""
     try:
-        if _should_send_prompts():
+        if is_content_tracing_enabled():
             json_input = json.dumps(
                 {
                     "args": [_serialize_input_value(value) for value in args],
@@ -120,7 +112,7 @@ def _serialize_input_value(value):
 def _handle_span_output(span, result):
     """Handle entity output logging"""
     try:
-        if _should_send_prompts():
+        if is_content_tracing_enabled():
             json_output = json.dumps(serialize_value(value=result))
             if _is_json_size_valid(json_output):
                 span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_OUTPUT, json_output)
