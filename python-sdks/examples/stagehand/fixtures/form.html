@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+<head><title>Acme - Wire transfer</title></head>
+<body>
+  <h1>New wire transfer</h1>
+  <form id="transfer">
+    <label>Recipient <input id="recipient" name="recipient"></label>
+    <label>Amount (USD) <input id="amount" name="amount" type="number"></label>
+    <label>Memo <input id="memo" name="memo"></label>
+    <label>Approval PIN <input id="pin" name="pin" type="password"></label>
+    <button id="submit" type="submit">Submit transfer</button>
+  </form>
+  <p id="result"></p>
+  <script>
+    document.getElementById("transfer").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const data = new FormData(event.target);
+      document.getElementById("result").textContent =
+        `Transfer of $${data.get("amount")} to ${data.get("recipient")} submitted.`;
+    });
+  </script>
+</body>
+</html>

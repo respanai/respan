@@ -467,6 +467,13 @@
     },
     {
       "ecosystem": "python",
+      "name": "respan-instrumentation-stagehand",
+      "path": "python-sdks/instrumentations/respan-instrumentation-stagehand",
+      "registry": "pypi",
+      "python_tests": true
+    },
+    {
+      "ecosystem": "python",
       "name": "respan-instrumentation-smolagents",
       "path": "python-sdks/instrumentations/respan-instrumentation-smolagents",
       "registry": "pypi"

@@ -1,0 +1,33 @@
+<!doctype html>
+<html>
+<head><title>Acme - Sign in</title></head>
+<body>
+  <h1 id="heading">Sign in to Acme</h1>
+  <form id="login">
+    <label>Email <input id="email" name="email" type="email" autocomplete="username"></label>
+    <label>Password <input id="password" name="password" type="password" autocomplete="current-password"></label>
+    <button type="submit">Sign in</button>
+  </form>
+  <p id="status"></p>
+  <script>
+    // A cookie stands in for a real session, so a second run with the same
+    // userDataDir starts signed in (the persisted-login cookbook's point).
+    const signedIn = () => document.cookie.includes("acme_session=1");
+    function render() {
+      if (signedIn()) {
+        document.getElementById("login").style.display = "none";
+        document.getElementById("heading").textContent = "Welcome back to Acme";
+        document.getElementById("status").textContent = "Signed in. 3 open invoices.";
+      }
+    }
+    document.getElementById("login").addEventListener("submit", (event) => {
+      event.preventDefault();
+      if (document.getElementById("email").value && document.getElementById("password").value) {
+        document.cookie = "acme_session=1; max-age=86400; path=/";
+        render();
+      }
+    });
+    render();
+  </script>
+</body>
+</html>
