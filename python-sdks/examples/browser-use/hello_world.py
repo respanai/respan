@@ -28,6 +28,8 @@ respan = Respan(
     api_key=RESPAN_API_KEY,
     base_url=RESPAN_BASE_URL,
     app_name="browser-use-hello-world",
+    # The end user this run is for: shows on every span and in Respan's Users view.
+    customer_identifier=os.getenv("RESPAN_CUSTOMER_ID", "browser-use-hello-world"),
     instrumentations=[BrowserUseInstrumentor()],
 )
 
