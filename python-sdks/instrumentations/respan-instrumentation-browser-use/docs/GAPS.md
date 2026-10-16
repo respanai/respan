@@ -71,6 +71,9 @@ detail (scrolls, typing, hovers).
 | G10 | **Off-scope, staging infra (root cause confirmed):** the presigned media URL for a lifted screenshot (`kwaistagingblob.blob.core.windows.net/files/media/...`) returns `AuthorizationFailure` from a public client inside its validity window. Cause: backend `iac/azure/storage.py:80-83` sets the AKS-staging storage account to `network_rule_set default_action=DENY` (VNet + private endpoint only). The backend hands browsers user-delegation SAS URLs (`clickhouse/views/logs.py` `_serve_log_media`), which can never load from outside the VNet. That affects **every** log-media image/audio on staging, not just screenshots. Prod uses S3 and is not affected. | screenshots (and all log media) do not render in the staging UI | infra decision: allow public network access with SAS-only auth (keep shared keys and anonymous access off), or proxy media through the API. Handed off, not changed here |
 | G11 | **Off-scope, gateway:** the Respan gateway answers an invalid API key with **403**. browser-use switches to `fallback_llm` only on 401/402/429/5xx or connection errors, so a browser-use agent whose key is wrong never fails over when it goes through Respan. Found by scenario 14 on staging. | `fallback_llm` silently doesn't trigger on bad keys | backend decision: 401 for an invalid key (the usual meaning), or document it |
 | G12 | ~~`Agent.rerun_history()` exported every replayed action as its own one-span trace.~~ **Fixed:** replays get a `browser_use.rerun` agent root span in the Agent's thread. Covered by the baseline. | - | - |
+| G14 | **Off-scope, frontend:** the trace tree (`SidePanelLeftContent.tsx`) draws failed spans exactly like successful ones; failure shows only in the side-panel status tag after clicking the span (`Tag.tsx` `status_code >= 400`). A trace can say "2 errors" with nothing red in the tree (fallback_model trace `fa0917c5`). | errors are invisible until you click every span | FE: mark rows with `status_code >= 400`, jump to the first failed span from the error count |
+| G15 | **Off-scope, backend:** an SDK-side connection error on an LLM span is classified as `provider_down` / `azure_openai` / `500`. The provider was not down; the client could not connect. Since 0.1.2 the span's `error_message` carries the real cause (`ModelProviderError: Connection error.`). | misleading error classification | backend: don't infer provider/status for traced (non-gateway) spans |
+| G16 | browser-use's judge defaults to the primary model and does not use `fallback_llm`, so when the primary fails the judge's call fails too and the run has no verdict. browser-use behaviour, not ours; scenario 14 sets `judge_llm`, and `run_all.py` fails any finished run without a `judge_verdict`. | silent extra error span | documented |
 | G8 | Version pin `browser-use >=0.13,<0.14`. The hooks (`Agent.run/step`, `Tools.act`, `TokenCost.register_llm`) have been stable since 0.6, but private-ish seams can move. | breakage on 0.14 | widen the pin after testing each minor |
 
 ## Baseline (2026-10-15)
@@ -110,7 +113,7 @@ extract action's LLM span, cancellation handling, sensitive-data placeholders.
 
 ## Verification log
 
-- Unit + e2e + baseline tests: `pytest tests` (24 tests; the e2e test drives a real headless
+- Unit + e2e + baseline tests: `pytest tests` (28 tests; the e2e test drives a real headless
   Chrome with a scripted LLM and a local HTTP page).
 - Staging soak (2026-10-15): real `azure/gpt-4.1-mini` through the staging
   gateway, real sites, spans exported to `staging-api.respan.ai`.
@@ -124,3 +127,8 @@ extract action's LLM span, cancellation handling, sensitive-data placeholders.
     root `agent.browser_use`. Token counts and cost were computed server-side.
   - Step output's screenshot came back as a media-storage URL (the backend
     lifted the data URI), see G10 for the access error on staging.
+- 2026-10-16: PyPI 0.1.2 verified from a clean `pip install`: 27/27 scenarios pass
+  on staging with the live checks (exported-vs-stored span counts, one root, a
+  tool span per executed action, an LLM span per step, step totals vs
+  browser-use's own count, judge verdict on finished runs, customer/thread ids
+  on every span, no secrets).

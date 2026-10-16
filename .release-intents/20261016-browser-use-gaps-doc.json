@@ -1,0 +1,6 @@
+{
+  "summary": "browser-use: GAPS.md records the frontend/backend/judge findings from the 0.1.2 verification",
+  "packages": {
+    "respan-instrumentation-browser-use": "none"
+  }
+}
