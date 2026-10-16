@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from collections import OrderedDict
 from typing import Any
@@ -15,10 +14,9 @@ from opentelemetry.sdk.trace import (
     SynchronousMultiSpanProcessor,
 )
 from opentelemetry.semconv_ai import SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY
-from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+from respan_tracing import is_content_tracing_enabled
 
 logger = logging.getLogger(__name__)
-_OFF = {"false", "0", "off", "no"}
 
 
 def suppressed(ctx: Any = None) -> bool:
@@ -31,14 +29,10 @@ def suppressed(ctx: Any = None) -> bool:
 def permitted(setting: bool = True, ctx: Any = None) -> bool:
     return bool(
         setting
-        and context.get_value(ENABLE_CONTENT_TRACING_KEY) is not False
-        and context.get_value(ENABLE_CONTENT_TRACING_KEY, ctx) is not False
+        and is_content_tracing_enabled()
+        and is_content_tracing_enabled(ctx)
         and not suppressed()
         and not suppressed(ctx)
-        and all(
-            os.getenv(name, "true").strip().lower() not in _OFF
-            for name in ("TRACELOOP_TRACE_CONTENT", "RESPAN_TRACE_CONTENT")
-        )
     )
 
 

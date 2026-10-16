@@ -23,9 +23,10 @@ from opentelemetry.semconv.attributes.error_attributes import ERROR_TYPE
 from opentelemetry.semconv_ai import SpanAttributes as AI
 from opentelemetry.trace import SpanKind, Status, StatusCode
 from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE, RESPAN_METADATA
+from respan_tracing import is_content_tracing_enabled
 from respan_tracing.core.tracer import RespanTracer
 
-from ._policy import CapturePolicy, PrivacyObserver, explicit_capture, suppressed
+from ._policy import CapturePolicy, PrivacyObserver, suppressed
 from ._serialization import (
     REDACTED,
     initialize_native_types,
@@ -752,7 +753,7 @@ class AlephAlphaInstrumentor:
                 def detach(token):
                     # Processor export suppression is transient, and must never
                     # veto a pending sibling merely because its parent exports.
-                    if not explicit_capture():
+                    if not is_content_tracing_enabled():
                         manager.observer.notice()
                     return original_detach(token)
 

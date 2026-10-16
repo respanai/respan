@@ -24,7 +24,7 @@ from respan_sdk.constants.llm_logging import (
     LOG_TYPE_WORKFLOW,
 )
 from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
-from respan_tracing.decorators.base import _should_send_prompts
+from respan_tracing import is_content_tracing_enabled
 from wrapt import FunctionWrapper, ObjectProxy
 
 from ._compat import _ContextPreservingIterator
@@ -151,7 +151,9 @@ def patch_workflow_nodes(tracer):
         return _ContextPreservingIterator(traced())
 
     async def advisor_call(wrapped, instance, args, kwargs):
-        token = _ADVISOR_START.set((context.get_current(), _should_send_prompts()))
+        token = _ADVISOR_START.set(
+            (context.get_current(), is_content_tracing_enabled())
+        )
         try:
             return await wrapped(*args, **kwargs)
         finally:
@@ -166,7 +168,7 @@ def patch_workflow_nodes(tracer):
         # only actual LlmResponse metadata is translated here.
         snapshot = _ADVISOR_START.get() or (
             context.get_current(),
-            _should_send_prompts(),
+            is_content_tracing_enabled(),
         )
         context_token = context.attach(snapshot[0])
         policy_token = _content_policy_override.set(snapshot[1])

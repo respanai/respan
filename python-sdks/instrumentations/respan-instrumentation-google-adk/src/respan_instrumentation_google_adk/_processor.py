@@ -50,7 +50,7 @@ from respan_sdk.constants.span_attributes import (
     RESPAN_SPAN_TOOL_CALLS,
     RESPAN_SPAN_TOOLS,
 )
-from respan_tracing.decorators.base import _should_send_prompts
+from respan_tracing import is_content_tracing_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -684,7 +684,7 @@ class GoogleADKSpanProcessor(SpanProcessor):
         if _scope_name(span) == GOOGLE_ADK_SCOPE_NAME:
             policy = _content_policy_override.get()
             self._policy[span.get_span_context().span_id] = (
-                _should_send_prompts() if policy is None else policy
+                is_content_tracing_enabled() if policy is None else policy
             )
 
     def on_end(self, span: ReadableSpan) -> None:
@@ -693,7 +693,7 @@ class GoogleADKSpanProcessor(SpanProcessor):
             return
 
         span_id = getattr(getattr(span, "context", None), "span_id", None)
-        content_allowed = self._policy.pop(span_id, _should_send_prompts())
+        content_allowed = self._policy.pop(span_id, is_content_tracing_enabled())
         hidden_input = not content_allowed or any(
             getattr(self._config, key, False)
             for key in (

@@ -11,7 +11,7 @@ packages = [
 
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
-respan-tracing = "^2.17.0"
+respan-tracing = "^2.21.1"
 respan-sdk = ">=2.6.26"
 elasticsearch = ">=8.13.0,<10.0.0"
 elastic-transport = ">=8.13.0,<10.0.0"

@@ -20,8 +20,7 @@ from respan_sdk.constants.span_attributes import (
     RESPAN_SPAN_TOOL_CALLS,
     RESPAN_SPAN_TOOLS,
 )
-
-from ._privacy import content_enabled
+from respan_tracing import is_content_tracing_enabled
 
 GROQ_OPENINFERENCE_SCOPE_NAME = "openinference.instrumentation.groq"
 GEN_AI_PROMPT_PREFIX = f"{TLSpanAttributes.LLM_PROMPTS}."
@@ -237,9 +236,9 @@ class GroqInputSpanProcessor(SpanProcessor):
         self._hidden: set[int] = set()
 
     def on_start(self, span, parent_context=None) -> None:
-        if _span_scope_name(
-            span
-        ) == GROQ_OPENINFERENCE_SCOPE_NAME and not content_enabled(parent_context):
+        if _span_scope_name(span) == GROQ_OPENINFERENCE_SCOPE_NAME and not (
+            is_content_tracing_enabled() and is_content_tracing_enabled(parent_context)
+        ):
             self._hidden.add(span.get_span_context().span_id)
 
     def on_end(self, span: ReadableSpan) -> None:

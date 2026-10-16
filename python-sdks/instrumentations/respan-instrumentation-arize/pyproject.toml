@@ -15,7 +15,7 @@ arize = ">=8.35.0,<9"
 opentelemetry-semantic-conventions-ai = ">=0.4.13,<0.6"
 opentelemetry-semantic-conventions = ">=0.60b0,<1"
 respan-sdk = ">=2.7.6"
-respan-tracing = ">=2.20.0"
+respan-tracing = ">=2.21.1"
 
 [tool.poetry.plugins."respan.instrumentations"]
 arize = "respan_instrumentation_arize:ArizeInstrumentor"

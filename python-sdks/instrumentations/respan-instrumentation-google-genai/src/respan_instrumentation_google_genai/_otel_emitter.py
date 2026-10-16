@@ -22,6 +22,7 @@ from respan_sdk.utils.data_processing.id_processing import (
     format_span_id,
     format_trace_id,
 )
+from respan_tracing import is_content_tracing_enabled
 from respan_tracing.utils.span_factory import build_readable_span, inject_span
 
 from respan_instrumentation_google_genai._constants import (
@@ -37,7 +38,6 @@ from respan_instrumentation_google_genai._constants import (
     TOTAL_TOKEN_COUNT_KEY,
 )
 from respan_instrumentation_google_genai._translator import (
-    capture_content,
     contents_with_history,
     extract_tool_calls,
     extract_tools,
@@ -107,7 +107,7 @@ def _set_output_attrs(
     attrs: dict[str, Any],
     response_or_chunks: Any,
 ) -> None:
-    if capture_content():
+    if is_content_tracing_enabled():
         output = format_output(response_or_chunks=response_or_chunks)
         attrs[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = output
         attrs[f"{SpanAttributes.LLM_COMPLETIONS}.0.role"] = ASSISTANT_ROLE
@@ -137,7 +137,7 @@ def _set_request_attrs(attrs: dict[str, Any], request_kwargs: dict[str, Any]) ->
     if model:
         attrs[SpanAttributes.LLM_REQUEST_MODEL] = model
 
-    if not capture_content():
+    if not is_content_tracing_enabled():
         return
     config = request_kwargs.get(CONFIG_KEY)
     tools = extract_tools(config=config)

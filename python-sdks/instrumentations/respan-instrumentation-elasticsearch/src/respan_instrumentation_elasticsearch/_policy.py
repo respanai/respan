@@ -3,7 +3,6 @@
 # ruff: noqa: BLE001 -- telemetry privacy faults fail closed.
 from __future__ import annotations
 
-import os
 import threading
 import weakref
 from collections import OrderedDict
@@ -12,11 +11,11 @@ from contextvars import ContextVar
 from opentelemetry import context, trace
 from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor, _Span
 from opentelemetry.semconv_ai import SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY
+from respan_tracing import is_content_tracing_enabled
 from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
 
 CREATING_CALL = ContextVar("respan_elasticsearch_creating_call", default=None)
 
-_TRACED_CONTENT_OVERRIDE = "override_enable_content_tracing"
 _TRACED_CONTENT_ATTRIBUTE = "traceloop.enable_content_tracing"
 
 
@@ -54,15 +53,8 @@ def content_allowed(setting=True, parent_context=None, *, honor_suppression=True
     return bool(
         setting
         and (not honor_suppression or not suppressed(parent_context))
-        and all(
-            context.get_value(key, candidate) is not False
-            for candidate in (parent_context, context.get_current())
-            for key in (ENABLE_CONTENT_TRACING_KEY, _TRACED_CONTENT_OVERRIDE)
-        )
-        and all(
-            os.getenv(name, "true").strip().lower() not in {"false", "0", "off", "no"}
-            for name in ("TRACELOOP_TRACE_CONTENT", "RESPAN_TRACE_CONTENT")
-        )
+        and is_content_tracing_enabled(parent_context)
+        and is_content_tracing_enabled()
     )
 
 

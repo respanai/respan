@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import weakref
 from collections import OrderedDict
 from typing import Any
@@ -14,13 +13,17 @@ from opentelemetry.sdk.util import BoundedList
 from opentelemetry.semconv._incubating.attributes.error_attributes import ERROR_MESSAGE
 from opentelemetry.semconv_ai import SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY
 from opentelemetry.trace import Status, StatusCode
-from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+from respan_tracing import is_content_tracing_enabled
+from respan_tracing.constants.context_constants import (
+    ENABLE_CONTENT_TRACING_KEY,
+    OVERRIDE_ENABLE_CONTENT_TRACING_KEY,
+    TRACE_CONTENT_KEY,
+)
 
-_OFF = {"false", "0", "no", "off"}
 _CAPTURE_KEYS = (
     ENABLE_CONTENT_TRACING_KEY,
-    "trace_content",
-    "override_enable_content_tracing",
+    TRACE_CONTENT_KEY,
+    OVERRIDE_ENABLE_CONTENT_TRACING_KEY,
 )
 
 
@@ -32,16 +35,7 @@ def suppressed(carrier: Any = None) -> bool:
 
 
 def context_capture(carrier: Any = None) -> bool:
-    return not suppressed(carrier) and explicit_capture(carrier)
-
-
-def explicit_capture(carrier: Any = None) -> bool:
-    return all(
-        context.get_value(key, carrier) is not False for key in _CAPTURE_KEYS
-    ) and all(
-        os.getenv(key, "true").strip().lower() not in _OFF
-        for key in ("TRACELOOP_TRACE_CONTENT", "RESPAN_TRACE_CONTENT")
-    )
+    return not suppressed(carrier) and is_content_tracing_enabled(carrier)
 
 
 class PrivacyObserver(SpanProcessor):

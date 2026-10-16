@@ -29,8 +29,8 @@ from respan_sdk.constants.span_attributes import (
     RESPAN_LOG_TYPE,
     RESPAN_METADATA,
 )
+from respan_tracing import is_content_tracing_enabled
 from respan_tracing.core.tracer import RespanTracer
-from respan_tracing.decorators.base import _should_send_prompts
 
 from . import _attributes as attrs
 
@@ -359,7 +359,7 @@ class _Patch:
                 or (self.kind, id(instance)) in _CALLS.get()
             ):
                 return result
-            capture = self.capture and _CAPTURE.get() and _should_send_prompts()
+            capture = self.capture and _CAPTURE.get() and is_content_tracing_enabled()
             operation = _Operation(
                 self.kind,
                 instance,

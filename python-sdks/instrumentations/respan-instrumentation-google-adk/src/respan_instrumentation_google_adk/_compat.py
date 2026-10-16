@@ -11,7 +11,7 @@ from importlib.metadata import version
 from typing import Any
 
 from packaging.version import Version
-from respan_tracing.decorators.base import _should_send_prompts
+from respan_tracing import is_content_tracing_enabled
 
 from ._processor import _content_policy_override
 
@@ -63,7 +63,7 @@ class _ContextPreservingIterator:
         policy = _content_policy_override.get()
         self._context.run(
             _content_policy_override.set,
-            _should_send_prompts() if policy is None else policy,
+            is_content_tracing_enabled() if policy is None else policy,
         )
         self._requests: asyncio.Queue | None = None
         self._worker: asyncio.Task | None = None

@@ -6,7 +6,6 @@ import asyncio
 import contextvars
 import inspect
 import logging
-import os
 from typing import Any
 
 from openai import APIStatusError
@@ -24,17 +23,11 @@ from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import (
     GEN_AI_TOOL_CALL_ID,
 )
 from opentelemetry.semconv.attributes.http_attributes import HTTP_RESPONSE_STATUS_CODE
+from respan_tracing import is_content_tracing_enabled
 from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
 from wrapt import wrap_function_wrapper
 
 logger = logging.getLogger(__name__)
-
-
-def capture_content(parent_context=None):
-    return (
-        os.getenv("TRACELOOP_TRACE_CONTENT", "true").lower() != "false"
-        and context.get_value(ENABLE_CONTENT_TRACING_KEY, parent_context) is not False
-    )
 
 
 def _safe_attributes(function, *args, **kwargs):
@@ -116,7 +109,7 @@ class _Stream:
         self._iterator = iterator
         self._active = active
         self._context = contextvars.copy_context()
-        if not capture_content():
+        if not is_content_tracing_enabled():
             self._context.run(
                 lambda: context.attach(
                     context.set_value(ENABLE_CONTENT_TRACING_KEY, False)
@@ -223,7 +216,7 @@ def _stream_wrapper(tracer, kind, generation):
             return _Stream(
                 iterator, terminal=TaskResult, active=lambda: generation["enabled"]
             )
-        content = capture_content()
+        content = is_content_tracing_enabled()
         arguments = _arguments(wrapped, args, kwargs)
         if kind is Kind.LLM:
             attrs = _model_attributes(instance, arguments, content)
@@ -264,7 +257,7 @@ def _model_wrapper(tracer, generation):
             context._SUPPRESS_INSTRUMENTATION_KEY
         ):
             return await wrapped(*args, **kwargs)
-        content = capture_content()
+        content = is_content_tracing_enabled()
         arguments = _arguments(wrapped, args, kwargs)
         with tracer.start_as_current_span(
             f"{type(instance).__name__}.create",
@@ -292,7 +285,7 @@ def _tool_wrapper(tracer, generation):
         tool_call = arguments.get("tool_call")
         if tool_call is None:
             return await wrapped(*args, **kwargs)
-        content = capture_content()
+        content = is_content_tracing_enabled()
         attrs = {
             OI.OPENINFERENCE_SPAN_KIND: Kind.TOOL.value,
             OI.TOOL_NAME: tool_call.name,

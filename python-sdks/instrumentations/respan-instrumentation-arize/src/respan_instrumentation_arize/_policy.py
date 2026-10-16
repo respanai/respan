@@ -1,22 +1,15 @@
 """Private content policy and OTel suppression."""
 
-import os
-
 from opentelemetry import context
 from opentelemetry.semconv_ai import (
     SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY,
     SpanAttributes,
 )
-from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+from respan_tracing import is_content_tracing_enabled
 
 
 def content_allowed(setting=True):
-    return (
-        setting
-        and context.get_value(ENABLE_CONTENT_TRACING_KEY) is not False
-        and os.getenv("TRACELOOP_TRACE_CONTENT", "true").strip().lower()
-        not in {"false", "0", "off", "no"}
-    )
+    return setting and is_content_tracing_enabled()
 
 
 def suppressed():

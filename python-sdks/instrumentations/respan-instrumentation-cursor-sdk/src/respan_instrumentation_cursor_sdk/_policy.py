@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
-import os
 import threading
 import weakref
 from collections import OrderedDict
 
 from opentelemetry import context, trace
 from opentelemetry.sdk.trace import SpanProcessor
-from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
-
-_OFF = {"false", "0", "off", "no"}
+from respan_tracing import is_content_tracing_enabled
 
 
 class Bound:
@@ -20,14 +17,7 @@ class Bound:
 
 
 def permitted(ctx=None):
-    return (
-        context.get_value(ENABLE_CONTENT_TRACING_KEY) is not False
-        and context.get_value(ENABLE_CONTENT_TRACING_KEY, ctx) is not False
-        and all(
-            os.getenv(name, "true").strip().lower() not in _OFF
-            for name in ("TRACELOOP_TRACE_CONTENT", "RESPAN_TRACE_CONTENT")
-        )
-    )
+    return is_content_tracing_enabled() and is_content_tracing_enabled(ctx)
 
 
 def suppressed():

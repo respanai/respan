@@ -26,9 +26,9 @@ from respan_sdk.constants.span_attributes import (
     RESPAN_INTERNAL_SPAN_NAME_KIND,
     RESPAN_LOG_TYPE,
 )
+from respan_tracing import is_content_tracing_enabled
 from wrapt import FunctionWrapper
 
-from ._privacy import content_enabled
 from ._streaming import _capture_response, _request_parameters
 
 logger = logging.getLogger(__name__)
@@ -174,7 +174,7 @@ def _start(parameters: dict, log_type: str, operation: str, config: TraceConfig)
     }
     if parameters.get("model"):
         attrs[SpanAttributes.LLM_REQUEST_MODEL] = str(parameters["model"])
-    capture_content = content_enabled()
+    capture_content = is_content_tracing_enabled()
     hidden_input = (
         not capture_content
         or config.hide_inputs
