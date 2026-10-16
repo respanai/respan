@@ -19,7 +19,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import httpx
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
@@ -27,6 +26,12 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
 from browser_use import Browser, ChatOpenAI  # noqa: E402
 from respan import Respan  # noqa: E402
 from respan_instrumentation_browser_use import BrowserUseInstrumentor  # noqa: E402
+from respan_tracing.testing.live import (  # noqa: E402
+    RespanLogsClient,
+    is_error,
+    json_field,
+    trace_problems,
+)
 
 API_KEY = os.getenv("RESPAN_API_KEY")
 BASE_URL = os.getenv("RESPAN_BASE_URL", "https://api.respan.ai/api").rstrip("/")
@@ -117,54 +122,19 @@ async def execute(scenario: Scenario) -> None:
 # -- live verification --------------------------------------------------------
 
 
+LOGS = RespanLogsClient(BASE_URL, API_KEY)
+
+
 def fetch_trace(trace_id: str) -> list[dict[str, Any]]:
-    response = httpx.post(
-        f"{BASE_URL}/request-logs/list/",
-        params={"page_size": 500},
-        json={"filters": {"trace_unique_id": {"operator": "", "value": [trace_id]}}},
-        headers={"Authorization": f"Bearer {API_KEY}"},
-        timeout=30,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    return payload.get("results", payload) if isinstance(payload, dict) else payload
-
-
-async def wait_for_trace(trace_id: str, timeout: float = 180) -> list[dict[str, Any]]:
-    """Poll until the span count stops changing (ingestion is asynchronous)."""
-    deadline, last, rows = time.monotonic() + timeout, -1, []
-    while time.monotonic() < deadline:
-        rows = await asyncio.to_thread(fetch_trace, trace_id)
-        if rows and len(rows) == last:
-            return rows
-        last = len(rows)
-        await asyncio.sleep(10)
-    return rows
-
-
-def _is_error(row: dict[str, Any]) -> bool:
-    return (row.get("status_code") or 200) >= 400
+    return LOGS.trace_rows(trace_id)
 
 
 def _agent_output(row: dict[str, Any]) -> dict[str, Any]:
-    output = row.get("output")
-    if isinstance(output, str):
-        try:
-            output = json.loads(output)
-        except ValueError:
-            return {}
-    return output if isinstance(output, dict) else {}
+    return json_field(row, "output")
 
 
 def _span_id(row: dict[str, Any]) -> str | None:
-    """The list API omits a row's own span id; the detail endpoint has it."""
-    response = httpx.get(
-        f"{BASE_URL}/request-logs/{row['unique_id']}/",
-        headers={"Authorization": f"Bearer {API_KEY}"},
-        timeout=30,
-    )
-    response.raise_for_status()
-    return response.json().get("span_unique_id")
+    return LOGS.detail(row["unique_id"]).get("span_unique_id")
 
 
 async def structure_problems(rows: list[dict[str, Any]]) -> list[str]:
@@ -237,7 +207,7 @@ class Result:
 async def verify(scenario: Scenario) -> Result:
     expect = scenario.expect
     trace_ids = sorted(_traces.get(scenario.name, ()))
-    traces = {t: await wait_for_trace(t) for t in trace_ids}
+    traces = {t: await asyncio.to_thread(LOGS.wait_for_trace, t) for t in trace_ids}
     rows = [r for t in trace_ids for r in traces[t]]
     problems: list[str] = []
 
@@ -247,13 +217,16 @@ async def verify(scenario: Scenario) -> Result:
 
     check(len(trace_ids) == expect.traces, f"{len(trace_ids)} traces, expected {expect.traces}")
     for trace_id, trace_rows in traces.items():
-        check(bool(trace_rows), f"trace {trace_id} not found in Respan")
-        check(
-            len(trace_rows) == _exported[trace_id],
-            f"trace {trace_id[:8]}: SDK exported {_exported[trace_id]} spans, Respan has {len(trace_rows)}",
+        problems.extend(
+            f"trace {trace_id[:8]}: {problem}"
+            for problem in trace_problems(
+                trace_rows,
+                exported=_exported[trace_id],
+                customer_identifier=CUSTOMER,
+                metadata={"scenario": scenario.name, "run_id": RUN_ID},
+                forbidden=expect.forbidden,
+            )
         )
-        roots = [r for r in trace_rows if not r.get("span_parent_id")]
-        check(len(roots) == 1, f"trace {trace_id[:8]}: {len(roots)} root spans")
         agents = [r for r in trace_rows if r.get("log_type") == "agent"]
         if agents:
             session = (agents[0].get("metadata") or {}).get("browser_use.session.id")
@@ -265,27 +238,15 @@ async def verify(scenario: Scenario) -> Result:
     want_agents = expect.traces if expect.agent_spans is None else expect.agent_spans
     check(len(agents) == want_agents, f"{len(agents)} agent spans, expected {want_agents}")
     for row in rows:
-        name = row.get("span_name")
-        check(row.get("customer_identifier") == CUSTOMER, f"{name}: customer_identifier missing")
-        metadata = row.get("metadata") or {}
-        check(metadata.get("scenario") == scenario.name, f"{name}: metadata.scenario missing")
-        check(metadata.get("run_id") == RUN_ID, f"{name}: metadata.run_id missing")
-        if row.get("log_type") == "chat" and not _is_error(row):
-            check((row.get("prompt_tokens") or 0) > 0, f"{name}: no prompt tokens")
-            check((row.get("completion_tokens") or 0) > 0, f"{name}: no completion tokens")
-            check((row.get("cost") or 0) > 0, f"{name}: no cost")
-        dumped = json.dumps(row, default=str)
-        for secret in expect.forbidden:
-            check(secret not in dumped, f"{name}: contains a forbidden value")
         if expect.prompt_images is False and row.get("log_type") == "chat":
-            check(not _has_prompt_image(row), f"{name}: a screenshot reached the model")
+            check(not _has_prompt_image(row), f"{row.get('span_name')}: a screenshot reached the model")
 
     names = {r.get("span_name") for r in rows}
     for wanted in expect.spans_include:
         check(wanted in names, f"no {wanted} span")
     for model in expect.models_include:
         check(span_name(model) in names, f"no call to {model}")
-    failed = {r.get("span_name") for r in rows if _is_error(r)}
+    failed = {r.get("span_name") for r in rows if is_error(r)}
     for wanted in expect.error_spans:
         check(wanted in failed, f"{wanted} should be an error span")
     if expect.success is not None:

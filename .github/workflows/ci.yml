@@ -201,11 +201,23 @@ jobs:
           python3 -m venv .ci-test-venv
           . .ci-test-venv/bin/activate
           python -m pip install --upgrade pip
-          # Local respan-sdk / respan-tracing, so a change there is tested against
-          # this package. respan-ai --no-deps: its bundled instrumentor floors may
-          # be unpublished (see the respan-ai smoke check below).
-          python -m pip install ../../respan-sdk ../../respan-tracing . pytest pytest-asyncio
-          python -m pip install --no-deps ../../respan
+          # Local respan-sdk / respan-tracing / respan-ai, so a change there is
+          # tested against this package. Repo packages go in --no-deps: a floor on
+          # an unreleased respan-tracing (bumped at publish time) can't resolve.
+          python -m pip install ../../respan-sdk ../../respan-tracing pytest pytest-asyncio
+          python -m pip install --no-deps . ../../respan
+          python - <<'PY' > third-party.txt
+          import tomllib
+          deps = tomllib.load(open("pyproject.toml", "rb"))["tool"]["poetry"]["dependencies"]
+          for name, spec in deps.items():
+              if name != "python" and not name.startswith("respan"):
+                  spec = spec if isinstance(spec, str) else spec.get("version", "*")
+                  if spec.startswith("^"):  # poetry caret -> pip range
+                      major = spec[1:].split(".")[0]
+                      spec = f">={spec[1:]},<{int(major) + 1}"
+                  print(name if spec == "*" else f"{name}{spec}")
+          PY
+          python -m pip install -r third-party.txt
           python -m pytest tests -q
 
       # A1: respan-ai bundles the native respan-instrumentation-* plugins so a bare

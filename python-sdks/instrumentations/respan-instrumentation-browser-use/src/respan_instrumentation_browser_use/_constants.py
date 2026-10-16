@@ -36,11 +36,3 @@ ANTHROPIC_USAGE_MODULES = frozenset(
 
 # Placeholder for inline media dropped from captured content.
 IMAGE_PLACEHOLDER = "[image omitted: {media_type}, {size} base64 chars]"
-DATA_URL_PREFIX = "data:"
-# Exported screenshots are re-encoded: browser-use's full-viewport PNGs are
-# ~0.5 MB of base64 each and appear twice per step (step output + the prompt).
-SCREENSHOT_MAX_WIDTH = 1280
-SCREENSHOT_JPEG_QUALITY = 70
-
-# Marker set on patched callables so a second activation never double-wraps.
-PATCH_MARKER = "__respan_browser_use_wrapped__"

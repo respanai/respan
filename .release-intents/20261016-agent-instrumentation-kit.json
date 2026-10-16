@@ -1,0 +1,7 @@
+{
+  "summary": "respan-tracing: agent instrumentation kit (AgentScope, agent_span, set_error/record_error, MethodPatcher, compact_image_data_url) + testing.capture_exported_spans + testing.live; browser-use uses it",
+  "packages": {
+    "respan-tracing": "minor",
+    "respan-instrumentation-browser-use": "patch"
+  }
+}
