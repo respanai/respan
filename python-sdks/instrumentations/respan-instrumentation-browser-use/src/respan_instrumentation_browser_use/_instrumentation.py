@@ -18,7 +18,6 @@ from __future__ import annotations
 import importlib
 import inspect
 import logging
-import os
 import threading
 import traceback
 from collections.abc import Callable, Iterator, Mapping
@@ -46,6 +45,7 @@ from respan_sdk.constants.llm_logging import (
     LOG_TYPE_TASK,
     LOG_TYPE_TOOL,
 )
+from respan_sdk.constants.otlp_constants import OTEL_EXCEPTION_EVENT_NAME
 from respan_sdk.constants.span_attributes import (
     RESPAN_INTERNAL_SPAN_NAME_DETAIL,
     RESPAN_LOG_TYPE,
@@ -53,7 +53,7 @@ from respan_sdk.constants.span_attributes import (
     RESPAN_THREADS_ID,
     RESPAN_TRACE_GROUP_ID,
 )
-from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+from respan_tracing import is_content_tracing_enabled
 from respan_tracing.core.tracer import RespanTracer
 
 from respan_instrumentation_browser_use._constants import (
@@ -66,7 +66,6 @@ from respan_instrumentation_browser_use._constants import (
     ATTR_PAGE_URL,
     ATTR_SESSION_ID,
     ATTR_STEP_NUMBER,
-    EXCEPTION_EVENT,
     INSTRUMENTATION_NAME,
     PATCH_MARKER,
     RERUN_NAME_DETAIL,
@@ -97,6 +96,7 @@ _IN_LLM: ContextVar[bool] = ContextVar("respan_browser_use_in_llm", default=Fals
 _AGENT_SESSION: ContextVar[str | None] = ContextVar(
     "respan_browser_use_agent_session", default=None
 )
+_ERROR_MESSAGE_LIMIT = 500
 _GROUPING_ATTRIBUTES = (RESPAN_THREADS_ID, RESPAN_SESSION_ID, RESPAN_TRACE_GROUP_ID)
 # (secret value, "<secret>name</secret>") pairs of the running Agent's sensitive_data.
 # browser-use masks secrets only in what it sends the model; its action results and
@@ -104,7 +104,6 @@ _GROUPING_ATTRIBUTES = (RESPAN_THREADS_ID, RESPAN_SESSION_ID, RESPAN_TRACE_GROUP
 _SECRETS: ContextVar[tuple[tuple[str, str], ...]] = ContextVar(
     "respan_browser_use_secrets", default=()
 )
-_FALSE_VALUES = {"0", "false", "no", "off"}
 # Chat spans carry llm.request.type instead of a span kind.
 _SPAN_KINDS = {
     LOG_TYPE_AGENT: TraceloopSpanKindValues.AGENT.value,
@@ -114,12 +113,7 @@ _SPAN_KINDS = {
 
 
 def _content_allowed(runtime: _Runtime) -> bool:
-    return (
-        runtime.capture_content
-        and context.get_value(ENABLE_CONTENT_TRACING_KEY) is not False
-        and os.getenv("TRACELOOP_TRACE_CONTENT", "true").strip().lower()
-        not in _FALSE_VALUES
-    )
+    return runtime.capture_content and is_content_tracing_enabled()
 
 
 def _safe(operation: Callable[[], Any]) -> None:
@@ -189,10 +183,15 @@ def _mask_secrets(span: Any) -> None:
 
 
 def _record_error(span: Any, error: BaseException, *, with_message: bool) -> None:
-    span.set_status(Status(StatusCode.ERROR, type(error).__name__))
+    # The status description is what Respan shows as the span's error message;
+    # the type alone ("ModelProviderError") hides the cause.
+    description = type(error).__name__
+    if with_message and (message := _masked(str(error)).strip()):
+        description = f"{description}: {message[:_ERROR_MESSAGE_LIMIT]}"
+    span.set_status(Status(StatusCode.ERROR, description))
     if with_message and _SECRETS.get():
         span.add_event(
-            EXCEPTION_EVENT,
+            OTEL_EXCEPTION_EVENT_NAME,
             {
                 EXCEPTION_TYPE: type(error).__name__,
                 EXCEPTION_MESSAGE: _masked(str(error)),
@@ -205,7 +204,7 @@ def _record_error(span: Any, error: BaseException, *, with_message: bool) -> Non
         span.record_exception(error)
     else:
         # Provider and validation errors echo prompts and raw model output.
-        span.add_event(EXCEPTION_EVENT, {EXCEPTION_TYPE: type(error).__name__})
+        span.add_event(OTEL_EXCEPTION_EVENT_NAME, {EXCEPTION_TYPE: type(error).__name__})
 
 
 class _Runtime:

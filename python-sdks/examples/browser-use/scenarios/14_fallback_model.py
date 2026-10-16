@@ -20,6 +20,9 @@ async def run():
         task="What is the title of the #1 story on https://news.ycombinator.com ?",
         llm=broken,
         fallback_llm=llm(),
+        # The judge defaults to the PRIMARY model and does not fall back, so
+        # without this the judge's call fails too (a second, silent error span).
+        judge_llm=llm(),
         browser=browser(),
     )
     await agent.run(max_steps=6)
