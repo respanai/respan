@@ -1,0 +1,4 @@
+# Only for verify_live.py, which reads the traces back from Respan.
+# respan-tracing is installed from this repo, so the checks match the code next to it.
+-e ../../../python-sdks/respan-tracing
+python-dotenv>=1.0.0

@@ -18,6 +18,7 @@
     "instrumentations/respan-instrumentation-pi",
     "instrumentations/respan-instrumentation-stagehand",
     "instrumentations/respan-instrumentation-playwright",
+    "instrumentations/respan-instrumentation-puppeteer",
     "instrumentations/respan-instrumentation-flue",
     "instrumentations/respan-instrumentation-langchain",
     "instrumentations/respan-instrumentation-llama-index",
