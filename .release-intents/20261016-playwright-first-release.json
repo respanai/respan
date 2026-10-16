@@ -1,0 +1,6 @@
+{
+  "summary": "First PyPI release of respan-instrumentation-playwright",
+  "packages": {
+    "respan-instrumentation-playwright": "new"
+  }
+}
