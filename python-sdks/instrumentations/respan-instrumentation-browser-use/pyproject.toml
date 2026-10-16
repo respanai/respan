@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "respan-instrumentation-browser-use"
-version = "0.1.3"
+version = "0.1.4"
 description = "Respan instrumentation plugin for browser-use agents"
 authors = ["Respan <team@respan.ai>"]
 license = "Apache 2.0"
