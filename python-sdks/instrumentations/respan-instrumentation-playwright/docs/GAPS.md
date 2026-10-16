@@ -89,7 +89,7 @@ task on its own); it stays as a regression guard.
 
 ## Verification log
 
-- `pytest tests` (23 tests: 14 baseline + 9 unit), real headless Chrome, on
+- `pytest tests` (24 tests: 14 baseline + 10 unit), real headless Chrome, on
   Playwright 1.64.0 and 1.50.0.
 - Live (2026-10-15): `examples/playwright/run_all.py`, 14 scenarios mirroring
   Playwright for Python's docs, verified live against a Respan environment by
