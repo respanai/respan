@@ -86,6 +86,12 @@
     },
     {
       "ecosystem": "javascript",
+      "name": "@respan/instrumentation-playwright",
+      "path": "javascript-sdks/instrumentations/respan-instrumentation-playwright",
+      "registry": "npm"
+    },
+    {
+      "ecosystem": "javascript",
       "name": "@respan/instrumentation-flue",
       "path": "javascript-sdks/instrumentations/respan-instrumentation-flue",
       "registry": "npm"
