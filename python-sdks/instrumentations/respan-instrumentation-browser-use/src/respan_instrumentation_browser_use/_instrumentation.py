@@ -182,13 +182,16 @@ def _mask_secrets(span: Any) -> None:
             span.set_attribute(key, masked)
 
 
-def _record_error(span: Any, error: BaseException, *, with_message: bool) -> None:
+def _set_error(span: Any, summary: str, detail: Any, *, with_message: bool) -> None:
     # The status description is what Respan shows as the span's error message;
-    # the type alone ("ModelProviderError") hides the cause.
-    description = type(error).__name__
-    if with_message and (message := _masked(str(error)).strip()):
-        description = f"{description}: {message[:_ERROR_MESSAGE_LIMIT]}"
-    span.set_status(Status(StatusCode.ERROR, description))
+    # the summary alone ("step failed", "ModelProviderError") hides the cause.
+    if with_message and (message := _masked(str(detail or "")).strip()):
+        summary = f"{summary}: {message[:_ERROR_MESSAGE_LIMIT]}"
+    span.set_status(Status(StatusCode.ERROR, summary))
+
+
+def _record_error(span: Any, error: BaseException, *, with_message: bool) -> None:
+    _set_error(span, type(error).__name__, error, with_message=with_message)
     if with_message and _SECRETS.get():
         span.add_event(
             OTEL_EXCEPTION_EVENT_NAME,
@@ -393,7 +396,9 @@ class _Runtime:
         state = item.state
         # browser-use catches step failures and records them as result errors.
         if item.result and all(result.error for result in item.result):
-            span.set_status(Status(StatusCode.ERROR, "step failed"))
+            _set_error(
+                span, "step failed", item.result[0].error, with_message=_content_allowed(self)
+            )
         if not _content_allowed(self):
             return  # URLs carry magic-link tokens and session ids in query strings
         if state.url:
@@ -455,8 +460,8 @@ class _Runtime:
 
     def _act_end(self, span: Any, result: Any) -> None:
         # browser-use returns action failures as ActionResult.error, not exceptions.
-        if getattr(result, "error", None):
-            span.set_status(Status(StatusCode.ERROR, "action error"))
+        if error := getattr(result, "error", None):
+            _set_error(span, "action error", error, with_message=_content_allowed(self))
         if _content_allowed(self):
             span.set_attribute(
                 SpanAttributes.TRACELOOP_ENTITY_OUTPUT,

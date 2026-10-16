@@ -295,6 +295,7 @@ async def test_failed_action_is_an_error_tool_span(exporter, instrumentor):
     }
     if result.error:
         assert span.status.status_code is StatusCode.ERROR
+        assert span.status.description.startswith("action error: ")
     else:
         assert span.status.status_code is not StatusCode.ERROR
 

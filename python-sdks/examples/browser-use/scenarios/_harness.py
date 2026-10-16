@@ -197,7 +197,9 @@ async def structure_problems(rows: list[dict[str, Any]]) -> list[str]:
             recorded = recorded_steps + (1 if "tool" in kinds else 0)
             if recorded != output["steps"]:
                 problems.append(f"agent reports {output['steps']} steps, trace has {recorded}")
-        elif row.get("log_type") == "task" and "results" in output:
+        # A step whose model reply failed validation records one error result
+        # and runs no action, so only steps with actions need tool spans.
+        elif row.get("log_type") == "task" and "actions" in output:
             step = (row.get("metadata") or {}).get("browser_use.step.number")
             if kinds.count("tool") != len(output["results"]):
                 problems.append(
