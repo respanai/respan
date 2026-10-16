@@ -5,3 +5,6 @@ TRACE_GROUP_ID_KEY = "respan_trace_group_identifier"
 PARAMS_KEY = "respan_params"
 ENABLE_CONTENT_TRACING_KEY = "respan_enable_content_tracing"
 PENDING_SPAN_LINKS_KEY = "respan_pending_span_links"
+# OpenLLMetry's content switches; instrumentations honour them alongside ours.
+TRACE_CONTENT_KEY = "trace_content"
+OVERRIDE_ENABLE_CONTENT_TRACING_KEY = "override_enable_content_tracing"

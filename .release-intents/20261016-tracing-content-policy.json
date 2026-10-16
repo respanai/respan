@@ -1,0 +1,6 @@
+{
+  "summary": "respan-tracing: public is_content_tracing_enabled(), the one content-capture policy every instrumentation shares (TRACELOOP_/RESPAN_TRACE_CONTENT + Respan and OpenLLMetry context keys)",
+  "packages": {
+    "respan-tracing": "patch"
+  }
+}
