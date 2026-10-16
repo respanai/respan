@@ -2,22 +2,17 @@
 
 from __future__ import annotations
 
-import base64
-import binascii
-import io
 import json
 import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from PIL import Image  # a browser-use dependency
-
-from respan_instrumentation_browser_use._constants import (
+from respan_tracing.utils.agent_instrumentation import (
     DATA_URL_PREFIX,
-    IMAGE_PLACEHOLDER,
-    SCREENSHOT_JPEG_QUALITY,
-    SCREENSHOT_MAX_WIDTH,
+    compact_image_data_url,
 )
+
+from respan_instrumentation_browser_use._constants import IMAGE_PLACEHOLDER
 
 _MAX_DEPTH = 32
 _IMAGE_PART = "image_url"
@@ -53,25 +48,6 @@ def json_string(value: Any) -> str:
     return json.dumps(jsonable(value), ensure_ascii=False, default=str)
 
 
-def compact_image(data_url: str) -> str:
-    """Re-encode an inline image as a smaller JPEG data URL; return it unchanged on any failure."""
-    header, _, payload = data_url.partition(",")
-    if not header.startswith(DATA_URL_PREFIX) or not header.endswith(";base64"):
-        return data_url
-    try:
-        image = Image.open(io.BytesIO(base64.b64decode(payload, validate=True)))
-        image = image.convert("RGB")
-        if image.width > SCREENSHOT_MAX_WIDTH:
-            height = round(image.height * SCREENSHOT_MAX_WIDTH / image.width)
-            image = image.resize((SCREENSHOT_MAX_WIDTH, height))
-        out = io.BytesIO()
-        image.save(out, "JPEG", quality=SCREENSHOT_JPEG_QUALITY, optimize=True)
-    except (OSError, ValueError, binascii.Error):
-        return data_url
-    compact = f"data:image/jpeg;base64,{base64.b64encode(out.getvalue()).decode()}"
-    return compact if len(compact) < len(data_url) else data_url
-
-
 def _image_placeholder(image_url: Mapping[str, Any]) -> str:
     url = image_url.get("url") or ""
     return IMAGE_PLACEHOLDER.format(
@@ -93,7 +69,7 @@ def _content(content: Any, *, keep_images: bool) -> Any:
             # Remote image URLs are small and render as-is.
             parts.append({"type": _IMAGE_PART, _IMAGE_PART: {"url": url}})
         elif keep_images:
-            parts.append({"type": _IMAGE_PART, _IMAGE_PART: {"url": compact_image(url)}})
+            parts.append({"type": _IMAGE_PART, _IMAGE_PART: {"url": compact_image_data_url(url)}})
         else:
             parts.append({"type": "text", "text": _image_placeholder(image_url)})
     return parts

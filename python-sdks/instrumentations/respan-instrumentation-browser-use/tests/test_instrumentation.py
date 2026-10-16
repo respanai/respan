@@ -23,10 +23,6 @@ from opentelemetry.semconv_ai import (
     SpanAttributes,
 )
 from opentelemetry.trace import StatusCode
-from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
-from respan_tracing.exporters.respan import _export_span_name
-from respan_tracing.utils.preprocessing.span_processing import is_processable_span
-
 from respan_instrumentation_browser_use import BrowserUseInstrumentor
 from respan_instrumentation_browser_use._constants import (
     ATTR_ACTION_NAME,
@@ -35,6 +31,9 @@ from respan_instrumentation_browser_use._constants import (
     ATTR_STEP_NUMBER,
 )
 from respan_instrumentation_browser_use._instrumentation import _openai_suppressor
+from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
+from respan_tracing.exporters.respan import _export_span_name
+from respan_tracing.utils.preprocessing.span_processing import is_processable_span
 
 from .conftest import ScriptedLLM, chrome_path
 

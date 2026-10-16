@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import ExitStack
 from typing import Any
 
 import pytest
 from browser_use import Agent, BrowserProfile, BrowserSession
-from opentelemetry import trace
 from opentelemetry.semconv_ai import SpanAttributes
-from respan import Respan
+from respan_instrumentation_browser_use import BrowserUseInstrumentor
+from respan_instrumentation_browser_use._constants import ATTR_PAGE_URL
 from respan_sdk.constants.span_attributes import (
     RESPAN_LOG_TYPE,
     RESPAN_METADATA,
@@ -25,11 +26,9 @@ from respan_sdk.constants.span_attributes import (
     RESPAN_THREADS_ID,
     RESPAN_TRACE_GROUP_ID,
 )
-from respan_tracing.core.tracer import RespanTracer
-from respan_tracing.utils.span_factory import _PROPAGATED_ATTRIBUTES
+from respan_tracing.testing import UNREACHABLE_BASE_URL, capture_exported_spans
 
-from respan_instrumentation_browser_use import BrowserUseInstrumentor
-from respan_instrumentation_browser_use._constants import ATTR_PAGE_URL
+from respan import Respan
 
 from .conftest import ScriptedLLM, chrome_path
 
@@ -39,38 +38,27 @@ pytestmark = pytest.mark.skipif(
 
 CUSTOMER_ID = "respan.customer_params.customer_identifier"
 CUSTOMER_METADATA = {"agent_id": "a1", "role": "planner"}
-# Nothing listens here: the exporter's network calls fail fast and are ignored.
-UNREACHABLE = "http://127.0.0.1:9/api"
 
 
 @pytest.fixture
-def pipeline(monkeypatch):
+def pipeline():
     """Build `Respan(...)` with the browser-use instrumentor; return the exported spans."""
-    clients: list[Respan] = []
-    defaults = _PROPAGATED_ATTRIBUTES.set({})
+    with ExitStack() as stack:
 
-    def make(instrumentor: BrowserUseInstrumentor | None = None, **kwargs: Any):
-        exported: list[Any] = []
-        client = Respan(
-            api_key="test-key",
-            base_url=UNREACHABLE,
-            instrumentations=[instrumentor or BrowserUseInstrumentor()],
-            span_postprocess_callback=exported.append,
-            **kwargs,
-        )
-        # OTel lets the global provider be set once per process; point it at
-        # this client's provider so every test exports through its own pipeline.
-        monkeypatch.setattr(
-            trace, "_TRACER_PROVIDER", RespanTracer._instance.tracer_provider
-        )
-        clients.append(client)
-        return client, exported
+        def make(instrumentor: BrowserUseInstrumentor | None = None, **kwargs: Any):
+            return stack.enter_context(
+                capture_exported_spans(
+                    lambda on_export: Respan(
+                        api_key="test-key",
+                        base_url=UNREACHABLE_BASE_URL,
+                        instrumentations=[instrumentor or BrowserUseInstrumentor()],
+                        span_postprocess_callback=on_export,
+                        **kwargs,
+                    )
+                )
+            )
 
-    yield make
-    for client in clients:
-        client.shutdown()
-    RespanTracer.reset_instance()
-    _PROPAGATED_ATTRIBUTES.reset(defaults)
+        yield make
 
 
 def script(*actions: dict[str, Any], answer: str = "done") -> list[dict[str, Any]]:

@@ -19,24 +19,16 @@ import importlib
 import inspect
 import logging
 import threading
-import traceback
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from functools import cache, partial, wraps
 from typing import Any
-from urllib.parse import quote, quote_plus
 
 from opentelemetry import context, trace
-from opentelemetry.semconv.attributes.exception_attributes import (
-    EXCEPTION_MESSAGE,
-    EXCEPTION_STACKTRACE,
-    EXCEPTION_TYPE,
-)
 from opentelemetry.semconv_ai import (
     SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY,
     SpanAttributes,
-    TraceloopSpanKindValues,
 )
 from opentelemetry.trace import Status, StatusCode
 from respan_sdk.constants.llm_logging import (
@@ -45,16 +37,17 @@ from respan_sdk.constants.llm_logging import (
     LOG_TYPE_TASK,
     LOG_TYPE_TOOL,
 )
-from respan_sdk.constants.otlp_constants import OTEL_EXCEPTION_EVENT_NAME
-from respan_sdk.constants.span_attributes import (
-    RESPAN_INTERNAL_SPAN_NAME_DETAIL,
-    RESPAN_LOG_TYPE,
-    RESPAN_SESSION_ID,
-    RESPAN_THREADS_ID,
-    RESPAN_TRACE_GROUP_ID,
-)
 from respan_tracing import is_content_tracing_enabled
 from respan_tracing.core.tracer import RespanTracer
+from respan_tracing.utils.agent_instrumentation import (
+    PATCH_MARKER,
+    AgentScope,
+    MethodPatcher,
+    agent_span,
+    compact_image_data_url,
+    safely,
+    set_error,
+)
 
 from respan_instrumentation_browser_use._constants import (
     AGENT_MODULE,
@@ -67,7 +60,6 @@ from respan_instrumentation_browser_use._constants import (
     ATTR_SESSION_ID,
     ATTR_STEP_NUMBER,
     INSTRUMENTATION_NAME,
-    PATCH_MARKER,
     RERUN_NAME_DETAIL,
     SPAN_ACTION,
     SPAN_AGENT,
@@ -79,7 +71,6 @@ from respan_instrumentation_browser_use._constants import (
     TRACER_NAME,
 )
 from respan_instrumentation_browser_use._serialization import (
-    compact_image,
     content_text,
     json_string,
     jsonable,
@@ -91,47 +82,15 @@ _LOCK = threading.RLock()
 _RUNTIME: _Runtime | None = None
 # Fallback / wrapper models call an inner model's ainvoke; only the outer call is a span.
 _IN_LLM: ContextVar[bool] = ContextVar("respan_browser_use_in_llm", default=False)
-# The running Agent's session id. Every span of a run, and of the follow-up runs
-# of the same Agent, defaults to it as thread, session and trace group.
-_AGENT_SESSION: ContextVar[str | None] = ContextVar(
-    "respan_browser_use_agent_session", default=None
-)
-_ERROR_MESSAGE_LIMIT = 500
-_GROUPING_ATTRIBUTES = (RESPAN_THREADS_ID, RESPAN_SESSION_ID, RESPAN_TRACE_GROUP_ID)
-# (secret value, "<secret>name</secret>") pairs of the running Agent's sensitive_data.
+# The running Agent's session id (default thread / session / trace group of every
+# span, so follow-up runs of the same Agent group together) and its sensitive_data.
 # browser-use masks secrets only in what it sends the model; its action results and
 # errors (e.g. "Navigation to https://...?token=<real value> blocked") carry them.
-_SECRETS: ContextVar[tuple[tuple[str, str], ...]] = ContextVar(
-    "respan_browser_use_secrets", default=()
-)
-# Chat spans carry llm.request.type instead of a span kind.
-_SPAN_KINDS = {
-    LOG_TYPE_AGENT: TraceloopSpanKindValues.AGENT.value,
-    LOG_TYPE_TASK: TraceloopSpanKindValues.TASK.value,
-    LOG_TYPE_TOOL: TraceloopSpanKindValues.TOOL.value,
-}
+_SCOPE = AgentScope("respan_browser_use")
 
 
 def _content_allowed(runtime: _Runtime) -> bool:
     return runtime.capture_content and is_content_tracing_enabled()
-
-
-def _safe(operation: Callable[[], Any]) -> None:
-    try:
-        operation()
-    except Exception:  # telemetry must never change agent behaviour
-        logger.debug("browser-use telemetry failed open", exc_info=True)
-
-
-def _default_grouping(span: Any) -> None:
-    # Respan's span processor has already copied the customer's propagated
-    # thread/session/trace group onto the span in start_span; those win.
-    agent_session = _AGENT_SESSION.get()
-    if agent_session is None:
-        return
-    for key in _GROUPING_ATTRIBUTES:
-        if not span.attributes.get(key):
-            span.set_attribute(key, agent_session)
 
 
 def _non_negative_int(value: Any) -> int | None:
@@ -140,74 +99,8 @@ def _non_negative_int(value: Any) -> int | None:
     return None
 
 
-@contextmanager
-def _agent_scope(agent: Any) -> Iterator[None]:
-    """Grouping ids and secrets of `agent`, for every span inside its run."""
-    session = _AGENT_SESSION.set(str(agent.session_id))
-    secrets = _SECRETS.set(_secret_replacements(getattr(agent, "sensitive_data", None)))
-    try:
-        yield
-    finally:
-        _SECRETS.reset(secrets)
-        _AGENT_SESSION.reset(session)
-
-
-def _secret_replacements(sensitive_data: Any) -> tuple[tuple[str, str], ...]:
-    """sensitive_data is {name: value} or {domain: {name: value}}."""
-    replacements: dict[str, str] = {}
-    for key, value in (sensitive_data or {}).items():
-        items = value.items() if isinstance(value, Mapping) else [(key, value)]
-        for name, secret in items:
-            if not isinstance(secret, str) or not secret:
-                continue
-            placeholder = f"<secret>{name}</secret>"
-            # A secret typed into a URL is percent-encoded there.
-            for variant in (secret, quote(secret, safe=""), quote_plus(secret)):
-                replacements[variant] = placeholder
-    # Longest first, so a secret containing another is replaced whole.
-    return tuple(sorted(replacements.items(), key=lambda pair: -len(pair[0])))
-
-
-def _masked(text: str) -> str:
-    for secret, placeholder in _SECRETS.get():
-        text = text.replace(secret, placeholder)
-    return text
-
-
-def _mask_secrets(span: Any) -> None:
-    if not _SECRETS.get():
-        return
-    for key, value in list((span.attributes or {}).items()):
-        if isinstance(value, str) and (masked := _masked(value)) != value:
-            span.set_attribute(key, masked)
-
-
-def _set_error(span: Any, summary: str, detail: Any, *, with_message: bool) -> None:
-    # The status description is what Respan shows as the span's error message;
-    # the summary alone ("step failed", "ModelProviderError") hides the cause.
-    if with_message and (message := _masked(str(detail or "")).strip()):
-        summary = f"{summary}: {message[:_ERROR_MESSAGE_LIMIT]}"
-    span.set_status(Status(StatusCode.ERROR, summary))
-
-
-def _record_error(span: Any, error: BaseException, *, with_message: bool) -> None:
-    _set_error(span, type(error).__name__, error, with_message=with_message)
-    if with_message and _SECRETS.get():
-        span.add_event(
-            OTEL_EXCEPTION_EVENT_NAME,
-            {
-                EXCEPTION_TYPE: type(error).__name__,
-                EXCEPTION_MESSAGE: _masked(str(error)),
-                EXCEPTION_STACKTRACE: _masked(
-                    "".join(traceback.format_exception(error))
-                ),
-            },
-        )
-    elif with_message:
-        span.record_exception(error)
-    else:
-        # Provider and validation errors echo prompts and raw model output.
-        span.add_event(OTEL_EXCEPTION_EVENT_NAME, {EXCEPTION_TYPE: type(error).__name__})
+def _agent_scope(agent: Any) -> Any:
+    return _SCOPE.run(agent.session_id, getattr(agent, "sensitive_data", None))
 
 
 class _Runtime:
@@ -216,58 +109,22 @@ class _Runtime:
         self.capture_screenshots = capture_screenshots
         self.active = True
         self.count = 1
-        self.patches: list[tuple[type, str, Any]] = []
+        self.patcher = MethodPatcher()
 
     @property
     def tracer(self) -> trace.Tracer:
         # Resolved per call so a provider installed after activation is honoured.
         return trace.get_tracer(TRACER_NAME)
 
-    def patch(self, owner: type, name: str, factory: Callable[[Any], Any]) -> None:
-        original = owner.__dict__.get(name)
-        if original is None or getattr(original, PATCH_MARKER, False):
-            return
-        wrapper = factory(original)
-        setattr(wrapper, PATCH_MARKER, True)
-        setattr(owner, name, wrapper)
-        self.patches.append((owner, name, original))
-
-    def restore(self) -> None:
-        for owner, name, original in reversed(self.patches):
-            if getattr(owner.__dict__.get(name), PATCH_MARKER, False):
-                setattr(owner, name, original)
-        self.patches.clear()
-
-    @contextmanager
-    def span(
-        self, name: str, log_type: str, *, detail: str | None = None
-    ) -> Iterator[Any]:
-        attributes: dict[str, Any] = {
-            RESPAN_LOG_TYPE: log_type,
-            SpanAttributes.TRACELOOP_ENTITY_NAME: name,
-        }
-        if detail:
-            # The exporter names agent/tool spans "<kind>.<detail>"; without a hint
-            # the agent would show as "agent.browser_use.agent".
-            attributes[RESPAN_INTERNAL_SPAN_NAME_DETAIL] = detail
-        if span_kind := _SPAN_KINDS.get(log_type):
-            # respan-tracing exports only spans with a span kind or an LLM request
-            # type; without this the agent/step/action spans never leave the process.
-            attributes[SpanAttributes.TRACELOOP_SPAN_KIND] = span_kind
-        span = self.tracer.start_span(name, attributes=attributes)
-        _safe(partial(_default_grouping, span))
-        token = context.attach(trace.set_span_in_context(span))
-        try:
-            yield span
-        except BaseException as error:
-            _safe(
-                partial(_record_error, span, error, with_message=_content_allowed(self))
-            )
-            raise
-        finally:
-            context.detach(token)
-            _safe(partial(_mask_secrets, span))
-            span.end()
+    def span(self, name: str, log_type: str, *, detail: str | None = None) -> Any:
+        return agent_span(
+            self.tracer,
+            name,
+            log_type,
+            scope=_SCOPE,
+            content_allowed=partial(_content_allowed, self),
+            detail=detail,
+        )
 
     # -- agent ---------------------------------------------------------------
 
@@ -284,9 +141,9 @@ class _Runtime:
             ):
                 # Follow-up runs (add_new_task) append to the same history.
                 before = len(agent.history.history)
-                _safe(lambda: runtime._agent_start(span, agent))
+                safely(lambda: runtime._agent_start(span, agent))
                 history = await original(agent, *args, **kwargs)
-                _safe(lambda: runtime._agent_end(span, history, before))
+                safely(lambda: runtime._agent_end(span, history, before))
                 return history
 
         return run
@@ -304,9 +161,9 @@ class _Runtime:
                 _agent_scope(agent),
                 runtime.span(SPAN_RERUN, LOG_TYPE_AGENT, detail=RERUN_NAME_DETAIL) as span,
             ):
-                _safe(lambda: runtime._rerun_start(span, agent, history))
+                safely(lambda: runtime._rerun_start(span, agent, history))
                 results = await original(agent, history, *args, **kwargs)
-                _safe(lambda: runtime._rerun_end(span, results))
+                safely(lambda: runtime._rerun_end(span, results))
                 return results
 
         return rerun_history
@@ -383,7 +240,7 @@ class _Runtime:
                 if number is not None:
                     span.set_attribute(ATTR_STEP_NUMBER, number)
                 result = await original(agent, *args, **kwargs)
-                _safe(lambda: runtime._step_end(span, agent, before))
+                safely(lambda: runtime._step_end(span, agent, before))
                 return result
 
         return step
@@ -396,8 +253,12 @@ class _Runtime:
         state = item.state
         # browser-use catches step failures and records them as result errors.
         if item.result and all(result.error for result in item.result):
-            _set_error(
-                span, "step failed", item.result[0].error, with_message=_content_allowed(self)
+            set_error(
+                span,
+                "step failed",
+                item.result[0].error,
+                with_message=_content_allowed(self),
+                mask=_SCOPE.mask,
             )
         if not _content_allowed(self):
             return  # URLs carry magic-link tokens and session ids in query strings
@@ -429,7 +290,7 @@ class _Runtime:
             # the log view renders it, so no separate upload API is needed.
             output["screenshot"] = {
                 "type": "image_url",
-                "image_url": {"url": compact_image(f"data:image/png;base64,{screenshot}")},
+                "image_url": {"url": compact_image_data_url(f"data:image/png;base64,{screenshot}")},
             }
         span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_OUTPUT, json_string(output))
 
@@ -453,7 +314,7 @@ class _Runtime:
                         SpanAttributes.TRACELOOP_ENTITY_INPUT, json_string(params)
                     )
                 result = await original(tools, action, *args, **kwargs)
-                _safe(lambda: runtime._act_end(span, result))
+                safely(lambda: runtime._act_end(span, result))
                 return result
 
         return act
@@ -461,7 +322,9 @@ class _Runtime:
     def _act_end(self, span: Any, result: Any) -> None:
         # browser-use returns action failures as ActionResult.error, not exceptions.
         if error := getattr(result, "error", None):
-            _set_error(span, "action error", error, with_message=_content_allowed(self))
+            set_error(
+                span, "action error", error, with_message=_content_allowed(self), mask=_SCOPE.mask
+            )
         if _content_allowed(self):
             span.set_attribute(
                 SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
@@ -476,10 +339,10 @@ class _Runtime:
         @wraps(original)
         def register_llm(service: Any, llm: Any, *args: Any, **kwargs: Any) -> Any:
             if runtime.active and llm is not None:
-                _safe(lambda: runtime.patch_llm_class(type(llm)))
+                safely(lambda: runtime.patch_llm_class(type(llm)))
             result = original(service, llm, *args, **kwargs)
             if runtime.active and llm is not None:
-                _safe(lambda: runtime.wrap_llm_instance(llm))
+                safely(lambda: runtime.wrap_llm_instance(llm))
             return result
 
         return register_llm
@@ -531,14 +394,14 @@ class _Runtime:
         if not self.active or _IN_LLM.get():
             return await call(messages, *args, **kwargs)
         with self.span(SPAN_LLM, LOG_TYPE_CHAT) as span:
-            _safe(lambda: self._llm_start(span, llm, messages))
+            safely(lambda: self._llm_start(span, llm, messages))
             in_llm = _IN_LLM.set(True)
             try:
                 with _suppress_provider_llm_spans():
                     response = await call(messages, *args, **kwargs)
             finally:
                 _IN_LLM.reset(in_llm)
-            _safe(lambda: self._llm_end(span, llm, response))
+            safely(lambda: self._llm_end(span, llm, response))
             return response
 
     def _llm_start(self, span: Any, llm: Any, messages: Any) -> None:
@@ -695,15 +558,15 @@ class BrowserUseInstrumentor:
                 capture_screenshots=self._capture_screenshots,
             )
             try:
-                runtime.patch(agent_module.Agent, "run", runtime.wrap_run)
-                runtime.patch(agent_module.Agent, "rerun_history", runtime.wrap_rerun)
-                runtime.patch(agent_module.Agent, "step", runtime.wrap_step)
-                runtime.patch(tools_module.Tools, "act", runtime.wrap_act)
-                runtime.patch(
+                runtime.patcher.patch(agent_module.Agent, "run", runtime.wrap_run)
+                runtime.patcher.patch(agent_module.Agent, "rerun_history", runtime.wrap_rerun)
+                runtime.patcher.patch(agent_module.Agent, "step", runtime.wrap_step)
+                runtime.patcher.patch(tools_module.Tools, "act", runtime.wrap_act)
+                runtime.patcher.patch(
                     tokens_module.TokenCost, "register_llm", runtime.wrap_register_llm
                 )
             except Exception:
-                runtime.restore()
+                runtime.patcher.restore()
                 raise
             _RUNTIME = runtime
             self._runtime = runtime
@@ -718,6 +581,6 @@ class BrowserUseInstrumentor:
             if runtime.count:
                 return
             runtime.active = False
-            runtime.restore()
+            runtime.patcher.restore()
             if _RUNTIME is runtime:
                 _RUNTIME = None
