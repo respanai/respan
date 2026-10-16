@@ -5,10 +5,10 @@
 // processor and filters, then the exporter. Assertions read what the exporter
 // would send.
 //
-// Customer metadata is applied by @respan/tracing's span processor, which
-// (since 1.6) writes it as one canonical `respan.metadata` JSON attribute
-// and folds any flat `respan.metadata.<key>` aliases into it. Thread / session
-// / trace group are what group a Stagehand session's spans.
+// Ingestion collects ONLY flat `respan.metadata.<key>` attributes; a
+// JSON-string `respan.metadata` is dropped (and @respan/tracing 1.6 writes
+// propagated metadata as exactly that). Thread / session / trace group are
+// what group a Stagehand session's spans.
 import assert from "node:assert/strict";
 import test from "node:test";
 import { context } from "@opentelemetry/api";
@@ -77,16 +77,6 @@ async function session(flow, { model = scriptedModel(), modelName } = {}) {
   }
 }
 
-/** Customer metadata on a span, in either shape the Respan pipeline emits. */
-function metadataOf(span) {
-  const out = {};
-  const canonical = span.attributes["respan.metadata"];
-  if (typeof canonical === "string") Object.assign(out, JSON.parse(canonical));
-  for (const [key, value] of Object.entries(span.attributes))
-    if (key.startsWith("respan.metadata.")) out[key.slice("respan.metadata.".length)] = value;
-  return out;
-}
-
 const byEntity = (spans, name) => spans.filter((s) => s.attributes[ENTITY] === name);
 const sessionId = (spans) => byEntity(spans, "stagehand.session")[0].attributes["stagehand.session.id"];
 
@@ -138,13 +128,14 @@ test("baseline: span tree is session -> operation -> llm / browser action", asyn
   assert.equal(JSON.parse(root.attributes[OUTPUT]).operations, 2);
 });
 
-test("baseline: custom metadata reaches every span", async () => {
+test("baseline: custom metadata is flat respan.metadata.<key> on every span", async () => {
   await propagateAttributes({ metadata: CUSTOMER_METADATA }, () => session(standardFlow));
   const spans = await exported();
   assertFullSession(spans);
   for (const span of spans) {
-    const metadata = metadataOf(span);
-    for (const [key, value] of Object.entries(CUSTOMER_METADATA)) assert.equal(metadata[key], value, `${span.name} ${key}`);
+    for (const [key, value] of Object.entries(CUSTOMER_METADATA))
+      assert.equal(span.attributes[`respan.metadata.${key}`], value, `${span.name} ${key}`);
+    assert.equal(span.attributes["respan.metadata"], undefined, span.name);
   }
 });
 
@@ -256,7 +247,7 @@ test("baseline: content off keeps identifiers and drops content", async () => {
   assertFullSession(spans);
   for (const span of spans) {
     assert.equal(span.attributes[CUSTOMER_ID], "customer-1", span.name);
-    assert.equal(metadataOf(span).agent_id, "a1", span.name);
+    assert.equal(span.attributes["respan.metadata.agent_id"], "a1", span.name);
     assert.ok(span.attributes[THREAD], span.name);
     const dumped = JSON.stringify(span.attributes);
     assert.ok(!dumped.includes("A private instruction"), span.name);

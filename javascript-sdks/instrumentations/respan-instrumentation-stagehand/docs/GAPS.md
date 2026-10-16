@@ -51,7 +51,8 @@ seams instead:
 - `tests/stagehand_baseline.test.mjs` (CI runs it): drives the real Stagehand
   4.2.1 SDK and its Chrome extension in headless local Chrome, against a local
   page, with a scripted client model, through Respan's real span processor and
-  exporter. It checks on every exported span: customer metadata,
+  exporter. It checks on every exported span: customer metadata as flat
+  `respan.metadata.<key>` (never a JSON blob),
   `customer_identifier`, thread / session / trace group defaulting to the
   session with customer values winning, parallel sessions in separate traces,
   concurrent operations keeping their own LLM calls, content capture off,

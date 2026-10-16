@@ -47,6 +47,8 @@ stagehand.session        agent   Stagehand.create() ... close(): settings in; op
   (the Browserbase session id when there is one). Values set with
   `respan.propagateAttributes({ thread_identifier, group_identifier, ... })` win.
   `customer_identifier` and the other propagated fields reach every span.
+  Customer metadata is exported as one flat `respan.metadata.<key>` attribute
+  per key, the shape Respan ingestion reads.
 - **LLM calls.** Stagehand v4 runs its inference inside its Chrome extension.
   - With a **client model** (`model: { generate }`) every inference comes back
     to your process, so each one is a full `chat` span: messages (with images),

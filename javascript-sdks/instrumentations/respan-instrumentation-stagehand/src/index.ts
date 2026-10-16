@@ -563,6 +563,7 @@ class Runtime {
   }
 
   endSpan(session: Session, span: Span): void {
+    safely(() => flattenMetadata(span));
     if (session.secrets.size) safely(() => maskSpan(session, span));
     span.end();
   }
@@ -653,6 +654,31 @@ function setUsage(span: Span, usage: any): void {
     span.setAttribute(LLM_USAGE_CACHE_READ_INPUT_TOKENS, cached);
   }
   if (reasoning) span.setAttribute(GEN_AI_USAGE_REASONING_TOKENS, reasoning);
+}
+
+/**
+ * Customer metadata as one flat `respan.metadata.<key>` attribute per key, the
+ * shape Respan ingestion reads. Some @respan/tracing versions fold propagated
+ * metadata into a single JSON `respan.metadata` attribute when the span starts,
+ * which ingestion drops; expand it before the span ends.
+ */
+function flattenMetadata(span: Span): void {
+  const attributes = (span as any).attributes as Record<string, unknown> | undefined;
+  const canonical = attributes?.[RespanSpanAttributes.RESPAN_METADATA];
+  if (typeof canonical !== "string") return;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(canonical);
+  } catch {
+    return;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+  for (const [key, value] of Object.entries(parsed as Row)) {
+    const flat = `${RespanSpanAttributes.RESPAN_METADATA}.${key}`;
+    if (attributes![flat] === undefined && value !== undefined && value !== null)
+      span.setAttribute(flat, typeof value === "string" || typeof value === "number" || typeof value === "boolean" ? value : JSON.stringify(value));
+  }
+  delete attributes![RespanSpanAttributes.RESPAN_METADATA];
 }
 
 function mask(session: Session, text: string): string {
