@@ -1,0 +1,6 @@
+node_modules/
+.env
+runs/
+browser-data/
+.venv/
+package-lock.json

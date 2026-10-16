@@ -2178,6 +2178,33 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@browserbasehq/sdk@npm:^2.16.0":
+  version: 2.22.0
+  resolution: "@browserbasehq/sdk@npm:2.22.0"
+  dependencies:
+    "@types/node": "npm:^18.11.18"
+    "@types/node-fetch": "npm:^2.6.4"
+    abort-controller: "npm:^3.0.0"
+    agentkeepalive: "npm:^4.2.1"
+    form-data-encoder: "npm:1.7.2"
+    formdata-node: "npm:^4.3.2"
+    node-fetch: "npm:^2.6.7"
+  checksum: 10c0/c6b0213c81f033257a999d9fd3413bb89d8335e4d34c83b3fdbcf6af6aa650013070ed39058495d694e6099a08c6dea876aa7db8621b073aaca35e0d9cdde582
+  languageName: node
+  linkType: hard
+
+"@browserbasehq/stagehand@npm:4.2.1":
+  version: 4.2.1
+  resolution: "@browserbasehq/stagehand@npm:4.2.1"
+  dependencies:
+    "@browserbasehq/sdk": "npm:^2.16.0"
+    "@opentelemetry/api": "npm:1.9.1"
+    "@opentelemetry/core": "npm:2.9.0"
+    zod: "npm:4.4.3"
+  checksum: 10c0/9564157e1790b6c6af109562266798db08c1850d48accc7339d36b1f730908184392b4678007e03d991bdb67fffd4dbcada5f48a62c9a705c6723a8ebae15fc7
+  languageName: node
+  linkType: hard
+
 "@bufbuild/protobuf@npm:1.10.0":
   version: 1.10.0
   resolution: "@bufbuild/protobuf@npm:1.10.0"
@@ -4625,7 +4652,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@opentelemetry/api@npm:^1.3.0, @opentelemetry/api@npm:^1.9.1":
+"@opentelemetry/api@npm:1.9.1, @opentelemetry/api@npm:^1.3.0, @opentelemetry/api@npm:^1.9.1":
   version: 1.9.1
   resolution: "@opentelemetry/api@npm:1.9.1"
   checksum: 10c0/c608485fc8b5a91e1f7e05e843b45b509307456b31cd2ad365933d90813e40ebfedf179f1451c762037e82d7c76aa8500e95d2da3609f640a1206cde5322cd14
@@ -5174,6 +5201,18 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@opentelemetry/resources@npm:1.30.1":
+  version: 1.30.1
+  resolution: "@opentelemetry/resources@npm:1.30.1"
+  dependencies:
+    "@opentelemetry/core": "npm:1.30.1"
+    "@opentelemetry/semantic-conventions": "npm:1.28.0"
+  peerDependencies:
+    "@opentelemetry/api": ">=1.0.0 <1.10.0"
+  checksum: 10c0/688e73258283c80662bfa9a858aaf73bf3b832a18d96e546d0dddfa6dcec556cdfa087a1d0df643435293406009e4122d7fb7eeea69aa87b539d3bab756fba74
+  languageName: node
+  linkType: hard
+
 "@opentelemetry/resources@npm:2.1.0":
   version: 2.1.0
   resolution: "@opentelemetry/resources@npm:2.1.0"
@@ -5464,6 +5503,19 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@opentelemetry/sdk-trace-base@npm:^1.26.0":
+  version: 1.30.1
+  resolution: "@opentelemetry/sdk-trace-base@npm:1.30.1"
+  dependencies:
+    "@opentelemetry/core": "npm:1.30.1"
+    "@opentelemetry/resources": "npm:1.30.1"
+    "@opentelemetry/semantic-conventions": "npm:1.28.0"
+  peerDependencies:
+    "@opentelemetry/api": ">=1.0.0 <1.10.0"
+  checksum: 10c0/77019dc3efaeceb41b4c54dd83b92f0ccd81ecceca544cbbe8e0aee4b2c8727724bdb9dcecfe00622c16d60946ae4beb69a5c0e7d85c4bc7ef425bd84f8b970c
+  languageName: node
+  linkType: hard
+
 "@opentelemetry/sdk-trace-base@npm:^2.0.1":
   version: 2.11.0
   resolution: "@opentelemetry/sdk-trace-base@npm:2.11.0"
@@ -5566,6 +5618,13 @@ __metadata:
   peerDependencies:
     "@opentelemetry/api": ">=1.3.0 <1.10.0"
   checksum: 10c0/8a6d2be45c3be8a66b455443edd0f1dcb571fc9e12edc310a87ae87a6cb15303a36d0b91ba5b5595e5f5715adc75316a171097b71e96014584c634c398c09043
+  languageName: node
+  linkType: hard
+
+"@opentelemetry/semantic-conventions@npm:1.28.0":
+  version: 1.28.0
+  resolution: "@opentelemetry/semantic-conventions@npm:1.28.0"
+  checksum: 10c0/deb8a0f744198071e70fea27143cf7c9f7ecb7e4d7b619488c917834ea09b31543c1c2bcea4ec5f3cf68797f0ef3549609c14e859013d9376400ac1499c2b9cb
   languageName: node
   linkType: hard
 
@@ -6233,7 +6292,23 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@respan/instrumentation-openrouter@npm:^0.1.0, @respan/instrumentation-openrouter@workspace:instrumentations/respan-instrumentation-openrouter":
+"@respan/instrumentation-openrouter@npm:^0.1.0":
+  version: 0.1.1
+  resolution: "@respan/instrumentation-openrouter@npm:0.1.1"
+  dependencies:
+    "@opentelemetry/api": "npm:^1.9.0"
+    "@opentelemetry/sdk-trace-base": "npm:^2.10.0"
+    "@opentelemetry/semantic-conventions": "npm:^1.43.0"
+    "@respan/respan-sdk": "npm:^1.1.7"
+    "@respan/tracing": "npm:^1.1.4"
+    "@traceloop/ai-semantic-conventions": "npm:^0.4.0"
+  peerDependencies:
+    "@openrouter/sdk": ">=0.13.0"
+  checksum: 10c0/b2649a9e66847fd10f0c009a4a58ecd3f9fceadddc70da8d50b3eead4f380c7c095c4eed64b47b6c677523dbcbf1eb279c45af9715e8f16c2c22030ae049aa6b
+  languageName: node
+  linkType: hard
+
+"@respan/instrumentation-openrouter@workspace:instrumentations/respan-instrumentation-openrouter":
   version: 0.0.0-use.local
   resolution: "@respan/instrumentation-openrouter@workspace:instrumentations/respan-instrumentation-openrouter"
   dependencies:
@@ -6291,6 +6366,25 @@ __metadata:
     "@traceloop/ai-semantic-conventions": "npm:^0.13.0"
     "@types/node": "npm:^22.15.29"
     typescript: "npm:^5.7.3"
+  languageName: unknown
+  linkType: soft
+
+"@respan/instrumentation-stagehand@workspace:instrumentations/respan-instrumentation-stagehand":
+  version: 0.0.0-use.local
+  resolution: "@respan/instrumentation-stagehand@workspace:instrumentations/respan-instrumentation-stagehand"
+  dependencies:
+    "@browserbasehq/stagehand": "npm:4.2.1"
+    "@opentelemetry/api": "npm:^1.9.0"
+    "@opentelemetry/core": "npm:^2.10.0"
+    "@opentelemetry/sdk-trace-base": "npm:^2.10.0"
+    "@respan/respan-sdk": "npm:^1.4.0"
+    "@respan/tracing": "npm:^1.6.1"
+    "@traceloop/ai-semantic-conventions": "npm:^0.13.0"
+    "@types/node": "npm:^22.15.29"
+    typescript: "npm:^5.7.3"
+    zod: "npm:4.4.3"
+  peerDependencies:
+    "@browserbasehq/stagehand": ">=4.2.0 <5"
   languageName: unknown
   linkType: soft
 
@@ -6413,7 +6507,27 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@respan/instrumentation-writer@npm:^0.1.0, @respan/instrumentation-writer@workspace:instrumentations/respan-instrumentation-writer":
+"@respan/instrumentation-writer@npm:^0.1.0":
+  version: 0.1.0
+  resolution: "@respan/instrumentation-writer@npm:0.1.0"
+  dependencies:
+    "@opentelemetry/api": "npm:^1.9.0"
+    "@opentelemetry/core": "npm:^1.26.0"
+    "@opentelemetry/sdk-trace-base": "npm:^1.26.0"
+    "@opentelemetry/semantic-conventions": "npm:^1.40.0"
+    "@respan/respan-sdk": "npm:^1.1.7"
+    "@respan/tracing": "npm:^1.1.6"
+    "@traceloop/ai-semantic-conventions": "npm:^0.13.0"
+  peerDependencies:
+    writer-sdk: ">=2.0.0"
+  peerDependenciesMeta:
+    writer-sdk:
+      optional: false
+  checksum: 10c0/97eba56dda4a93a868ca1515c65f4aa5f4c8d6cdb6340216cceebb0a76bcaf91c2dfb6bbd7e48b24fc1f29bcd636cb7340a86ecae3ce40ea71b126a677b1d780
+  languageName: node
+  linkType: hard
+
+"@respan/instrumentation-writer@workspace:instrumentations/respan-instrumentation-writer":
   version: 0.0.0-use.local
   resolution: "@respan/instrumentation-writer@workspace:instrumentations/respan-instrumentation-writer"
   dependencies:
@@ -7748,6 +7862,13 @@ __metadata:
     "@opentelemetry/api": "npm:^1.9.0"
     "@opentelemetry/semantic-conventions": "npm:^1.40.0"
   checksum: 10c0/1f5be5a99b16e35fcea475fddd38d0caa9c72b7f0946ad686343bc978601d0d97ea50662955276214fc2348e8c4e5aa3814a341b73b3d701411c8bd22bc94a14
+  languageName: node
+  linkType: hard
+
+"@traceloop/ai-semantic-conventions@npm:^0.4.0":
+  version: 0.4.0
+  resolution: "@traceloop/ai-semantic-conventions@npm:0.4.0"
+  checksum: 10c0/267efc1818581ff760c4736d320b3fff070d65e766106bd033ade3fb035c502de82e293d6c0cebd83eb3c7b61e0d5a4b02238c5c210afcc3bd926fb362457d28
   languageName: node
   linkType: hard
 
@@ -15845,6 +15966,13 @@ __metadata:
   languageName: node
   linkType: hard
 
+"zod@npm:4.4.3, zod@npm:^3.25.0 || ^4.0.0, zod@npm:^4.1.5, zod@npm:^4.1.8, zod@npm:^4.2.1, zod@npm:^4.4.3":
+  version: 4.4.3
+  resolution: "zod@npm:4.4.3"
+  checksum: 10c0/7ea31b558e88f9faf44f31dd185e2e1cbf51fed3081787fb96cc2534749b50c0acfc6da7f0922a7353ed092dd358c7d50c28ea96c94d04af64191bd33152eca3
+  languageName: node
+  linkType: hard
+
 "zod@npm:^3.24.2, zod@npm:^3.25.0, zod@npm:^3.25.34, zod@npm:^3.25.76":
   version: 3.25.76
   resolution: "zod@npm:3.25.76"
@@ -15856,13 +15984,6 @@ __metadata:
   version: 4.3.6
   resolution: "zod@npm:4.3.6"
   checksum: 10c0/860d25a81ab41d33aa25f8d0d07b091a04acb426e605f396227a796e9e800c44723ed96d0f53a512b57be3d1520f45bf69c0cb3b378a232a00787a2609625307
-  languageName: node
-  linkType: hard
-
-"zod@npm:^3.25.0 || ^4.0.0, zod@npm:^4.1.5, zod@npm:^4.1.8, zod@npm:^4.2.1, zod@npm:^4.4.3":
-  version: 4.4.3
-  resolution: "zod@npm:4.4.3"
-  checksum: 10c0/7ea31b558e88f9faf44f31dd185e2e1cbf51fed3081787fb96cc2534749b50c0acfc6da7f0922a7353ed092dd358c7d50c28ea96c94d04af64191bd33152eca3
   languageName: node
   linkType: hard
 

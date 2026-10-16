@@ -1,0 +1,6 @@
+{
+  "summary": "New @respan/instrumentation-stagehand: Respan tracing for Stagehand v4 browser agents (not released yet; npm publisher setup first)",
+  "packages": {
+    "@respan/instrumentation-stagehand": "none"
+  }
+}
