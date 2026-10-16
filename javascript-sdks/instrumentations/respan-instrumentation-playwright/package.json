@@ -1,0 +1,69 @@
+{
+  "name": "@respan/instrumentation-playwright",
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Respan instrumentation plugin for Playwright (playwright, playwright-core, @playwright/test)",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "author": "Respan <team@respan.ai>",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/respanai/respan",
+    "directory": "javascript-sdks/instrumentations/respan-instrumentation-playwright"
+  },
+  "keywords": [
+    "respan",
+    "playwright",
+    "browser-automation",
+    "browser-agent",
+    "tracing",
+    "observability",
+    "llm"
+  ],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc -p tsconfig.json && node --test tests/*.test.mjs",
+    "publish:package": "yarn npm publish",
+    "release": "yarn build && yarn version patch && yarn publish:package"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.0",
+    "@respan/respan-sdk": "^1.4.0",
+    "@traceloop/ai-semantic-conventions": "^0.13.0"
+  },
+  "peerDependencies": {
+    "@respan/tracing": ">=1.5.0",
+    "playwright-core": ">=1.55.0 <1.65.0"
+  },
+  "peerDependenciesMeta": {
+    "@respan/tracing": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@opentelemetry/sdk-trace-base": "^2.10.0",
+    "@playwright/test": "1.64.1",
+    "@respan/tracing": "^1.6.1",
+    "@types/node": "^22.15.29",
+    "playwright-core": "1.64.1",
+    "typescript": "^5.7.3"
+  }
+}
