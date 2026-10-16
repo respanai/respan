@@ -18,15 +18,13 @@ from typing import Any
 
 import pytest
 from opentelemetry import context as context_api
-from opentelemetry.semconv_ai import SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY, SpanAttributes
+from opentelemetry.semconv_ai import (
+    SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY,
+    SpanAttributes,
+)
 from opentelemetry.trace import StatusCode
 from pydantic import BaseModel
-from respan_instrumentation_stagehand import StagehandInstrumentor, with_model_name
-from respan_instrumentation_stagehand._constants import (
-    ATTR_CACHE_STATUS,
-    ATTR_PAGE_URL,
-    ATTR_SESSION_ID,
-)
+from respan import Respan, workflow
 from respan_sdk.constants.span_attributes import (
     RESPAN_LOG_TYPE,
     RESPAN_METADATA,
@@ -37,7 +35,12 @@ from respan_sdk.constants.span_attributes import (
 from respan_tracing.testing import UNREACHABLE_BASE_URL, capture_exported_spans
 from stagehand import Stagehand, local_browser
 
-from respan import Respan, workflow
+from respan_instrumentation_stagehand import StagehandInstrumentor, with_model_name
+from respan_instrumentation_stagehand._constants import (
+    ATTR_CACHE_STATUS,
+    ATTR_PAGE_URL,
+    ATTR_SESSION_ID,
+)
 
 from .conftest import USAGE, ScriptedModel, chrome_path
 

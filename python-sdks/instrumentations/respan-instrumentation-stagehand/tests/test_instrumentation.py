@@ -10,11 +10,15 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.semconv_ai import SpanAttributes
+from stagehand import Page, Stagehand
+
 from respan_instrumentation_stagehand import StagehandInstrumentor, with_model_name
-from respan_instrumentation_stagehand._constants import ATTR_USAGE_SOURCE, USAGE_SOURCE_OPERATION
+from respan_instrumentation_stagehand._constants import (
+    ATTR_USAGE_SOURCE,
+    USAGE_SOURCE_OPERATION,
+)
 from respan_instrumentation_stagehand._instrumentation import _SCOPE, _Session
 from respan_instrumentation_stagehand._serialization import chat_messages, completion
-from stagehand import Page, Stagehand
 
 
 def test_built_in_model_usage_becomes_one_content_free_chat_span(monkeypatch):

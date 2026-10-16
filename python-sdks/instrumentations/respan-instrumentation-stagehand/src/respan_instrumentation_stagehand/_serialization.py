@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import base64
 import json
-import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from typing import Any
 
-from respan_tracing.utils.agent_instrumentation import compact_image_data_url
+from respan_tracing.utils.agent_instrumentation import (  # noqa: F401 - re-exported
+    compact_image_data_url,
+    json_string,
+    jsonable,
+)
 
 from respan_instrumentation_stagehand._constants import (
     IMAGE_PLACEHOLDER,
@@ -18,37 +21,6 @@ from respan_instrumentation_stagehand._constants import (
 _MAX_DEPTH = 32
 _JPEG_MAGIC = b"\xff\xd8\xff"
 Block = dict[str, Any]
-
-
-def jsonable(value: Any, *, depth: int = 0) -> Any:
-    """A JSON-safe copy: pydantic models are dumped, binary becomes its length,
-    classes and other objects their type name."""
-    if value is None or isinstance(value, bool | int | str):
-        return value
-    if isinstance(value, float):
-        return value if math.isfinite(value) else str(value)
-    if isinstance(value, bytes | bytearray):
-        return {"type": "bytes", "length": len(value)}
-    if depth >= _MAX_DEPTH:
-        return {"type": type(value).__name__, "truncated": True}
-    if isinstance(value, type):
-        return {"type": value.__name__}
-    dump = getattr(value, "model_dump", None)
-    if callable(dump):
-        try:
-            # by_alias: Stagehand's only aliases are JSON-schema keys ("schema", "$schema").
-            return jsonable(dump(mode="json", by_alias=True, exclude_none=True), depth=depth + 1)
-        except Exception:  # noqa: BLE001 - telemetry must fail open
-            return {"type": type(value).__name__, "serialization_error": True}
-    if isinstance(value, Mapping):
-        return {str(k): jsonable(v, depth=depth + 1) for k, v in value.items() if v is not None}
-    if isinstance(value, Sequence):
-        return [jsonable(v, depth=depth + 1) for v in value]
-    return {"type": type(value).__name__}
-
-
-def json_string(value: Any) -> str:
-    return json.dumps(jsonable(value), ensure_ascii=False, default=str)
 
 
 def image_part(data: str, mime: str, *, keep: bool) -> Block:

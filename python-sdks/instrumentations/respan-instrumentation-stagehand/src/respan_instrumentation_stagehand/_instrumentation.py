@@ -26,14 +26,13 @@ import threading
 import uuid
 import weakref
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager, nullcontext
-from functools import cache, partial, wraps
+from contextlib import contextmanager
+from functools import partial, wraps
 from typing import Any, Optional
 
 from opentelemetry import context as context_api
 from opentelemetry import trace
 from opentelemetry.semconv_ai import (
-    SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY,
     SpanAttributes,
     TraceloopSpanKindValues,
 )
@@ -58,6 +57,7 @@ from respan_tracing.utils.agent_instrumentation import (
     safely,
     secret_replacements,
     set_error,
+    suppress_provider_llm_spans,
 )
 
 from respan_instrumentation_stagehand._constants import (
@@ -591,7 +591,7 @@ class _Runtime:
             if session.model_name:
                 span.set_attribute(SpanAttributes.LLM_REQUEST_MODEL, session.model_name)
             safely(partial(self.llm_start, span, dumped))
-            with _suppress_provider_llm_spans():
+            with suppress_provider_llm_spans():
                 result = await generate(params, *args, **kwargs)
             safely(partial(self.llm_end, span, result))
             return result
@@ -794,35 +794,6 @@ def _set_usage(span: Any, usage: Mapping[str, Any]) -> None:
         span.set_attribute(SpanAttributes.LLM_USAGE_CACHE_READ_INPUT_TOKENS, cached)
     if reasoning := _non_negative_int(usage.get("reasoning_tokens")):
         span.set_attribute(SpanAttributes.GEN_AI_USAGE_REASONING_TOKENS, reasoning)
-
-
-@cache
-def _openai_suppressor() -> Callable[[], Any]:
-    # Optional dependency, resolved once: a failed import is not cached by Python.
-    try:
-        from respan_instrumentation_openai._instrumentation import (
-            suppress_openai_instrumentation,
-        )
-    except ImportError:
-        return nullcontext
-    return suppress_openai_instrumentation
-
-
-@contextmanager
-def _suppress_provider_llm_spans() -> Iterator[None]:
-    """Provider SDK instrumentations would log the call the chat span already carries.
-
-    Most honour OTel's language-model suppression key; Respan's OpenAI
-    instrumentation has its own switch.
-    """
-    token = context_api.attach(
-        context_api.set_value(SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY, True)
-    )
-    try:
-        with _openai_suppressor()():
-            yield
-    finally:
-        context_api.detach(token)
 
 
 def with_model_name(generate: Callable[..., Any], model_name: str) -> Callable[..., Any]:
