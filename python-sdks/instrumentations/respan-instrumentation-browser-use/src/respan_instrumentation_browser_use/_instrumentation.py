@@ -280,9 +280,11 @@ class _Runtime:
                 _agent_scope(agent),
                 runtime.span(SPAN_AGENT, LOG_TYPE_AGENT, detail=AGENT_NAME_DETAIL) as span,
             ):
+                # Follow-up runs (add_new_task) append to the same history.
+                before = len(agent.history.history)
                 _safe(lambda: runtime._agent_start(span, agent))
                 history = await original(agent, *args, **kwargs)
-                _safe(lambda: runtime._agent_end(span, history))
+                _safe(lambda: runtime._agent_end(span, history, before))
                 return history
 
         return run
@@ -334,13 +336,16 @@ class _Runtime:
                 SpanAttributes.TRACELOOP_ENTITY_INPUT, json_string({"task": agent.task})
             )
 
-    def _agent_end(self, span: Any, history: Any) -> None:
+    def _agent_end(self, span: Any, history: Any, before: int) -> None:
         is_successful = history.is_successful()
+        items = history.history[before:]
         output: dict[str, Any] = {
             "is_done": history.is_done(),
             "is_successful": is_successful,
-            "steps": len(history.history),
-            "duration_seconds": history.total_duration_seconds(),
+            "steps": len(items),
+            "duration_seconds": sum(
+                item.metadata.duration_seconds for item in items if item.metadata
+            ),
         }
         # browser-use's built-in judge (use_judge=True by default) grades the run.
         if (validated := history.is_validated()) is not None:

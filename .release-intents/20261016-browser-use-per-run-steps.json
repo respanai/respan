@@ -1,0 +1,6 @@
+{
+  "summary": "browser-use: agent span reports this run's steps and duration, not the history it shares with earlier follow-up runs",
+  "packages": {
+    "respan-instrumentation-browser-use": "patch"
+  }
+}

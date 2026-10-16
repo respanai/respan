@@ -180,9 +180,13 @@ async def structure_problems(rows: list[dict[str, Any]]) -> list[str]:
     for row, span_id in zip(parents, ids, strict=True):
         kids = children.get(span_id or "", [])
         kinds = [k.get("log_type") for k in kids]
+        # A step cut short (stop callback, max_steps) has a span but no history entry.
+        recorded_steps = sum(
+            1 for k in kids if k.get("log_type") == "task" and "results" in _agent_output(k)
+        )
         output = _agent_output(row)
         if row.get("span_name") == "agent.browser_use" and "steps" in output:
-            recorded = kinds.count("task") + (1 if "tool" in kinds else 0)
+            recorded = recorded_steps + (1 if "tool" in kinds else 0)
             if recorded != output["steps"]:
                 problems.append(f"agent reports {output['steps']} steps, trace has {recorded}")
         elif row.get("log_type") == "task" and "results" in output:
