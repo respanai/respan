@@ -1,0 +1,3 @@
+# Test-only dependencies: the in-process Skyvern engine the baseline drives.
+# The package itself depends only on the base `skyvern` client.
+skyvern[local]>=1.0.56,<2.0.0

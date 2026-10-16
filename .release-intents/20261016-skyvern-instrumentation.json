@@ -1,0 +1,6 @@
+{
+  "summary": "respan-instrumentation-skyvern: new package tracing Skyvern runs (tasks, steps, LLM calls, browser actions), with a baseline wire-contract test and live example scenarios",
+  "packages": {
+    "respan-instrumentation-skyvern": "none"
+  }
+}
