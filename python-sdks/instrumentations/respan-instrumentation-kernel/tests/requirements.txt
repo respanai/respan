@@ -1,0 +1,4 @@
+# Test-only dependencies. The baseline connects Playwright to the local Chrome
+# behind the fake Kernel API (the way Kernel's templates connect over CDP);
+# the package itself does not depend on Playwright.
+playwright>=1.50.0,<1.65.0

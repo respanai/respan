@@ -1,0 +1,6 @@
+{
+  "summary": "respan-instrumentation-kernel: new package tracing Kernel cloud browsers (browsers, computer, process, Playwright execution, replays, KernelApp actions), with a baseline wire-contract test against a local fake Kernel API and example scenarios",
+  "packages": {
+    "respan-instrumentation-kernel": "none"
+  }
+}
