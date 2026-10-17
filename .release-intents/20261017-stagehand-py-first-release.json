@@ -1,0 +1,6 @@
+{
+  "summary": "First PyPI release of respan-instrumentation-stagehand",
+  "packages": {
+    "respan-instrumentation-stagehand": "new"
+  }
+}
