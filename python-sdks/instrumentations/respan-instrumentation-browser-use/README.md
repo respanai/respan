@@ -63,8 +63,10 @@ browser_use.agent          agent   task in; final result, success, steps, usage 
 |---|---|---|
 | `capture_content` | `True` | `False` keeps span structure, timings, models, action names and token counts but drops the task, prompts, completions, action params and results, page URLs and titles, and exception messages (only the exception type is kept). `TRACELOOP_TRACE_CONTENT=false` does the same. |
 | `capture_screenshots` | `True` | `False` drops step screenshots and replaces inline images in prompts with a size placeholder. |
+| `record_session` | `RESPAN_RECORD_SESSION` env, else `False` | **Preview.** Records each run's pages with [rrweb](https://github.com/rrweb-io/rrweb) and puts a replay link on the agent span (`metadata.session_replay_url`, `metadata.session_replay_id`). Every input is masked and `sensitive_data` values never leave the process. Nothing is recorded when content capture is off. If the upload fails the run is unaffected and a local `.html` player is written instead (its path is logged). |
 
 ## Not yet covered
 
-- Session replay (rrweb recording synced to the step timeline). See `docs/GAPS.md`.
+- Session replay is a preview: one stream that follows the agent's focused tab, not
+  yet synced to the step timeline in the Respan UI. See `docs/GAPS.md`.
 - `browser_use.beta` agents.

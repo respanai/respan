@@ -7,6 +7,7 @@ TRACER_NAME = "respan.instrumentation.browser_use"
 AGENT_MODULE = "browser_use.agent.service"
 TOOLS_MODULE = "browser_use.tools.service"
 TOKENS_MODULE = "browser_use.tokens.service"
+SESSION_MANAGER_MODULE = "browser_use.browser.session_manager"
 
 SPAN_AGENT = "browser_use.agent"
 SPAN_RERUN = "browser_use.rerun"
