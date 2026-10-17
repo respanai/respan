@@ -1,0 +1,6 @@
+{
+  "summary": "First PyPI release of respan-instrumentation-skyvern",
+  "packages": {
+    "respan-instrumentation-skyvern": "new"
+  }
+}
