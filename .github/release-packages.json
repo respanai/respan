@@ -479,6 +479,13 @@
     },
     {
       "ecosystem": "python",
+      "name": "respan-instrumentation-kernel",
+      "path": "python-sdks/instrumentations/respan-instrumentation-kernel",
+      "registry": "pypi",
+      "python_tests": true
+    },
+    {
+      "ecosystem": "python",
       "name": "respan-instrumentation-stagehand",
       "path": "python-sdks/instrumentations/respan-instrumentation-stagehand",
       "registry": "pypi",
