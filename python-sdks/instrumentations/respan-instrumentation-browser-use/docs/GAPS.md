@@ -23,11 +23,34 @@ layer. Nothing in browser-use is forked; spans are standard OpenTelemetry.
 | Screenshot per step | via session recording | yes, JPEG on the step span |
 | Judge verdict, errors with their message | partly | yes |
 | `sensitive_data` kept out of traces | n/a | yes (placeholders, incl. URL-encoded values) |
-| Session replay (rrweb) | yes | **planned** |
+| Session replay (rrweb) | yes | **preview** (`record_session=True`): link on the agent span |
 
 ## Known limitations
 
-- **Session replay** is not available yet; each step carries a screenshot instead.
+- **Session replay** is a preview (`record_session=True` / `RESPAN_RECORD_SESSION=1`).
+  The recorder (`respan_tracing.utils.session_recording`, rrweb 2.0.0-alpha.4)
+  is injected over browser-use's own CDP connection into every page and new tab,
+  drained every 1.5 s, before each action and at each step end, and uploaded once
+  when the run ends. What it does not do yet:
+  - **One tab at a time.** rrweb replays one document, so the stream follows the
+    agent's focused tab (switching at that tab's fresh snapshot); background tabs
+    are recorded but not in the uploaded stream.
+  - **Events in flight when a page navigates away are lost** (up to the time
+    since the last drain, which runs right before every action, so in practice the
+    tail of the action that navigated).
+  - **Not synced to the step timeline** in the UI: the replay is a separate page
+    linked from the agent span.
+  - **Canvas, video, WebGL, cross-origin iframes, closed shadow roots** do not
+    replay faithfully (rrweb limits; canvas recording is off). Pages that block
+    script injection (`chrome://`, the PDF viewer) record nothing.
+  - **Size cap:** collection stops at 20 MB raw per run (the upload limit is 25 MB
+    gzipped) and the replay ends there.
+  - **Masking:** every input value is masked in the page; `sensitive_data` values
+    are masked in page text in the page and scrubbed from the whole payload
+    (attributes, URLs, CSS) before upload. Other on-page PII (names, emails shown
+    as text) is recorded as displayed.
+  - Images, fonts and cross-origin stylesheets rrweb cannot read are loaded from
+    the original site at playback time, so they can change or go missing later.
 - **Google GenAI / Mistral double logging:** if Respan's Google GenAI or Mistral
   instrumentation is also active, a `ChatGoogle` / Mistral call can be logged
   twice. OpenAI and Anthropic instrumentations are suppressed correctly.
@@ -49,6 +72,10 @@ layer. Nothing in browser-use is forked; spans are standard OpenTelemetry.
   defaulting to the Agent's session id (customer values win), follow-up runs in
   the same thread, parallel agents in separate traces, content off keeps ids and
   drops content, `sensitive_data` never exported, replays in one trace. CI runs it.
+  Session replay: a recorded run uploads a full snapshot plus incremental events,
+  typed values and `sensitive_data` never in the payload, the link lands on the
+  root span only, the stream follows a new tab, an upload failure leaves the run
+  intact (and a local player), and content off records nothing.
 - `examples/browser-use/run_all.py` runs 27 scenarios mirroring browser-use's own
   examples against a live Respan environment and checks every trace it reads
   back: exported vs stored span count, one root, a tool span per executed action,

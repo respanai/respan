@@ -1,0 +1,7 @@
+{
+  "summary": "Session replay preview: respan_tracing.utils.session_recording (rrweb over CDP, upload + local fallback) and record_session=True on BrowserUseInstrumentor. Spike; not released.",
+  "packages": {
+    "respan-tracing": "none",
+    "respan-instrumentation-browser-use": "none"
+  }
+}

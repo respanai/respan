@@ -10,8 +10,12 @@ thread / session / trace group, so those must be on every span.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
+import re
+import threading
 from contextlib import ExitStack
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import pytest
@@ -27,6 +31,12 @@ from respan_sdk.constants.span_attributes import (
     RESPAN_TRACE_GROUP_ID,
 )
 from respan_tracing.testing import UNREACHABLE_BASE_URL, capture_exported_spans
+from respan_tracing.testing.recordings import recording_stub_server
+from respan_tracing.utils import session_recording
+from respan_tracing.utils.session_recording import (
+    SESSION_REPLAY_ID_METADATA_KEY,
+    SESSION_REPLAY_URL_METADATA_KEY,
+)
 
 from respan import Respan
 
@@ -50,7 +60,7 @@ def pipeline():
                 capture_exported_spans(
                     lambda on_export: Respan(
                         api_key="test-key",
-                        base_url=UNREACHABLE_BASE_URL,
+                        base_url=kwargs.pop("base_url", UNREACHABLE_BASE_URL),
                         instrumentations=[instrumentor or BrowserUseInstrumentor()],
                         span_postprocess_callback=on_export,
                         **kwargs,
@@ -331,3 +341,179 @@ async def test_baseline_rerun_history_is_one_trace_in_the_agent_thread(
     assert {s.context.trace_id for s in replay} == {roots[0].context.trace_id}
     assert any(s.name == "navigate" for s in replay)
     assert {s.attributes.get(RESPAN_THREADS_ID) for s in replay} == {str(agent.session_id)}
+
+
+# -- session replay ------------------------------------------------------------
+
+REPLAY_SECRET = "s3cr3t-replay-4471"
+TYPED_VALUE = "typed-by-the-agent-9932"
+REPLAY_URL_KEY = f"{RESPAN_METADATA}.{SESSION_REPLAY_URL_METADATA_KEY}"
+REPLAY_ID_KEY = f"{RESPAN_METADATA}.{SESSION_REPLAY_ID_METADATA_KEY}"
+
+
+@pytest.fixture
+def form_page(tmp_path):
+    (tmp_path / "form.html").write_text(
+        "<title>Replay form</title><h1>Sign in</h1>"
+        f"<p>Your token is {REPLAY_SECRET}</p>"
+        '<input id="name" type="text" placeholder="name">'
+        '<a href="tab.html" target="_blank">Open the details tab</a>'
+    )
+    (tmp_path / "tab.html").write_text("<title>Details</title><h1>Details tab</h1>")
+    handler = functools.partial(SimpleHTTPRequestHandler, directory=str(tmp_path))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{server.server_address[1]}/form.html"
+    server.shutdown()
+
+
+def type_into_the_input(seen: str) -> dict[str, Any]:
+    # The last match: the browser state comes after the system prompt's examples.
+    index = int(re.findall(r"\[(\d+)\]<input", seen)[-1])
+    return {
+        "evaluation_previous_goal": "ok",
+        "memory": "",
+        "next_goal": "type",
+        "action": [{"input": {"index": index, "text": TYPED_VALUE}}],
+    }
+
+
+def click_the_link(seen: str) -> dict[str, Any]:
+    index = int(re.findall(r"\[(\d+)\]<a", seen)[-1])
+    return {
+        "evaluation_previous_goal": "ok",
+        "memory": "",
+        "next_goal": "open the tab",
+        "action": [{"click": {"index": index}}],
+    }
+
+
+def replay_script(url: str) -> list[Any]:
+    navigate, done, verdict = script({"navigate": {"url": url}})
+    return [navigate, type_into_the_input, done, verdict]
+
+
+async def run_recorded(
+    pipeline, tmp_path, url: str, stub, turns: list[Any] | None = None, **instrumentor: Any
+) -> tuple[Agent, list[Any]]:
+    _, spans = pipeline(
+        instrumentor=BrowserUseInstrumentor(record_session=True, **instrumentor),
+        base_url=stub.base_url,
+    )
+    session = browser(tmp_path)
+    agent = Agent(
+        task="Fill in the form",
+        llm=ScriptedLLM(turns or replay_script(url)),
+        browser_session=session,
+        sensitive_data={"token": REPLAY_SECRET},
+    )
+    try:
+        await agent.run(max_steps=5)
+    finally:
+        await session.kill()
+    return agent, spans
+
+
+async def test_baseline_session_replay_is_recorded_masked_and_linked(pipeline, tmp_path, form_page):
+    with recording_stub_server() as stub:
+        agent, spans = await run_recorded(pipeline, tmp_path, form_page, stub)
+
+    [root] = agent_spans(spans)
+    [upload] = stub.uploads
+    events = upload.body["events"]
+    types = [e["type"] for e in events]
+    assert 2 in types, types  # a full DOM snapshot ...
+    assert 3 in types, types  # ... plus incremental mutations / input
+    assert [e["timestamp"] for e in events] == sorted(e["timestamp"] for e in events)
+    assert any(form_page in json.dumps(e) for e in events if e["type"] == 4)
+    # The agent did type: the typed value reached the page, but only as a mask.
+    assert any(e["type"] == 3 and e["data"].get("source") == 5 for e in events), "no input event"
+    dumped = json.dumps(upload.body)
+    assert TYPED_VALUE not in dumped
+    assert REPLAY_SECRET not in dumped
+    # One recording per run, tied to the run's root span.
+    assert upload.body["trace_id"] == format(root.context.trace_id, "032x")
+    assert upload.body["span_id"] == format(root.context.span_id, "016x")
+    assert upload.body["session_id"] == str(agent.session_id)
+    assert upload.body["framework"] == "browser-use"
+    assert upload.headers["Authorization"] == "Bearer test-key"
+    recording_id = root.attributes[REPLAY_ID_KEY]
+    assert root.attributes[REPLAY_URL_KEY] == stub.view_url(recording_id)
+    for span in spans:
+        if span is not root:
+            assert REPLAY_URL_KEY not in span.attributes, span.name
+
+
+async def test_baseline_session_replay_upload_failure_does_not_break_the_run(
+    pipeline, tmp_path, form_page, monkeypatch
+):
+    monkeypatch.setattr(session_recording.tempfile, "gettempdir", lambda: str(tmp_path))
+    with recording_stub_server(status=500) as stub:
+        agent, spans = await run_recorded(pipeline, tmp_path, form_page, stub)
+
+    assert agent.history.is_done()
+    assert_one_full_run(spans)
+    [root] = agent_spans(spans)
+    assert REPLAY_URL_KEY not in root.attributes
+    assert len(stub.uploads) == 1
+    trace_id = format(root.context.trace_id, "032x")
+    assert (tmp_path / session_recording.LOCAL_REPLAY_DIR / f"{trace_id}.html").exists()
+
+
+async def test_baseline_session_replay_records_nothing_with_content_off(
+    pipeline, tmp_path, form_page
+):
+    with recording_stub_server() as stub:
+        agent, spans = await run_recorded(
+            pipeline, tmp_path, form_page, stub, capture_content=False
+        )
+
+    assert agent.history.is_done()
+    assert stub.uploads == []
+    assert not any(REPLAY_URL_KEY in s.attributes for s in spans)
+
+
+async def test_baseline_session_replay_follows_the_agent_into_a_new_tab(
+    pipeline, tmp_path, form_page
+):
+    navigate, done, verdict = script({"navigate": {"url": form_page}})
+    with recording_stub_server() as stub:
+        _, spans = await run_recorded(
+            pipeline, tmp_path, form_page, stub, turns=[navigate, click_the_link, done, verdict]
+        )
+
+    [upload] = stub.uploads
+    events = upload.body["events"]
+    hrefs = [e["data"]["href"] for e in events if e["type"] == 4]
+    tab = form_page.replace("form.html", "tab.html")
+    assert hrefs[-1] == tab, hrefs  # the stream switched to the tab the agent opened ...
+    after = events[[e.get("data", {}).get("href") for e in events].index(tab) :]
+    assert after[1]["type"] == 2  # ... from that tab's own full snapshot
+    assert "Details tab" in json.dumps(after)
+
+
+async def test_baseline_session_replay_follow_up_run_on_a_kept_browser_records_again(
+    pipeline, tmp_path, form_page
+):
+    with recording_stub_server() as stub:
+        pipeline(instrumentor=BrowserUseInstrumentor(record_session=True), base_url=stub.base_url)
+        session = browser(tmp_path, keep_alive=True)
+        tab = form_page.replace("form.html", "tab.html")
+        agent = Agent(
+            task="Read",
+            llm=ScriptedLLM([*script({"navigate": {"url": form_page}}), *script({"navigate": {"url": tab}})]),
+            browser_session=session,
+        )
+        try:
+            await agent.run(max_steps=4)
+            agent.add_new_task("Now the details")
+            await agent.run(max_steps=4)
+        finally:
+            await session.kill()
+
+    first, second = (u.body for u in stub.uploads)
+    assert first["trace_id"] != second["trace_id"]
+    # The second run re-arms the recorder the first run stopped in that page.
+    assert any(e["type"] == 2 for e in second["events"])
+    assert "Details tab" in json.dumps(second["events"])
+    assert "Details tab" not in json.dumps(first["events"])
