@@ -63,7 +63,7 @@ browser_use.agent          agent   task in; final result, success, steps, usage 
 |---|---|---|
 | `capture_content` | `True` | `False` keeps span structure, timings, models, action names and token counts but drops the task, prompts, completions, action params and results, page URLs and titles, and exception messages (only the exception type is kept). `TRACELOOP_TRACE_CONTENT=false` does the same. |
 | `capture_screenshots` | `True` | `False` drops step screenshots and replaces inline images in prompts with a size placeholder. |
-| `record_session` | `RESPAN_RECORD_SESSION` env, else `False` | **Preview.** Records each run's pages with [rrweb](https://github.com/rrweb-io/rrweb) and puts a replay link on the agent span (`metadata.session_replay_url`, `metadata.session_replay_id`). Every input is masked and `sensitive_data` values never leave the process. Nothing is recorded when content capture is off. If the upload fails the run is unaffected and a local `.html` player is written instead (its path is logged). |
+| `record_session` | `RESPAN_RECORD_SESSION` env, else `False` | **Preview.** Records each run's pages with [rrweb](https://github.com/rrweb-io/rrweb) and puts a replay link on every span of the run (`metadata.session_replay_url`, `metadata.session_replay_id`); each link ends in `#t=<ms>` and opens the replay at the moment that span started. Against a backend without link reservation, only the agent span is linked. Every input is masked and `sensitive_data` values never leave the process. Nothing is recorded when content capture is off. If the upload fails the run is unaffected and a local `.html` player is written instead (its path is logged). |
 
 ## Not yet covered
 

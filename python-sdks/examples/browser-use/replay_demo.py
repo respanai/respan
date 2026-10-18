@@ -5,9 +5,10 @@
 A short visible agent (Hacker News -> open a story -> back) with
 `record_session=True`: the instrumentation records the pages with rrweb over
 browser-use's own CDP connection, uploads the recording when the run ends, and
-puts a replay link on the agent span (`metadata.session_replay_url`). At the
-end this prints the trace link and the replay link; open the replay link to
-play the run back in your browser. `RESPAN_RECORD_SESSION=1` turns the same
+puts a replay link on every span (`metadata.session_replay_url`, ending in
+`#t=<ms>`: the moment that span started). At the end this prints, for the agent
+and one step / action / LLM call, the log link and its replay link; open a
+replay link to play the run back from that moment in your browser. `RESPAN_RECORD_SESSION=1` turns the same
 thing on without code changes.
 """
 
@@ -55,17 +56,19 @@ from browser_use import Agent, Browser, ChatOpenAI  # noqa: E402
 llm = ChatOpenAI(model=RESPAN_MODEL, api_key=RESPAN_API_KEY, base_url=RESPAN_BASE_URL)
 
 
-def stored_replay_url(trace_id: str) -> tuple[str | None, str | None]:
-    """Read the agent span back from Respan: its log link and stored replay URL."""
+def stored_rows(trace_id: str) -> list[dict]:
+    """Read the trace back from Respan (ingestion takes a few seconds)."""
     logs = RespanLogsClient(RESPAN_BASE_URL, RESPAN_API_KEY)
-    for _ in range(20):  # ingestion takes a few seconds
-        for row in logs.trace_rows(trace_id):
-            if row.get("log_type") == "agent":
-                url = (row.get("metadata") or {}).get(SESSION_REPLAY_URL_METADATA_KEY)
-                link = f"{RESPAN_PLATFORM_URL}/platform/requests?unique_id={row['unique_id']}"
-                return link, url
+    for _ in range(20):
+        rows = logs.trace_rows(trace_id)
+        if any(row.get("log_type") == "agent" for row in rows):
+            return rows
         time.sleep(3)
-    return None, None
+    return []
+
+
+def log_link(row: dict) -> str:
+    return f"{RESPAN_PLATFORM_URL}/platform/requests?unique_id={row['unique_id']}"
 
 
 async def main() -> None:
@@ -92,6 +95,16 @@ if __name__ == "__main__":
         trace_id = format(span.context.trace_id, "032x")
         print("\nTrace id:       ", trace_id)
         print("Replay (span):  ", span.attributes.get(REPLAY_URL_ATTR) or "(none - see the warning above)")
-        link, stored = stored_replay_url(trace_id)
-        print("Trace in Respan:", link or "(not ingested yet)")
-        print("Replay (stored):", stored or "(not on the stored span)")
+        rows = stored_rows(trace_id)
+        if not rows:
+            print("Trace in Respan: (not ingested yet)")
+            continue
+        # Every span links to the replay at the moment it started: print one of each kind.
+        for log_type in ("agent", "task", "tool", "chat"):
+            row = next((r for r in rows if r.get("log_type") == log_type), None)
+            if row is None:
+                continue
+            url = (row.get("metadata") or {}).get(SESSION_REPLAY_URL_METADATA_KEY)
+            print(f"\n[{log_type}] {row.get('span_name')}")
+            print("  log:   ", log_link(row))
+            print("  replay:", url or "(not on the stored span)")

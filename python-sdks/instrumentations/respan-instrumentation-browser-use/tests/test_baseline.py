@@ -437,6 +437,68 @@ async def test_baseline_session_replay_is_recorded_masked_and_linked(pipeline, t
     assert upload.body["session_id"] == str(agent.session_id)
     assert upload.body["framework"] == "browser-use"
     assert upload.headers["Authorization"] == "Bearer test-key"
+    # The link was reserved up front and the upload went under that id.
+    [reservation] = stub.reservations
+    recording_id = reservation.body["recording_id"]
+    assert upload.body["recording_id"] == recording_id
+    assert reservation.body["trace_id"] == upload.body["trace_id"]
+    assert root.attributes[REPLAY_URL_KEY] == f"{stub.view_url(recording_id)}#t=0"
+
+
+def replay_offset(span: Any) -> int:
+    url = span.attributes[REPLAY_URL_KEY]
+    base, _, offset = url.partition("#t=")
+    assert base and offset.isdigit(), url
+    return int(offset)
+
+
+async def test_baseline_session_replay_links_every_span_at_its_moment(pipeline, tmp_path, form_page):
+    with recording_stub_server() as stub:
+        _, spans = await run_recorded(pipeline, tmp_path, form_page, stub)
+
+    [reservation] = stub.reservations
+    [upload] = stub.uploads
+    recording_id = reservation.body["recording_id"]
+    view_url = stub.view_url(recording_id)
+    assert_one_full_run(spans)
+    # EVERY exported span of the recorded run opens the same replay ...
+    for span in spans:
+        assert span.attributes.get(REPLAY_ID_KEY) == recording_id, span.name
+        assert span.attributes[REPLAY_URL_KEY].startswith(f"{view_url}#t="), span.name
+    names = {s.name for s in spans}
+    assert {"browser_use.step", "browser_use.llm", "navigate", "input"} <= names, names
+    # ... at the moment the span started: children never seek before their parent,
+    # and later steps seek later.
+    by_id = {s.context.span_id: s for s in spans}
+    for span in spans:
+        if span.parent is not None and span.parent.span_id in by_id:
+            assert replay_offset(span) >= replay_offset(by_id[span.parent.span_id]), span.name
+    steps = sorted((s for s in spans if s.name == "browser_use.step"), key=lambda s: s.start_time)
+    assert [replay_offset(s) for s in steps] == sorted(replay_offset(s) for s in steps)
+    assert replay_offset(steps[-1]) > 0
+    # One marker per span for the player's timeline, sent with the upload.
+    markers = {m["span_id"]: m for m in upload.body["markers"]}
+    for span in spans:
+        marker = markers[format(span.context.span_id, "016x")]
+        assert marker["t_ms"] == replay_offset(span), span.name
+    kinds = {m["kind"] for m in markers.values()}
+    assert kinds == {"agent", "step", "tool", "llm"}, kinds
+    assert REPLAY_SECRET not in json.dumps(upload.body["markers"])
+
+
+async def test_baseline_session_replay_without_reserve_links_only_the_root(
+    pipeline, tmp_path, form_page
+):
+    # An older backend has no reserve endpoint: the run still records, uploads,
+    # and links the root span after the upload, as before.
+    with recording_stub_server(reserve_status=404) as stub:
+        agent, spans = await run_recorded(pipeline, tmp_path, form_page, stub)
+
+    assert agent.history.is_done()
+    [root] = agent_spans(spans)
+    [upload] = stub.uploads
+    assert "recording_id" not in upload.body
+    assert "markers" not in upload.body
     recording_id = root.attributes[REPLAY_ID_KEY]
     assert root.attributes[REPLAY_URL_KEY] == stub.view_url(recording_id)
     for span in spans:
@@ -448,7 +510,7 @@ async def test_baseline_session_replay_upload_failure_does_not_break_the_run(
     pipeline, tmp_path, form_page, monkeypatch
 ):
     monkeypatch.setattr(session_recording.tempfile, "gettempdir", lambda: str(tmp_path))
-    with recording_stub_server(status=500) as stub:
+    with recording_stub_server(status=500, reserve_status=404) as stub:
         agent, spans = await run_recorded(pipeline, tmp_path, form_page, stub)
 
     assert agent.history.is_done()
@@ -470,6 +532,7 @@ async def test_baseline_session_replay_records_nothing_with_content_off(
 
     assert agent.history.is_done()
     assert stub.uploads == []
+    assert stub.reservations == []
     assert not any(REPLAY_URL_KEY in s.attributes for s in spans)
 
 

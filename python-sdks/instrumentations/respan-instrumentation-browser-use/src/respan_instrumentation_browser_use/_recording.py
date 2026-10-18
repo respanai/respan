@@ -6,6 +6,9 @@ browser-use 0.13 drives Chrome through one root ``cdp-use`` client
 out-of-process frame enters its pool. The recorder sends raw CDP on that root
 client, attaches to the targets that exist when the run's first step/action
 starts, and to every target attached afterwards (new tabs, popups, OOPIFs).
+
+The replay's link is reserved when the run starts, so every span of the run
+(agent, steps, actions, LLM calls) links to the replay at its own moment.
 """
 
 from __future__ import annotations
@@ -15,7 +18,9 @@ from typing import Any, Optional
 
 from respan_tracing.utils.agent_instrumentation import secret_replacements
 from respan_tracing.utils.session_recording import (
+    ReplayLinks,
     SessionRecorder,
+    reserve_recording,
     set_replay_metadata,
     upload_recording,
 )
@@ -38,7 +43,22 @@ class RunRecording:
         self.browser = getattr(agent, "browser_session", None)
         secrets = [secret for secret, _ in secret_replacements(getattr(agent, "sensitive_data", None))]
         self.recorder = SessionRecorder(self._send, secrets=secrets)
+        self.links = ReplayLinks(self.recorder.started_at)
         self.started = False
+
+    def _ids(self, span: Any) -> dict[str, str]:
+        context = span.get_span_context()
+        return {
+            "trace_id": format(context.trace_id, "032x"),
+            "span_id": format(context.span_id, "016x"),
+            "session_id": str(getattr(self.agent, "session_id", "") or ""),
+            "framework": INSTRUMENTATION_NAME,
+        }
+
+    async def reserve(self, span: Any) -> None:
+        """Get the replay link up front and put it on the agent span at 0."""
+        self.links.reservation = await reserve_recording(**self._ids(span))
+        self.links.stamp(span, kind="agent", label="agent", t_ms=0)
 
     async def _send(self, method: str, params: Optional[dict], session_id: Optional[str]) -> dict:
         client = getattr(self.browser, "_cdp_client_root", None)
@@ -87,15 +107,15 @@ class RunRecording:
         await self.stop()
         if not self.started:
             return
-        context = span.get_span_context()
+        reservation = self.links.reservation
         upload = await upload_recording(
             self.recorder.recording(),
-            trace_id=format(context.trace_id, "032x"),
-            span_id=format(context.span_id, "016x"),
-            session_id=str(getattr(self.agent, "session_id", "") or ""),
-            framework=INSTRUMENTATION_NAME,
+            recording_id=reservation.recording_id if reservation else None,
+            markers=self.links.markers,
+            **self._ids(span),
         )
-        set_replay_metadata(span, upload)
+        if reservation is None:
+            set_replay_metadata(span, upload)
 
 
 async def on_target_attached(manager: Any, event: Any) -> None:

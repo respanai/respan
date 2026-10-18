@@ -85,11 +85,13 @@ Not covered here, because they need accounts or setup this example can't assume:
 ## Session replay (preview)
 
 `replay_demo.py` runs a short visible agent (Hacker News -> a story's comments ->
-back) with `BrowserUseInstrumentor(record_session=True)`. When the run ends it
-prints the trace id, the replay link the SDK put on the agent span
-(`metadata.session_replay_url`) and the same link as stored in Respan. Open the
-link to watch the run; it plays without logging in and is time-limited (the
-upload response's `expires_at`; about a week on staging).
+back) with `BrowserUseInstrumentor(record_session=True)`. Every span of the run
+(agent, steps, actions, LLM calls) carries `metadata.session_replay_url`, ending
+in `#t=<ms>`: the replay opens paused at the moment that span started, with a
+list of every step / action / LLM call beside it to jump between. When the run
+ends the demo prints the log link and replay link of the agent and of one step,
+action and LLM call, as stored in Respan. The links play without logging in and
+are time-limited (`expires_at`; about a week on staging).
 
 `RESPAN_RECORD_SESSION=1` turns recording on for any script here, e.g.
 `RESPAN_RECORD_SESSION=1 python scenarios/09_multi_tab.py`. If the upload fails

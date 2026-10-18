@@ -9,7 +9,8 @@ Laminar SDK is installed. This instrumentation wraps the same seams directly:
 * ``<llm class>.ainvoke``  -> ``chat`` span for every model call, any provider
 
 With ``record_session=True`` the run is also recorded with rrweb over browser-use's
-own CDP connection (see ``_recording``) and the agent span links to the replay.
+own CDP connection (see ``_recording``) and every span links to the replay at
+the moment it started.
 
 LLM classes are patched just before ``TokenCost.register_llm`` captures the bound
 ``ainvoke``: every model browser-use uses (main, extraction, judge, fallback,
@@ -119,6 +120,20 @@ async def _recording_call(method: str) -> None:
         logger.debug("session recording %s failed open", method, exc_info=True)
 
 
+def _link_to_replay(span: Any, kind: str, label: Any) -> None:
+    """Link a span of a recorded run to the replay at the moment it starts."""
+    recording = _RECORDING.get()
+    if recording is not None:
+        safely(lambda: recording.links.stamp(span, kind=kind, label=str(label)))
+
+
+async def _reserve_recording(recording: RunRecording, span: Any) -> None:
+    try:
+        await recording.reserve(span)
+    except Exception:
+        logger.debug("session recording reserve failed open", exc_info=True)
+
+
 async def _finish_recording(recording: RunRecording, span: Any) -> None:
     try:
         await recording.finish(span)
@@ -174,6 +189,8 @@ class _Runtime:
                     if runtime.record_session and _content_allowed(runtime)
                     else None
                 )
+                if recording is not None:
+                    await _reserve_recording(recording, span)
                 token = _RECORDING.set(recording)
                 try:
                     history = await original(agent, *args, **kwargs)
@@ -278,6 +295,7 @@ class _Runtime:
             with runtime.span(SPAN_STEP, LOG_TYPE_TASK) as span:
                 if number is not None:
                     span.set_attribute(ATTR_STEP_NUMBER, number)
+                _link_to_replay(span, "step", f"step {number}" if number is not None else "step")
                 await _recording_call("ensure_started")
                 result = await original(agent, *args, **kwargs)
                 await _recording_call("drain")
@@ -352,6 +370,7 @@ class _Runtime:
             with runtime.span(name or SPAN_ACTION, LOG_TYPE_TOOL) as span:
                 if name:
                     span.set_attribute(ATTR_ACTION_NAME, name)
+                _link_to_replay(span, "tool", name or SPAN_ACTION)
                 if _content_allowed(runtime):
                     # Params are captured before browser-use substitutes sensitive_data,
                     # so secrets stay as their <secret>name</secret> placeholders.
@@ -464,6 +483,7 @@ class _Runtime:
             return await call(messages, *args, **kwargs)
         with self.span(SPAN_LLM, LOG_TYPE_CHAT) as span:
             safely(lambda: self._llm_start(span, llm, messages))
+            _link_to_replay(span, "llm", getattr(llm, "model", None) or SPAN_LLM)
             in_llm = _IN_LLM.set(True)
             try:
                 with suppress_provider_llm_spans():

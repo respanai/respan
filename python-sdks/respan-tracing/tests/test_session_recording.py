@@ -17,9 +17,11 @@ from respan_tracing.utils.session_recording import (
     RRWEB_FULL_SNAPSHOT,
     RRWEB_META,
     Recording,
+    ReplayLinks,
     SessionRecorder,
     is_session_recording_requested,
     recorder_script,
+    reserve_recording,
     set_replay_metadata,
     upload_recording,
 )
@@ -305,6 +307,91 @@ def test_replay_link_is_flat_respan_metadata():
     assert span.attributes["respan.metadata.session_replay_url"] == "https://view/rid"
     assert span.attributes["respan.metadata.session_replay_id"] == "rid"
     span.end()
+
+
+@pytest.mark.asyncio
+async def test_reserve_then_upload_under_the_reserved_id_with_markers():
+    with recording_stub_server() as stub:
+        reserved = await reserve_recording(
+            trace_id=TRACE_ID,
+            span_id=SPAN_ID,
+            session_id="s",
+            framework="x",
+            base_url=stub.base_url,
+            api_key="k",
+        )
+        assert reserved is not None
+        markers = [{"t_ms": 0, "label": "agent", "span_id": SPAN_ID, "kind": "agent"}]
+        upload = await upload_recording(
+            recording(),
+            trace_id=TRACE_ID,
+            span_id=SPAN_ID,
+            session_id="s",
+            framework="x",
+            recording_id=reserved.recording_id,
+            markers=markers,
+            base_url=stub.base_url,
+            api_key="k",
+        )
+    [sent] = stub.reservations
+    assert sent.path == "/api/browser-sessions/recordings/reserve/"
+    assert sent.headers["Authorization"] == "Bearer k"
+    assert (sent.body["trace_id"], sent.body["span_id"]) == (TRACE_ID, SPAN_ID)
+    assert upload is not None and upload.recording_id == reserved.recording_id
+    body = stub.uploads[0].body
+    assert body["recording_id"] == reserved.recording_id
+    assert body["markers"] == markers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [404, 500])
+async def test_reserve_failure_returns_none(status):
+    with recording_stub_server(reserve_status=status) as stub:
+        reserved = await reserve_recording(
+            trace_id=TRACE_ID, span_id=SPAN_ID, session_id="s", framework="x",
+            base_url=stub.base_url, api_key="k",
+        )
+    assert reserved is None
+    assert await reserve_recording(
+        trace_id=TRACE_ID, span_id=SPAN_ID, session_id="s", framework="x",
+        base_url="http://127.0.0.1:9/api", api_key="k", timeout=2,
+    ) is None
+
+
+def test_replay_links_stamp_every_span_with_its_offset():
+    tracer = TracerProvider().get_tracer("t")
+    started = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    links = ReplayLinks(started)
+    span = tracer.start_span("step")
+    assert links.stamp(span, kind="step", label="step 1") is None  # nothing reserved
+    assert "respan.metadata.session_replay_url" not in span.attributes
+    links.reservation = session_recording.RecordingUpload("rid", "https://view/rid.html?sig=1")
+    marker = links.stamp(span, kind="step", label="step 1", t_ms=1250)
+    assert span.attributes["respan.metadata.session_replay_url"] == "https://view/rid.html?sig=1#t=1250"
+    assert span.attributes["respan.metadata.session_replay_id"] == "rid"
+    assert marker == {
+        "t_ms": 1250, "label": "step 1", "span_id": format(span.get_span_context().span_id, "016x"),
+        "kind": "step",
+    }
+    assert links.offset_ms(datetime(2026, 1, 1, 0, 0, 2, tzinfo=timezone.utc)) == 2000
+    links.stamp(span, kind="tool", label="x" * 500, t_ms=1)
+    assert len(links.markers[-1]["label"]) == session_recording.MAX_MARKER_LABEL_CHARS
+    span.end()
+
+
+def test_player_html_seeks_to_the_hash_and_lists_markers():
+    html = session_recording.player_html(
+        {
+            "trace_id": "t",
+            "started_at": "2026-01-01T00:00:00Z",
+            "ended_at": "2026-01-01T00:00:10Z",
+            "events": [meta(1767225600500), full(1767225600501)],
+            "markers": [{"t_ms": 2000, "label": "</script>step 1", "span_id": "a", "kind": "step"}],
+        }
+    )
+    assert '"started_at_ms":1767225600000' in html
+    assert "step 1" in html and "</script>step 1" not in html
+    assert 'location.hash' in html and "player.goto(" in html
 
 
 def test_player_html_cannot_be_broken_out_of_by_page_content():

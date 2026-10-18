@@ -23,7 +23,7 @@ layer. Nothing in browser-use is forked; spans are standard OpenTelemetry.
 | Screenshot per step | via session recording | yes, JPEG on the step span |
 | Judge verdict, errors with their message | partly | yes |
 | `sensitive_data` kept out of traces | n/a | yes (placeholders, incl. URL-encoded values) |
-| Session replay (rrweb) | yes | **preview** (`record_session=True`): link on the agent span |
+| Session replay (rrweb) | yes | **preview** (`record_session=True`): link on every span, seeking to its moment |
 
 ## Known limitations
 
@@ -38,8 +38,12 @@ layer. Nothing in browser-use is forked; spans are standard OpenTelemetry.
   - **Events in flight when a page navigates away are lost** (up to the time
     since the last drain, which runs right before every action, so in practice the
     tail of the action that navigated).
-  - **Not synced to the step timeline** in the UI: the replay is a separate page
-    linked from the agent span.
+  - **Not embedded in the trace view yet**: every span links to the replay page at
+    its own moment (`#t=<ms>`) and the page lists every span to jump between, but
+    the platform does not show the player beside the span tree.
+  - **Links are reserved before the run**: if the upload then fails, the spans'
+    links point at a replay that does not exist (the local `.html` is still
+    written).
   - **Canvas, video, WebGL, cross-origin iframes, closed shadow roots** do not
     replay faithfully (rrweb limits; canvas recording is off). Pages that block
     script injection (`chrome://`, the PDF viewer) record nothing.
@@ -73,8 +77,10 @@ layer. Nothing in browser-use is forked; spans are standard OpenTelemetry.
   the same thread, parallel agents in separate traces, content off keeps ids and
   drops content, `sensitive_data` never exported, replays in one trace. CI runs it.
   Session replay: a recorded run uploads a full snapshot plus incremental events,
-  typed values and `sensitive_data` never in the payload, the link lands on the
-  root span only, the stream follows a new tab, an upload failure leaves the run
+  typed values and `sensitive_data` never in the payload, the reserved link lands
+  on every span with its own `#t` offset (children never before their parent) and
+  a marker per span is uploaded, a backend without reserve still links the root
+  span, the stream follows a new tab, an upload failure leaves the run
   intact (and a local player), and content off records nothing.
 - `examples/browser-use/run_all.py` runs 27 scenarios mirroring browser-use's own
   examples against a live Respan environment and checks every trace it reads

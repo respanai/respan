@@ -13,10 +13,15 @@ exist and which one the agent is looking at; the recorder does the rest:
   at run end), keeping events in memory with the target they came from;
 - stops collecting above a size cap and marks the recording ``truncated``.
 
-``upload_recording`` then sends it to Respan once (gzipped JSON, see
-``RECORDINGS_PATH``) and never raises: on any failure it logs a warning and
-writes a local ``.json.gz`` plus a standalone ``.html`` player instead.
-``set_replay_metadata`` puts the resulting link on the agent's root span.
+``reserve_recording`` asks Respan for the replay's link when the run starts
+(``RESERVE_PATH``), so ``ReplayLinks`` can put it on EVERY span of the run, each
+with ``#t=<ms>`` seeking the player to the moment that span started, and keep a
+marker per span for the player's timeline. ``upload_recording`` then sends the
+events once (gzipped JSON, see ``RECORDINGS_PATH``) under the reserved id and
+never raises: on any failure it logs a warning and writes a local ``.json.gz``
+plus a standalone ``.html`` player instead. Without a reservation (an older
+backend) only the agent's root span gets a link, after the upload
+(``set_replay_metadata``).
 """
 
 from __future__ import annotations
@@ -47,12 +52,17 @@ logger = logging.getLogger(__name__)
 
 RECORD_SESSION_ENV = "RESPAN_RECORD_SESSION"
 RECORDINGS_PATH = "/browser-sessions/recordings/"
+RESERVE_PATH = "/browser-sessions/recordings/reserve/"
 SESSION_REPLAY_URL_METADATA_KEY = "session_replay_url"
 SESSION_REPLAY_ID_METADATA_KEY = "session_replay_id"
 
 DRAIN_INTERVAL_SECONDS = 1.5
 CDP_CALL_TIMEOUT_SECONDS = 3.0
 UPLOAD_TIMEOUT_SECONDS = 15.0
+RESERVE_TIMEOUT_SECONDS = 5.0
+MAX_MARKERS = 2000
+MAX_MARKER_LABEL_CHARS = 200
+SEEK_FRAGMENT = "#t="
 MAX_RAW_BYTES = 20 * 1024 * 1024
 FOCUS_SWITCH_SLACK_MS = 20
 LOCAL_REPLAY_DIR = "respan-session-replays"
@@ -183,6 +193,10 @@ class SessionRecorder:
     @property
     def truncated(self) -> bool:
         return self._truncated
+
+    @property
+    def started_at(self) -> datetime:
+        return self._started_at
 
     @property
     def is_stopped(self) -> bool:
@@ -391,9 +405,11 @@ def recording_body(
     span_id: str,
     session_id: Optional[str],
     framework: str,
+    recording_id: Optional[str] = None,
+    markers: Sequence[dict[str, Any]] = (),
 ) -> bytes:
     """The gzipped JSON body ``RECORDINGS_PATH`` accepts."""
-    body = {
+    body: dict[str, Any] = {
         "trace_id": trace_id,
         "span_id": span_id,
         "session_id": session_id or "",
@@ -402,6 +418,10 @@ def recording_body(
         "framework": framework,
         "events": recording.events,
     }
+    if recording_id:
+        body["recording_id"] = recording_id
+    if markers:
+        body["markers"] = list(markers)
     text = _mask_json(json.dumps(body, separators=(",", ":")), recording.secrets)
     return gzip.compress(text.encode("utf-8"))
 
@@ -414,17 +434,60 @@ def _resolve_endpoint(base_url: Optional[str], api_key: Optional[str]) -> tuple[
     return base_url, api_key
 
 
-def _post(url: str, api_key: str, body: bytes, timeout: float) -> requests.Response:
-    return requests.post(
-        url,
-        data=body,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "Content-Encoding": "gzip",
-        },
-        timeout=timeout,
+def _post(
+    url: str, api_key: str, body: bytes, timeout: float, *, is_gzipped: bool = True
+) -> requests.Response:
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    if is_gzipped:
+        headers["Content-Encoding"] = "gzip"
+    return requests.post(url, data=body, headers=headers, timeout=timeout)
+
+
+def _upload_from(data: dict[str, Any]) -> RecordingUpload:
+    return RecordingUpload(
+        recording_id=str(data["recording_id"]),
+        view_url=str(data["view_url"]),
+        events_url=data.get("events_url"),
+        expires_at=data.get("expires_at"),
     )
+
+
+async def reserve_recording(
+    *,
+    trace_id: str,
+    span_id: str,
+    session_id: Optional[str],
+    framework: str,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    timeout: float = RESERVE_TIMEOUT_SECONDS,
+) -> Optional[RecordingUpload]:
+    """Get the replay's id and link before anything is recorded. Never raises.
+
+    ``None`` (e.g. 404 from a backend without the endpoint) means: fall back to
+    linking the root span after the upload.
+    """
+    base_url, api_key = _resolve_endpoint(base_url, api_key)
+    if not base_url or not api_key:
+        return None
+    body = json.dumps(
+        {
+            "trace_id": trace_id,
+            "span_id": span_id,
+            "session_id": session_id or "",
+            "framework": framework,
+        }
+    ).encode("utf-8")
+    try:
+        response = await asyncio.to_thread(
+            _post, base_url.rstrip("/") + RESERVE_PATH, api_key, body, timeout, is_gzipped=False
+        )
+        if response.status_code == 201:
+            return _upload_from(response.json())
+        logger.debug("session replay reserve returned HTTP %s", response.status_code)
+    except Exception:
+        logger.debug("session replay reserve failed", exc_info=True)
+    return None
 
 
 async def upload_recording(
@@ -434,11 +497,16 @@ async def upload_recording(
     span_id: str,
     session_id: Optional[str],
     framework: str,
+    recording_id: Optional[str] = None,
+    markers: Sequence[dict[str, Any]] = (),
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
     timeout: float = UPLOAD_TIMEOUT_SECONDS,
 ) -> Optional[RecordingUpload]:
-    """POST the recording once. Never raises; on failure keeps a local copy."""
+    """POST the recording once (under ``recording_id`` when one was reserved).
+
+    Never raises; on failure keeps a local copy.
+    """
     if not recording.events:
         return None
     try:
@@ -448,6 +516,8 @@ async def upload_recording(
             span_id=span_id,
             session_id=session_id,
             framework=framework,
+            recording_id=recording_id,
+            markers=markers,
         )
     except Exception:
         logger.warning("Respan session recording could not be serialized", exc_info=True)
@@ -461,13 +531,7 @@ async def upload_recording(
         try:
             response = await asyncio.to_thread(_post, url, api_key, body, timeout)
             if response.status_code == 201:
-                data = response.json()
-                return RecordingUpload(
-                    recording_id=str(data["recording_id"]),
-                    view_url=str(data["view_url"]),
-                    events_url=data.get("events_url"),
-                    expires_at=data.get("expires_at"),
-                )
+                return _upload_from(response.json())
             reason = f"HTTP {response.status_code}: {response.text[:200]}"
         except Exception as exc:
             reason = f"{type(exc).__name__}: {exc}"
@@ -486,30 +550,85 @@ _PLAYER_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><title>Respan session replay {trace_id}</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/rrweb-player@{version}/dist/style.css">
-<style>body{{margin:0;font:14px system-ui,sans-serif;background:#f5f5f5}}header{{padding:10px 16px}}#player{{padding:0 16px}}</style>
-</head><body>
+<style>body{{margin:0;font:14px system-ui,sans-serif;background:#f5f5f5;color:#222}}
+header{{padding:10px 16px}}main{{display:flex;gap:16px;padding:0 16px;align-items:flex-start}}
+#ticks{{position:relative;height:10px;margin:6px 0;background:#e3e3e3;border-radius:3px}}
+#ticks span{{position:absolute;top:0;width:2px;height:10px;background:#555;cursor:pointer}}
+#ticks span.step{{background:#2b6cb0}}#ticks span.tool{{background:#c05621}}#ticks span.llm{{background:#6b46c1}}
+#markers{{list-style:none;margin:0;padding:0;max-height:80vh;overflow:auto;min-width:220px;max-width:320px}}
+#markers li{{padding:4px 8px;cursor:pointer;border-left:3px solid #ccc;margin-bottom:2px;background:#fff;overflow-wrap:anywhere}}
+#markers li.step{{border-color:#2b6cb0}}#markers li.tool{{border-color:#c05621}}#markers li.llm{{border-color:#6b46c1}}
+#markers li.active{{background:#fff3c4}}#markers time{{color:#777;margin-right:6px;font-variant-numeric:tabular-nums}}
+</style></head><body>
 <header>trace <code>{trace_id}</code> &middot; session <code>{session_id}</code> &middot; {duration}</header>
-<div id="player"></div>
+<main><div><div id="player"></div><div id="ticks"></div></div><ul id="markers"></ul></main>
 <script id="events" type="application/json">{events}</script>
+<script id="replay-meta" type="application/json">{meta}</script>
 <script src="https://cdn.jsdelivr.net/npm/rrweb-player@{version}/dist/index.js"></script>
 <script>
 var events = JSON.parse(document.getElementById("events").textContent);
-window.respanReplay = new rrwebPlayer({{target: document.getElementById("player"),
-  props: {{events: events, autoPlay: true, width: Math.min(window.innerWidth - 32, 1280)}}}});
+var meta = JSON.parse(document.getElementById("replay-meta").textContent);
+var markers = meta.markers || [];
+var player = window.respanReplay = new rrwebPlayer({{target: document.getElementById("player"),
+  props: {{events: events, autoPlay: false, width: Math.min(window.innerWidth - 380, 1280)}}}});
+var info = player.getReplayer().getMetaData();
+// t_ms counts from the recording's started_at; the player counts from its first event.
+var shift = (meta.started_at_ms || info.startTime) - info.startTime;
+function offset(tMs) {{ return Math.max(0, Math.min(info.totalTime, shift + tMs)); }}
+function fmt(ms) {{ var s = Math.floor(ms / 1000); return Math.floor(s / 60) + ":" + ("0" + s % 60).slice(-2); }}
+var items = [];
+function select(i) {{ items.forEach(function (li, j) {{ li.classList.toggle("active", j === i); }}); }}
+function seek(tMs, play) {{
+  player.goto(offset(tMs), !!play);
+  var best = -1;
+  markers.forEach(function (m, i) {{ if (m.t_ms <= tMs) best = i; }});
+  select(best);
+}}
+var list = document.getElementById("markers"), ticks = document.getElementById("ticks");
+markers.forEach(function (m, i) {{
+  var li = document.createElement("li"); li.className = m.kind || "";
+  var time = document.createElement("time"); time.textContent = fmt(Math.max(0, m.t_ms));
+  li.appendChild(time); li.appendChild(document.createTextNode(m.label || m.kind || ""));
+  li.title = m.span_id || "";
+  li.onclick = function () {{ history.replaceState(null, "", "#t=" + m.t_ms); seek(m.t_ms, false); }};
+  list.appendChild(li); items.push(li);
+  var tick = document.createElement("span"); tick.className = m.kind || "";
+  tick.style.left = (100 * offset(m.t_ms) / Math.max(1, info.totalTime)) + "%";
+  tick.title = (m.label || "") + " " + fmt(m.t_ms); tick.onclick = li.onclick;
+  ticks.appendChild(tick);
+}});
+function fromHash() {{
+  var params = new URLSearchParams(location.hash.slice(1));
+  if (params.has("t")) {{ seek(parseInt(params.get("t"), 10) || 0, params.get("play") === "1"); }}
+  else {{ player.play(); }}
+}}
+window.addEventListener("hashchange", fromHash);
+fromHash();
 </script>
 </body></html>
 """
 
 
-def player_html(body: dict[str, Any]) -> str:
-    """A self-contained page that plays ``body['events']`` with rrweb-player."""
-    events = json.dumps(body.get("events") or [], separators=(",", ":"))
+def _epoch_ms(value: Any) -> Optional[int]:
     try:
-        started = datetime.fromisoformat(body["started_at"].replace("Z", "+00:00"))
-        ended = datetime.fromisoformat(body["ended_at"].replace("Z", "+00:00"))
-        duration = f"{(ended - started).total_seconds():.1f}s"
+        return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp() * 1000)
     except Exception:
-        duration = ""
+        return None
+
+
+def player_html(body: dict[str, Any]) -> str:
+    """A self-contained page that plays ``body['events']`` with rrweb-player.
+
+    ``#t=<ms since started_at>`` seeks there (paused; ``&play=1`` plays), and
+    ``body['markers']`` are listed beside the player and ticked under it.
+    """
+    events = json.dumps(body.get("events") or [], separators=(",", ":"))
+    started_ms, ended_ms = _epoch_ms(body.get("started_at")), _epoch_ms(body.get("ended_at"))
+    duration = f"{(ended_ms - started_ms) / 1000:.1f}s" if started_ms and ended_ms else ""
+    meta = json.dumps(
+        {"started_at_ms": started_ms, "markers": body.get("markers") or []},
+        separators=(",", ":"),
+    )
     return _PLAYER_HTML.format(
         version=RRWEB_PLAYER_VERSION,
         trace_id=_html_text(body.get("trace_id")),
@@ -517,6 +636,7 @@ def player_html(body: dict[str, Any]) -> str:
         duration=duration,
         # "</" would end the script element early.
         events=events.replace("</", "<\\/"),
+        meta=meta.replace("</", "<\\/"),
     )
 
 
@@ -546,3 +666,54 @@ def set_replay_metadata(span: Any, upload: Optional[RecordingUpload]) -> None:
         return
     span.set_attribute(f"{RESPAN_METADATA}.{SESSION_REPLAY_URL_METADATA_KEY}", upload.view_url)
     span.set_attribute(f"{RESPAN_METADATA}.{SESSION_REPLAY_ID_METADATA_KEY}", upload.recording_id)
+
+
+def _hex_span_id(span: Any) -> str:
+    return format(span.get_span_context().span_id, "016x")
+
+
+class ReplayLinks:
+    """Puts the reserved replay link on every span of a recorded run.
+
+    ``stamp`` sets ``session_replay_url`` (with ``#t=<ms since started_at>``,
+    the moment the span started) and ``session_replay_id`` on the span, and
+    keeps a marker for the player. Without a reservation it does nothing, and
+    the root span is linked after the upload instead.
+    """
+
+    def __init__(self, started_at: datetime) -> None:
+        self.started_at = started_at
+        self.reservation: Optional[RecordingUpload] = None
+        self.markers: list[dict[str, Any]] = []
+
+    @property
+    def is_reserved(self) -> bool:
+        return self.reservation is not None
+
+    def offset_ms(self, moment: Optional[datetime] = None) -> int:
+        moment = moment or datetime.now(timezone.utc)
+        return max(0, int((moment - self.started_at).total_seconds() * 1000))
+
+    def url_at(self, t_ms: int) -> Optional[str]:
+        if self.reservation is None:
+            return None
+        return f"{self.reservation.view_url}{SEEK_FRAGMENT}{t_ms}"
+
+    def stamp(self, span: Any, *, kind: str, label: str, t_ms: Optional[int] = None) -> Optional[dict]:
+        if self.reservation is None:
+            return None
+        t_ms = self.offset_ms() if t_ms is None else t_ms
+        span.set_attribute(f"{RESPAN_METADATA}.{SESSION_REPLAY_URL_METADATA_KEY}", self.url_at(t_ms))
+        span.set_attribute(
+            f"{RESPAN_METADATA}.{SESSION_REPLAY_ID_METADATA_KEY}", self.reservation.recording_id
+        )
+        if len(self.markers) >= MAX_MARKERS:
+            return None
+        marker = {
+            "t_ms": t_ms,
+            "label": str(label)[:MAX_MARKER_LABEL_CHARS],
+            "span_id": _hex_span_id(span),
+            "kind": kind,
+        }
+        self.markers.append(marker)
+        return marker
