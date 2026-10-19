@@ -1,0 +1,7 @@
+{
+  "summary": "Session replay (preview): BrowserUseInstrumentor(record_session=True) / RESPAN_RECORD_SESSION=1 records each run with rrweb over browser-use's CDP connection; every span links to the replay at its own moment (#t=<ms>) and the player lists every span. Shared recorder in respan_tracing.utils.session_recording (link reserved at run start, upload + local fallback).",
+  "packages": {
+    "respan-tracing": "minor",
+    "respan-instrumentation-browser-use": "minor"
+  }
+}

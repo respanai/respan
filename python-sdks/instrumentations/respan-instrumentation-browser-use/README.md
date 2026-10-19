@@ -63,8 +63,41 @@ browser_use.agent          agent   task in; final result, success, steps, usage 
 |---|---|---|
 | `capture_content` | `True` | `False` keeps span structure, timings, models, action names and token counts but drops the task, prompts, completions, action params and results, page URLs and titles, and exception messages (only the exception type is kept). `TRACELOOP_TRACE_CONTENT=false` does the same. |
 | `capture_screenshots` | `True` | `False` drops step screenshots and replaces inline images in prompts with a size placeholder. |
+| `record_session` | `RESPAN_RECORD_SESSION` env, else `False` | **Preview.** Records each run's pages with [rrweb](https://github.com/rrweb-io/rrweb) and puts a replay link on every span of the run (`metadata.session_replay_url`, `metadata.session_replay_id`); each link ends in `#t=<ms>` and opens the replay at the moment that span started. Against a backend without link reservation, only the agent span is linked. Every input is masked and `sensitive_data` values never leave the process. Nothing is recorded when content capture is off. If the upload fails the run is unaffected and a local `.html` player is written instead (its path is logged). |
+
+## Session replay (preview)
+
+Record what the browser did and watch it back from the trace:
+
+```python
+respan = Respan(instrumentations=[BrowserUseInstrumentor(record_session=True)])
+```
+
+or, without code changes, `RESPAN_RECORD_SESSION=1 python your_agent.py`.
+
+- **What is recorded.** The pages the agent drives, with
+  [rrweb](https://github.com/rrweb-io/rrweb) (DOM snapshots + changes, not video),
+  over browser-use's own CDP connection. Nothing to install in the browser.
+- **Where to watch it.** Every span of a recorded run (agent, steps, actions, LLM
+  calls) carries `metadata.session_replay_url`. Open it from the log's metadata:
+  the replay opens paused at the moment that span started (`#t=<ms>`), with every
+  step, action and LLM call listed beside it to jump between. `metadata.session_replay_id`
+  is the same on every span of the run.
+- **Privacy.** Every input value is masked in the page, `sensitive_data` values never
+  leave the process, and nothing is recorded with `capture_content=False`.
+- **Failure is harmless.** The recording is uploaded once, when the run ends; if
+  that fails the run is unaffected and a local `.html` player is written instead
+  (its path is logged). The links are time-limited; `expires_at` comes back with the
+  upload.
+- **Limits.** One stream that follows the agent's focused tab; canvas and video do not
+  replay; images load from the original site at playback. Full list in
+  [`docs/GAPS.md`](docs/GAPS.md).
+
+`examples/browser-use/replay_demo.py` runs a short recorded agent and prints the
+replay links.
 
 ## Not yet covered
 
-- Session replay (rrweb recording synced to the step timeline). See `docs/GAPS.md`.
+- Session replay is a preview: one stream that follows the agent's focused tab, not
+  yet synced to the step timeline in the Respan UI. See `docs/GAPS.md`.
 - `browser_use.beta` agents.

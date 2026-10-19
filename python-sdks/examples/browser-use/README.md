@@ -25,6 +25,7 @@ on the next run. Outside this repo: `pip install respan-instrumentation-browser-
 
 ```bash
 python hello_world.py                         # one agent, watch Chrome read Hacker News
+python replay_demo.py                         # same, recorded: prints the trace + replay link
 python scenarios/11_sensitive_data.py         # any single scenario, then its live check
 python run_all.py --list                      # all scenarios
 python run_all.py                             # run them all, check every trace in Respan
@@ -80,6 +81,22 @@ Not covered here, because they need accounts or setup this example can't assume:
 - `browser_use.beta`: needs the Browser Use terminal binary.
 - Other model providers: the instrumentation traces all of browser-use's model
   classes the same way, but this example only has the Respan gateway.
+
+## Session replay (preview)
+
+`replay_demo.py` runs a short visible agent (Hacker News -> a story's comments ->
+back) with `BrowserUseInstrumentor(record_session=True)`. Every span of the run
+(agent, steps, actions, LLM calls) carries `metadata.session_replay_url`, ending
+in `#t=<ms>`: the replay opens paused at the moment that span started, with a
+list of every step / action / LLM call beside it to jump between. When the run
+ends the demo prints the log link and replay link of the agent and of one step,
+action and LLM call, as stored in Respan. The links play without logging in and
+are time-limited (`expires_at` in the upload response).
+
+`RESPAN_RECORD_SESSION=1` turns recording on for any script here, e.g.
+`RESPAN_RECORD_SESSION=1 python scenarios/09_multi_tab.py`. If the upload fails
+the run is unaffected; the SDK logs a warning with the path of a local `.html`
+player instead. Limits are in the package's `docs/GAPS.md`.
 
 ## What a trace looks like
 

@@ -8,6 +8,10 @@ Laminar SDK is installed. This instrumentation wraps the same seams directly:
 * ``Tools.act``            -> ``tool`` span per browser action (click, navigate, ...)
 * ``<llm class>.ainvoke``  -> ``chat`` span for every model call, any provider
 
+With ``record_session=True`` the run is also recorded with rrweb over browser-use's
+own CDP connection (see ``_recording``) and every span links to the replay at
+the moment it started.
+
 LLM classes are patched just before ``TokenCost.register_llm`` captures the bound
 ``ainvoke``: every model browser-use uses (main, extraction, judge, fallback,
 compaction) passes through it, and patching later would miss the captured method.
@@ -46,6 +50,7 @@ from respan_tracing.utils.agent_instrumentation import (
     set_error,
     suppress_provider_llm_spans,
 )
+from respan_tracing.utils.session_recording import is_session_recording_requested
 
 from respan_instrumentation_browser_use._constants import (
     AGENT_MODULE,
@@ -59,6 +64,7 @@ from respan_instrumentation_browser_use._constants import (
     ATTR_STEP_NUMBER,
     INSTRUMENTATION_NAME,
     RERUN_NAME_DETAIL,
+    SESSION_MANAGER_MODULE,
     SPAN_ACTION,
     SPAN_AGENT,
     SPAN_LLM,
@@ -68,6 +74,8 @@ from respan_instrumentation_browser_use._constants import (
     TOOLS_MODULE,
     TRACER_NAME,
 )
+from respan_instrumentation_browser_use._recording import CURRENT as _RECORDING
+from respan_instrumentation_browser_use._recording import RunRecording, on_target_attached
 from respan_instrumentation_browser_use._serialization import (
     content_text,
     json_string,
@@ -101,10 +109,45 @@ def _agent_scope(agent: Any) -> Any:
     return _SCOPE.run(agent.session_id, getattr(agent, "sensitive_data", None))
 
 
+async def _recording_call(method: str) -> None:
+    """Run a recorder hook of the current run; telemetry never fails the agent."""
+    recording = _RECORDING.get()
+    if recording is None:
+        return
+    try:
+        await getattr(recording, method)()
+    except Exception:
+        logger.debug("session recording %s failed open", method, exc_info=True)
+
+
+def _link_to_replay(span: Any, kind: str, label: Any) -> None:
+    """Link a span of a recorded run to the replay at the moment it starts."""
+    recording = _RECORDING.get()
+    if recording is not None:
+        safely(lambda: recording.links.stamp(span, kind=kind, label=str(label)))
+
+
+async def _reserve_recording(recording: RunRecording, span: Any) -> None:
+    try:
+        await recording.reserve(span)
+    except Exception:
+        logger.debug("session recording reserve failed open", exc_info=True)
+
+
+async def _finish_recording(recording: RunRecording, span: Any) -> None:
+    try:
+        await recording.finish(span)
+    except Exception:
+        logger.debug("session recording finish failed open", exc_info=True)
+
+
 class _Runtime:
-    def __init__(self, *, capture_content: bool, capture_screenshots: bool) -> None:
+    def __init__(
+        self, *, capture_content: bool, capture_screenshots: bool, record_session: bool
+    ) -> None:
         self.capture_content = capture_content
         self.capture_screenshots = capture_screenshots
+        self.record_session = record_session
         self.active = True
         self.count = 1
         self.patcher = MethodPatcher()
@@ -140,7 +183,22 @@ class _Runtime:
                 # Follow-up runs (add_new_task) append to the same history.
                 before = len(agent.history.history)
                 safely(lambda: runtime._agent_start(span, agent))
-                history = await original(agent, *args, **kwargs)
+                # Content off records nothing: a replay is all page content.
+                recording = (
+                    RunRecording(agent)
+                    if runtime.record_session and _content_allowed(runtime)
+                    else None
+                )
+                if recording is not None:
+                    await _reserve_recording(recording, span)
+                token = _RECORDING.set(recording)
+                try:
+                    history = await original(agent, *args, **kwargs)
+                finally:
+                    _RECORDING.reset(token)
+                    if recording is not None:
+                        # Upload before the span ends so it can carry the link.
+                        await _finish_recording(recording, span)
                 safely(lambda: runtime._agent_end(span, history, before))
                 return history
 
@@ -237,7 +295,10 @@ class _Runtime:
             with runtime.span(SPAN_STEP, LOG_TYPE_TASK) as span:
                 if number is not None:
                     span.set_attribute(ATTR_STEP_NUMBER, number)
+                _link_to_replay(span, "step", f"step {number}" if number is not None else "step")
+                await _recording_call("ensure_started")
                 result = await original(agent, *args, **kwargs)
+                await _recording_call("drain")
                 safely(lambda: runtime._step_end(span, agent, before))
                 return result
 
@@ -302,9 +363,14 @@ class _Runtime:
             if not runtime.active:
                 return await original(tools, action, *args, **kwargs)
             name, params = _action_call(action)
+            # Drain before acting: a click or navigate replaces the document, and
+            # whatever the page buffered since the last drain goes with it.
+            await _recording_call("ensure_started")
+            await _recording_call("drain")
             with runtime.span(name or SPAN_ACTION, LOG_TYPE_TOOL) as span:
                 if name:
                     span.set_attribute(ATTR_ACTION_NAME, name)
+                _link_to_replay(span, "tool", name or SPAN_ACTION)
                 if _content_allowed(runtime):
                     # Params are captured before browser-use substitutes sensitive_data,
                     # so secrets stay as their <secret>name</secret> placeholders.
@@ -328,6 +394,30 @@ class _Runtime:
                 SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
                 json_string(_action_result(result)),
             )
+
+    # -- session recording ----------------------------------------------------
+
+    def wrap_close(self, original: Any) -> Any:
+        @wraps(original)
+        async def close(agent: Any, *args: Any, **kwargs: Any) -> Any:
+            # Agent.run's finally closes (and usually kills) the browser: the last
+            # drain has to happen first.
+            await _recording_call("stop")
+            return await original(agent, *args, **kwargs)
+
+        return close
+
+    def wrap_target_attached(self, original: Any) -> Any:
+        @wraps(original)
+        async def handle_target_attached(manager: Any, event: Any, *args: Any, **kwargs: Any) -> Any:
+            result = await original(manager, event, *args, **kwargs)
+            try:
+                await on_target_attached(manager, event)
+            except Exception:
+                logger.debug("session recording attach failed open", exc_info=True)
+            return result
+
+        return handle_target_attached
 
     # -- llm -----------------------------------------------------------------
 
@@ -393,6 +483,7 @@ class _Runtime:
             return await call(messages, *args, **kwargs)
         with self.span(SPAN_LLM, LOG_TYPE_CHAT) as span:
             safely(lambda: self._llm_start(span, llm, messages))
+            _link_to_replay(span, "llm", getattr(llm, "model", None) or SPAN_LLM)
             in_llm = _IN_LLM.set(True)
             try:
                 with suppress_provider_llm_spans():
@@ -488,10 +579,18 @@ class BrowserUseInstrumentor:
     name = INSTRUMENTATION_NAME
 
     def __init__(
-        self, *, capture_content: bool = True, capture_screenshots: bool = True
+        self,
+        *,
+        capture_content: bool = True,
+        capture_screenshots: bool = True,
+        record_session: bool | None = None,
     ) -> None:
+        """``record_session``: record each run with rrweb and link the replay from
+        the agent span (``respan.metadata.session_replay_url``). Defaults to the
+        ``RESPAN_RECORD_SESSION`` env var; never records with content capture off."""
         self._capture_content = capture_content
         self._capture_screenshots = capture_screenshots
+        self._record_session = is_session_recording_requested(record_session)
         self._runtime: _Runtime | None = None
 
     def activate(self) -> None:
@@ -503,10 +602,11 @@ class BrowserUseInstrumentor:
             if tracer is not None and not getattr(tracer, "is_enabled", True):
                 return
             if _RUNTIME is not None:
-                if (_RUNTIME.capture_content, _RUNTIME.capture_screenshots) != (
-                    self._capture_content,
-                    self._capture_screenshots,
-                ):
+                if (
+                    _RUNTIME.capture_content,
+                    _RUNTIME.capture_screenshots,
+                    _RUNTIME.record_session,
+                ) != (self._capture_content, self._capture_screenshots, self._record_session):
                     raise ValueError(
                         "browser-use instrumentation is already active with different settings"
                     )
@@ -517,12 +617,14 @@ class BrowserUseInstrumentor:
                 agent_module = importlib.import_module(AGENT_MODULE)
                 tools_module = importlib.import_module(TOOLS_MODULE)
                 tokens_module = importlib.import_module(TOKENS_MODULE)
+                session_manager_module = importlib.import_module(SESSION_MANAGER_MODULE)
             except ImportError:
                 logger.debug("browser-use is not installed; instrumentation skipped")
                 return
             runtime = _Runtime(
                 capture_content=self._capture_content,
                 capture_screenshots=self._capture_screenshots,
+                record_session=self._record_session,
             )
             try:
                 runtime.patcher.patch(agent_module.Agent, "run", runtime.wrap_run)
@@ -532,6 +634,13 @@ class BrowserUseInstrumentor:
                 runtime.patcher.patch(
                     tokens_module.TokenCost, "register_llm", runtime.wrap_register_llm
                 )
+                if runtime.record_session:
+                    runtime.patcher.patch(agent_module.Agent, "close", runtime.wrap_close)
+                    runtime.patcher.patch(
+                        session_manager_module.SessionManager,
+                        "_handle_target_attached",
+                        runtime.wrap_target_attached,
+                    )
             except Exception:
                 runtime.patcher.restore()
                 raise

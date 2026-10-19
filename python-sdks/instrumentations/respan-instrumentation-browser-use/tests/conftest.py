@@ -68,10 +68,21 @@ class ScriptedLLM:
     async def ainvoke(self, messages, output_format=None, **kwargs):
         self.calls += 1
         payload = self.outputs.pop(0)
+        if callable(payload):  # a turn that depends on what the model was shown
+            payload = payload(prompt_text(messages))
         completion = (
             output_format.model_validate(payload) if output_format else str(payload)
         )
         return ChatInvokeCompletion(completion=completion, usage=usage())
+
+
+def prompt_text(messages) -> str:
+    texts = []
+    for message in messages:
+        content = getattr(message, "content", None)
+        parts = content if isinstance(content, list) else [content]
+        texts.extend(p if isinstance(p, str) else getattr(p, "text", "") or "" for p in parts)
+    return "\n".join(texts)
 
 
 def chrome_path() -> str | None:
