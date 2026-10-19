@@ -91,7 +91,7 @@ in `#t=<ms>`: the replay opens paused at the moment that span started, with a
 list of every step / action / LLM call beside it to jump between. When the run
 ends the demo prints the log link and replay link of the agent and of one step,
 action and LLM call, as stored in Respan. The links play without logging in and
-are time-limited (`expires_at`; about a week on staging).
+are time-limited (`expires_at` in the upload response).
 
 `RESPAN_RECORD_SESSION=1` turns recording on for any script here, e.g.
 `RESPAN_RECORD_SESSION=1 python scenarios/09_multi_tab.py`. If the upload fails
