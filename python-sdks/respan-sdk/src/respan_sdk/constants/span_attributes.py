@@ -57,6 +57,8 @@ class RespanSpanAttributes(str, Enum):
 
     # Span links
     RESPAN_LINK_TIMESTAMP = "respan.link.timestamp"
+    # Why a span links to another one; values in RespanLinkType.
+    RESPAN_LINK_TYPE = "respan.link.type"
 
     # Logging
     LOG_METHOD = "respan.entity.log_method"
@@ -109,6 +111,18 @@ RESPAN_ENVIRONMENT = RespanSpanAttributes.RESPAN_ENVIRONMENT.value
 
 # Span links
 RESPAN_LINK_TIMESTAMP = RespanSpanAttributes.RESPAN_LINK_TIMESTAMP.value
+RESPAN_LINK_TYPE = RespanSpanAttributes.RESPAN_LINK_TYPE.value
+
+
+class RespanLinkType(str, Enum):
+    """Values of the ``respan.link.type`` link attribute."""
+
+    # A conversation turn's root links to the previous turn's root (one trace per turn).
+    PREVIOUS_TURN = "previous_turn"
+    # A sub-agent's root links to the tool call that spawned it.
+    SPAWNED_BY = "spawned_by"
+    # The first turn of a resumed session links to the last turn it resumed.
+    RESUMED_FROM = "resumed_from"
 
 # Logging
 RESPAN_LOG_METHOD = RespanSpanAttributes.LOG_METHOD.value

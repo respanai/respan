@@ -1,0 +1,7 @@
+{
+  "summary": "Add the respan.link.type span-link attribute (RESPAN_LINK_TYPE) and its values (previous_turn, spawned_by, resumed_from) used to link long agent sessions across traces.",
+  "packages": {
+    "respan-sdk": "patch",
+    "@respan/respan-sdk": "patch"
+  }
+}
