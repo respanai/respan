@@ -32,6 +32,6 @@
     "typescript": "^5.9.2"
   },
   "resolutions": {
-    "hono": "4.13.2"
+    "hono": "4.13.13"
   }
 }
