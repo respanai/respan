@@ -41,12 +41,14 @@ Before the first submission:
 1. **OpenAI org.** The submitter needs the Owner role (or a role with
    *Apps Management: Write*), and the organization must be verified in
    platform.openai.com → Settings → Organization.
-2. **MCP server.** `respanai/respan-mcp#25` must be deployed, so the tool names
-   in the test cases exist (#24, already deployed, added the tool annotations
-   OpenAI requires and the domain-verification endpoint).
+2. **MCP server.** The test cases name tools that `mcp.respan.ai` serves today.
+   If the server's tools change, update `tools_triggered` first (see below).
 3. **Reviewer account.** Create an email-and-password Respan login in the
    *Respan Demo* organization with no MFA. It goes in the dashboard's
-   **Review details**, never in this package.
+   **Review details**, never in this package. OAuth connects read-only by
+   default and every positive test case is read-only, so tell the reviewer
+   to sign in with email and password and leave "Also allow changes"
+   unchecked.
 4. **Fresh demo data.** The test cases look back 30 days. Run `respan demo`
    against the Respan Demo organization right before submitting (and before
    any resubmission) so the `demo.*` traces are recent.
