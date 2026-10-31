@@ -2,7 +2,6 @@
 // Checks chatgpt-plugin/ against OpenAI's plugin submission rules, then zips it
 // for upload at https://platform.openai.com/plugins.
 //
-//   node scripts/build-plugins.mjs          # refresh chatgpt-plugin/skills first
 //   node scripts/build-chatgpt-plugin.mjs   # check + write chatgpt-plugin/dist/respan-chatgpt-plugin.zip
 //   node scripts/build-chatgpt-plugin.mjs --check   # check only
 //
@@ -16,8 +15,10 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const pluginDir = join(here, '..', 'chatgpt-plugin');
 const zipPath = join(pluginDir, 'dist', 'respan-chatgpt-plugin.zip');
-// Only these go into the ZIP; README.md and dist/ stay out.
-const PACKAGE_ENTRIES = ['plugin.json', 'mcp.json', 'assets', 'skills'];
+// Only these go into the ZIP; README.md and dist/ stay out. The plugin is
+// MCP-only for now: skills can be added in a later version, but an MCP server
+// cannot be added to a plugin first published without one.
+const PACKAGE_ENTRIES = ['plugin.json', 'mcp.json', 'assets'];
 
 const errors = [];
 const check = (ok, message) => {
@@ -144,9 +145,6 @@ negative.forEach((testCase, i) => {
 check(isHttpsUrl(review.demo_recording_url ?? ''), 'review.demo_recording_url must be the https URL of the demo video');
 check(!('test_credentials' in review) && !('reviewer_instructions' in review), 'review: credentials go in the dashboard, not the ZIP');
 check(typeof openai.publication?.release_notes === 'string', 'publication.release_notes is required');
-
-// --- Skills ---
-check(existsSync(join(pluginDir, 'skills', 'respan', 'SKILL.md')), 'skills/respan/SKILL.md is missing; run node scripts/build-plugins.mjs');
 
 if (errors.length > 0) {
   console.error(`chatgpt-plugin is not ready to submit (${errors.length} problem${errors.length === 1 ? '' : 's'}):`);
