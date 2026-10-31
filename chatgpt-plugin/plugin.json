@@ -2,7 +2,7 @@
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "respan",
   "version": "1.0.0",
-  "description": "Respan for ChatGPT and Codex: inspect LLM logs and traces, track usage and errors, and manage prompts and monitors in your Respan workspace.",
+  "description": "Respan for ChatGPT and Codex: connects the hosted Respan MCP server to inspect LLM logs and traces, track usage and errors, and manage prompts and monitors in your Respan workspace.",
   "author": {
     "name": "Respan",
     "url": "https://respan.ai"
@@ -64,9 +64,9 @@
             },
             {
               "description": "Summarize usage and cost",
-              "prompt": "How much did my app spend on LLM calls in the last 30 days, and which model cost the most?",
-              "tools_triggered": "metrics_summary, metrics_grouped",
-              "expected_behavior": "Reports the test workspace's total requests, cost and tokens for the last 30 days, and ranks models by cost, naming the most expensive one."
+              "prompt": "How much did my app spend on LLM calls in the last 30 days, and how many requests did it make?",
+              "tools_triggered": "metric_summary",
+              "expected_behavior": "Reports the test workspace's total requests, cost and tokens for the last 30 days from Respan, without inventing numbers."
             },
             {
               "description": "Find flagged behaviors",
