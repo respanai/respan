@@ -265,7 +265,7 @@ No code changes needed — just change the model string. View all models at `htt
 
 #### Fallbacks
 
-A bare model name (`gpt-4o`) already fails over across the providers that serve it. To fall back to a different model, define a route for the model name in the gateway settings. A request that sends `fallback_models` is refused with a 400.
+A bare model name (`gpt-4o`) already fails over across the providers that serve it. To fall back to a different model, define a route for the model name in the gateway settings.
 
 #### Retries
 
