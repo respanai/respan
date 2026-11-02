@@ -513,7 +513,6 @@ const RespanParamsSchema = z.object({
   disable_fallback: z.boolean().optional().default(false),
   exclude_models: z.array(z.string()).optional(),
   exclude_providers: z.array(z.string()).optional(),
-  fallback_models: z.array(z.string()).optional(),
   load_balance_group: LoadBalanceGroupSchema.optional(),
   load_balance_models: z.array(LoadBalanceModelSchema).optional(),
   retry_params: RetryParamsSchema.optional(),

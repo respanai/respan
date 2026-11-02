@@ -31,7 +31,6 @@ export interface PromptVersion {
     reasoning_effort?: ReasoningEffortType;
     variables?: Record<string, any>;
     readonly?: boolean;
-    fallback_models?: string[];
     load_balance_models?: Record<string, any>[];
     tools?: Record<string, any>[];
     tool_choice?: ToolChoiceType | Record<string, any>;

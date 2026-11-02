@@ -263,19 +263,9 @@ No code changes needed — just change the model string. View all models at `htt
 
 ### Advanced Features
 
-#### Fallback Models
+#### Fallbacks
 
-Automatic failover if the primary model fails:
-
-```python
-response = client.chat.completions.create(
-    model="gpt-4o",
-    messages=[...],
-    extra_body={
-        "fallback_models": ["claude-sonnet-4-20250514", "gemini-2.0-flash"],
-    },
-)
-```
+A bare model name (`gpt-4o`) already fails over across the providers that serve it. To fall back to a different model, define a route for the model name in the gateway settings.
 
 #### Retries
 

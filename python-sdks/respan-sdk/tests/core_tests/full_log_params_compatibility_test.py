@@ -139,7 +139,6 @@ class TestFullLogParamsCompatibility:
             # Proxy options
             "disable_fallback": False,
             "exclude_models": ["bad_model"],
-            "fallback_models": ["backup_model"],
             
             # Dataset fields
             "dataset_id": "dataset_123",
