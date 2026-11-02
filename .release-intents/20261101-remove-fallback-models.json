@@ -1,0 +1,8 @@
+{
+  "summary": "Remove the retired fallback_models param; routes replace it",
+  "packages": {
+    "respan-sdk": "minor",
+    "@respan/respan-sdk": "minor",
+    "@respan/cli": "patch"
+  }
+}

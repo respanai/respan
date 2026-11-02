@@ -39,7 +39,6 @@ export interface DemoPromptVersion {
   stream?: boolean;
   thinking?: Record<string, unknown>;
   variables?: Record<string, unknown>;
-  fallback_models?: string[];
   load_balance_models?: Record<string, unknown>[];
   tools?: Record<string, unknown>[];
   tool_choice?: string | Record<string, unknown>;
@@ -92,9 +91,6 @@ export const DEMO_PROMPTS: DemoPromptFixture[] = [
       "variables": {
         "customer_message": ""
       },
-      "fallback_models": [
-        "openai/gpt-5.4"
-      ],
       "tools": [
         {
           "type": "function",

@@ -208,7 +208,6 @@ class RespanLogParams(PreprocessLogDataMixin, RespanBaseModel):
     disable_fallback: Optional[bool] = False
     exclude_models: Optional[List[str]] = None
     exclude_providers: Optional[List[str]] = None
-    fallback_models: Optional[List[str]] = None
     load_balance_group: Optional[LoadBalanceGroup] = None
     load_balance_models: Optional[List[LoadBalanceModel]] = None
     first_token_timeout: Optional[float] = None
