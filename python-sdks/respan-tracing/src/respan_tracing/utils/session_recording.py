@@ -384,6 +384,15 @@ class RecordingUpload:
     view_url: str
     events_url: Optional[str] = None
     expires_at: Optional[str] = None
+    # The player's stored reference (``respan://recordings/...html``). Spans
+    # keep this, never a signed link: Respan signs a fresh link on every read.
+    uri: Optional[str] = None
+
+    @property
+    def span_url(self) -> str:
+        """What a span stores: the reference, or the link from a backend
+        that predates references."""
+        return self.uri or self.view_url
 
 
 def _iso(moment: datetime) -> str:
@@ -449,6 +458,7 @@ def _upload_from(data: dict[str, Any]) -> RecordingUpload:
         view_url=str(data["view_url"]),
         events_url=data.get("events_url"),
         expires_at=data.get("expires_at"),
+        uri=data.get("uri"),
     )
 
 
@@ -664,7 +674,7 @@ def set_replay_metadata(span: Any, upload: Optional[RecordingUpload]) -> None:
     """Flat ``respan.metadata.session_replay_url`` / ``_id`` on the agent's root span."""
     if upload is None:
         return
-    span.set_attribute(f"{RESPAN_METADATA}.{SESSION_REPLAY_URL_METADATA_KEY}", upload.view_url)
+    span.set_attribute(f"{RESPAN_METADATA}.{SESSION_REPLAY_URL_METADATA_KEY}", upload.span_url)
     span.set_attribute(f"{RESPAN_METADATA}.{SESSION_REPLAY_ID_METADATA_KEY}", upload.recording_id)
 
 
@@ -697,7 +707,7 @@ class ReplayLinks:
     def url_at(self, t_ms: int) -> Optional[str]:
         if self.reservation is None:
             return None
-        return f"{self.reservation.view_url}{SEEK_FRAGMENT}{t_ms}"
+        return f"{self.reservation.span_url}{SEEK_FRAGMENT}{t_ms}"
 
     def stamp(self, span: Any, *, kind: str, label: str, t_ms: Optional[int] = None) -> Optional[dict]:
         if self.reservation is None:
