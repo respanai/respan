@@ -1,0 +1,6 @@
+{
+  "summary": "Skyvern tests: install without yutori, skip the baseline until it returns",
+  "packages": {
+    "respan-instrumentation-skyvern": "none"
+  }
+}

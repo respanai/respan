@@ -18,6 +18,11 @@ from typing import Any
 
 import httpx
 import pytest
+
+# Skyvern's in-process engine imports `yutori` at load time, and `yutori` was
+# removed from PyPI. Skip until it can be installed again (see tests/requirements.txt).
+pytest.importorskip("yutori", reason="skyvern's local engine needs yutori, removed from PyPI")
+
 from opentelemetry.semconv_ai import SpanAttributes
 from respan_instrumentation_skyvern import SkyvernInstrumentor
 from respan_instrumentation_skyvern._constants import ATTR_PAGE_URL, ATTR_PROMPT_NAME
