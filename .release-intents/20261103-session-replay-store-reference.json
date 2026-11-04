@@ -1,0 +1,7 @@
+{
+  "summary": "Session replay: spans store the recording reference, not a signed link",
+  "packages": {
+    "respan-tracing": "patch",
+    "respan-instrumentation-browser-use": "none"
+  }
+}

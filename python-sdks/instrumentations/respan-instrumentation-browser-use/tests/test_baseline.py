@@ -442,7 +442,7 @@ async def test_baseline_session_replay_is_recorded_masked_and_linked(pipeline, t
     recording_id = reservation.body["recording_id"]
     assert upload.body["recording_id"] == recording_id
     assert reservation.body["trace_id"] == upload.body["trace_id"]
-    assert root.attributes[REPLAY_URL_KEY] == f"{stub.view_url(recording_id)}#t=0"
+    assert root.attributes[REPLAY_URL_KEY] == f"{stub.uri(recording_id)}#t=0"
 
 
 def replay_offset(span: Any) -> int:
@@ -459,12 +459,12 @@ async def test_baseline_session_replay_links_every_span_at_its_moment(pipeline, 
     [reservation] = stub.reservations
     [upload] = stub.uploads
     recording_id = reservation.body["recording_id"]
-    view_url = stub.view_url(recording_id)
+    stored_uri = stub.uri(recording_id)
     assert_one_full_run(spans)
     # EVERY exported span of the recorded run opens the same replay ...
     for span in spans:
         assert span.attributes.get(REPLAY_ID_KEY) == recording_id, span.name
-        assert span.attributes[REPLAY_URL_KEY].startswith(f"{view_url}#t="), span.name
+        assert span.attributes[REPLAY_URL_KEY].startswith(f"{stored_uri}#t="), span.name
     names = {s.name for s in spans}
     assert {"browser_use.step", "browser_use.llm", "navigate", "input"} <= names, names
     # ... at the moment the span started: children never seek before their parent,
@@ -500,7 +500,7 @@ async def test_baseline_session_replay_without_reserve_links_only_the_root(
     assert "recording_id" not in upload.body
     assert "markers" not in upload.body
     recording_id = root.attributes[REPLAY_ID_KEY]
-    assert root.attributes[REPLAY_URL_KEY] == stub.view_url(recording_id)
+    assert root.attributes[REPLAY_URL_KEY] == stub.uri(recording_id)
     for span in spans:
         if span is not root:
             assert REPLAY_URL_KEY not in span.attributes, span.name

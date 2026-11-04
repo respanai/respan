@@ -43,6 +43,9 @@ class RecordingStub:
     def view_url(self, recording_id: str) -> str:
         return f"{self.base_url}/replays/{recording_id}.html"
 
+    def uri(self, recording_id: str) -> str:
+        return f"respan://recordings/org/trace/{recording_id}.html"
+
 
 @contextmanager
 def recording_stub_server(status: int = 201, reserve_status: int = 201) -> Iterator[RecordingStub]:
@@ -92,6 +95,7 @@ def recording_stub_server(status: int = 201, reserve_status: int = 201) -> Itera
             return {
                 "recording_id": recording_id,
                 "view_url": stub.view_url(recording_id),
+                "uri": stub.uri(recording_id),
                 "events_url": f"{stub.base_url}/replays/{recording_id}.json.gz",
                 "expires_at": "2099-01-01T00:00:00Z",
             }

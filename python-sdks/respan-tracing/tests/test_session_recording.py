@@ -211,6 +211,7 @@ async def test_upload_posts_the_contract_body_gzipped():
         )
     assert upload is not None
     assert upload.view_url == stub.view_url(upload.recording_id)
+    assert upload.uri == stub.uri(upload.recording_id)
     [sent] = stub.uploads
     assert sent.path == "/api/browser-sessions/recordings/"
     assert sent.headers["Authorization"] == "Bearer key-1"
@@ -299,6 +300,19 @@ async def test_nothing_recorded_uploads_nothing():
             is None
         )
     assert stub.uploads == []
+
+
+def test_spans_store_the_reference_not_the_signed_link():
+    span = TracerProvider().get_tracer("t").start_span("agent")
+    upload = session_recording.RecordingUpload(
+        "rid", "https://view/rid?sig=1", uri="respan://recordings/o/t/rid.html"
+    )
+    set_replay_metadata(span, upload)
+    assert span.attributes["respan.metadata.session_replay_url"] == "respan://recordings/o/t/rid.html"
+    links = ReplayLinks(datetime(2026, 1, 1, tzinfo=timezone.utc))
+    links.reservation = upload
+    assert links.url_at(5) == "respan://recordings/o/t/rid.html#t=5"
+    span.end()
 
 
 def test_replay_link_is_flat_respan_metadata():
