@@ -1,3 +1,70 @@
 # Test-only dependencies: the in-process Skyvern engine the baseline drives.
 # The package itself depends only on the base `skyvern` client.
-skyvern[local]>=1.0.56,<2.0.0
+#
+# This is skyvern 1.0.56's `local` extra listed out, minus `yutori`. Every
+# `skyvern[local]` release requires `yutori`, which was removed from PyPI, so
+# `skyvern[local]` cannot be installed. test_baseline.py skips while `yutori`
+# is missing. Go back to `skyvern[local]>=1.0.56,<2.0.0` once it installs again.
+aioboto3<15,>=14.3.0
+aiofiles<25,>=24.1.0
+aiohttp<4,>=3.14.3
+aiosqlite<0.23,>=0.21.0
+alembic<2,>=1.19.1
+anthropic<0.123,>=0.122.0
+asyncache<0.4,>=0.3.1
+asyncssh<3,>=2.14.2
+authlib>=1.7.2
+azure-identity<2,>=1.24.0
+azure-keyvault-secrets<5,>=4.11.1
+azure-storage-blob>=12.30.0
+beautifulsoup4<5,>=4.14.3
+croniter<4,>=1.3.8
+cryptography>=48.0.1
+curlparser<0.2,>=0.1.0
+email-validator<3,>=2.2.0
+fastapi<0.137,>=0.136.1
+filetype<2,>=1.2.0
+fuzzysearch<1,>=0.8
+google-auth-oauthlib<2,>=1.4.0
+google-auth<3,>=2.56.3
+google-cloud-aiplatform<2,>=1.164.0
+google-cloud-secret-manager<3,>=2.30.0
+google-cloud-storage<4,>=3.13.1
+greenlet==3.0.3; (python_version >= '3.11' and python_version < '3.12')
+greenlet>3.0.3; (python_version >= '3.12')
+jinja2<4,>=3.1.6
+json-repair<0.64,>=0.63.2
+json5<1,>=0.15.0
+jsonschema>=4.23.0
+lark<2,>=1.2.2
+libcst<2,>=1.9.0
+litellm>=1.85.0
+onepassword-sdk==0.4.1
+openai>=1.68.2
+opentelemetry-api<2,>=1.44.0
+pandas<4,>=3.0.5
+pdfplumber<0.12,>=0.11.10
+pillow>=12.3.0
+playwright==1.46.0; (python_version >= '3.11' and python_version < '3.12')
+playwright>1.46.0; (python_version >= '3.12')
+psutil>=7.0.0
+pyarrow<24,>=18.0.0
+pyasn1>=0.6.4
+pyjwt[crypto]<3,>=2.15.1
+pyotp<3,>=2.9.0
+pypdf<7,>=6.19.0
+python-calamine>=0.8.2
+python-docx>=1.1.0
+python-multipart<1,>=0.0.30
+requests-toolbelt<2,>=1.0.0
+sqlalchemy<3,>=2.0.29
+sse-starlette<4,>=3.4.8
+starlette-context<0.6,>=0.3.6
+starlette>=1.3.1
+tiktoken>=0.13.0
+tldextract<6,>=5.3.2
+toml<0.11,>=0.10.2
+tornado>=6.5.10
+urllib3>=2.8.0
+websockets<15.1,>=14.0
+zstandard>=0.25.0
