@@ -92,9 +92,8 @@ Cursor's two redirect URIs baked in
 `http://localhost:8787/callback` for desktop). The server validates redirect URIs
 against the ones sealed into the ID and rejects anything else.
 
-The Claude Code plugin still ships the API-key path (`userConfig.api_key`)
-because Claude Code prompts for secrets at install time; Cursor has no
-equivalent, and OAuth is the better flow anyway.
+The Claude Code plugin uses OAuth too, but needs no `auth` block: Claude Code
+starts OAuth from the `401` challenge on its own.
 
 ## Test locally
 
