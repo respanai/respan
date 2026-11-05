@@ -7,6 +7,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { tightenCredentialPermissions } from '../lib/config.js';
 
 // Resolve the v2/traces endpoint (OTLP JSON format)
 export function resolveTracesEndpoint(baseUrl?: string): string {
@@ -100,6 +101,8 @@ export function resolveCredentials(): Credentials | null {
   if (!apiKey) {
     const credsFile = path.join(os.homedir(), '.respan', 'credentials.json');
     if (fs.existsSync(credsFile)) {
+      // Hook-only users may never run the CLI again after logging in
+      tightenCredentialPermissions();
       try {
         const creds = JSON.parse(fs.readFileSync(credsFile, 'utf-8'));
         const configFile = path.join(os.homedir(), '.respan', 'config.json');

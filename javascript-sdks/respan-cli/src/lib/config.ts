@@ -5,6 +5,8 @@ import * as os from 'node:os';
 const CONFIG_DIR = path.join(os.homedir(), '.respan');
 const CREDENTIALS_FILE = path.join(CONFIG_DIR, 'credentials.json');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
+const CONFIG_DIR_MODE = 0o700;
+const CREDENTIALS_FILE_MODE = 0o600;
 
 export interface ApiKeyCredential {
   type: 'api_key';
@@ -27,10 +29,22 @@ export interface Config {
   defaults?: Record<string, string>;
 }
 
-function ensureConfigDir(): void {
-  if (!fs.existsSync(CONFIG_DIR)) {
-    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+// Removes group and other access, keeping the owner's bits. Best-effort: a path
+// we can't chmod (another owner, read-only mount) must stay usable, and Windows
+// doesn't map these modes to ACLs.
+function restrictToOwner(target: string): void {
+  if (process.platform === 'win32') return;
+  try {
+    const mode = fs.statSync(target).mode & 0o777;
+    if (mode & 0o077) fs.chmodSync(target, mode & 0o700);
+  } catch {
+    // Missing, or not ours to change
   }
+}
+
+function ensureConfigDir(): void {
+  fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: CONFIG_DIR_MODE });
+  restrictToOwner(CONFIG_DIR);
 }
 
 function readJson<T>(filePath: string, fallback: T): T {
@@ -43,14 +57,28 @@ function readJson<T>(filePath: string, fallback: T): T {
   }
 }
 
-function writeJson(filePath: string, data: unknown): void {
+function writeJson(filePath: string, data: unknown, mode: number = 0o666): void {
   ensureConfigDir();
-  fs.writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n', 'utf-8');
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n', { encoding: 'utf-8', mode });
 }
 
 // --- Credentials ---
 
+// Tightens files written by older CLI versions, which used the default modes.
+export function tightenCredentialPermissions(): void {
+  restrictToOwner(CONFIG_DIR);
+  restrictToOwner(CREDENTIALS_FILE);
+}
+
+function writeCredentials(creds: Record<string, Credential>): void {
+  // writeFileSync's mode only applies when it creates the file, so tighten an
+  // existing one first: new secrets must not land in a world-readable file.
+  restrictToOwner(CREDENTIALS_FILE);
+  writeJson(CREDENTIALS_FILE, creds, CREDENTIALS_FILE_MODE);
+}
+
 export function getAllCredentials(): Record<string, Credential> {
+  tightenCredentialPermissions();
   return readJson<Record<string, Credential>>(CREDENTIALS_FILE, {});
 }
 
@@ -63,7 +91,7 @@ export function getCredential(profile?: string): Credential | undefined {
 export function setCredential(profile: string, credential: Credential): void {
   const creds = getAllCredentials();
   creds[profile] = credential;
-  writeJson(CREDENTIALS_FILE, creds);
+  writeCredentials(creds);
   // Set active profile if this is the first credential
   const config = getConfig();
   if (!config.activeProfile) {
@@ -74,7 +102,7 @@ export function setCredential(profile: string, credential: Credential): void {
 export function deleteCredential(profile: string): void {
   const creds = getAllCredentials();
   delete creds[profile];
-  writeJson(CREDENTIALS_FILE, creds);
+  writeCredentials(creds);
 }
 
 // --- Config ---
