@@ -37,9 +37,14 @@ import {
   type Context,
   type HrTime,
 } from "@opentelemetry/api";
-import { hrTime } from "@opentelemetry/core";
+import {
+  hrTime,
+  hrTimeDuration,
+  hrTimeToSeconds,
+} from "@opentelemetry/core";
 import type { ReadableSpan } from "@opentelemetry/sdk-trace-base";
 import {
+  ATTR_GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK,
   ATTR_GEN_AI_TOOL_CALL_ID,
   ATTR_GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
@@ -1312,6 +1317,12 @@ export class PiSessionTracer {
         pending.startTime,
         pending.firstTokenTime,
       );
+      const firstChunkSeconds = hrTimeToSeconds(
+        hrTimeDuration(pending.startTime, pending.firstTokenTime),
+      );
+      if (firstChunkSeconds > 0) {
+        attrs[ATTR_GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK] = firstChunkSeconds;
+      }
     }
     // pi emits turn_start before the LLM call, so the turn current at message_end
     // is this response's turn (the pending value covers dangling calls).

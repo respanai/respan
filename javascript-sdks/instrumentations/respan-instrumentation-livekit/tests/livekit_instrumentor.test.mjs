@@ -257,6 +257,7 @@ test("real OTel 2 merges a direct llm_request into llm_node and preserves retry 
     assert.equal(chat.attributes["gen_ai.usage.completion_tokens"], 4);
     assert.equal(chat.attributes["llm.usage.total_tokens"], 16);
     assert.equal(chat.attributes["gen_ai.usage.cache_read.input_tokens"], 2);
+    assert.equal(chat.attributes["gen_ai.response.time_to_first_chunk"], 0.125);
     const chatMetadata = JSON.parse(
       chat.attributes[RespanSpanAttributes.RESPAN_METADATA],
     );
@@ -348,7 +349,53 @@ test("standalone llm_request remains a chat without metrics-as-output or empty c
     assert.equal(exported.attributes["traceloop.entity.output"], undefined);
     assert.equal(exported.attributes["gen_ai.completion.0.role"], undefined);
     assert.equal(exported.attributes["gen_ai.completion.0.content"], undefined);
+    assert.equal(
+      exported.attributes["gen_ai.response.time_to_first_chunk"],
+      undefined,
+    );
     assertNoRawLiveKitAttributes(exported);
+  } finally {
+    instrumentor.deactivate();
+    await harness.provider.shutdown();
+  }
+});
+
+test("standalone llm_request converts metrics ttftMs to time_to_first_chunk seconds", async () => {
+  const harness = createOTel2Harness("legacy");
+  const instrumentor = createInstrumentor();
+  await instrumentor.activate();
+
+  try {
+    for (const [model, ttftMs] of [
+      ["streamed-model", 250],
+      ["no-chunk-model", -1],
+    ]) {
+      const request = harness.tracer.startSpan("llm_request", {
+        attributes: {
+          "gen_ai.provider.name": "livekit",
+          "gen_ai.request.model": model,
+          "lk.llm_metrics": JSON.stringify({
+            ttftMs,
+            metadata: { modelProvider: "livekit", modelName: model },
+          }),
+        },
+      });
+      request.end();
+    }
+
+    const [streamed, noChunk] = harness.exporter
+      .getFinishedSpans()
+      .filter((span) => span.attributes["gen_ai.request.model"] !== undefined);
+    assert.equal(streamed.attributes["gen_ai.request.model"], "streamed-model");
+    assert.equal(
+      streamed.attributes["gen_ai.response.time_to_first_chunk"],
+      0.25,
+    );
+    assert.equal(noChunk.attributes["gen_ai.request.model"], "no-chunk-model");
+    assert.equal(
+      noChunk.attributes["gen_ai.response.time_to_first_chunk"],
+      undefined,
+    );
   } finally {
     instrumentor.deactivate();
     await harness.provider.shutdown();

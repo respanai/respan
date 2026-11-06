@@ -40,6 +40,7 @@ export const AI_RESPONSE_OBJECT = "ai.response.object";
 export const AI_RESPONSE_TEXT = "ai.response.text";
 export const AI_RESPONSE_TOOL_CALLS = "ai.response.toolCalls";
 export const AI_RESPONSE_MS_TO_FINISH = "ai.response.msToFinish";
+export const AI_RESPONSE_MS_TO_FIRST_CHUNK = "ai.response.msToFirstChunk";
 export const AI_USAGE_PROMPT_TOKENS = "ai.usage.promptTokens";
 export const AI_USAGE_COMPLETION_TOKENS = "ai.usage.completionTokens";
 export const AI_USAGE_INPUT_TOKENS = "ai.usage.inputTokens";

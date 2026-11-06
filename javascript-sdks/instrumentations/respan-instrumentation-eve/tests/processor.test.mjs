@@ -182,6 +182,38 @@ test("maps legacy AI SDK token aliases into canonical usage totals", () => {
   assertNoOffContractAliases(attrs);
 });
 
+test("emits gen_ai.response.time_to_first_chunk in seconds on AI SDK 7 chat spans", () => {
+  const attrs = translate("chat openai/gpt-4.1", {
+    "gen_ai.operation.name": "chat",
+    "gen_ai.provider.name": "openai",
+    "gen_ai.request.model": "gpt-4.1",
+    "gen_ai.client.operation.time_to_first_chunk": 0.42,
+  });
+
+  assert.equal(attrs["respan.entity.log_type"], "text");
+  assert.equal(attrs["gen_ai.response.time_to_first_chunk"], 0.42);
+});
+
+test("converts legacy msToFirstChunk to seconds and skips non-positive values", () => {
+  const streamed = translate("ai.streamText.doStream", {
+    "ai.model.id": "gpt-4o-mini",
+    "ai.model.provider": "openai.chat",
+    "ai.response.text": "world",
+    "ai.response.msToFirstChunk": 300,
+    "ai.response.msToFinish": 900,
+  });
+  assert.equal(streamed["gen_ai.response.time_to_first_chunk"], 0.3);
+  assertRawVendorAttrsStripped(streamed);
+
+  const zero = translate("ai.streamText.doStream", {
+    "ai.model.id": "gpt-4o-mini",
+    "ai.model.provider": "openai.chat",
+    "ai.response.text": "world",
+    "ai.response.msToFirstChunk": 0,
+  });
+  assert.equal(zero["gen_ai.response.time_to_first_chunk"], undefined);
+});
+
 test("maps legacy embedding input, vector, and model while stripping raw aliases", () => {
   const attrs = translate("ai.embed.doEmbed", {
     "ai.model.id": "text-embedding-3-small",

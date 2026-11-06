@@ -6,6 +6,7 @@ import test from "node:test";
 import { BasicTracerProvider } from "@opentelemetry/sdk-trace-base";
 import { ROOT_CONTEXT, context, trace } from "@opentelemetry/api";
 import {
+  ATTR_GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK,
   ATTR_GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
 } from "@opentelemetry/semantic-conventions/incubating";
@@ -218,6 +219,8 @@ const assistantFinal = {
   timestamp: 4,
 };
 
+const FIRST_CHUNK_DELAY_MS = 5;
+
 async function replayRun(
   pi,
   ctx,
@@ -248,6 +251,8 @@ async function replayRun(
     { message: { ...assistantWithTool, content: [], stopReason: "pending" } },
     ctx,
   );
+  // A measurable gap so the first-chunk latency is strictly positive.
+  await new Promise((resolve) => setTimeout(resolve, FIRST_CHUNK_DELAY_MS));
   await pi.emit(
     "message_update",
     {
@@ -740,6 +745,17 @@ test("extension replay emits canonical agent/chat/tool spans", async () => {
   assert.equal(metadata(chat1)["reasoning_tokens"], 1);
   assert.equal(metadata(chat1)["estimated_cost_usd"], 0.01);
   assert.equal(typeof metadata(chat1)["time_to_first_token_ms"], "number");
+  // OTel GenAI `gen_ai.response.time_to_first_chunk` is the same latency in
+  // seconds (unrounded; the metadata value is whole milliseconds).
+  const firstChunkSeconds =
+    chat1.attributes[ATTR_GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK];
+  assert.equal(typeof firstChunkSeconds, "number");
+  // Positive, not >= the replay's delay: timers fire with millisecond
+  // granularity, so the measured gap can land just under it on CI.
+  assert.ok(firstChunkSeconds > 0 && Number.isFinite(firstChunkSeconds));
+  assert.ok(
+    Math.abs(firstChunkSeconds * 1000 - metadata(chat1)["time_to_first_token_ms"]) <= 0.5,
+  );
   assert.equal(metadata(chat1)["stop_reason"], "toolUse");
   assert.equal(metadata(chat1)["response_id"], "resp-1");
   assert.equal(metadata(chat1)["turn_index"], 0);
@@ -777,6 +793,10 @@ test("extension replay emits canonical agent/chat/tool spans", async () => {
   assert.equal(chat2.attributes[ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS], 0);
   assert.equal(chat2.attributes["llm.usage.total_tokens"], 11);
   assert.equal(metadata(chat2)["time_to_first_token_ms"], undefined);
+  assert.equal(
+    chat2.attributes[ATTR_GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK],
+    undefined,
+  );
   assert.equal(metadata(chat2)["turn_index"], 1);
   const chat2Input = JSON.parse(chat2.attributes["traceloop.entity.input"]);
   assert.equal(chat2Input.length, 2);

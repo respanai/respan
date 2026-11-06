@@ -13,6 +13,7 @@ import {
   ATTR_GEN_AI_OPERATION_NAME,
   ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
   ATTR_GEN_AI_PROVIDER_NAME,
+  ATTR_GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK,
   ATTR_GEN_AI_USAGE_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_OUTPUT_TOKENS,
 } from "@opentelemetry/semantic-conventions/incubating";
@@ -504,6 +505,24 @@ function addChatAttributes(
       attrs,
       ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
       cachedTokens,
+    );
+  }
+  // llm_node spans carry lk.response.ttft in seconds; llm_request spans carry
+  // lk.llm_metrics.ttftMs in milliseconds (-1 when no chunk arrived).
+  const ttftMs = asNumber(metrics?.ttftMs);
+  const firstChunkSeconds =
+    numberAttr(attrs, LK_RESPONSE_TTFT) ??
+    (ttftMs !== undefined ? ttftMs / 1000 : undefined);
+  if (
+    firstChunkSeconds !== undefined &&
+    firstChunkSeconds > 0 &&
+    attrs[ATTR_GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK] === undefined
+  ) {
+    setAttr(
+      span,
+      attrs,
+      ATTR_GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK,
+      firstChunkSeconds,
     );
   }
 

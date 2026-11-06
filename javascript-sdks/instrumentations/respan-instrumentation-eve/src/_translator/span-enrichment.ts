@@ -6,6 +6,7 @@ import {
   ATTR_GEN_AI_REQUEST_MODEL,
   ATTR_GEN_AI_RESPONSE_FINISH_REASONS,
   ATTR_GEN_AI_RESPONSE_ID,
+  ATTR_GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK,
   ATTR_GEN_AI_SYSTEM,
   ATTR_GEN_AI_SYSTEM_INSTRUCTIONS,
   ATTR_GEN_AI_TOOL_CALL_ID,
@@ -13,11 +14,13 @@ import {
   ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_OUTPUT_TOKENS,
+  METRIC_GEN_AI_CLIENT_OPERATION_TIME_TO_FIRST_CHUNK,
 } from "@opentelemetry/semantic-conventions/incubating";
 import { RespanLogType, RespanSpanAttributes } from "@respan/respan-sdk";
 import { SpanAttributes as TraceloopSpanAttributes } from "@traceloop/ai-semantic-conventions";
 import {
   AI_RESPONSE_MS_TO_FINISH,
+  AI_RESPONSE_MS_TO_FIRST_CHUNK,
   AI_PREFIX,
   AI_MODEL_PROVIDER,
   AI_TELEMETRY_METADATA_PREFIX,
@@ -288,6 +291,20 @@ export function enrichPerformanceMetrics(
       attrs,
       "time_to_first_token",
       String(Number(msToFinish) / 1000),
+    );
+  }
+
+  // AI SDK model spans carry first-chunk latency as the GenAI client metric
+  // (seconds) or as ai.response.msToFirstChunk (milliseconds).
+  const msToFirstChunk = numberAttr(attrs[AI_RESPONSE_MS_TO_FIRST_CHUNK]);
+  const firstChunkSeconds =
+    numberAttr(attrs[METRIC_GEN_AI_CLIENT_OPERATION_TIME_TO_FIRST_CHUNK]) ??
+    (msToFirstChunk !== undefined ? msToFirstChunk / 1000 : undefined);
+  if (firstChunkSeconds !== undefined && firstChunkSeconds > 0) {
+    setDefault(
+      attrs,
+      ATTR_GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK,
+      firstChunkSeconds,
     );
   }
 
