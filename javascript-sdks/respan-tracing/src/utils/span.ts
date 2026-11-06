@@ -6,6 +6,10 @@ import {
   RESPAN_SPAN_ATTRIBUTES_MAP,
 } from "@respan/respan-sdk";
 import { metadataAttributeKey, LOG_PREFIX_DEBUG, LOG_PREFIX_WARN } from "../constants/index.js";
+import {
+  setTimeToFirstTokenAttribute,
+  timeToFirstTokenParam,
+} from "./timeToFirstToken.js";
 
 // Global tracer instance (singleton)
 let _tracer: Tracer;
@@ -152,6 +156,8 @@ const setRespanAttributes = (
       // Use original params if validation fails, but continue processing
       validatedParams = respanParams;
     }
+
+    setTimeToFirstTokenAttribute(span, timeToFirstTokenParam(respanParams));
 
     // Set attributes based on the imported mapping
     Object.entries(validatedParams).forEach(([key, value]) => {

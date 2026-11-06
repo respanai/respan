@@ -10,6 +10,7 @@ from respan_sdk.respan_types.span_types import SpanLink
 from respan_sdk.respan_types.param_types import RespanParams
 from pydantic import ValidationError
 
+from respan_tracing.contexts.span import set_time_to_first_token_attribute
 from respan_tracing.core.tracer import RespanTracer
 from respan_tracing.processors import SpanBuffer
 from respan_tracing.processors.base import _active_span_buffer
@@ -136,11 +137,11 @@ class RespanClient:
     ):
         """Set Respan-specific attributes on a span."""
         try:
-            # Validate parameters
+            remaining_params = set_time_to_first_token_attribute(span, respan_params)
             validated_params = (
-                respan_params 
-                if isinstance(respan_params, RespanParams) 
-                else RespanParams.model_validate(respan_params)
+                remaining_params
+                if isinstance(remaining_params, RespanParams)
+                else RespanParams.model_validate(remaining_params)
             )
             
             # Set attributes based on the mapping

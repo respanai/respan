@@ -71,6 +71,10 @@ class RespanSpanAttributes(str, Enum):
     # carrying its own usage.
     GATEWAY_LOG_ID = "respan.gateway.log_id"
 
+    # Bare (unprefixed) keys the backend reads straight into a log column.
+    # Time to first token, in seconds, on any span kind.
+    TIME_TO_FIRST_TOKEN = "time_to_first_token"
+
 
 # ---------------------------------------------------------------------------
 # Flat convenience aliases (avoid .value boilerplate in SDK code)
@@ -118,6 +122,9 @@ RESPAN_LOG_PARENT_ID = RespanSpanAttributes.LOG_PARENT_ID.value
 RESPAN_LOG_ROOT_ID = RespanSpanAttributes.LOG_ROOT_ID.value
 RESPAN_LOG_SOURCE = RespanSpanAttributes.LOG_SOURCE.value
 RESPAN_GATEWAY_LOG_ID = RespanSpanAttributes.GATEWAY_LOG_ID.value
+
+# Bare backend column keys
+TIME_TO_FIRST_TOKEN = RespanSpanAttributes.TIME_TO_FIRST_TOKEN.value
 
 # ---------------------------------------------------------------------------
 # Mapping: user-facing kwargs → span attribute keys

@@ -52,6 +52,10 @@ export enum RespanSpanAttributes {
     // a link only and reports no usage or content of its own.
     RESPAN_GATEWAY_LOG_ID = "respan.gateway.log_id",
 
+    // Bare (unprefixed) keys the backend reads straight into a log column.
+    // Time to first token, in seconds, on any span kind.
+    TIME_TO_FIRST_TOKEN = "time_to_first_token",
+
     // Respan metadata attributes (agent-specific)
     RESPAN_METADATA_AGENT_NAME = "respan.metadata.agent_name",
     RESPAN_METADATA_FROM_AGENT = "respan.metadata.from_agent",

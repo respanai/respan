@@ -1,5 +1,9 @@
 import { trace, context, AttributeValue } from '@opentelemetry/api';
 import { RespanParams, RESPAN_SPAN_ATTRIBUTES_MAP } from '@respan/respan-sdk';
+import {
+    setTimeToFirstTokenAttribute,
+    timeToFirstTokenParam,
+} from '../utils/timeToFirstToken.js';
 
 /**
  * A context manager for setting Respan-specific attributes on the current span
@@ -21,6 +25,8 @@ export async function withRespanSpanAttributes<T>(
 
     // Set attributes first, but don't let errors block execution
     try {
+        setTimeToFirstTokenAttribute(currentSpan, timeToFirstTokenParam(params));
+
         Object.entries(params).forEach(([key, value]) => {
             if (key in RESPAN_SPAN_ATTRIBUTES_MAP && key !== "metadata") {
                 try {

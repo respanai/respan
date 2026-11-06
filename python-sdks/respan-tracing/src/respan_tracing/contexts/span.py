@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import logging
+import math
 from typing import Any, Dict, List, Optional, Union
 from opentelemetry import trace, context as context_api
 from opentelemetry.trace.span import Span
@@ -24,10 +25,70 @@ from respan_tracing.utils.logging import get_respan_logger
 
 from respan_tracing.constants.generic_constants import LOGGER_NAME_SPAN
 from respan_tracing.constants.context_constants import PENDING_SPAN_LINKS_KEY
+from respan_tracing.constants.tracing import TIME_TO_FIRST_TOKEN_ATTR
 
 __all__ = ["SpanLink", "span_link_to_otel", "span_to_link", "respan_span_attributes", "attach_span_links"]
 
 logger = get_respan_logger(LOGGER_NAME_SPAN)
+
+# respan_params keys that carry time to first token, in seconds. ``ttft`` wins
+# when both are given, matching how RespanParams maps the alias.
+TTFT_PARAM_KEY = "ttft"
+TIME_TO_FIRST_TOKEN_PARAM_KEYS = (TTFT_PARAM_KEY, TIME_TO_FIRST_TOKEN_ATTR)
+
+
+def _time_to_first_token_seconds(value: Any) -> Optional[float]:
+    """Return ``value`` as finite, non-negative seconds, or None if it is not one."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    return seconds
+
+
+def set_time_to_first_token_attribute(
+    span: Span, respan_params: Union[Dict[str, Any], RespanParams]
+) -> Union[Dict[str, Any], RespanParams]:
+    """Set the bare ``time_to_first_token`` span attribute from respan_params.
+
+    The value is not in RESPAN_SPAN_ATTRIBUTES_MAP (it must not propagate to
+    child spans), so it is handled here. An invalid value is dropped with a
+    warning instead of failing validation for the other params.
+
+    Returns:
+        The params still to be validated and mapped, without the TTFT keys.
+    """
+    if isinstance(respan_params, RespanParams):
+        raw_value = respan_params.time_to_first_token
+        remaining_params: Union[Dict[str, Any], RespanParams] = respan_params
+    else:
+        raw_value = next(
+            (
+                respan_params[key]
+                for key in TIME_TO_FIRST_TOKEN_PARAM_KEYS
+                if key in respan_params
+            ),
+            None,
+        )
+        remaining_params = {
+            key: value
+            for key, value in respan_params.items()
+            if key not in TIME_TO_FIRST_TOKEN_PARAM_KEYS
+        }
+
+    if raw_value is None:
+        return remaining_params
+
+    seconds = _time_to_first_token_seconds(raw_value)
+    if seconds is None:
+        logger.warning(
+            f"Ignoring {TIME_TO_FIRST_TOKEN_ATTR}={raw_value!r}: "
+            "expected a finite, non-negative number of seconds"
+        )
+    else:
+        span.set_attribute(TIME_TO_FIRST_TOKEN_ATTR, seconds)
+    return remaining_params
 
 
 def span_link_to_otel(link: SpanLink) -> trace.Link:
@@ -160,11 +221,11 @@ def respan_span_attributes(respan_params: Union[Dict[str, Any], RespanParams]):
         return
 
     try:
-        # Keep your original validation
+        remaining_params = set_time_to_first_token_attribute(current_span, respan_params)
         validated_params = (
-            respan_params 
-            if isinstance(respan_params, RespanParams) 
-            else RespanParams.model_validate(respan_params)
+            remaining_params
+            if isinstance(remaining_params, RespanParams)
+            else RespanParams.model_validate(remaining_params)
         )
         
         for key, value in validated_params.model_dump(mode="json").items():

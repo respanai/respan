@@ -362,6 +362,17 @@ await kai.withTask({ name: 'process_data' }, async () => {
 - `getTracer()` - Get the tracer for manual span creation
 - `flush()` - Force flush all pending spans
 
+**Time to first token:** report a streaming call's time to first token as a
+Respan param, in seconds (`ttft` is an alias). Do not put it in `metadata`:
+metadata is not read into the TTFT column.
+
+```typescript
+getClient().updateCurrentSpan({ respanParams: { timeToFirstToken: 0.42 } });
+```
+
+The value must be a finite, non-negative number of seconds; anything else is
+ignored with a warning.
+
 ### Multi-Processor Routing
 
 Route spans to different destinations based on processor names:
