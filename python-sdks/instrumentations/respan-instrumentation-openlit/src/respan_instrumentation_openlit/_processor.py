@@ -671,6 +671,7 @@ def _private_attributes(attrs):
         TLSpanAttributes.LLM_USAGE_CACHE_READ_INPUT_TOKENS,
         TLSpanAttributes.LLM_USAGE_CACHE_CREATION_INPUT_TOKENS,
         TLSpanAttributes.LLM_USAGE_REASONING_TOKENS,
+        GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK,
         "http.response.status_code",
     }
     kept = {

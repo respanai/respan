@@ -70,3 +70,18 @@ def test_span_without_server_ttft_gets_no_time_to_first_chunk() -> None:
     attrs = _translate(_openlit_chat_attributes())
 
     assert TIME_TO_FIRST_CHUNK not in attrs
+
+
+def test_server_ttft_survives_private_mode() -> None:
+    span = FakeSpan(_openlit_chat_attributes(**{SERVER_TTFT: 0.31}))
+    translate_openlit_span(span, capture_content=False)
+
+    assert span._attributes[TIME_TO_FIRST_CHUNK] == 0.31
+    assert SERVER_TTFT not in span._attributes
+
+
+def test_sender_time_to_first_chunk_survives_private_mode() -> None:
+    span = FakeSpan(_openlit_chat_attributes(**{TIME_TO_FIRST_CHUNK: 0.2}))
+    translate_openlit_span(span, capture_content=False)
+
+    assert span._attributes[TIME_TO_FIRST_CHUNK] == 0.2
