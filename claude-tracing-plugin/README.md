@@ -12,7 +12,7 @@ install the separate `respan` plugin. It doesn't send your sessions anywhere.
 ## Install
 
 ```bash
-claude plugin marketplace add respanai/respan
+claude plugin marketplace add respanai/claude-plugins
 claude plugin install session-traces@respan
 ```
 
@@ -69,5 +69,7 @@ claude plugin validate ./claude-tracing-plugin --strict
 ```
 
 `claude --plugin-dir ./claude-tracing-plugin` doesn't prompt for the API key, and without one
-the mod doesn't load. To test the real flow, run `claude plugin marketplace add ./` from the
-repo root, then follow [Install](#install).
+the mod doesn't load. Users install the plugin through
+[respanai/claude-plugins](https://github.com/respanai/claude-plugins), which points at this
+directory on `main`. To release a change, merge it with a higher `version` in
+`.claude-plugin/plugin.json`.
