@@ -18,6 +18,13 @@ export const LOG_PREFIX_ERROR = "[Respan Error]" as const;
 export const LOG_PREFIX_WARN = "[Respan Warning]" as const;
 
 /**
+ * Bare backend column key for time to first token, in seconds. Mirrors
+ * RespanSpanAttributes.TIME_TO_FIRST_TOKEN in @respan/respan-sdk; restated here
+ * so this package works on its released @respan/respan-sdk floor.
+ */
+export const TIME_TO_FIRST_TOKEN_ATTR = "time_to_first_token" as const;
+
+/**
  * Build a fully-qualified metadata attribute key.
  * Single source of truth for the `respan.metadata.<key>` pattern
  * used in span attributes across the SDK.

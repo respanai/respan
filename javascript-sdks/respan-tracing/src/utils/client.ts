@@ -2,6 +2,7 @@ import { trace, context, SpanStatusCode, Tracer } from "@opentelemetry/api";
 import { ReadableSpan } from "@opentelemetry/sdk-trace-base";
 import { RespanSpanAttributes } from "@respan/respan-sdk";
 import { metadataAttributeKey, LOG_PREFIX, LOG_PREFIX_WARN } from "../constants/index.js";
+import { setTimeToFirstTokenAttribute } from "./timeToFirstToken.js";
 
 /**
  * Options for updating a span
@@ -24,6 +25,10 @@ export interface UpdateSpanOptions {
     traceGroupIdentifier?: string;
     /** Additional metadata */
     metadata?: Record<string, any>;
+    /** Time to first token, in seconds */
+    timeToFirstToken?: number;
+    /** Alias of timeToFirstToken (seconds); wins when both are given */
+    ttft?: number;
   };
 }
 
@@ -185,7 +190,13 @@ class RespanClientImpl implements RespanClient {
 
     // Update Respan-specific parameters
     if (options.respanParams) {
-      const { customerIdentifier, traceGroupIdentifier, metadata } = options.respanParams;
+      const { customerIdentifier, traceGroupIdentifier, metadata, timeToFirstToken, ttft } =
+        options.respanParams;
+
+      setTimeToFirstTokenAttribute(
+        currentSpan,
+        ttft !== undefined ? ttft : timeToFirstToken
+      );
 
       if (customerIdentifier) {
         currentSpan.setAttribute(RespanSpanAttributes.RESPAN_CUSTOMER_PARAMS_ID, customerIdentifier);

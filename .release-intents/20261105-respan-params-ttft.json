@@ -1,0 +1,9 @@
+{
+  "summary": "Map respan_params time_to_first_token / ttft to the bare time_to_first_token span attribute (seconds) instead of silently dropping it",
+  "packages": {
+    "respan-sdk": "patch",
+    "respan-tracing": "patch",
+    "@respan/respan-sdk": "patch",
+    "@respan/tracing": "patch"
+  }
+}

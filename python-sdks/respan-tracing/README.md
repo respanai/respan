@@ -1360,6 +1360,17 @@ result = process_data("user-123", {"key": "value"})
 
 See [`examples/simple_span_updating_example.py`](examples/simple_span_updating_example.py) for a complete example.
 
+**Time to first token:** report a streaming call's time to first token as a
+respan param, in seconds (`ttft` is an alias). Do not put it in `metadata`:
+metadata is not read into the TTFT column.
+
+```python
+get_client().update_current_span(respan_params={"time_to_first_token": 0.42})
+```
+
+The value must be a finite, non-negative number of seconds; anything else is
+ignored with a warning.
+
 ### Flushing Spans
 
 When batching is enabled (`is_batching_enabled=True`, the default), spans are exported in the background on a periodic schedule. In most cases this is transparent — the SDK registers an `atexit` handler that flushes remaining spans when the process exits.
