@@ -1,0 +1,6 @@
+{
+  "summary": "Keep OpenLIT's gen_ai.server.time_to_first_token as gen_ai.response.time_to_first_chunk (seconds) instead of stripping it",
+  "packages": {
+    "respan-instrumentation-openlit": "patch"
+  }
+}

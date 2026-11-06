@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -39,6 +40,7 @@ from respan_sdk.constants.span_attributes import (
 )
 
 from respan_instrumentation_openlit._constants import (
+    GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK,
     OFF_CONTRACT_ALIASES,
     OPENLIT_INSTRUMENTATION_NAME,
     OPENLIT_OPERATION_LOG_TYPES,
@@ -340,6 +342,20 @@ def _set_usage(attrs):
         attrs.pop(TLSpanAttributes.LLM_USAGE_TOTAL_TOKENS, None)
 
 
+def _set_time_to_first_chunk(attrs: dict[str, Any]) -> None:
+    """Keep OpenLIT's server-side TTFT (seconds) as the standard GenAI attr.
+
+    A sender-provided time_to_first_chunk always wins; the OpenLIT source
+    attribute itself is still stripped with the other vendor-only fields.
+    """
+
+    if GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK in attrs:
+        return
+    value = attrs.get(SemanticConvention.GEN_AI_SERVER_TTFT)
+    if type(value) in (int, float) and math.isfinite(value) and value > 0:
+        attrs[GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK] = value
+
+
 def _clear_synthetic_usage(attrs):
     for key in list(attrs):
         if key.startswith(("gen_ai.usage.", "llm.usage.")):
@@ -470,6 +486,7 @@ def translate_openlit_span(span: ReadableSpan, *, capture_content: bool) -> bool
 
     if _is_truthy(attrs.get("gen_ai.request.stream")):
         attrs[TLSpanAttributes.LLM_IS_STREAMING] = True
+    _set_time_to_first_chunk(attrs)
 
     operation = safe_text(attrs.get(GEN_AI_OPERATION_NAME), limit=128).lower()
     if log_type in {"chat", "text"}:
