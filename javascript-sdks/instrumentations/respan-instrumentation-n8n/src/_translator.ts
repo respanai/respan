@@ -14,6 +14,7 @@ import {
   ATTR_GEN_AI_RESPONSE_FINISH_REASONS,
   ATTR_GEN_AI_RESPONSE_ID,
   ATTR_GEN_AI_RESPONSE_MODEL,
+  ATTR_GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK,
   ATTR_GEN_AI_SYSTEM,
   ATTR_GEN_AI_TOOL_CALL_ARGUMENTS,
   ATTR_GEN_AI_TOOL_CALL_ID,
@@ -55,6 +56,7 @@ const AI_PROMPT_MESSAGES = "ai.prompt.messages";
 const AI_PROMPT_TOOLS = "ai.prompt.tools";
 const AI_RESPONSE_TEXT = "ai.response.text";
 const AI_RESPONSE_TOOL_CALLS = "ai.response.toolCalls";
+const AI_RESPONSE_MS_TO_FIRST_CHUNK = "ai.response.msToFirstChunk";
 const AI_USAGE_INPUT_TOKENS = "ai.usage.inputTokens";
 const AI_USAGE_OUTPUT_TOKENS = "ai.usage.outputTokens";
 const AI_USAGE_TOTAL_TOKENS = "ai.usage.totalTokens";
@@ -456,6 +458,10 @@ function enrichAiSdkLlmAttributes(attrs: MutableAttributes): void {
   if (responseId) setDefault(attrs, ATTR_GEN_AI_RESPONSE_ID, responseId);
   const responseModel = stringAttr(attrs, "ai.response.model");
   if (responseModel) setDefault(attrs, ATTR_GEN_AI_RESPONSE_MODEL, responseModel);
+  const msToFirstChunk = numberAttr(attrs[AI_RESPONSE_MS_TO_FIRST_CHUNK]);
+  if (msToFirstChunk !== undefined && msToFirstChunk > 0) {
+    setDefault(attrs, ATTR_GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK, msToFirstChunk / 1000);
+  }
 }
 
 function enrichMemoryContent(attrs: MutableAttributes, operation: string): void {
@@ -732,7 +738,7 @@ function collectN8nMetadata(attrs: Readonly<MutableAttributes>): Record<string, 
   if (aiOperation !== undefined) aiSdk.operation = aiOperation;
   if (functionId !== undefined) aiSdk.function_id = functionId;
   for (const [rawKey, metadataKey] of [
-    ["ai.response.msToFirstChunk", "time_to_first_output_ms"],
+    [AI_RESPONSE_MS_TO_FIRST_CHUNK, "time_to_first_output_ms"],
     ["ai.response.msToFinish", "response_time_ms"],
     ["ai.response.avgOutputTokensPerSecond", "output_tokens_per_second"],
   ] as const) {

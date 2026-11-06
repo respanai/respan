@@ -1,0 +1,10 @@
+{
+  "summary": "Emit the OTel GenAI gen_ai.response.time_to_first_chunk attribute (seconds) on LLM spans that already measure first-chunk latency",
+  "packages": {
+    "@respan/instrumentation-eve": "minor",
+    "@respan/instrumentation-livekit": "minor",
+    "@respan/instrumentation-n8n": "minor",
+    "@respan/instrumentation-pi": "minor",
+    "@respan/instrumentation-vercel": "minor"
+  }
+}

@@ -6,6 +6,7 @@ import {
   ATTR_GEN_AI_REQUEST_MODEL,
   ATTR_GEN_AI_RESPONSE_FINISH_REASONS,
   ATTR_GEN_AI_RESPONSE_ID,
+  ATTR_GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK,
   ATTR_GEN_AI_SYSTEM,
   ATTR_GEN_AI_SYSTEM_INSTRUCTIONS,
   METRIC_GEN_AI_CLIENT_OPERATION_DURATION,
@@ -225,6 +226,9 @@ export function enrichPerformanceMetrics(attrs: SpanAttributes, spanName: string
   setDefault(attrs, "llm.is_streaming", spanName.toLowerCase().includes("stream") || firstChunkSeconds !== undefined);
   if (firstChunkSeconds !== undefined) {
     setMetadata(attrs, "time_to_first_token", String(firstChunkSeconds));
+  }
+  if (firstChunkSeconds !== undefined && firstChunkSeconds > 0) {
+    setDefault(attrs, ATTR_GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK, firstChunkSeconds);
   }
 
   const durationSeconds = numberAttr(attrs[METRIC_GEN_AI_CLIENT_OPERATION_DURATION]) ??

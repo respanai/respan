@@ -704,6 +704,10 @@ test("maps LegacyOpenTelemetry stream detail and keeps structural spans only in 
     false,
   );
   assert.deepEqual(semanticCapture.spans[0].events, []);
+  assert.equal(
+    semanticCapture.spans[0].attributes["gen_ai.response.time_to_first_chunk"],
+    0.017,
+  );
   assert.deepEqual(metadata(semanticCapture.spans[0]).n8n.ai_sdk, {
     operation: "ai.streamText.doStream",
     function_id: "stream-agent",
@@ -724,6 +728,10 @@ test("maps LegacyOpenTelemetry stream detail and keeps structural spans only in 
     "ai.streamText.doStream",
     "ai.streamText",
   ]);
+  assert.equal(
+    legacyCapture.spans[0].attributes["gen_ai.response.time_to_first_chunk"],
+    0.017,
+  );
   for (const span of legacyCapture.spans) {
     assert.equal(span.attributes["respan.internal.drop_span"], undefined);
     assert.equal(span.attributes["respan.internal.export_parent_span_id"], undefined);

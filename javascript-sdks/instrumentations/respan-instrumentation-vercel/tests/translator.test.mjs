@@ -982,6 +982,17 @@ test("AI SDK 7 chat-named streaming spans preserve first chunk and total duratio
   });
   assert.equal(attrs["llm.is_streaming"], true);
   assert.deepEqual(JSON.parse(attrs["respan.metadata"]), { time_to_first_token: "0.125", generation_time: "1.25" });
+  assert.equal(attrs["gen_ai.response.time_to_first_chunk"], 0.125);
+});
+
+test("legacy msToFirstChunk becomes gen_ai.response.time_to_first_chunk in seconds", () => {
+  const attrs = runTranslator("ai.streamText.doStream", {
+    ...baseLLMSpan,
+    "ai.response.msToFirstChunk": 250,
+    "ai.response.msToFinish": 900,
+  });
+  assert.equal(attrs["gen_ai.response.time_to_first_chunk"], 0.25);
+  assert.equal(JSON.parse(attrs["respan.metadata"]).time_to_first_token, "0.25");
 });
 
 test("legacy streaming latency uses first chunk, never finish duration, as TTFT", () => {
@@ -991,6 +1002,7 @@ test("legacy streaming latency uses first chunk, never finish duration, as TTFT"
     "ai.response.msToFinish": 900,
   });
   assert.deepEqual(JSON.parse(attrs["respan.metadata"]), { time_to_first_token: "0", generation_time: "0.9" });
+  assert.equal(attrs["gen_ai.response.time_to_first_chunk"], undefined);
 });
 
 test("evaluation translates state, questions, and answers as task content", () => {
