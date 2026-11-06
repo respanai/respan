@@ -301,19 +301,6 @@ const EvaluationParamsSchema = z.object({
   sample_percentage: z.number().optional(),
 });
 
-const LoadBalanceModelSchema = z.object({
-  model: z.string(),
-  credentials: z.record(z.string(), z.any()).optional(),
-  weight: z
-    .number()
-    .refine((val) => val > 0, "Weight has to be greater than 0"),
-});
-
-const LoadBalanceGroupSchema = z.object({
-  group_id: z.string(),
-  models: z.array(LoadBalanceModelSchema).optional(),
-});
-
 const PostHogIntegrationSchema = z.object({
   posthog_api_key: z.string(),
   posthog_base_url: z.string(),
@@ -512,8 +499,6 @@ const RespanParamsSchema = z.object({
   //#region respan proxy options
   exclude_models: z.array(z.string()).optional(),
   exclude_providers: z.array(z.string()).optional(),
-  load_balance_group: LoadBalanceGroupSchema.optional(),
-  load_balance_models: z.array(LoadBalanceModelSchema).optional(),
   retry_params: RetryParamsSchema.optional(),
   respan_params: z.record(z.string(), z.any()).optional(),
   //#region deprecated
@@ -616,8 +601,6 @@ export {
   CustomerSchema,
   CacheOptionsSchema,
   RetryParamsSchema,
-  LoadBalanceGroupSchema,
-  LoadBalanceModelSchema,
   EvaluationParamsSchema,
   PromptParamSchema,
   OverrideConfigSchema,

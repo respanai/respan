@@ -85,33 +85,6 @@ class EvaluationParams(RespanBaseModel):
         return super().model_dump(*args, **kwargs)
 
 
-class LoadBalanceModel(RespanBaseModel):
-    model: str
-    credentials: dict = None
-    weight: int
-
-    def model_dump(self, *args, **kwargs) -> Dict[str, Any]:
-        kwargs["exclude_none"] = True
-        return super().model_dump(*args, **kwargs)
-
-    @field_validator("weight")
-    def validate_weight(cls, v):
-        if v <= 0:
-            raise ValueError("Weight has to be greater than 0")
-        return v
-
-    model_config = ConfigDict(protected_namespaces=())
-
-
-class LoadBalanceGroup(RespanBaseModel):
-    group_id: str
-    models: Optional[List[LoadBalanceModel]] = None
-
-    def model_dump(self, *args, **kwargs) -> Dict[str, Any]:
-        kwargs["exclude_none"] = True
-        return super().model_dump(*args, **kwargs)
-
-
 class Customer(RespanBaseModel):
     customer_identifier: Union[str, int, None] = None
     name: Optional[Union[str, None]] = None
@@ -377,8 +350,6 @@ class RespanParams(RespanBaseModel, PreprocessLogDataMixin):
     # region: respan proxy options
     exclude_models: Optional[List[str]] = None
     exclude_providers: Optional[List[str]] = None
-    load_balance_group: Optional[LoadBalanceGroup] = None
-    load_balance_models: Optional[List[LoadBalanceModel]] = None
     first_token_timeout: Optional[float] = None
     retry_params: Optional[RetryParams] = None
     respan_params: Optional[dict] = (

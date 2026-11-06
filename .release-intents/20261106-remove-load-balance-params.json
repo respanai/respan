@@ -1,0 +1,8 @@
+{
+  "summary": "Remove the retired load_balance_models and load_balance_group params; split routes replace them",
+  "packages": {
+    "respan-sdk": "minor",
+    "@respan/respan-sdk": "minor",
+    "@respan/cli": "patch"
+  }
+}

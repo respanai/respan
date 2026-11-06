@@ -24,8 +24,6 @@ from .param_types import (
     CacheOptions,
     Customer,
     RespanAPIControlParams,
-    LoadBalanceGroup,
-    LoadBalanceModel,
     RetryParams,
 )
 from ..constants.llm_logging import LogType
@@ -207,8 +205,6 @@ class RespanLogParams(PreprocessLogDataMixin, RespanBaseModel):
     # region: respan proxy options
     exclude_models: Optional[List[str]] = None
     exclude_providers: Optional[List[str]] = None
-    load_balance_group: Optional[LoadBalanceGroup] = None
-    load_balance_models: Optional[List[LoadBalanceModel]] = None
     first_token_timeout: Optional[float] = None
     retry_params: Optional[RetryParams] = None
     respan_params: Optional[dict] = None

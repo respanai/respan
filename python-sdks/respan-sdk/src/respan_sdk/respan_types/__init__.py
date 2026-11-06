@@ -8,8 +8,6 @@ from .param_types import RespanParams, RespanTextLogParams
 from .param_types import (
     EvaluationParams,
     RetryParams,
-    LoadBalanceGroup,
-    LoadBalanceModel,
     CacheOptions,
     Customer,
     PromptParam,
@@ -69,8 +67,6 @@ __all__ = [
     # Parameter types
     "EvaluationParams",
     "RetryParams",
-    "LoadBalanceGroup",
-    "LoadBalanceModel",
     "CacheOptions",
     "Customer",
     "PromptParam",
