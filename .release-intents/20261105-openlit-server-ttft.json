@@ -1,6 +1,6 @@
 {
-  "summary": "Keep OpenLIT's gen_ai.server.time_to_first_token as gen_ai.response.time_to_first_chunk (seconds) instead of stripping it",
+  "summary": "Keep OpenLIT's gen_ai.server.time_to_first_token as gen_ai.response.time_to_first_chunk (seconds) instead of stripping it (release held: no PyPI trusted publisher on this package yet)",
   "packages": {
-    "respan-instrumentation-openlit": "patch"
+    "respan-instrumentation-openlit": "none"
   }
 }
