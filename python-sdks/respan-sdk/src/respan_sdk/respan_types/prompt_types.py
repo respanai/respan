@@ -59,7 +59,6 @@ class PromptVersion(RespanBaseModel):
     reasoning_effort: Optional[str] = None
     variables: VariableDictType = {}
     readonly: bool = False
-    load_balance_models: Optional[List[Dict[str, Any]]] = None
     tools: Optional[List[Dict[str, Any]]] = None
     tool_choice: Optional[Union[str, Dict[str, Any]]] = None
     response_format: Optional[Union[str, Dict[str, Any], None]] = None

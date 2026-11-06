@@ -39,7 +39,6 @@ export interface DemoPromptVersion {
   stream?: boolean;
   thinking?: Record<string, unknown>;
   variables?: Record<string, unknown>;
-  load_balance_models?: Record<string, unknown>[];
   tools?: Record<string, unknown>[];
   tool_choice?: string | Record<string, unknown>;
   response_format?: Record<string, unknown>;
