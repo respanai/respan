@@ -633,6 +633,7 @@
       "ecosystem": "python",
       "name": "respan-instrumentation-openlit",
       "path": "python-sdks/instrumentations/respan-instrumentation-openlit",
+      "python_tests": true,
       "registry": "pypi"
     },
     {
