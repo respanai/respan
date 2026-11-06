@@ -2,10 +2,7 @@
   "mcpServers": {
     "respan": {
       "type": "http",
-      "url": "https://mcp.respan.ai/mcp",
-      "headers": {
-        "Authorization": "Bearer ${user_config.api_key}"
-      }
+      "url": "https://mcp.respan.ai/mcp"
     }
   }
 }

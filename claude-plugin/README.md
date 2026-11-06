@@ -3,7 +3,7 @@
 Packages Respan's `/respan` skill and the hosted Respan MCP server into a single
 installable Claude Code plugin. One install gives a user the Respan know-how
 (tracing, gateway, prompts, evals, datasets) **and** live access to the Respan
-platform via MCP tools — no separate `claude mcp add` step.
+platform via MCP tools — no separate `claude mcp add` step, and no API key to paste.
 
 ## Install
 
@@ -14,14 +14,30 @@ From inside Claude Code:
 /plugin install respan@respan
 ```
 
-You'll be prompted for a Respan API key at install time (create one at
-https://platform.respan.ai); it's stored in your OS keychain, never in a settings
-file. Once installed, the `/respan` skill auto-activates by description and the
-hosted MCP tools (`mcp__respan__*`) are live in the session.
+The `/respan` skill auto-activates by description as soon as the plugin is
+installed. To use the hosted MCP tools (`mcp__plugin_respan_respan__*`), sign in
+once: run `/mcp`, select `plugin:respan:respan`, and finish the sign-in in your
+browser. If you can't use a browser, as in CI, see
+[Using an API key](#using-an-api-key).
 
 > The plugin skill is namespaced by Claude Code as `/respan:respan` if you invoke
 > it explicitly — but you rarely need to type it, since it fires automatically
 > when a task matches its description.
+
+### Updating from 0.1.0
+
+Version 0.1.0 came from the old `respanai/respan` marketplace and asked for an API
+key. That marketplace is gone, so `claude plugin update` can't reach the plugin.
+Remove the old marketplace, add the new one, and reinstall:
+
+```bash
+claude plugin marketplace remove respan
+claude plugin marketplace add respanai/claude-plugins
+claude plugin install respan@respan
+```
+
+Removing the old marketplace uninstalls the plugin and deletes the API key it
+saved, where it can. Then restart Claude Code and sign in with `/mcp`.
 
 ## What's inside
 
@@ -36,7 +52,7 @@ directory only:
 │   └── build-plugins.mjs   # copies the shared skill into each plugin (see below)
 └── claude-plugin/
     ├── .claude-plugin/
-    │   └── plugin.json     # plugin manifest: name, version, api_key user config
+    │   └── plugin.json     # plugin manifest: name, version
     ├── .mcp.json           # connects the hosted MCP server at mcp.respan.ai
     └── skills/
         └── respan/         # GENERATED — do not hand-edit
@@ -74,8 +90,8 @@ From the monorepo root, load the plugin directly without a marketplace:
 claude --plugin-dir ./claude-plugin
 ```
 
-You'll be prompted for a Respan API key (create one at https://platform.respan.ai).
-Then invoke the skill and confirm the MCP tools are live (`mcp__respan__*`).
+Run `/mcp`, select `plugin:respan:respan`, and sign in. Then invoke the skill and
+confirm the MCP tools are live (`mcp__plugin_respan_respan__*`).
 
 The full marketplace path (add + install) installs from `main`, exactly as end
 users do:
@@ -83,7 +99,12 @@ users do:
 ```bash
 claude plugin marketplace add respanai/claude-plugins
 claude plugin install respan@respan
+claude mcp list
 ```
+
+`claude mcp list` should show `plugin:respan:respan` as `! Needs authentication`
+until you sign in. These commands don't need a sign-in, so you can keep them out
+of your own config by running `export CLAUDE_CONFIG_DIR="$(mktemp -d)"` first.
 
 Validate the plugin from the repo root before publishing:
 
@@ -93,11 +114,37 @@ claude plugin validate ./claude-plugin --strict
 
 ## Authentication
 
-The manifest declares a `userConfig.api_key` (marked `sensitive`), so Claude Code
-prompts for it at install time and stores it in the OS keychain. `.mcp.json`
-injects it as `Authorization: Bearer ${user_config.api_key}` against the hosted
-server `https://mcp.respan.ai/mcp`. The server also supports OAuth browser
-sign-in; API-key config is what this plugin ships with first.
+Sign-in is OAuth. There is no API key to configure, and no secret in this repo.
+
+`.mcp.json` declares only the URL of the hosted server, `https://mcp.respan.ai/mcp`.
+An unauthenticated request gets a `401` with a `WWW-Authenticate` header pointing
+at the server's OAuth metadata, so Claude Code reports `! Needs authentication`
+until you sign in with `/mcp`. Claude Code registers itself with the server and
+stores the token.
+
+### Using an API key
+
+Use a key where nobody can finish a browser sign-in: CI, containers, or `claude -p`
+on a machine that hasn't signed in. Create one at https://platform.respan.ai, set
+it as `RESPAN_API_KEY`, and add the server yourself:
+
+```bash
+claude mcp add --transport http --scope user respan https://mcp.respan.ai/mcp \
+  --header 'Authorization: Bearer ${RESPAN_API_KEY}'
+```
+
+Keep the single quotes. Claude Code then reads the key from the environment when
+it starts, and saves only the `${RESPAN_API_KEY}` reference in its config.
+
+- If the plugin is installed too, `claude mcp list` shows only this `respan`
+  server, because both use the same URL. Its tools are named `mcp__respan__*`.
+- `✔ Connected` doesn't prove the key works. The server accepts any key when
+  connecting and rejects a bad one only when a tool runs, so run a tool to check.
+
+> **Why doesn't the plugin offer a key option as well?** A plugin's server can't
+> make its header optional. If a required `${user_config.*}` option is unset, the
+> server doesn't load at all. If an optional one is unset, Claude Code still sends
+> the `Authorization` header, which turns off the OAuth fallback.
 
 ## Distribution
 
