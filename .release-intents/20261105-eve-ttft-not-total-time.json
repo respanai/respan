@@ -1,0 +1,6 @@
+{
+  "summary": "Stop reporting ai.response.msToFinish (total generation time) as time_to_first_token in @respan/instrumentation-eve. TTFT now comes only from first-chunk timing; msToFinish fills generation_time. Bump is none: eve has no npm Trusted Publisher for publish.yml yet, so it ships with the held eve release intent once that exists.",
+  "packages": {
+    "@respan/instrumentation-eve": "none"
+  }
+}

@@ -214,6 +214,40 @@ test("converts legacy msToFirstChunk to seconds and skips non-positive values", 
   assert.equal(zero["gen_ai.response.time_to_first_chunk"], undefined);
 });
 
+function metadataOf(attrs) {
+  return attrs["respan.metadata"] ? JSON.parse(attrs["respan.metadata"]) : {};
+}
+
+test("never reports msToFinish (total generation time) as TTFT", () => {
+  const attrs = translate("ai.generateText.doGenerate", {
+    "ai.model.id": "gpt-4o-mini",
+    "ai.model.provider": "openai.chat",
+    "ai.response.text": "world",
+    "ai.response.msToFinish": 2400,
+  });
+
+  const metadata = metadataOf(attrs);
+  assert.equal(metadata.time_to_first_token, undefined);
+  assert.equal(attrs["gen_ai.response.time_to_first_chunk"], undefined);
+  assert.equal(metadata.generation_time, "2.4");
+  assertRawVendorAttrsStripped(attrs);
+});
+
+test("reports TTFT from real first-chunk timing, not msToFinish", () => {
+  const attrs = translate("ai.streamText.doStream", {
+    "ai.model.id": "gpt-4o-mini",
+    "ai.model.provider": "openai.chat",
+    "ai.response.text": "world",
+    "ai.response.msToFirstChunk": 300,
+    "ai.response.msToFinish": 2400,
+  });
+
+  const metadata = metadataOf(attrs);
+  assert.equal(metadata.time_to_first_token, "0.3");
+  assert.equal(attrs["gen_ai.response.time_to_first_chunk"], 0.3);
+  assert.equal(metadata.generation_time, "2.4");
+});
+
 test("maps legacy embedding input, vector, and model while stripping raw aliases", () => {
   const attrs = translate("ai.embed.doEmbed", {
     "ai.model.id": "text-embedding-3-small",

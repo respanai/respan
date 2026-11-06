@@ -285,22 +285,15 @@ export function enrichPerformanceMetrics(
   else if (/generate/i.test(spanName))
     setDefault(attrs, LLM_IS_STREAMING, false);
 
-  const msToFinish = attrs[AI_RESPONSE_MS_TO_FINISH];
-  if (msToFinish !== undefined) {
-    setMetadata(
-      attrs,
-      "time_to_first_token",
-      String(Number(msToFinish) / 1000),
-    );
-  }
-
   // AI SDK model spans carry first-chunk latency as the GenAI client metric
-  // (seconds) or as ai.response.msToFirstChunk (milliseconds).
+  // (seconds) or as ai.response.msToFirstChunk (milliseconds). This is the
+  // only source of TTFT.
   const msToFirstChunk = numberAttr(attrs[AI_RESPONSE_MS_TO_FIRST_CHUNK]);
   const firstChunkSeconds =
     numberAttr(attrs[METRIC_GEN_AI_CLIENT_OPERATION_TIME_TO_FIRST_CHUNK]) ??
     (msToFirstChunk !== undefined ? msToFirstChunk / 1000 : undefined);
   if (firstChunkSeconds !== undefined && firstChunkSeconds > 0) {
+    setMetadata(attrs, "time_to_first_token", String(firstChunkSeconds));
     setDefault(
       attrs,
       ATTR_GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK,
@@ -321,6 +314,13 @@ export function enrichPerformanceMetrics(
   const generationTime = attrs[GEN_AI_USAGE_GENERATION_TIME];
   if (generationTime !== undefined) {
     setMetadata(attrs, "generation_time", String(generationTime));
+  }
+
+  // ai.response.msToFinish is the total generation time, never time to first
+  // token, so it only fills generation_time.
+  const msToFinish = numberAttr(attrs[AI_RESPONSE_MS_TO_FINISH]);
+  if (msToFinish !== undefined) {
+    setMetadata(attrs, "generation_time", String(msToFinish / 1000));
   }
 
   const warnings = attrs[GEN_AI_USAGE_WARNINGS];
