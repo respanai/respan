@@ -1,0 +1,8 @@
+{
+  "summary": "Publish the gen_ai.response.time_to_first_chunk release (#510) for @respan/instrumentation-livekit, @respan/instrumentation-pi and @respan/instrumentation-vercel. Run 42138633100 published nothing: npm returned E404 on @respan/instrumentation-eve, which (like @respan/instrumentation-n8n) was first published by hand and has no Trusted Publisher for this repository's publish.yml (contribution/cicd.md). eve and n8n ship in a separate intent once their Trusted Publishers exist.",
+  "packages": {
+    "@respan/instrumentation-livekit": "minor",
+    "@respan/instrumentation-pi": "minor",
+    "@respan/instrumentation-vercel": "minor"
+  }
+}
