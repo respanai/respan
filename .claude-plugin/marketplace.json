@@ -8,6 +8,11 @@
       "name": "respan",
       "source": "./claude-plugin",
       "description": "Respan for Claude Code: tracing, evals, prompts, datasets, and gateway routing."
+    },
+    {
+      "name": "session-traces",
+      "source": "./claude-tracing-plugin",
+      "description": "Send your Claude Code sessions to Respan as traces."
     }
   ]
 }

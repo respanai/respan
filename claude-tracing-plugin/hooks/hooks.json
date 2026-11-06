@@ -1,0 +1,4 @@
+{
+  "description": "Traces Claude Code sessions to Respan",
+  "modules": ["./register.mjs"]
+}
