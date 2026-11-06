@@ -60,7 +60,6 @@ export interface SpanData {
   // Required Respan platform fields
   warnings?: string;
   encoding_format?: string;
-  disable_fallback?: boolean;
   respan_params?: Record<string, unknown>;
   field_name?: string;
   delimiter?: string;
