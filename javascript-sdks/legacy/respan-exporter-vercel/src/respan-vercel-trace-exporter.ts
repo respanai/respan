@@ -194,7 +194,6 @@ export class RespanExporter implements SpanExporter {
       delimiter: "\n\n",
       disable_log: false,
       request_breakdown: false,
-      disable_fallback: false,
       ...(customerParams || {}),
     };
 

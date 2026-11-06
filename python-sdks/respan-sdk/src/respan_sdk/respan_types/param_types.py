@@ -375,7 +375,6 @@ class RespanParams(RespanBaseModel, PreprocessLogDataMixin):
     # endregion: respan logging control
 
     # region: respan proxy options
-    disable_fallback: Optional[bool] = False
     exclude_models: Optional[List[str]] = None
     exclude_providers: Optional[List[str]] = None
     load_balance_group: Optional[LoadBalanceGroup] = None

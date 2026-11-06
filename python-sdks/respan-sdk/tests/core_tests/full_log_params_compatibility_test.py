@@ -137,7 +137,6 @@ class TestFullLogParamsCompatibility:
             "evaluation_identifier": "eval_123",
             
             # Proxy options
-            "disable_fallback": False,
             "exclude_models": ["bad_model"],
             
             # Dataset fields

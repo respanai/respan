@@ -510,7 +510,6 @@ const RespanParamsSchema = z.object({
   //#endregion respan logging control
 
   //#region respan proxy options
-  disable_fallback: z.boolean().optional().default(false),
   exclude_models: z.array(z.string()).optional(),
   exclude_providers: z.array(z.string()).optional(),
   load_balance_group: LoadBalanceGroupSchema.optional(),

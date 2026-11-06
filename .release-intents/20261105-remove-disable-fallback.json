@@ -1,0 +1,8 @@
+{
+  "summary": "Remove the deprecated disable_fallback param",
+  "packages": {
+    "respan-sdk": "minor",
+    "@respan/respan-sdk": "minor",
+    "@respan/cli": "patch"
+  }
+}
