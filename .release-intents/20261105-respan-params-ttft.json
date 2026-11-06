@@ -4,6 +4,6 @@
     "respan-sdk": "patch",
     "respan-tracing": "patch",
     "@respan/respan-sdk": "patch",
-    "@respan/tracing": "patch"
+    "@respan/tracing": "none"
   }
 }
