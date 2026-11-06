@@ -19,6 +19,11 @@ OPENLIT_SOURCE_INPUT = "openlit.respan.source_input"
 OPENLIT_SOURCE_TOOLS = "openlit.respan.source_tools"
 OPENLIT_RAW_USAGE_OBSERVED = "openlit.respan.raw_usage_observed"
 
+# OTel GenAI semconv `GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK` (seconds). It only
+# ships in opentelemetry-semantic-conventions>=0.63b0, above this package's
+# declared floor, so it is named locally until that floor moves.
+GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK = "gen_ai.response.time_to_first_chunk"
+
 OPENLIT_OPERATION_LOG_TYPES = {
     "chat": "chat",
     "completion": "text",
@@ -93,7 +98,7 @@ STANDARD_GEN_AI_ATTRIBUTES = {
     "gen_ai.response.finish_reasons",
     "gen_ai.response.id",
     "gen_ai.response.model",
-    "gen_ai.response.time_to_first_chunk",
+    GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK,
     "gen_ai.retrieval.documents",
     "gen_ai.retrieval.query.text",
     "gen_ai.system",
