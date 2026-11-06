@@ -10,7 +10,7 @@ platform via MCP tools — no separate `claude mcp add` step.
 From inside Claude Code:
 
 ```
-/plugin marketplace add respanai/respan
+/plugin marketplace add respanai/claude-plugins
 /plugin install respan@respan
 ```
 
@@ -25,13 +25,13 @@ hosted MCP tools (`mcp__respan__*`) are live in the session.
 
 ## What's inside
 
-The marketplace manifest lives at the **repo root** and points at this plugin
-directory, so `respanai/respan` resolves as a marketplace on its own:
+The marketplace lives in its own repository,
+[respanai/claude-plugins](https://github.com/respanai/claude-plugins), and points at
+this directory with a `git-subdir` source, so installing the plugin downloads this
+directory only:
 
 ```
 <repo root>/
-├── .claude-plugin/
-│   └── marketplace.json    # marketplace entry → source: "./claude-plugin"
 ├── scripts/
 │   └── build-plugins.mjs   # copies the shared skill into each plugin (see below)
 └── claude-plugin/
@@ -77,18 +77,18 @@ claude --plugin-dir ./claude-plugin
 You'll be prompted for a Respan API key (create one at https://platform.respan.ai).
 Then invoke the skill and confirm the MCP tools are live (`mcp__respan__*`).
 
-To exercise the full marketplace path (add + install) exactly as end users do,
-point Claude Code at the repo root:
+The full marketplace path (add + install) installs from `main`, exactly as end
+users do:
 
 ```bash
-claude plugin marketplace add ./
+claude plugin marketplace add respanai/claude-plugins
 claude plugin install respan@respan
 ```
 
-Validate the marketplace + plugin from the repo root before publishing:
+Validate the plugin from the repo root before publishing:
 
 ```bash
-claude plugin validate . --strict
+claude plugin validate ./claude-plugin --strict
 ```
 
 ## Authentication
@@ -101,19 +101,22 @@ sign-in; API-key config is what this plugin ships with first.
 
 ## Distribution
 
-The repo root ships a `.claude-plugin/marketplace.json` that references this
-plugin via `source: "./claude-plugin"`, so `respanai/respan` resolves as a marketplace
-directly — that's the self-hosted install path shown under [Install](#install)
-above, and it's the canonical way to get the plugin. It needs no Anthropic review
-and updates the moment you push.
+[respanai/claude-plugins](https://github.com/respanai/claude-plugins) is the
+marketplace: it lists this plugin and `session-traces` from `../claude-tracing-plugin/`,
+each pointing at its directory on `main` here. That's the self-hosted install path
+shown under [Install](#install) above, and it's the canonical way to get the plugin.
+It needs no Anthropic review. To release a change, merge it here with a higher
+`version` in `.claude-plugin/plugin.json`; users get it with
+`claude plugin marketplace update respan`.
 
 To also list it in Anthropic's community catalog for discoverability at
 https://claude.com/plugins:
 
 1. `node scripts/build-plugins.mjs` and commit the result.
-2. `claude plugin validate . --strict` (from the repo root).
-3. Submit at https://platform.claude.com/plugins/submit, pointing at
-   `respanai/respan`. Anthropic runs automated validation + safety screening,
+2. `claude plugin validate ./claude-plugin --strict` (from the repo root).
+3. Submit at https://platform.claude.com/plugins/submit. The plugin's code is in
+   `claude-plugin/` here, and the marketplace that lists it is
+   `respanai/claude-plugins`. Anthropic runs automated validation + safety screening,
    pins your commit SHA in the catalog, and syncs nightly. **Don't** open a PR
    against `anthropics/claude-plugins-community` — it's read-only and PRs are
    auto-closed.
