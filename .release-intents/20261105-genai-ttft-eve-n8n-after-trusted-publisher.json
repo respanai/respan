@@ -1,0 +1,7 @@
+{
+  "summary": "Publish the gen_ai.response.time_to_first_chunk release (#510) for @respan/instrumentation-eve and @respan/instrumentation-n8n, which run 42138633100 left unpublished: npm returned E404 because both were first published by hand and have no Trusted Publisher for this repository's publish.yml. Merge only after the Trusted Publisher is configured on npmjs.com for both packages.",
+  "packages": {
+    "@respan/instrumentation-eve": "minor",
+    "@respan/instrumentation-n8n": "minor"
+  }
+}
