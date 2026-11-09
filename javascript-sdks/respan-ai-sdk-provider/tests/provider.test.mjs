@@ -92,11 +92,23 @@ test("a missing API key fails when the model is used, not at import", () => {
 });
 
 test("maker prefixes are dropped so the gateway can fall back across providers", async () => {
-  assert.equal((await send("anthropic/claude-sonnet-4.5")).body.model, "claude-sonnet-4.5");
+  assert.equal((await send("anthropic/claude-sonnet-4.5")).body.model, "claude-sonnet-4-5");
   assert.equal((await send("openai/gpt-5.5")).body.model, "gpt-5.5");
   assert.match((await send("google/gemini-3.5-flash")).url, /\/models\/gemini-3\.5-flash:generateContent$/);
   assert.equal(gatewayModelId("azure/gpt-5.5"), "azure/gpt-5.5");
   assert.equal(gatewayModelId("claude-haiku-4-5"), "claude-haiku-4-5");
+});
+
+test("Claude version dots become dashes so the Anthropic provider applies the model's limits", async () => {
+  for (const id of ["anthropic/claude-sonnet-4.5", "claude-sonnet-4.5", "claude-sonnet-4-5"]) {
+    const call = await send(id);
+    assert.equal(call.body.model, "claude-sonnet-4-5", id);
+    assert.equal(call.body.max_tokens, 64000, id);
+  }
+  assert.equal(gatewayModelId("anthropic/claude-opus-4.1"), "claude-opus-4-1");
+  assert.equal(gatewayModelId("google/gemini-3.5-flash"), "gemini-3.5-flash");
+  assert.equal(gatewayModelId("openai/gpt-5.5"), "gpt-5.5");
+  assert.equal(gatewayModelId("bedrock/claude-sonnet-4.5"), "bedrock/claude-sonnet-4.5");
 });
 
 test("wireFormat picks the format from the prefix or the model name", () => {

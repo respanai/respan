@@ -47,8 +47,14 @@ export function wireFormat(modelId: string): WireFormat {
  */
 export function gatewayModelId(modelId: string): string {
   const { prefix, name } = split(modelId);
-  if (prefix === undefined) return modelId;
   const maker =
-    ANTHROPIC_PREFIXES.has(prefix) || GOOGLE_PREFIXES.has(prefix) || OPENAI_PREFIXES.has(prefix);
-  return maker ? name : modelId;
+    prefix !== undefined &&
+    (ANTHROPIC_PREFIXES.has(prefix) || GOOGLE_PREFIXES.has(prefix) || OPENAI_PREFIXES.has(prefix));
+  const id = maker ? name : modelId;
+  // Claude IDs are written with dashes (`claude-sonnet-4-5`). The AI SDK's Anthropic
+  // provider only recognizes that spelling: given `claude-sonnet-4.5` it falls back
+  // to a generic max_tokens default above the model's limit, and the call fails.
+  return wireFormat(modelId) === "anthropic" && (maker || prefix === undefined)
+    ? id.replace(/(\d)\.(\d)/g, "$1-$2")
+    : id;
 }
