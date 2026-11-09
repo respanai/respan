@@ -1,0 +1,6 @@
+{
+  "summary": "Add @respan/ai-sdk-provider, the Respan gateway as a Vercel AI SDK provider",
+  "packages": {
+    "@respan/ai-sdk-provider": "new"
+  }
+}

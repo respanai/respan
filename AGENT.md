@@ -28,6 +28,7 @@ Active package areas:
 - `javascript-sdks/respan-tracing`
 - `javascript-sdks/respan`
 - `javascript-sdks/respan-cli`
+- `javascript-sdks/respan-ai-sdk-provider` (gateway client for the Vercel AI SDK; not part of tracing)
 - `javascript-sdks/instrumentations/*`
 
 Anything under `python-sdks/legacy/` or `javascript-sdks/legacy/` is outside the active architecture and outside the main CI/CD and release flow.
@@ -133,7 +134,7 @@ If a PR changes a release-managed package:
 Current release automation covers:
 
 - Python: `respan-ai`, `respan-sdk`, `respan-tracing`, and all packages under `python-sdks/instrumentations/`
-- JavaScript: `@respan/respan`, `@respan/cli`, `@respan/respan-sdk`, `@respan/tracing`, and all packages under `javascript-sdks/instrumentations/`
+- JavaScript: `@respan/respan`, `@respan/cli`, `@respan/ai-sdk-provider`, `@respan/respan-sdk`, `@respan/tracing`, and all packages under `javascript-sdks/instrumentations/`
 
 For new active instrumentations that should publish:
 
