@@ -49,13 +49,13 @@ Set the default provider as above and keep your model IDs. `openai/`, `anthropic
 
 | ID | Sent to the gateway as |
 |---|---|
-| `anthropic/claude-sonnet-4.5` | `claude-sonnet-4.5` |
+| `anthropic/claude-sonnet-4.5` | `claude-sonnet-4-5` |
 | `google/gemini-3.5-flash` | `gemini-3.5-flash` |
 | `openai/gpt-5.5` | `gpt-5.5` |
 | `azure/gpt-5.5` | `azure/gpt-5.5` (pinned to Azure) |
 | `smart` | `smart` (a route) |
 
-Version dots and dashes are interchangeable: `claude-sonnet-4.5` and `claude-sonnet-4-5` are the same model.
+Version dots and dashes are interchangeable: `claude-sonnet-4.5` and `claude-sonnet-4-5` are the same model. Claude IDs are sent with dashes, the spelling the Anthropic provider uses to pick the model's output limit.
 
 ## Options
 

@@ -1,0 +1,6 @@
+{
+  "summary": "Send Claude IDs with dashes so the Anthropic provider applies the right max_tokens",
+  "packages": {
+    "@respan/ai-sdk-provider": "patch"
+  }
+}
