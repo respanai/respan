@@ -14,6 +14,12 @@
     },
     {
       "ecosystem": "javascript",
+      "name": "@respan/ai-sdk-provider",
+      "path": "javascript-sdks/respan-ai-sdk-provider",
+      "registry": "npm"
+    },
+    {
+      "ecosystem": "javascript",
       "name": "@respan/instrumentation-anthropic",
       "path": "javascript-sdks/instrumentations/respan-instrumentation-anthropic",
       "registry": "npm"

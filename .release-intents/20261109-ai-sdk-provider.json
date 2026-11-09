@@ -1,0 +1,6 @@
+{
+  "summary": "Add @respan/ai-sdk-provider (0.1.0 was published by hand; this CI release validates Trusted Publishing)",
+  "packages": {
+    "@respan/ai-sdk-provider": "patch"
+  }
+}

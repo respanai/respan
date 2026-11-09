@@ -1,0 +1,52 @@
+{
+  "name": "@respan/ai-sdk-provider",
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Respan gateway provider for the Vercel AI SDK",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "author": "Respan <team@respan.ai>",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/respanai/respan",
+    "directory": "javascript-sdks/respan-ai-sdk-provider"
+  },
+  "keywords": [
+    "ai",
+    "ai-sdk",
+    "vercel-ai-sdk",
+    "llm-gateway",
+    "respan"
+  ],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc -p tsconfig.json && node --test tests/*.test.mjs",
+    "publish:package": "yarn npm publish",
+    "release": "yarn build && yarn version patch && yarn publish:package"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "4.0.78",
+    "@ai-sdk/google": "4.0.93",
+    "@ai-sdk/openai": "4.0.91",
+    "@ai-sdk/openai-compatible": "3.0.67",
+    "@ai-sdk/provider": "4.0.26",
+    "@ai-sdk/provider-utils": "5.0.58"
+  },
+  "peerDependencies": {
+    "ai": ">=7.0.0 <8.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.29",
+    "ai": "^7.0.136",
+    "typescript": "^5.7.3"
+  }
+}
