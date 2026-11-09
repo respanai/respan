@@ -1,6 +1,6 @@
 {
-  "summary": "Add @respan/ai-sdk-provider, the Respan gateway as a Vercel AI SDK provider",
+  "summary": "Add @respan/ai-sdk-provider (0.1.0 published by hand to bootstrap Trusted Publishing)",
   "packages": {
-    "@respan/ai-sdk-provider": "new"
+    "@respan/ai-sdk-provider": "none"
   }
 }
