@@ -1,0 +1,11 @@
+{
+  "summary": "Instrumentations send the framework's own conversation id (LangGraph thread_id, Agno session_id, Mastra threadId, OpenAI Agents group_id) as the Respan session when the user set none. Not released yet: the release is a separate intent once publishing is approved.",
+  "packages": {
+    "respan-instrumentation-agno": "none",
+    "respan-instrumentation-langchain": "none",
+    "respan-instrumentation-openai-agents": "none",
+    "@respan/instrumentation-langchain": "none",
+    "@respan/instrumentation-mastra": "none",
+    "@respan/instrumentation-openai-agents": "none"
+  }
+}

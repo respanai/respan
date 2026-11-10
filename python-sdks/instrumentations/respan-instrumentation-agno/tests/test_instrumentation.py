@@ -21,8 +21,10 @@ from respan_instrumentation_agno._constants import (
 )
 from respan_sdk.constants.span_attributes import (
     RESPAN_LOG_TYPE,
+    RESPAN_SESSION_ID,
 )
 from respan_tracing.core.tracer import RespanTracer
+from respan_tracing.utils.span_factory import propagate_attributes
 
 AGNO_PROMPT_PREFIX = f"{SpanAttributes.LLM_PROMPTS}."
 AGNO_COMPLETION_PREFIX = f"{SpanAttributes.LLM_COMPLETIONS}."
@@ -318,6 +320,45 @@ def test_sync_run_emits_agent_chat_and_tool_spans(captured_spans):
     assert tool_attributes[SpanAttributes.TRACELOOP_ENTITY_NAME] == "lookup_weather"
     assert tool_attributes[SpanAttributes.TRACELOOP_WORKFLOW_NAME] == "Weather Agent"
     assert tool_attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] == "sunny"
+
+
+def _emit_agent_run(output):
+    _otel_emitter.emit_agno_run(
+        target=FakeAgent(),
+        target_kind=AGNO_TARGET_AGENT,
+        input_value="What is the weather?",
+        output=output,
+        events=None,
+        started_at_ns=100,
+        ended_at_ns=200,
+    )
+
+
+def test_agno_session_id_is_the_respan_session(captured_spans):
+    _emit_agent_run(FakeRunOutput())
+    assert captured_spans[0].attributes[RESPAN_SESSION_ID] == "session_123"
+
+
+@pytest.mark.parametrize(
+    "user_grouping",
+    [
+        {"session_identifier": "user-session"},
+        {"thread_identifier": "user-thread"},
+        {"trace_group_identifier": "user-group"},
+    ],
+)
+def test_user_grouping_wins_over_agno_session_id(captured_spans, user_grouping):
+    with propagate_attributes(**user_grouping):
+        _emit_agent_run(FakeRunOutput())
+    assert RESPAN_SESSION_ID not in captured_spans[0].attributes
+
+
+@pytest.mark.parametrize("session_id", [None, "", "x" * 256])
+def test_no_respan_session_without_a_usable_agno_session_id(captured_spans, session_id):
+    output = FakeRunOutput()
+    output.session_id = session_id
+    _emit_agent_run(output)
+    assert RESPAN_SESSION_ID not in captured_spans[0].attributes
 
 
 def test_instrumented_sync_stream_emits_after_consumption(captured_spans):

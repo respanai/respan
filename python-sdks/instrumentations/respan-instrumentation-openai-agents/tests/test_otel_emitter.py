@@ -45,7 +45,13 @@ from respan_instrumentation_openai_agents._serialization import (
     flatten_metadata_attributes,
     json_string,
 )
-from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE, RESPAN_METADATA
+from respan_sdk.constants.span_attributes import (
+    RESPAN_LOG_TYPE,
+    RESPAN_METADATA,
+    RESPAN_SESSION_ID,
+    RESPAN_TRACE_GROUP_ID,
+)
+from respan_tracing.utils.span_factory import propagate_attributes
 
 _BANNED_ALIASES = {
     "completion_tokens",
@@ -79,6 +85,48 @@ def _capture_spans(monkeypatch):
     captured = []
     monkeypatch.setattr(_otel_emitter, "inject_span", captured.append)
     return captured
+
+
+def _emit_trace_with_group(group_id):
+    _otel_emitter.emit_trace(
+        SimpleNamespace(
+            name="contract",
+            trace_id="trace_" + "a" * 32,
+            group_id=group_id,
+            metadata=None,
+        )
+    )
+
+
+def test_trace_group_id_is_the_respan_session(monkeypatch):
+    captured = _capture_spans(monkeypatch)
+    _emit_trace_with_group("conv-1")
+    assert captured[0].attributes[RESPAN_SESSION_ID] == "conv-1"
+    # The trace group stays for older backends.
+    assert captured[0].attributes[RESPAN_TRACE_GROUP_ID] == "conv-1"
+
+
+@pytest.mark.parametrize(
+    "user_grouping",
+    [
+        {"session_identifier": "user-session"},
+        {"thread_identifier": "user-thread"},
+        {"trace_group_identifier": "user-group"},
+    ],
+)
+def test_user_grouping_wins_over_trace_group_id(monkeypatch, user_grouping):
+    captured = _capture_spans(monkeypatch)
+    with propagate_attributes(**user_grouping):
+        _emit_trace_with_group("conv-1")
+    session = captured[0].attributes.get(RESPAN_SESSION_ID)
+    assert session in (None, user_grouping.get("session_identifier"))
+
+
+@pytest.mark.parametrize("group_id", [None, "", "x" * 256])
+def test_no_respan_session_without_a_usable_group_id(monkeypatch, group_id):
+    captured = _capture_spans(monkeypatch)
+    _emit_trace_with_group(group_id)
+    assert RESPAN_SESSION_ID not in captured[0].attributes
 
 
 def test_emit_response_uses_complete_chat_contract(monkeypatch):

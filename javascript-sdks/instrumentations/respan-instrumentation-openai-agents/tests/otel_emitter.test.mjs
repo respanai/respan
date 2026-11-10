@@ -108,6 +108,10 @@ test("emit trace stores SDK trace metadata on workflow span", () => {
     attrs[RespanSpanAttributes.RESPAN_TRACE_GROUP_ID],
     "openai-agents-ts-123",
   );
+  assert.equal(
+    attrs[RespanSpanAttributes.RESPAN_SESSION_ID],
+    "openai-agents-ts-123",
+  );
   assert.deepEqual(JSON.parse(attrs[RespanSpanAttributes.RESPAN_METADATA]), {
     group_id: "openai-agents-ts-123",
     run_id: "openai-agents-ts-123",
@@ -643,6 +647,7 @@ test("registered trace marker and grouping propagate to every emitted child", ()
       attrs[RespanSpanAttributes.RESPAN_TRACE_GROUP_ID],
       "marker-group",
     );
+    assert.equal(attrs[RespanSpanAttributes.RESPAN_SESSION_ID], "marker-group");
     assert.equal(
       attrs["respan.metadata.custom_identifier"],
       "otel2-fix-marker",
@@ -650,6 +655,17 @@ test("registered trace marker and grouping propagate to every emitted child", ()
     assert.equal(attrs["respan.metadata.run_id"], "otel2-fix-marker");
   } finally {
     clearSdkTrace(traceId);
+  }
+});
+
+test("no session from an empty or overlong groupId", () => {
+  for (const groupId of ["", " ", "x".repeat(256)]) {
+    const span = emitAndCaptureSpan({
+      traceId: "trace_session_skip",
+      name: "skip.workflow",
+      groupId,
+    });
+    assert.equal(span.attributes[RespanSpanAttributes.RESPAN_SESSION_ID], undefined);
   }
 });
 

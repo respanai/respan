@@ -100,6 +100,8 @@ RUN_OUTPUT_MARKER_KEYS = (
 
 AGNO_RUN_ID_ATTR = "agno.run.id"
 AGNO_SESSION_ID_ATTR = "agno.session.id"
+# Respan stores at most this many characters of a session id.
+SESSION_ID_MAX_LENGTH = 255
 AGNO_USER_ID_ATTR = "agno.user.id"
 AGNO_AGENT_ID_ATTR = "agno.agent.id"
 AGNO_AGENT_NAME_ATTR = "agno.agent.name"

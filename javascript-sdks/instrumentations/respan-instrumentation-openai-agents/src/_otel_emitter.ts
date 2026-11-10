@@ -37,6 +37,8 @@ const GEN_AI_COMPLETION_PREFIX = `${SpanAttributes.LLM_COMPLETIONS}.0`;
 const GEN_AI_COMPLETION_ROLE = `${GEN_AI_COMPLETION_PREFIX}.role`;
 const GEN_AI_COMPLETION_CONTENT = `${GEN_AI_COMPLETION_PREFIX}.content`;
 const GEN_AI_COMPLETION_TOOL_CALLS = `${GEN_AI_COMPLETION_PREFIX}.tool_calls`;
+// Respan stores at most this many characters of a session id.
+const SESSION_ID_MAX_LENGTH = 255;
 
 interface SdkTraceContext {
   groupId?: string;
@@ -810,11 +812,23 @@ function buildReadableSpan(opts: BuildSpanOptions): ReadableSpan {
   } satisfies ReadableSpan;
 }
 
+/**
+ * The trace's groupId is the SDK's conversation id: send it as the Respan
+ * session too (the trace group stays for older backends). A session already on
+ * the span wins.
+ */
+function setGroupSession(attrs: Record<string, any>, groupId: string): void {
+  if (attrs[RespanSpanAttributes.RESPAN_SESSION_ID]) return;
+  if (!groupId.trim() || groupId.length > SESSION_ID_MAX_LENGTH) return;
+  attrs[RespanSpanAttributes.RESPAN_SESSION_ID] = groupId;
+}
+
 function applySdkTraceContext(attrs: Record<string, any>, traceId: string): void {
   const traceContext = sdkTraceContexts.get(traceId);
   if (!traceContext) return;
 
   if (traceContext.groupId) {
+    setGroupSession(attrs, traceContext.groupId);
     attrs[RespanSpanAttributes.RESPAN_TRACE_GROUP_ID] = traceContext.groupId;
   }
   const traceMetadata = traceContext.metadata;
@@ -995,6 +1009,7 @@ function emitTrace(traceObj: Trace): void {
   attrs[SpanAttributes.TRACELOOP_WORKFLOW_NAME] = traceName;
   const metadata: Record<string, any> = {};
   if (traceObj.groupId) {
+    setGroupSession(attrs, traceObj.groupId);
     attrs[RespanSpanAttributes.RESPAN_TRACE_GROUP_ID] = traceObj.groupId;
     metadata.group_id = traceObj.groupId;
   }

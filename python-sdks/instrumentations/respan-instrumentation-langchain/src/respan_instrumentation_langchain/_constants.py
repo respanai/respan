@@ -10,6 +10,9 @@ LANGCHAIN_SERIALIZED_ATTR = "langchain.serialized"
 LANGCHAIN_FRAMEWORK_ATTR = f"{RESPAN_METADATA}.framework"
 LANGCHAIN_RETRY_COUNT_ATTR = "langchain.retry_count"
 LANGCHAIN_RETRY_STATE_ATTR = "langchain.retry_state"
+LANGCHAIN_THREAD_ID_KEY = "thread_id"
+# Respan stores at most this many characters of a session id.
+SESSION_ID_MAX_LENGTH = 255
 
 LANGCHAIN_MESSAGE_ROLE_MAP = {
     "ai": "assistant",

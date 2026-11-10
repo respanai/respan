@@ -660,3 +660,45 @@ test("late canonical context veto on the actual span is immutable", async () => 
   assert.equal(actual.attributes["late.payload"], undefined);
 });
 test.after(() => provider.shutdown());
+
+const SESSION = "respan.sessions.session_identifier";
+
+test("metadata thread_id (LangGraph configurable.thread_id) is the Respan session", async () => {
+  reset();
+  await RunnableLambda.from((x) => x).invoke(
+    "q",
+    addRespanCallback({ metadata: { thread_id: "thread-1" } }, handler()),
+  );
+  assert.equal(attrs("workflow")[SESSION], "thread-1");
+});
+
+test("a session, thread or trace group set by the user wins over thread_id", async () => {
+  for (const key of [
+    SESSION,
+    "respan.threads.thread_identifier",
+    "respan.trace.trace_group_identifier",
+  ]) {
+    reset();
+    // Respan's processor copies the user's propagated attributes on start.
+    onStart = (span) => span.setAttribute(key, "user-set");
+    await RunnableLambda.from((x) => x).invoke(
+      "q",
+      addRespanCallback({ metadata: { thread_id: "thread-1" } }, handler()),
+    );
+    assert.equal(
+      attrs("workflow")[SESSION],
+      key === SESSION ? "user-set" : undefined,
+    );
+  }
+});
+
+test("no session without a usable thread_id", async () => {
+  for (const metadata of [{}, { thread_id: "" }, { thread_id: "x".repeat(256) }]) {
+    reset();
+    await RunnableLambda.from((x) => x).invoke(
+      "q",
+      addRespanCallback({ metadata }, handler()),
+    );
+    assert.equal(attrs("workflow")[SESSION], undefined);
+  }
+});

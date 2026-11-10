@@ -1,10 +1,37 @@
 import { types } from "node:util";
 import type { Span } from "@opentelemetry/api";
+import { RespanSpanAttributes } from "@respan/respan-sdk";
 import { data, snapshot, type CapturePolicy } from "./_privacy.js";
 
 export const LANGCHAIN_RUN_ID_ATTR = "langchain.run_id";
 export const LANGCHAIN_PARENT_RUN_ID_ATTR = "langchain.parent_run_id";
 export const LANGCHAIN_FRAMEWORK_ATTR = "langchain.framework";
+export const LANGCHAIN_THREAD_ID_KEY = "thread_id";
+// Respan stores at most this many characters of a session id.
+const SESSION_ID_MAX_LENGTH = 255;
+const GROUPING_ATTRIBUTES = [
+  RespanSpanAttributes.RESPAN_SESSION_ID,
+  RespanSpanAttributes.RESPAN_THREADS_ID,
+  RespanSpanAttributes.RESPAN_TRACE_GROUP_ID,
+];
+
+/**
+ * Send the run's thread_id (LangGraph `configurable.thread_id`) as the Respan
+ * session, unless the user already set a session, thread or trace group:
+ * Respan's processor copies the user's propagated ones onto the span at start,
+ * and those win.
+ */
+export function setFrameworkSession(span: Span, threadId: unknown): void {
+  if (
+    typeof threadId !== "string" ||
+    !threadId.trim() ||
+    threadId.length > SESSION_ID_MAX_LENGTH
+  )
+    return;
+  const current = (span as unknown as { attributes?: unknown }).attributes;
+  if (GROUPING_ATTRIBUTES.some((key) => data(current, key))) return;
+  span.setAttribute(RespanSpanAttributes.RESPAN_SESSION_ID, threadId);
+}
 export interface LangChainCallbackConfig {
   callbacks?: unknown;
 }
