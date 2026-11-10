@@ -60,4 +60,23 @@ This sample uses Mastra's released deterministic model and keeps spans in memory
 
 Complete native input and output envelopes are JSON encoded, including multimodal parts, structured results, tool history, scalar values, and embedding vectors when Mastra includes them. Model tool schemas come from native `attributes.tools`; older native events exposing only `availableTools` retain names only. Token totals and HTTP status are emitted only when actually supplied. Mastra can redact, filter, or truncate data before exporter events: its default serializer bounds arrays to 50 items and depth to 8. Configure Mastra's `serializationOptions` when larger native payloads are needed. The adapter cannot restore data already removed upstream. Ambient OpenTelemetry context supplies external parent relationships. Mastra exporter events do not carry remote OpenTelemetry trace flags, so an external parent ID without ambient context is retained in metadata rather than assigned an invented sampling flag.
 
+## Sessions
+
+When you set no session id, the agent's memory thread id (`memory: { thread }`, which Mastra reports as the agent run's `threadId`) is sent as the run's Respan session id
+(`respan.sessions.session_identifier`), so every turn of one conversation lands in
+one session with no Respan-specific code.
+
+A session, thread or trace group you set yourself always wins:
+
+```ts
+import { propagateAttributes } from "@respan/respan";
+
+await propagateAttributes({ session_identifier: "my-session" }, () =>
+  agent.generate("Hello", { memory: { thread, resource } }), // runs here keep "my-session"
+);
+```
+
+An empty id or one longer than 255 characters is not sent; Respan then detects the
+session on the server. Unchanged: a `threadId` or `thread_identifier` in Mastra's request context is still sent as the thread id, and counts as yours, so it also wins.
+
 [`RespanMastraExporter`](#respaninstrumentation-mastra) remains an alias of `MastraInstrumentor`.
