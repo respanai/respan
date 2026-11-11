@@ -1,7 +1,7 @@
 {
   "name": "@respan/instrumentation-n8n",
   "type": "module",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Respan instrumentation for n8n native OpenTelemetry workflow and agent spans",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
