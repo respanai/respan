@@ -92,6 +92,7 @@ The instrumentor translates those emitted spans; it does not turn on `experiment
 - Agent, task, and workflow structure
 - Speech generation, transcription, and streaming transcription with `ai >=7.0.124` and `@ai-sdk/otel >=1.0.124`: text, audio size/format descriptors, provider usage, and semantic `speech`/`transcribe` span names. The native adapter does not emit audio bytes; these spans record descriptors only.
 - Customer, session, thread, trace-group, and JSON metadata fields
+- Calls through the Respan gateway with [`@respan/ai-sdk-provider`](https://www.npmjs.com/package/@respan/ai-sdk-provider): the model-call span links to the gateway's log (`respan.gateway.log_id`) and carries no usage, cost or content of its own, so each call shows once with the gateway's numbers
 
 ## License
 

@@ -39,12 +39,15 @@
     "@ai-sdk/openai": "4.0.91",
     "@ai-sdk/openai-compatible": "3.0.67",
     "@ai-sdk/provider": "4.0.26",
-    "@ai-sdk/provider-utils": "5.0.58"
+    "@ai-sdk/provider-utils": "5.0.58",
+    "@opentelemetry/api": "^1.9.0"
   },
   "peerDependencies": {
     "ai": ">=7.0.0 <8.0.0"
   },
   "devDependencies": {
+    "@opentelemetry/context-async-hooks": "^2.10.0",
+    "@opentelemetry/sdk-trace-base": "^2.10.0",
     "@types/node": "^22.15.29",
     "ai": "^7.0.136",
     "typescript": "^5.7.3"

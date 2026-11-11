@@ -1,0 +1,9 @@
+{
+  "summary": "Vercel AI SDK calls through the Respan gateway (@respan/ai-sdk-provider) link the model-call span to the gateway log instead of logging the call twice; OpenAI Agents and Agno send the framework session on every span of the run, not only the root. Not released yet: the release is a separate intent.",
+  "packages": {
+    "@respan/ai-sdk-provider": "none",
+    "@respan/instrumentation-vercel": "none",
+    "respan-instrumentation-agno": "none",
+    "respan-instrumentation-openai-agents": "none"
+  }
+}

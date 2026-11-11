@@ -14,6 +14,7 @@ import {
   type FetchFunction,
 } from "@ai-sdk/provider-utils";
 import { gatewayModelId, wireFormat } from "./_models.js";
+import { linkingGatewayLog } from "./_tracing.js";
 
 export { gatewayModelId, wireFormat, type WireFormat } from "./_models.js";
 
@@ -57,7 +58,7 @@ export function createRespan(settings: RespanProviderSettings = {}): RespanProvi
       environmentVariableName: "RESPAN_API_KEY",
       description: "Respan",
     });
-  const shared = { headers: settings.headers, fetch: settings.fetch };
+  const shared = { headers: settings.headers, fetch: linkingGatewayLog(settings.fetch) };
 
   // Each delegate is created on first use so a missing key fails at call time,
   // not at import time, and only the formats you use are instantiated.

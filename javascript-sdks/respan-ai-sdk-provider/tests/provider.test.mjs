@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { generateText } from "ai";
+import { context, trace } from "@opentelemetry/api";
+import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
+import { BasicTracerProvider } from "@opentelemetry/sdk-trace-base";
+import { generateText, streamText } from "ai";
 import { createRespan, gatewayModelId, wireFormat } from "../dist/index.js";
 
 const BASE = "https://gateway.test";
@@ -120,4 +123,87 @@ test("wireFormat picks the format from the prefix or the model name", () => {
   assert.equal(wireFormat("o4-mini"), "openai");
   assert.equal(wireFormat("bedrock/claude-sonnet-4-5"), "chat");
   assert.equal(wireFormat("smart"), "chat");
+});
+
+// --- Gateway log link -------------------------------------------------------
+// The gateway logs every call it serves and returns that row's id in
+// x-respan-log-id. The AI SDK's model-call span names the row instead of
+// counting the call a second time.
+
+const LOG_ID = "4f1c1b0e5c8a4d3e9b7a6f5e4d3c2b1a";
+const contextManager = new AsyncLocalStorageContextManager().enable();
+context.setGlobalContextManager(contextManager);
+const tracer = new BasicTracerProvider().getTracer("test");
+
+function gatewayFetch({ stream = false, logId = LOG_ID } = {}) {
+  return async () => {
+    const headers = {
+      "content-type": stream ? "text/event-stream" : "application/json",
+      ...(logId ? { "x-respan-log-id": logId } : {}),
+    };
+    if (!stream) {
+      return new Response(JSON.stringify({
+        id: "chatcmpl-1", object: "chat.completion", created: 1, model: "azure/gpt-4.1-mini",
+        choices: [{ index: 0, message: { role: "assistant", content: "Hi!" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+      }), { status: 200, headers });
+    }
+    const chunks = [
+      { id: "chatcmpl-1", object: "chat.completion.chunk", created: 1, model: "azure/gpt-4.1-mini",
+        choices: [{ index: 0, delta: { role: "assistant", content: "Hi!" }, finish_reason: null }] },
+      { id: "chatcmpl-1", object: "chat.completion.chunk", created: 1, model: "azure/gpt-4.1-mini",
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 } },
+    ];
+    const body = chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("") + "data: [DONE]\n\n";
+    return new Response(body, { status: 200, headers });
+  };
+}
+
+// Stands in for the AI SDK's model-call span, which is the active span while
+// the provider calls the gateway (AI SDK 7 names it `chat <model>`).
+async function inSpan(attributes, run) {
+  const span = tracer.startSpan("chat azure/gpt-4.1-mini", { attributes });
+  await context.with(trace.setSpan(context.active(), span), run);
+  span.end();
+  return span.attributes;
+}
+
+const MODEL_CALL = { "gen_ai.operation.name": "chat" };
+
+test("generateText links the model-call span to the gateway log", async () => {
+  const respan = createRespan({ apiKey: "k", baseURL: BASE, fetch: gatewayFetch() });
+  const attrs = await inSpan(MODEL_CALL, () =>
+    generateText({ model: respan("azure/gpt-4.1-mini"), prompt: "Hi", maxRetries: 0 }));
+  assert.equal(attrs["respan.gateway.log_id"], LOG_ID);
+});
+
+test("streamText links the model-call span to the gateway log", async () => {
+  const respan = createRespan({ apiKey: "k", baseURL: BASE, fetch: gatewayFetch({ stream: true }) });
+  const attrs = await inSpan(MODEL_CALL, async () => {
+    const result = streamText({ model: respan("azure/gpt-4.1-mini"), prompt: "Hi", maxRetries: 0 });
+    assert.equal(await result.text, "Hi!");
+  });
+  assert.equal(attrs["respan.gateway.log_id"], LOG_ID);
+});
+
+test("legacy AI SDK model-call spans are linked too", async () => {
+  const respan = createRespan({ apiKey: "k", baseURL: BASE, fetch: gatewayFetch() });
+  const attrs = await inSpan({ "ai.operationId": "ai.generateText.doGenerate" }, () =>
+    generateText({ model: respan("azure/gpt-4.1-mini"), prompt: "Hi", maxRetries: 0 }));
+  assert.equal(attrs["respan.gateway.log_id"], LOG_ID);
+});
+
+test("a span that is not an AI SDK model call is never linked", async () => {
+  const respan = createRespan({ apiKey: "k", baseURL: BASE, fetch: gatewayFetch() });
+  const attrs = await inSpan({ "traceloop.span.kind": "task" }, () =>
+    generateText({ model: respan("azure/gpt-4.1-mini"), prompt: "Hi", maxRetries: 0 }));
+  assert.equal(attrs["respan.gateway.log_id"], undefined);
+});
+
+test("no header, no link", async () => {
+  const respan = createRespan({ apiKey: "k", baseURL: BASE, fetch: gatewayFetch({ logId: "" }) });
+  const attrs = await inSpan(MODEL_CALL, () =>
+    generateText({ model: respan("azure/gpt-4.1-mini"), prompt: "Hi", maxRetries: 0 }));
+  assert.equal(attrs["respan.gateway.log_id"], undefined);
 });

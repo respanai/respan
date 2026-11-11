@@ -1053,3 +1053,38 @@ test("global content opt-out strips raw and already canonical content", () => {
     else process.env.RESPAN_TRACE_CONTENT = previous;
   }
 });
+
+test("a gateway-linked model call carries the link, not usage, cost or content", () => {
+  // The gateway already logged this call (x-respan-log-id); the span is a link
+  // only, or the call is counted twice.
+  for (const [name, attributes] of [
+    ["ai.generateText.doGenerate", { ...baseLLMSpan, "gen_ai.usage.cost": 0.002 }],
+    ["chat gpt-4o-mini", {
+      "gen_ai.operation.name": "chat",
+      "gen_ai.provider.name": "openai",
+      "gen_ai.request.model": "gpt-4o-mini",
+      "gen_ai.input.messages": JSON.stringify([{ role: "user", parts: [{ type: "text", content: "hi" }] }]),
+      "gen_ai.output.messages": JSON.stringify([{ role: "assistant", parts: [{ type: "text", content: "hello" }] }]),
+      "gen_ai.usage.input_tokens": 12,
+      "gen_ai.usage.output_tokens": 4,
+      "gen_ai.usage.cost": 0.002,
+      "gen_ai.client.operation.duration": 1.25,
+    }],
+  ]) {
+    const attrs = runTranslator(name, { ...attributes, "respan.gateway.log_id": "gw-log-1" });
+    assert.equal(attrs["respan.gateway.log_id"], "gw-log-1", name);
+    assert.equal(attrs["gen_ai.request.model"], "gpt-4o-mini", name);
+    const leaked = Object.keys(attrs).filter((key) =>
+      /^(gen_ai\.usage\.|llm\.usage\.|ai\.usage\.|gen_ai\.prompt\.|gen_ai\.completion\.)/.test(key) ||
+      ["traceloop.entity.input", "traceloop.entity.output", "gen_ai.input.messages", "gen_ai.output.messages"].includes(key));
+    assert.deepEqual(leaked, [], name);
+    const metadata = JSON.parse(attrs["respan.metadata"] ?? "{}");
+    assert.equal(metadata.cost, undefined, name);
+  }
+});
+
+test("a model call without a gateway link keeps its usage", () => {
+  const attrs = runTranslator("ai.generateText.doGenerate", baseLLMSpan);
+  assert.equal(attrs["respan.gateway.log_id"], undefined);
+  assert.equal(attrs["gen_ai.usage.input_tokens"], 5);
+});
