@@ -1,0 +1,8 @@
+{
+  "summary": "Publish the Vercel log id fix (#529, DEV-14223): @respan/ai-sdk-provider links the AI SDK model-call span to the gateway log (respan.gateway.log_id from x-respan-log-id) and @respan/instrumentation-vercel drops usage, cost and content from a linked span, so each gateway call shows once in a trace; respan-instrumentation-openai-agents sends the framework session on every span of the run, not only the root. respan-instrumentation-agno is held: it has no PyPI Trusted Publisher for publish.yml (DEV-13958), so it ships in a separate intent once one exists.",
+  "packages": {
+    "@respan/ai-sdk-provider": "patch",
+    "@respan/instrumentation-vercel": "patch",
+    "respan-instrumentation-openai-agents": "patch"
+  }
+}
