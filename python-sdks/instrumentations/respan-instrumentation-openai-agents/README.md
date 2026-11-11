@@ -65,7 +65,7 @@ After running the script, traces appear on your [Respan dashboard](https://platf
 ## Sessions
 
 When you set no session id, the trace's `group_id` (`trace(..., group_id=...)` or `RunConfig(group_id=...)`) is sent as the run's Respan session id
-(`respan.sessions.session_identifier`), so every turn of one conversation lands in
+(`respan.sessions.session_identifier`) on every span of the run (workflow, agent, LLM, tool), so every turn of one conversation lands in
 one session with no Respan-specific code.
 
 A session, thread or trace group you set yourself always wins:
@@ -78,7 +78,7 @@ with propagate_attributes(session_identifier="my-session"):
 ```
 
 An empty id or one longer than 255 characters is not sent; Respan then detects the
-session on the server. Unchanged: the trace group (`respan.trace.trace_group_identifier`) is still sent, and no other span changes.
+session on the server. Unchanged: the trace group (`respan.trace.trace_group_identifier`) is still sent on the workflow span.
 
 ## Further Reading
 

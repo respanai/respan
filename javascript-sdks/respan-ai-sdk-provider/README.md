@@ -57,6 +57,10 @@ Set the default provider as above and keep your model IDs. `openai/`, `anthropic
 
 Version dots and dashes are interchangeable: `claude-sonnet-4.5` and `claude-sonnet-4-5` are the same model. Claude IDs are sent with dashes, the spelling the Anthropic provider uses to pick the model's output limit.
 
+## Tracing
+
+The gateway logs every call it serves. With [`@respan/instrumentation-vercel`](https://www.npmjs.com/package/@respan/instrumentation-vercel) on, the AI SDK's model-call span is linked to that log (`respan.gateway.log_id`, from the `x-respan-log-id` response header) instead of reporting the call again, so each call shows once in a trace, with the gateway's usage and cost. This covers `generateText` and `streamText`. Other spans are never touched.
+
 ## Options
 
 ```ts

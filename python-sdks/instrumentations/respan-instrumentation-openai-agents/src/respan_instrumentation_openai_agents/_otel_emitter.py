@@ -82,6 +82,24 @@ logger = logging.getLogger(__name__)
 # Respan stores at most this many characters of a session id.
 SESSION_ID_MAX_LENGTH = 255
 
+# group_id of each open trace: SDK spans do not carry it, and every span of the
+# run sends it as the session (the JS emitter's sdkTraceContexts).
+_TRACE_GROUP_IDS: dict[str, str] = {}
+
+
+def register_trace(trace_obj: Trace) -> None:
+    group_id = getattr(trace_obj, "group_id", None)
+    if group_id:
+        _TRACE_GROUP_IDS[trace_obj.trace_id] = group_id
+
+
+def clear_trace(trace_id: str) -> None:
+    _TRACE_GROUP_IDS.pop(trace_id, None)
+
+
+def clear_traces() -> None:
+    _TRACE_GROUP_IDS.clear()
+
 
 def _resolve_timestamps(item: SpanImpl) -> tuple[int | None, int | None]:
     start_ns = end_ns = None
@@ -367,6 +385,7 @@ def _build_item_span(
         attributes[SpanAttributes.TRACELOOP_ENTITY_OUTPUT] = json_string(
             {"error": {"message": message, "status_code": status_code}}
         )
+    _set_framework_session(attributes, _TRACE_GROUP_IDS.get(item.trace_id))
     _apply_content_privacy(attributes)
     return build_readable_span(
         name=safe_text(name, default="span"),

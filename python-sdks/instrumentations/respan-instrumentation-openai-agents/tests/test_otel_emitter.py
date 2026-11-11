@@ -122,6 +122,40 @@ def test_user_grouping_wins_over_trace_group_id(monkeypatch, user_grouping):
     assert session in (None, user_grouping.get("session_identifier"))
 
 
+def _run_real_trace(group_id):
+    set_trace_processors([_RespanTracingProcessor()])
+    with trace("contract", group_id=group_id), agent_span("Triage"):
+        with generation_span(model="gpt-4o-mini"):
+            pass
+        with function_span("weather", input="{}", output="sunny"):
+            pass
+
+
+def test_every_span_of_the_run_carries_the_group_session(monkeypatch):
+    captured = _capture_spans(monkeypatch)
+    _run_real_trace("conv-1")
+    assert len(captured) == 4
+    assert {span.attributes.get(RESPAN_SESSION_ID) for span in captured} == {"conv-1"}
+
+
+@pytest.mark.parametrize(
+    "user_grouping",
+    [
+        {"session_identifier": "user-session"},
+        {"thread_identifier": "user-thread"},
+        {"trace_group_identifier": "user-group"},
+    ],
+)
+def test_user_grouping_wins_on_child_spans(monkeypatch, user_grouping):
+    captured = _capture_spans(monkeypatch)
+    with propagate_attributes(**user_grouping):
+        _run_real_trace("conv-1")
+    assert len(captured) == 4
+    for span in captured:
+        session = span.attributes.get(RESPAN_SESSION_ID)
+        assert session in (None, user_grouping.get("session_identifier"))
+
+
 @pytest.mark.parametrize("group_id", [None, "", "x" * 256])
 def test_no_respan_session_without_a_usable_group_id(monkeypatch, group_id):
     captured = _capture_spans(monkeypatch)

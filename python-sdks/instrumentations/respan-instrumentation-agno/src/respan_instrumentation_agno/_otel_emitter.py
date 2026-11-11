@@ -248,6 +248,11 @@ def _set_framework_session(attributes: dict[str, Any], session_id: Any) -> None:
     attributes[RESPAN_SESSION_ID] = str(session_id)
 
 
+def _with_session(attributes: dict[str, Any], session_id: Any) -> dict[str, Any]:
+    _set_framework_session(attributes=attributes, session_id=session_id)
+    return attributes
+
+
 def _status_value(output: Any) -> str | None:
     status = _object_value(value=output, key=STATUS_KEY)
     if status is None:
@@ -914,6 +919,8 @@ def emit_agno_run(
         started_at_ns=started_at_ns,
     )
     root_status_code = 500 if _is_error_output(output=selected_output) else 200
+    # Every span of the run carries the session, not only the root.
+    session_id = _object_value(value=selected_output, key=SESSION_ID_KEY)
 
     root_span = build_readable_span(
         name=f"{AGNO_INSTRUMENTATION_NAME}.{target_kind}",
@@ -972,12 +979,15 @@ def emit_agno_run(
             parent_id=root_span_id,
             start_time_ns=started_at_ns,
             end_time_ns=ended_at_ns,
-            attributes=_chat_attributes(
-                target=target,
-                target_kind=target_kind,
-                input_value=input_value,
-                output=turn,
-                events=[] if messages else safe_events,
+            attributes=_with_session(
+                attributes=_chat_attributes(
+                    target=target,
+                    target_kind=target_kind,
+                    input_value=input_value,
+                    output=turn,
+                    events=[] if messages else safe_events,
+                ),
+                session_id=session_id,
             ),
             status_code=root_status_code,
         )
@@ -1014,11 +1024,14 @@ def emit_agno_run(
             parent_id=root_span_id,
             start_time_ns=started_at_ns,
             end_time_ns=ended_at_ns,
-            attributes=_tool_attributes(
-                target=target,
-                target_kind=target_kind,
-                output=selected_output,
-                tool_execution=tool_execution,
+            attributes=_with_session(
+                attributes=_tool_attributes(
+                    target=target,
+                    target_kind=target_kind,
+                    output=selected_output,
+                    tool_execution=tool_execution,
+                ),
+                session_id=session_id,
             ),
             status_code=tool_status_code,
         )
@@ -1042,11 +1055,14 @@ def emit_agno_run(
                 parent_id=root_span_id,
                 start_time_ns=started_at_ns,
                 end_time_ns=ended_at_ns,
-                attributes=_event_attributes(
-                    target=target,
-                    target_kind=target_kind,
-                    output=selected_output,
-                    event=event,
+                attributes=_with_session(
+                    attributes=_event_attributes(
+                        target=target,
+                        target_kind=target_kind,
+                        output=selected_output,
+                        event=event,
+                    ),
+                    session_id=session_id,
                 ),
             )
             inject_span(span=event_span)

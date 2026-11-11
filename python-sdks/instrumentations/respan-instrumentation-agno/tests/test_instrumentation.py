@@ -353,12 +353,40 @@ def test_user_grouping_wins_over_agno_session_id(captured_spans, user_grouping):
     assert RESPAN_SESSION_ID not in captured_spans[0].attributes
 
 
+def test_every_span_of_the_run_carries_the_agno_session(captured_spans):
+    _emit_agent_run(FakeRunOutput())
+    assert [span.name for span in captured_spans] == [
+        "agno.agent",
+        "agno.model_request",
+        "agno.tool",
+    ]
+    for span in captured_spans:
+        assert span.attributes[RESPAN_SESSION_ID] == "session_123", span.name
+
+
+@pytest.mark.parametrize(
+    "user_grouping",
+    [
+        {"session_identifier": "user-session"},
+        {"thread_identifier": "user-thread"},
+        {"trace_group_identifier": "user-group"},
+    ],
+)
+def test_user_grouping_wins_on_agno_child_spans(captured_spans, user_grouping):
+    with propagate_attributes(**user_grouping):
+        _emit_agent_run(FakeRunOutput())
+    for span in captured_spans:
+        session = span.attributes.get(RESPAN_SESSION_ID)
+        assert session in (None, user_grouping.get("session_identifier")), span.name
+
+
 @pytest.mark.parametrize("session_id", [None, "", "x" * 256])
 def test_no_respan_session_without_a_usable_agno_session_id(captured_spans, session_id):
     output = FakeRunOutput()
     output.session_id = session_id
     _emit_agent_run(output)
-    assert RESPAN_SESSION_ID not in captured_spans[0].attributes
+    for span in captured_spans:
+        assert RESPAN_SESSION_ID not in span.attributes, span.name
 
 
 def test_instrumented_sync_stream_emits_after_consumption(captured_spans):

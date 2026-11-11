@@ -17,7 +17,12 @@ from agents.tracing.spans import Span
 from agents.tracing.traces import Trace
 from opentelemetry import trace as otel_trace
 
-from respan_instrumentation_openai_agents._otel_emitter import emit_sdk_item
+from respan_instrumentation_openai_agents._otel_emitter import (
+    clear_trace,
+    clear_traces,
+    emit_sdk_item,
+    register_trace,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +154,7 @@ class _RespanTracingProcessor(TracingProcessor):
     def on_trace_start(self, trace: Trace) -> None:
         with self._lock:
             self._trace_starts.setdefault(trace.trace_id, time.time_ns())
+        register_trace(trace)
 
     def on_trace_end(self, trace: Trace) -> None:
         end_ns = time.time_ns()
@@ -162,6 +168,7 @@ class _RespanTracingProcessor(TracingProcessor):
             trace_start_ns=start_ns,
             trace_end_ns=end_ns,
         )
+        clear_trace(trace.trace_id)
         with self._lock:
             stale = [key for key in self._open_spans if key[0] == trace.trace_id]
             for key in stale:
@@ -190,6 +197,7 @@ class _RespanTracingProcessor(TracingProcessor):
             self._open_spans.clear()
             self._trace_starts.clear()
             self._seen.clear()
+        clear_traces()
 
     def force_flush(self) -> None:
         force_flush = getattr(otel_trace.get_tracer_provider(), "force_flush", None)

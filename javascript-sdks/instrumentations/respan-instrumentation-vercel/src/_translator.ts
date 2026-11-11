@@ -51,12 +51,14 @@ import {
   formatEmbeddingInput,
   formatEmbeddingOutput,
   instrumentationScopeName,
+  isRecord,
   isModernVercelAISpanName,
   isVercelAISpan,
   isVercelAIScope,
   modernOperationName,
   setMetadata,
   resolveLogType,
+  safeJsonParse,
   safeJsonStr,
   setDefault,
 } from "./_translator/shared.js";
@@ -408,6 +410,7 @@ export class VercelAITranslator implements RespanSpanTransformer {
 
     stripRedundantAttrs(attrs, logType);
     if (!captureContent) stripContentAttributes(attrs);
+    if (attrs[RespanSpanAttributes.RESPAN_GATEWAY_LOG_ID]) linkToGatewayLog(attrs);
   }
 
   /** Clear structural correlation state after the registry drains this lease. */
@@ -457,6 +460,32 @@ function isModernEmbeddingSpan(
   attrs: Record<string, any> | undefined,
 ): boolean {
   return modernOperationName(name, attrs ?? {}) === GEN_AI_OPERATION_NAME_VALUE_EMBEDDINGS;
+}
+
+// Usage the span would report on top of the gateway row.
+const GATEWAY_LINKED_DROPPED_PREFIXES = ["gen_ai.usage.", "llm.usage.", "ai.usage."];
+const GATEWAY_LINKED_DROPPED_METADATA = ["cost"];
+
+/**
+ * A model call the Respan gateway served (@respan/ai-sdk-provider sets
+ * respan.gateway.log_id from the x-respan-log-id response header) is already
+ * logged by the gateway with its usage, cost and content. The span keeps its
+ * place in the trace plus the link, and Respan shows the gateway row there. The
+ * backend estimates tokens from content when usage is absent, so content goes
+ * too. Mirrors the OpenAI and pi instrumentations.
+ */
+function linkToGatewayLog(attrs: Record<string, any>): void {
+  stripContentAttributes(attrs);
+  for (const key of Object.keys(attrs)) {
+    if (GATEWAY_LINKED_DROPPED_PREFIXES.some((prefix) => key.startsWith(prefix))) {
+      delete attrs[key];
+    }
+  }
+  const metadata = safeJsonParse(attrs[RespanSpanAttributes.RESPAN_METADATA]);
+  if (isRecord(metadata)) {
+    for (const key of GATEWAY_LINKED_DROPPED_METADATA) delete metadata[key];
+    attrs[RespanSpanAttributes.RESPAN_METADATA] = safeJsonStr(metadata);
+  }
 }
 
 /**

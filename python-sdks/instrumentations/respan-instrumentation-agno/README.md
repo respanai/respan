@@ -66,7 +66,7 @@ After running the script, traces appear on your [Respan dashboard](https://platf
 ## Sessions
 
 When you set no session id, Agno's `session_id` (the agent's or team's session) is sent as the run's Respan session id
-(`respan.sessions.session_identifier`), so every turn of one conversation lands in
+(`respan.sessions.session_identifier`) on every span of the run (agent, model request, tool), so every turn of one conversation lands in
 one session with no Respan-specific code. Pass the same `session_id` to `Agent(...)` or `agent.run(...)` to continue a conversation.
 
 A session, thread or trace group you set yourself always wins:
@@ -79,7 +79,7 @@ with propagate_attributes(session_identifier="my-session"):
 ```
 
 An empty id or one longer than 255 characters is not sent; Respan then detects the
-session on the server. Unchanged: the `agno.session.id` attribute is still sent, and no other span changes.
+session on the server. Unchanged: the `agno.session.id` attribute is still sent on the root span.
 
 ## Further Reading
 
