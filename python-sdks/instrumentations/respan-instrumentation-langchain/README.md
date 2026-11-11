@@ -58,6 +58,24 @@ The dependency floors are released `respan-tracing>=2.16.6,<3`,
 conventions `>=0.59b0`. They provide the canonical streaming, usage detail, tool
 ID, and provider constants used directly by the adapter.
 
+## Sessions
+
+When you set no session id, the run's `thread_id` metadata (LangGraph's `configurable.thread_id`) is sent as the run's Respan session id
+(`respan.sessions.session_identifier`), so every turn of one conversation lands in
+one session with no Respan-specific code. For LangGraph, pass `config={"configurable": {"thread_id": ...}}` as you already do for checkpointing.
+
+A session, thread or trace group you set yourself always wins:
+
+```python
+from respan import propagate_attributes
+
+with propagate_attributes(session_identifier="my-session"):
+    ...  # runs here keep "my-session"
+```
+
+An empty id or one longer than 255 characters is not sent; Respan then detects the
+session on the server. Unchanged: LangGraph spans still carry the thread id (`respan.threads.thread_identifier`), and no other span changes.
+
 ## Privacy and lifecycle
 
 `LangChainInstrumentor(include_content=False)` or an explicit

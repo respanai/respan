@@ -43,6 +43,25 @@ The real tracer sampler runs before payload capture. DROP and RECORD_ONLY runs d
 
 LLM spans preserve complete canonical messages, multimodal content, tool definitions, final output, and provider usage before optional indexed attributes consume OTel's default attribute budget. Tool execution spans contain `{name, arguments}`, the real result, and `gen_ai.tool.call.id` when the native callback exposes it. Agent action notifications remain events on their existing run, so they do not invent tool executions.
 
+## Sessions
+
+When you set no session id, the run's `thread_id` metadata (LangGraph's `configurable.thread_id`) is sent as the run's Respan session id
+(`respan.sessions.session_identifier`), so every turn of one conversation lands in
+one session with no Respan-specific code.
+
+A session, thread or trace group you set yourself always wins:
+
+```ts
+import { propagateAttributes } from "@respan/respan";
+
+await propagateAttributes({ session_identifier: "my-session" }, () =>
+  graph.invoke(input, config), // runs here keep "my-session"
+);
+```
+
+An empty id or one longer than 255 characters is not sent; Respan then detects the
+session on the server. Unchanged: no other span changes.
+
 ## Compatibility
 
 Native transport suites cover `@langchain/core` 0.2.0 with `@langchain/openai` 0.0.30, and core 1.2.17 with OpenAI 1.6.2. Companion examples cover `langchain` 1.5.16 and `@langchain/langgraph` 1.4.21, including agents, tools, structured output, streaming, retries, fallbacks, errors, and graphs. The production floors are `@respan/tracing` 1.6.1 and `@respan/respan-sdk` 1.3.4.

@@ -51,10 +51,16 @@ from respan_sdk.constants.span_attributes import (
     RESPAN_METADATA_GUARDRAIL_NAME,
     RESPAN_METADATA_TO_AGENT,
     RESPAN_METADATA_TRIGGERED,
+    RESPAN_SESSION_ID,
+    RESPAN_THREADS_ID,
     RESPAN_TRACE_GROUP_ID,
 )
 from respan_tracing.utils.context import is_content_tracing_enabled
-from respan_tracing.utils.span_factory import build_readable_span, inject_span
+from respan_tracing.utils.span_factory import (
+    build_readable_span,
+    inject_span,
+    read_propagated_attributes,
+)
 
 from respan_instrumentation_openai_agents._serialization import (
     error_status_code,
@@ -72,6 +78,9 @@ from respan_instrumentation_openai_agents._utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Respan stores at most this many characters of a session id.
+SESSION_ID_MAX_LENGTH = 255
 
 
 def _resolve_timestamps(item: SpanImpl) -> tuple[int | None, int | None]:
@@ -372,6 +381,22 @@ def _build_item_span(
     )
 
 
+def _set_framework_session(attrs: dict[str, Any], group_id: Any) -> None:
+    """Send the trace's group_id (the SDK's conversation id) as the Respan
+    session, unless the user set a session, thread or trace group: those win."""
+    if not isinstance(group_id, str) or not group_id.strip():
+        return
+    if len(group_id) > SESSION_ID_MAX_LENGTH:
+        return
+    current = {**read_propagated_attributes(), **attrs}
+    if any(
+        current.get(key)
+        for key in (RESPAN_SESSION_ID, RESPAN_THREADS_ID, RESPAN_TRACE_GROUP_ID)
+    ):
+        return
+    attrs[RESPAN_SESSION_ID] = group_id
+
+
 def emit_trace(
     trace_obj: Trace,
     *,
@@ -393,6 +418,7 @@ def emit_trace(
     attrs[SpanAttributes.TRACELOOP_ENTITY_INPUT] = json_string({"workflow_name": name})
     group_id = getattr(trace_obj, "group_id", None)
     if group_id:
+        _set_framework_session(attrs, group_id)
         attrs[RESPAN_TRACE_GROUP_ID] = safe_text(group_id, limit=512)
     _apply_content_privacy(attrs)
     inject_span(

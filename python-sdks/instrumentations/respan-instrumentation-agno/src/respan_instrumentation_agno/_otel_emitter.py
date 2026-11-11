@@ -25,6 +25,9 @@ from respan_sdk.constants.span_attributes import (
     RESPAN_LOG_METHOD,
     RESPAN_LOG_TYPE,
     RESPAN_METADATA,
+    RESPAN_SESSION_ID,
+    RESPAN_THREADS_ID,
+    RESPAN_TRACE_GROUP_ID,
 )
 from respan_sdk.utils.data_processing.id_processing import (
     ensure_span_id,
@@ -32,7 +35,11 @@ from respan_sdk.utils.data_processing.id_processing import (
     format_span_id,
     format_trace_id,
 )
-from respan_tracing.utils.span_factory import build_readable_span, inject_span
+from respan_tracing.utils.span_factory import (
+    build_readable_span,
+    inject_span,
+    read_propagated_attributes,
+)
 
 from respan_instrumentation_agno._constants import (
     AGENT_ID_KEY,
@@ -94,6 +101,7 @@ from respan_instrumentation_agno._constants import (
     RUN_COMPLETED_EVENT_SUFFIX,
     RUN_ID_KEY,
     SESSION_ID_KEY,
+    SESSION_ID_MAX_LENGTH,
     STATUS_KEY,
     TEAM_ID_KEY,
     TEAM_NAME_KEY,
@@ -222,6 +230,22 @@ def _attribute_string(value: Any) -> str | None:
 def _set_if_present(attributes: dict[str, Any], key: str, value: Any) -> None:
     if value is not None:
         attributes[key] = value
+
+
+def _set_framework_session(attributes: dict[str, Any], session_id: Any) -> None:
+    """Send Agno's session_id as the Respan session, unless the user set a
+    session, thread or trace group (propagated or on the span): those win."""
+    if session_id is None or not str(session_id).strip():
+        return
+    if len(str(session_id)) > SESSION_ID_MAX_LENGTH:
+        return
+    current = {**read_propagated_attributes(), **attributes}
+    if any(
+        current.get(key)
+        for key in (RESPAN_SESSION_ID, RESPAN_THREADS_ID, RESPAN_TRACE_GROUP_ID)
+    ):
+        return
+    attributes[RESPAN_SESSION_ID] = str(session_id)
 
 
 def _status_value(output: Any) -> str | None:
@@ -664,6 +688,7 @@ def _root_attributes(
 
     _set_if_present(attributes=attributes, key=AGNO_RUN_ID_ATTR, value=run_id)
     _set_if_present(attributes=attributes, key=AGNO_SESSION_ID_ATTR, value=session_id)
+    _set_framework_session(attributes=attributes, session_id=session_id)
     _set_if_present(attributes=attributes, key=AGNO_USER_ID_ATTR, value=user_id)
     _set_if_present(attributes=attributes, key=AGNO_STATUS_ATTR, value=status)
     if target_kind == AGNO_TARGET_AGENT:

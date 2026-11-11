@@ -15,6 +15,21 @@ import {
 import { RespanLogType, RespanSpanAttributes } from "@respan/respan-sdk";
 import { SpanAttributes } from "@traceloop/ai-semantic-conventions";
 
+// Respan stores at most this many characters of a session id.
+const SESSION_ID_MAX_LENGTH = 255;
+// Request-context keys through which the user sets their own grouping.
+const USER_GROUPING_KEYS = [
+  "session_identifier",
+  "thread_identifier",
+  "trace_group_identifier",
+  "threadId",
+];
+const GROUPING_ATTRIBUTES = [
+  RespanSpanAttributes.RESPAN_SESSION_ID,
+  RespanSpanAttributes.RESPAN_THREADS_ID,
+  RespanSpanAttributes.RESPAN_TRACE_GROUP_ID,
+];
+
 /** Read data properties without invoking payload getters or proxy traps. */
 export function data(value: unknown, key: PropertyKey): any {
   if (!value || typeof value !== "object" || isProxy(value)) return undefined;
@@ -300,6 +315,29 @@ export function contentAttributes(span: AnyExportedSpan): Attributes {
     }
   }
   return attrs;
+}
+
+/**
+ * Mastra's memory thread id (agent_run `metadata.threadId`) as the Respan
+ * session, unless the user set a session, thread or trace group: propagated
+ * onto the span, or in the request context. Those win.
+ */
+export function sessionAttributes(
+  span: AnyExportedSpan,
+  existing: unknown,
+): Attributes {
+  const threadId = data(span.metadata, "threadId");
+  if (
+    typeof threadId !== "string" ||
+    !threadId.trim() ||
+    threadId.length > SESSION_ID_MAX_LENGTH
+  )
+    return {};
+  if (GROUPING_ATTRIBUTES.some((key) => data(existing, key))) return {};
+  const request = data(span, "requestContext");
+  if (USER_GROUPING_KEYS.some((key) => data(request, key) !== undefined))
+    return {};
+  return { [RespanSpanAttributes.RESPAN_SESSION_ID]: threadId };
 }
 
 export function metadataAttributes(

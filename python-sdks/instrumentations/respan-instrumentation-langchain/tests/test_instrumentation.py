@@ -43,8 +43,13 @@ from respan_instrumentation_langchain import (
     add_respan_callback,
 )
 from respan_instrumentation_langchain._serialization import json_value
-from respan_sdk.constants.span_attributes import RESPAN_LOG_TYPE
+from respan_sdk.constants.span_attributes import (
+    RESPAN_LOG_TYPE,
+    RESPAN_SESSION_ID,
+    RESPAN_THREADS_ID,
+)
 from respan_tracing.constants.context_constants import ENABLE_CONTENT_TRACING_KEY
+from respan_tracing.utils.span_factory import propagate_attributes
 
 INPUT = SpanAttributes.TRACELOOP_ENTITY_INPUT
 OUTPUT = SpanAttributes.TRACELOOP_ENTITY_OUTPUT
@@ -708,6 +713,68 @@ def test_native_langgraph_state_graph(spans):
     assert any(
         s.attributes.get("respan.metadata.framework") == "langgraph"
         for s in spans.get_finished_spans()
+    )
+
+
+def _thread_graph():
+    pytest.importorskip("langgraph")
+    from typing import TypedDict
+
+    from langgraph.graph import StateGraph
+
+    class State(TypedDict):
+        value: str
+
+    graph = StateGraph(State)
+    graph.add_node("echo", lambda state: {"value": state["value"] + "!"})
+    graph.set_entry_point("echo")
+    graph.set_finish_point("echo")
+    return graph.compile()
+
+
+def _thread_config(thread_id):
+    return {**config(), "configurable": {"thread_id": thread_id}}
+
+
+def test_langgraph_thread_id_is_the_session(spans):
+    _thread_graph().invoke({"value": "q"}, config=_thread_config("conv-1"))
+    finished = spans.get_finished_spans()
+    assert finished
+    assert {s.attributes.get(RESPAN_SESSION_ID) for s in finished} == {"conv-1"}
+    # The legacy thread attribute stays for older backends.
+    assert any(s.attributes.get(RESPAN_THREADS_ID) == "conv-1" for s in finished)
+
+
+def test_user_session_wins_over_langgraph_thread_id(spans):
+    with propagate_attributes(session_identifier="user-session"):
+        _thread_graph().invoke({"value": "q"}, config=_thread_config("conv-1"))
+    assert all(
+        s.attributes.get(RESPAN_SESSION_ID) is None for s in spans.get_finished_spans()
+    )
+
+
+def test_user_thread_wins_over_langgraph_thread_id(spans):
+    with propagate_attributes(thread_identifier="user-thread"):
+        _thread_graph().invoke({"value": "q"}, config=_thread_config("conv-1"))
+    assert all(
+        s.attributes.get(RESPAN_SESSION_ID) is None for s in spans.get_finished_spans()
+    )
+
+
+def test_respan_params_session_wins_over_langgraph_thread_id(spans):
+    cfg = _thread_config("conv-1")
+    cfg["metadata"]["respan_params"]["session_identifier"] = "user-session"
+    _thread_graph().invoke({"value": "q"}, config=cfg)
+    assert {
+        s.attributes.get(RESPAN_SESSION_ID) for s in spans.get_finished_spans()
+    } == {"user-session"}
+
+
+def test_no_session_without_a_thread_id_or_with_an_overlong_one(spans):
+    _thread_graph().invoke({"value": "q"}, config=config())
+    _thread_graph().invoke({"value": "q"}, config=_thread_config("x" * 256))
+    assert all(
+        s.attributes.get(RESPAN_SESSION_ID) is None for s in spans.get_finished_spans()
     )
 
 

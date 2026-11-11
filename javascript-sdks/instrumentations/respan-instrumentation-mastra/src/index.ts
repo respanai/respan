@@ -18,6 +18,7 @@ import {
   data,
   metadataAttributes,
   scalarAttributes,
+  sessionAttributes,
 } from "./_translator.js";
 import { capture, guard, refresh, type CapturePolicy } from "./_privacy.js";
 import type { ReadableSpan } from "@opentelemetry/sdk-trace-base";
@@ -159,6 +160,7 @@ export class MastraInstrumentor implements ObservabilityExporter {
     // Reading the guarded actual span observes any late allow_trace_content veto.
     void (actual as unknown as ReadableSpan).attributes;
     const allowContent = state.policy.inputs && state.policy.outputs;
+    actual.setAttributes(sessionAttributes(native, attrs));
     actual.setAttributes(scalarAttributes(native));
     if (allowContent) {
       actual.setAttributes(

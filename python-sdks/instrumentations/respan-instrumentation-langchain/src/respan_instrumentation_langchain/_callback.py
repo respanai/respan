@@ -48,6 +48,7 @@ from respan_sdk.constants.span_attributes import (
 )
 from respan_tracing.core.tracer import RespanTracer
 from respan_tracing.utils.context import is_content_tracing_enabled
+from respan_tracing.utils.span_factory import read_propagated_attributes
 
 from ._constants import (
     LANGCHAIN_FRAMEWORK_ATTR,
@@ -56,10 +57,20 @@ from ._constants import (
     LANGCHAIN_RUN_ID_ATTR,
     LANGCHAIN_SERIALIZED_ATTR,
     LANGCHAIN_TAGS_ATTR,
+    LANGCHAIN_THREAD_ID_KEY,
+    SESSION_ID_MAX_LENGTH,
 )
 from ._serialization import MAX_CHARS, data, json_value, text
 
 logger = logging.getLogger(__name__)
+_GROUPING_ATTRIBUTES = tuple(
+    RESPAN_SPAN_ATTRIBUTES_MAP[field_name]
+    for field_name in (
+        "session_identifier",
+        "thread_identifier",
+        "trace_group_identifier",
+    )
+)
 _MARKER_FIELDS = {
     "run_id",
     "example_run_id",
@@ -69,6 +80,20 @@ _MARKER_FIELDS = {
     "example_set",
     "example_name",
 }
+
+
+def _set_framework_session(span: Any, thread_id: Any) -> None:
+    """Send the run's thread_id (LangGraph ``configurable.thread_id``) as the
+    Respan session, unless the user already set a session, thread or trace
+    group on the span or in propagated attributes: those win."""
+    if not isinstance(thread_id, str) or not thread_id.strip():
+        return
+    if len(thread_id) > SESSION_ID_MAX_LENGTH:
+        return
+    current = {**read_propagated_attributes(), **(span.attributes or {})}
+    if any(current.get(key) for key in _GROUPING_ATTRIBUTES):
+        return
+    span.set_attribute(RESPAN_SPAN_ATTRIBUTES_MAP["session_identifier"], thread_id)
 
 
 def _safe_callback(method):
@@ -454,8 +479,9 @@ class RespanCallbackHandler(BaseCallbackHandler):
                     RESPAN_SPAN_ATTRIBUTES_MAP["trace_group_identifier"],
                     self._langflow_group,
                 )
+            _set_framework_session(span, (metadata or {}).get(LANGCHAIN_THREAD_ID_KEY))
             if framework == "langgraph" and isinstance(
-                (metadata or {}).get("thread_id"), str
+                (metadata or {}).get(LANGCHAIN_THREAD_ID_KEY), str
             ):
                 span.set_attribute(
                     RESPAN_SPAN_ATTRIBUTES_MAP["thread_identifier"],

@@ -33,11 +33,13 @@ import {
   LANGCHAIN_FRAMEWORK_ATTR,
   LANGCHAIN_RUN_ID_ATTR,
   LANGCHAIN_PARENT_RUN_ID_ATTR,
+  LANGCHAIN_THREAD_ID_KEY,
   detectFramework,
   extractName,
   extractModel,
   extractTools,
   extractLlmOutput,
+  setFrameworkSession,
   extractToolCallsFromMessages,
   extractUsage,
   normalizeChatMessages,
@@ -225,6 +227,7 @@ export class RespanCallbackHandler {
     policy.sampled =
       span.isRecording() &&
       !!(span.spanContext().traceFlags & TraceFlags.SAMPLED);
+    setFrameworkSession(span, data(metadata, LANGCHAIN_THREAD_ID_KEY));
     guard(span, policy);
     const record: RunRecord = {
       runId,

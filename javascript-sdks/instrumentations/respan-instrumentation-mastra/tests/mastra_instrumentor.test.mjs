@@ -770,3 +770,56 @@ test("unrelated exporter suppression cannot veto an already admitted native span
   );
   await observability.shutdown();
 });
+
+function agentRun(instance, threadId) {
+  const span = instance.startSpan({
+    name: "agent run",
+    type: SpanType.AGENT_RUN,
+    input: { messages: [] },
+    metadata: { runId: "run-1", resourceId: "user-1", threadId },
+  });
+  span.end({ output: { text: "ok" } });
+}
+
+test("agent memory threadId is the Respan session", async () => {
+  const { instance } = setup();
+  agentRun(instance, "thread-1");
+  await instance.flush?.();
+  assert.equal(
+    attrs("agent run")[RespanSpanAttributes.RESPAN_SESSION_ID],
+    "thread-1",
+  );
+});
+
+test("a session, thread or trace group set by the user wins over threadId", async () => {
+  for (const key of [
+    RespanSpanAttributes.RESPAN_SESSION_ID,
+    RespanSpanAttributes.RESPAN_THREADS_ID,
+    RespanSpanAttributes.RESPAN_TRACE_GROUP_ID,
+  ]) {
+    exporter.reset();
+    // Respan's processor copies the user's propagated attributes on start.
+    onStart = (span) => span.setAttribute(key, "user-set");
+    const { instance } = setup();
+    agentRun(instance, "thread-1");
+    await instance.flush?.();
+    const session = attrs("agent run")[RespanSpanAttributes.RESPAN_SESSION_ID];
+    assert.equal(
+      session,
+      key === RespanSpanAttributes.RESPAN_SESSION_ID ? "user-set" : undefined,
+    );
+  }
+});
+
+test("no session without a usable threadId", async () => {
+  for (const threadId of [undefined, "", "x".repeat(256)]) {
+    exporter.reset();
+    const { instance } = setup();
+    agentRun(instance, threadId);
+    await instance.flush?.();
+    assert.equal(
+      attrs("agent run")[RespanSpanAttributes.RESPAN_SESSION_ID],
+      undefined,
+    );
+  }
+});

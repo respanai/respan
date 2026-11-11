@@ -63,6 +63,24 @@ respan.flush()
 
 After running the script, traces appear on your [Respan dashboard](https://platform.respan.ai).
 
+## Sessions
+
+When you set no session id, Agno's `session_id` (the agent's or team's session) is sent as the run's Respan session id
+(`respan.sessions.session_identifier`), so every turn of one conversation lands in
+one session with no Respan-specific code. Pass the same `session_id` to `Agent(...)` or `agent.run(...)` to continue a conversation.
+
+A session, thread or trace group you set yourself always wins:
+
+```python
+from respan import propagate_attributes
+
+with propagate_attributes(session_identifier="my-session"):
+    ...  # runs here keep "my-session"
+```
+
+An empty id or one longer than 255 characters is not sent; Respan then detects the
+session on the server. Unchanged: the `agno.session.id` attribute is still sent, and no other span changes.
+
 ## Further Reading
 
 - [Agno examples in respan-example-projects](https://github.com/respanai/respan-example-projects/tree/main/python/tracing/agno)
