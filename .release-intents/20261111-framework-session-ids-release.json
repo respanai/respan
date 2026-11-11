@@ -1,0 +1,9 @@
+{
+  "summary": "Publish the framework-conversation-id-as-session release (#526, DEV-14149) for the packages whose Trusted Publisher exists: instrumentations send LangGraph thread_id, Mastra threadId and OpenAI Agents group_id as the Respan session when the user set none. respan-instrumentation-agno and respan-instrumentation-langchain (PyPI) are held: they have no Trusted Publisher for publish.yml (run 32519750132 failed with 403), so they ship in a separate intent once one exists.",
+  "packages": {
+    "respan-instrumentation-openai-agents": "minor",
+    "@respan/instrumentation-langchain": "minor",
+    "@respan/instrumentation-mastra": "minor",
+    "@respan/instrumentation-openai-agents": "minor"
+  }
+}
