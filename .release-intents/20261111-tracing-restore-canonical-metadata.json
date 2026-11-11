@@ -1,0 +1,6 @@
+{
+  "summary": "Restore canonical metadata merging that shipped in the hand-published @respan/tracing 1.6.1 but never landed on main",
+  "packages": {
+    "@respan/tracing": "none"
+  }
+}
