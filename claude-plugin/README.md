@@ -20,6 +20,20 @@ once: run `/mcp`, select `plugin:respan:respan`, and finish the sign-in in your
 browser. If you can't use a browser, as in CI, see
 [Using an API key](#using-an-api-key).
 
+### Respan Enterprise
+
+The plugin connects to Respan's platform server, `https://mcp.respan.ai/mcp`, by
+default. If your team signs in to Respan Enterprise, switch it before you sign in:
+
+1. Run `/plugin configure respan@respan` and set **Respan server** to
+   `https://mcp.respan.ai/mcp/enterprise`.
+2. Restart Claude Code, then run `/mcp`, select `plugin:respan:respan`, and sign in
+   with your Enterprise account.
+
+The option also appears in `/config`. Each server has its own sign-in, so if you
+change it later, sign in again with `/mcp`. The option needs Claude Code v2.1.271
+or later.
+
 > The plugin skill is namespaced by Claude Code as `/respan:respan` if you invoke
 > it explicitly — but you rarely need to type it, since it fires automatically
 > when a task matches its description.
@@ -52,8 +66,8 @@ directory only:
 │   └── build-plugins.mjs   # copies the shared skill into each plugin (see below)
 └── claude-plugin/
     ├── .claude-plugin/
-    │   └── plugin.json     # plugin manifest: name, version
-    ├── .mcp.json           # connects the hosted MCP server at mcp.respan.ai
+    │   └── plugin.json     # plugin manifest: name, version, server option
+    ├── .mcp.json           # connects the hosted MCP server the option picks
     └── skills/
         └── respan/         # GENERATED — do not hand-edit
             ├── SKILL.md
@@ -116,11 +130,14 @@ claude plugin validate ./claude-plugin --strict
 
 Sign-in is OAuth. There is no API key to configure, and no secret in this repo.
 
-`.mcp.json` declares only the URL of the hosted server, `https://mcp.respan.ai/mcp`.
-An unauthenticated request gets a `401` with a `WWW-Authenticate` header pointing
-at the server's OAuth metadata, so Claude Code reports `! Needs authentication`
-until you sign in with `/mcp`. Claude Code registers itself with the server and
-stores the token.
+`.mcp.json` declares only the server's URL, `${user_config.server}`, which Claude
+Code fills in from the **Respan server** option: `https://mcp.respan.ai/mcp` by
+default, or `https://mcp.respan.ai/mcp/enterprise`. An unauthenticated request gets
+a `401` with a `WWW-Authenticate` header pointing at that server's OAuth metadata,
+so Claude Code reports `! Needs authentication` until you sign in with `/mcp`.
+Claude Code registers itself with the server and stores the token. The two servers
+use separate OAuth authorization servers, so an Enterprise account signs in only
+through the Enterprise one.
 
 ### Using an API key
 
@@ -134,10 +151,12 @@ claude mcp add --transport http --scope user respan https://mcp.respan.ai/mcp \
 ```
 
 Keep the single quotes. Claude Code then reads the key from the environment when
-it starts, and saves only the `${RESPAN_API_KEY}` reference in its config.
+it starts, and saves only the `${RESPAN_API_KEY}` reference in its config. For
+Respan Enterprise, use `https://mcp.respan.ai/mcp/enterprise` and an Enterprise key.
 
-- If the plugin is installed too, `claude mcp list` shows only this `respan`
-  server, because both use the same URL. Its tools are named `mcp__respan__*`.
+- If the plugin is installed too and its **Respan server** option matches this
+  URL, `claude mcp list` shows only this `respan` server. Its tools are named
+  `mcp__respan__*`.
 - `✔ Connected` doesn't prove the key works. The server accepts any key when
   connecting and rejects a bad one only when a tool runs, so run a tool to check.
 

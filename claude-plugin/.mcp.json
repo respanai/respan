@@ -2,7 +2,7 @@
   "mcpServers": {
     "respan": {
       "type": "http",
-      "url": "https://mcp.respan.ai/mcp"
+      "url": "${user_config.server}"
     }
   }
 }
