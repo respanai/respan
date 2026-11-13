@@ -1,0 +1,6 @@
+{
+  "summary": "export_filter treats a multi-value list as in / not_in for every equal and not-equal operator alias, so \"not\" with a list no longer exports everything and \"equals\" with a list no longer drops matching spans.",
+  "packages": {
+    "respan-tracing": "patch"
+  }
+}

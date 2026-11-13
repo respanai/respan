@@ -171,12 +171,17 @@ def evaluate_export_filter(
         rule_value = field_condition.get("value")
         actual_value = span_data.get(field_name)
 
-        # Unwrap single-element lists (frontend sends lists)
+        # Unwrap single-element lists (frontend sends lists); a longer list
+        # means any of its values, for every alias of equal / not equal.
         if isinstance(rule_value, list):
             if len(rule_value) == 1:
                 rule_value = rule_value[0]
-            elif not operator or operator in (_OP_EQUAL, "=", "==", "eq"):
-                operator = _OP_IN
+            else:
+                normalized = normalize_operator(operator)
+                if normalized == _OP_EQUAL:
+                    operator = _OP_IN
+                elif normalized == _OP_NOT:
+                    operator = _OP_NOT_IN
 
         if not apply_operator(
             log_value=actual_value,
