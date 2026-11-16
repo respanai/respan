@@ -365,3 +365,69 @@ test("SpanNameTransformingExporter delegates export, forceFlush, and shutdown", 
   assert.equal(calls.flushed, true);
   assert.equal(calls.shutdown, true);
 });
+
+function spanWithContext(name, attributes, { traceId, spanId, parentSpanId }) {
+  return {
+    name,
+    attributes,
+    spanContext: () => ({ traceId, spanId, traceFlags: 1 }),
+    parentSpanContext: parentSpanId
+      ? { traceId, spanId: parentSpanId, traceFlags: 1 }
+      : undefined,
+  };
+}
+
+const CALL_TRACE = "a".repeat(32);
+const TURN_TRACE = "b".repeat(32);
+
+for (const style of ["semantic", "legacy"]) {
+  test(`[${style}] an export trace id moves the span and its parent link`, () => {
+    const child = transformReadableSpanName(
+      spanWithContext(
+        "llm_node",
+        { "respan.internal.export_trace_id": TURN_TRACE },
+        { traceId: CALL_TRACE, spanId: "c".repeat(16), parentSpanId: "d".repeat(16) }
+      ),
+      style
+    );
+    assert.equal(child.spanContext().traceId, TURN_TRACE);
+    assert.equal(child.spanContext().spanId, "c".repeat(16));
+    assert.equal(child.parentSpanContext.traceId, TURN_TRACE);
+    assert.equal(child.parentSpanContext.spanId, "d".repeat(16));
+    assert.equal(child.attributes["respan.internal.export_trace_id"], undefined);
+    // A later copy (Object.assign, as transformers do) keeps the move.
+    const copy = Object.assign(Object.create(Object.getPrototypeOf(child)), child);
+    assert.equal(copy.spanContext().traceId, TURN_TRACE);
+
+    // A moved span with an empty parent hint is a root in either style.
+    const root = transformReadableSpanName(
+      spanWithContext(
+        "agent_turn",
+        {
+          "respan.internal.export_trace_id": TURN_TRACE,
+          "respan.internal.export_parent_span_id": "",
+        },
+        { traceId: CALL_TRACE, spanId: "d".repeat(16), parentSpanId: "e".repeat(16) }
+      ),
+      style
+    );
+    assert.equal(root.spanContext().traceId, TURN_TRACE);
+    assert.equal(root.parentSpanContext, undefined);
+  });
+}
+
+test("a malformed export trace id is dropped and the span is not moved", () => {
+  for (const bad of ["xyz", "A".repeat(32), "a".repeat(31), 42]) {
+    const out = transformReadableSpanName(
+      spanWithContext(
+        "llm_node",
+        { "respan.internal.export_trace_id": bad },
+        { traceId: CALL_TRACE, spanId: "c".repeat(16), parentSpanId: "d".repeat(16) }
+      ),
+      "legacy"
+    );
+    assert.equal(out.spanContext().traceId, CALL_TRACE);
+    assert.equal(out.parentSpanContext.traceId, CALL_TRACE);
+    assert.equal(out.attributes["respan.internal.export_trace_id"], undefined);
+  }
+});
