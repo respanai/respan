@@ -2,7 +2,7 @@
 
 Translate the LiveKit Agents TypeScript SDK's native OpenTelemetry spans through
 Respan's tracing runtime. Tested with `@livekit/agents` 1.4.0 and 1.9.2; requires
-`@respan/tracing` 1.6.1 or newer.
+`@respan/tracing` 1.7.0 or newer (installed with this package).
 
 ```ts
 import { Respan } from "@respan/respan";
@@ -15,6 +15,15 @@ const respan = new Respan({
 await respan.initialize();
 // Start your normal LiveKit AgentSession after initialization.
 ```
+
+## Voice calls as sessions
+
+Each call is one Respan session, named by the call's trace id unless you set
+`respan.sessions.session_identifier` yourself. Each agent turn is its own trace in
+that session, and its root span carries the turn's timings in milliseconds under
+`respan.metadata.voice.*`: `turn_index`, `wait_ms` (end of user speech to first
+agent audio), `stt_ms`, `llm_ttft_ms`, `tts_ttfa_ms` and `interrupted`. A timing
+LiveKit didn't report is left out.
 
 The adapter uses LiveKit's public dynamic tracer and the active Respan provider.
 It preserves native session, tool, promise, stream, chunk, and error behavior.
