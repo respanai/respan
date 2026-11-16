@@ -14,6 +14,7 @@ from respan_sdk.constants.span_attributes import RESPAN_LOG_METHOD, RESPAN_LOG_T
 
 from ._policy import CapturePolicy, key, private_attributes
 from ._serialization import text
+from ._voice import VoiceTurns
 from ._translator import (
     build_livekit_llm_attrs,
     build_native_tool_attrs,
@@ -28,9 +29,16 @@ class LiveKitSpanProcessor(SpanProcessor):
         self.active = True
         self.on_drained = None
         self.source_usage = {}
+        self.voice = VoiceTurns()
 
     def on_start(self, span, parent_context=None):
         if self.active:
+            try:
+                self.voice.start(
+                    span, key(span), key(trace.get_current_span(parent_context))
+                )
+            except Exception:  # noqa: BLE001 - turn grouping cannot replace native span creation.
+                pass
             try:
                 self.policy.start(span, parent_context)
             except Exception:  # noqa: BLE001 - privacy observation cannot replace native span creation.
@@ -52,11 +60,17 @@ class LiveKitSpanProcessor(SpanProcessor):
             state[1] = False
             self.policy.closed[key(span)] = state
             capture = False
+        try:
+            grouped = self.voice.end(span, key(span), dict(span.attributes or {}))
+        except Exception:  # noqa: BLE001 - turn grouping observes without replacing native values.
+            grouped = None
         if not self.policy.owned(span):
+            if grouped is not None:
+                span._attributes = grouped
             return
         try:
             original = dict(span.attributes or {})
-            attrs = dict(original)
+            attrs = dict(grouped if grouped is not None else original)
             if is_livekit_llm_span(span.name, attrs):
                 translated = build_livekit_llm_attrs(
                     span_name=span.name,

@@ -23,6 +23,8 @@ from respan_sdk.constants.span_attributes import (
 from respan_tracing.constants.generic_constants import TRACE_CONTENT_OFF_VALUES
 from respan_tracing.utils.context import is_content_tracing_enabled
 
+from ._voice import VOICE_SOURCE_ATTRIBUTES
+
 
 def suppressed(ctx=None):
     return bool(
@@ -98,6 +100,8 @@ def private_attributes(attrs):
         GenAI.GEN_AI_TOOL_CALL_ID,
         ERROR_TYPE,
         HTTP_RESPONSE_STATUS_CODE,
+        # A turn's durations and interruption flag, read at its end.
+        *VOICE_SOURCE_ATTRIBUTES,
     }
     markers = {
         "run_id",
@@ -119,6 +123,9 @@ def private_attributes(attrs):
                 "llm.usage.",
                 "respan.threads.",
                 "respan.trace.",
+                "respan.sessions.",
+                # Voice timings are durations, not content.
+                RESPAN_METADATA + ".voice.",
                 "respan.customer_params.",
             )
         )

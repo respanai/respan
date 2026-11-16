@@ -1,0 +1,6 @@
+{
+  "summary": "LiveKit (Python): each call is a Respan session and each agent turn its own trace, with the turn's wait, transcription delay, LLM time to first token, TTS time to first audio and interruption on the turn root (respan.metadata.voice.*). DEV-14483.",
+  "packages": {
+    "respan-instrumentation-livekit": "minor"
+  }
+}
