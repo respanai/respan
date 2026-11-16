@@ -1,0 +1,6 @@
+{
+  "summary": "Pipecat (Python): each turn root carries its voice timings in respan.metadata.voice.* (turn_index, wait_ms from conversation.user_to_bot_latency, stt_ms / llm_ttft_ms / tts_ttfa_ms from each service's first service.ttfb_seconds, interrupted). DEV-14484.",
+  "packages": {
+    "respan-instrumentation-pipecat": "minor"
+  }
+}

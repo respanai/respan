@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from typing import Any
 
 from openinference.semconv.trace import (
@@ -46,6 +46,7 @@ from respan_sdk.constants.llm_logging import (
 from respan_sdk.constants.span_attributes import (
     RESPAN_LOG_METHOD,
     RESPAN_LOG_TYPE,
+    RESPAN_METADATA,
     RESPAN_SESSION_ID,
 )
 
@@ -343,11 +344,70 @@ def _normalize_status(span, attrs, *, is_chat):
     span._status = Status(StatusCode.ERROR, attrs.get(ERROR_MESSAGE))
 
 
+# A voice turn (DEV-14477): OpenInference makes each Pipecat turn a trace of its
+# own, rooted at the turn span, with one span per service under it. The turn
+# root gets ``respan.metadata.voice.*`` in milliseconds: the wait the user had
+# (``conversation.user_to_bot_latency``), each service's time to first byte
+# (``service.ttfb_seconds`` on its first span in the turn), the turn's position
+# and whether it was interrupted. Children end before their turn.
+_TURN_SPAN_NAME = "pipecat.conversation.turn"
+_VOICE_METADATA_PREFIX = f"{RESPAN_METADATA}.voice."
+_SERVICE_TTFB_VOICE_KEYS = {
+    "pipecat.stt": "stt_ms",
+    "pipecat.llm": "llm_ttft_ms",
+    "pipecat.tts": "tts_ttfa_ms",
+}
+_SERVICE_TTFB = "service.ttfb_seconds"
+_TURN_WAIT = "conversation.user_to_bot_latency"
+_TURN_NUMBER = "conversation.turn_number"
+_TURN_INTERRUPTED = "conversation.was_interrupted"
+_MAX_OPEN_TURNS = 4096
+
+
+def _seconds_to_ms(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value != value or value < 0 or value == float("inf"):
+        return None
+    return round(value * 1000, 1)
+
+
 class PipecatOpenInferenceTranslator(SpanProcessor):
     """SpanProcessor for OpenInference spans emitted by Pipecat."""
 
     def __init__(self, runtime=None):
         self.runtime = runtime
+        # turn span key -> voice timings its service spans reported
+        self._turn_timings: OrderedDict[tuple[int, int], dict[str, Any]] = OrderedDict()
+
+    def _record_voice(self, span: ReadableSpan, attrs: dict[str, Any]) -> None:
+        """Collect a service span's time to first byte under its turn; on the turn
+        root, write the turn's timings to its metadata."""
+        context = span.get_span_context()
+        if span.name == _TURN_SPAN_NAME:
+            timings = self._turn_timings.pop((context.trace_id, context.span_id), {})
+            wait = _seconds_to_ms(attrs.get(_TURN_WAIT))
+            if wait is not None:
+                timings["wait_ms"] = wait
+            turn_number = attrs.get(_TURN_NUMBER)
+            if isinstance(turn_number, int) and not isinstance(turn_number, bool):
+                timings["turn_index"] = max(turn_number - 1, 0)
+            if isinstance(attrs.get(_TURN_INTERRUPTED), bool):
+                timings["interrupted"] = attrs[_TURN_INTERRUPTED]
+            for voice_key, value in timings.items():
+                attrs[_VOICE_METADATA_PREFIX + voice_key] = value
+            return
+        voice_key = _SERVICE_TTFB_VOICE_KEYS.get(span.name)
+        parent = span.parent
+        if voice_key is None or parent is None:
+            return
+        reading = _seconds_to_ms(attrs.get(_SERVICE_TTFB))
+        if reading is None:
+            return
+        timings = self._turn_timings.setdefault((parent.trace_id, parent.span_id), {})
+        timings.setdefault(voice_key, reading)
+        while len(self._turn_timings) > _MAX_OPEN_TURNS:
+            self._turn_timings.popitem(last=False)
 
     def on_start(self, span: Any, parent_context: Any = None) -> None:
         pass
@@ -451,6 +511,8 @@ class PipecatOpenInferenceTranslator(SpanProcessor):
             attrs["conversation.was_interrupted"] = False
 
         _normalize_status(span, attrs, is_chat=is_chat)
+        # Before the raw ``service.*`` keys are dropped below.
+        self._record_voice(span, attrs)
         self._remove_raw_attrs(attrs)
         attrs.pop(TLSpanAttributes.TRACELOOP_SPAN_KIND, None)
         for key in list(attrs):
