@@ -7,6 +7,8 @@ import {
   LK_RESPONSE_TTFT,
   LK_SPEECH_INTERRUPTED,
   LK_TRANSCRIPTION_DELAY,
+  VOICE_KEYS,
+  VOICE_METADATA_SEGMENT,
 } from "./_constants.js";
 
 /**
@@ -20,16 +22,16 @@ import {
  * and every span of the call carries the call's trace id as its session id
  * unless the user set one. The turn root gets `respan.metadata.voice.*` in ms.
  */
-const VOICE_METADATA_PREFIX = `${RespanSpanAttributes.RESPAN_METADATA}.voice.`;
+const VOICE_METADATA_PREFIX = `${RespanSpanAttributes.RESPAN_METADATA}.${VOICE_METADATA_SEGMENT}.`;
 // LiveKit attribute (seconds) -> voice key (ms). On the agent_turn itself:
 const TURN_TIMINGS: ReadonlyArray<readonly [string, string]> = [
-  [LK_E2E_LATENCY, "wait_ms"],
-  [LK_TRANSCRIPTION_DELAY, "stt_ms"],
+  [LK_E2E_LATENCY, VOICE_KEYS.WAIT_MS],
+  [LK_TRANSCRIPTION_DELAY, VOICE_KEYS.STT_MS],
 ];
 // On a child of the turn; the first one seen wins (what the user waited on):
 const CHILD_TIMINGS: ReadonlyArray<readonly [string, string]> = [
-  [LK_RESPONSE_TTFT, "llm_ttft_ms"],
-  [LK_RESPONSE_TTFB, "tts_ttfa_ms"],
+  [LK_RESPONSE_TTFT, VOICE_KEYS.LLM_TTFT_MS],
+  [LK_RESPONSE_TTFB, VOICE_KEYS.TTS_TTFA_MS],
 ];
 const MAX_CALLS = 4096;
 
@@ -78,7 +80,7 @@ export class VoiceTurns {
         if (oldest === undefined) break;
         this._turnCounts.delete(oldest);
       }
-      this._timings.set(identity.key, { turn_index: index });
+      this._timings.set(identity.key, { [VOICE_KEYS.TURN_INDEX]: index });
       return;
     }
     const turn = parentKey ? this._turnOf.get(parentKey) : undefined;
@@ -121,7 +123,7 @@ export class VoiceTurns {
       if (reading !== undefined) timings[voiceKey] = reading;
     }
     if (typeof raw[LK_SPEECH_INTERRUPTED] === "boolean") {
-      timings.interrupted = raw[LK_SPEECH_INTERRUPTED];
+      timings[VOICE_KEYS.INTERRUPTED] = raw[LK_SPEECH_INTERRUPTED];
     }
     for (const [voiceKey, value] of Object.entries(timings)) {
       exported[`${VOICE_METADATA_PREFIX}${voiceKey}`] = value;

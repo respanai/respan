@@ -6803,7 +6803,7 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@respan/tracing@npm:^1.0.0, @respan/tracing@npm:^1.1.4, @respan/tracing@npm:^1.1.6, @respan/tracing@workspace:^, @respan/tracing@workspace:respan-tracing":
+"@respan/tracing@npm:^1.0.0, @respan/tracing@npm:^1.1.4, @respan/tracing@npm:^1.1.6, @respan/tracing@npm:^1.3.0, @respan/tracing@npm:^1.3.2, @respan/tracing@npm:^1.6.0, @respan/tracing@npm:^1.6.1, @respan/tracing@workspace:^, @respan/tracing@workspace:respan-tracing":
   version: 0.0.0-use.local
   resolution: "@respan/tracing@workspace:respan-tracing"
   dependencies:
@@ -6866,62 +6866,6 @@ __metadata:
       optional: true
   languageName: unknown
   linkType: soft
-
-"@respan/tracing@npm:^1.3.0, @respan/tracing@npm:^1.3.2, @respan/tracing@npm:^1.6.0, @respan/tracing@npm:^1.6.1":
-  version: 1.6.1
-  resolution: "@respan/tracing@npm:1.6.1"
-  dependencies:
-    "@opentelemetry/api": "npm:^1.9.0"
-    "@opentelemetry/core": "npm:^2.10.0"
-    "@opentelemetry/exporter-trace-otlp-http": "npm:^0.221.0"
-    "@opentelemetry/resources": "npm:^2.10.0"
-    "@opentelemetry/sdk-node": "npm:^0.221.0"
-    "@opentelemetry/sdk-trace-base": "npm:^2.10.0"
-    "@opentelemetry/sdk-trace-node": "npm:^2.10.0"
-    "@opentelemetry/semantic-conventions": "npm:^1.43.0"
-    "@respan/respan-sdk": "npm:^1.0.0"
-    "@traceloop/ai-semantic-conventions": "npm:^0.13.0"
-    "@traceloop/instrumentation-anthropic": "npm:^0.22.2"
-    "@traceloop/instrumentation-azure": "npm:^0.13.0"
-    "@traceloop/instrumentation-bedrock": "npm:^0.13.0"
-    "@traceloop/instrumentation-chromadb": "npm:^0.13.0"
-    "@traceloop/instrumentation-cohere": "npm:^0.13.0"
-    "@traceloop/instrumentation-langchain": "npm:^0.13.0"
-    "@traceloop/instrumentation-llamaindex": "npm:^0.13.0"
-    "@traceloop/instrumentation-openai": "npm:^0.14.4"
-    "@traceloop/instrumentation-pinecone": "npm:^0.13.0"
-    "@traceloop/instrumentation-qdrant": "npm:^0.13.0"
-    "@traceloop/instrumentation-together": "npm:^0.13.0"
-    "@traceloop/instrumentation-vertexai": "npm:^0.13.0"
-  dependenciesMeta:
-    "@traceloop/instrumentation-anthropic":
-      optional: true
-    "@traceloop/instrumentation-azure":
-      optional: true
-    "@traceloop/instrumentation-bedrock":
-      optional: true
-    "@traceloop/instrumentation-chromadb":
-      optional: true
-    "@traceloop/instrumentation-cohere":
-      optional: true
-    "@traceloop/instrumentation-langchain":
-      optional: true
-    "@traceloop/instrumentation-llamaindex":
-      optional: true
-    "@traceloop/instrumentation-openai":
-      optional: true
-    "@traceloop/instrumentation-pinecone":
-      optional: true
-    "@traceloop/instrumentation-qdrant":
-      optional: true
-    "@traceloop/instrumentation-together":
-      optional: true
-    "@traceloop/instrumentation-vertexai":
-      optional: true
-  checksum: 10c0/f1053e018a925cdf19deab9b472cb2a584ab691d307fcd4b863d6b44496571e041b1cd16382904ecf06c0739bf8838452bc3113f4f706953ae72e992b9f9d9fc
-  conditions: (os=darwin | os=linux | os=win32)
-  languageName: node
-  linkType: hard
 
 "@rolldown/binding-android-arm-eabi@npm:1.2.13":
   version: 1.2.13
