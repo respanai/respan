@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "respan-instrumentation-livekit"
-version = "0.1.2"
+version = "0.2.0"
 description = "Respan instrumentation plugin for LiveKit Agents"
 authors = ["Respan <team@respan.ai>"]
 license = "Apache 2.0"
