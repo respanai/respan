@@ -10,7 +10,11 @@ from opentelemetry.semconv._incubating.attributes.error_attributes import ERROR_
 from opentelemetry.semconv_ai import SpanAttributes as AI
 from opentelemetry.trace import Status, StatusCode
 from respan_sdk.constants.llm_logging import LogMethodChoices
-from respan_sdk.constants.span_attributes import RESPAN_LOG_METHOD, RESPAN_LOG_TYPE
+from respan_sdk.constants.span_attributes import (
+    RESPAN_INTERNAL_DROP_SPAN,
+    RESPAN_LOG_METHOD,
+    RESPAN_LOG_TYPE,
+)
 
 from ._audio import (
     AGENT_SESSION_SPAN,
@@ -25,6 +29,7 @@ from ._audio import (
 )
 from ._policy import CapturePolicy, key, private_attributes
 from ._serialization import text
+from ._structure import SpanStructure
 from ._voice import AGENT_TURN_SPAN, VOICE_METADATA_PREFIX, VoiceTurns
 from ._translator import (
     build_livekit_llm_attrs,
@@ -48,6 +53,7 @@ class LiveKitSpanProcessor(SpanProcessor):
         self.on_drained = None
         self.source_usage = {}
         self.voice = VoiceTurns()
+        self.structure = SpanStructure()
         # Only with capture_audio: frame copies and clips (see ``_audio``).
         self.audio = AudioClips() if capture_audio else None
         # The runtime's own tracer, for the ``user_speech`` spans.
@@ -60,6 +66,12 @@ class LiveKitSpanProcessor(SpanProcessor):
                     span, key(span), key(trace.get_current_span(parent_context))
                 )
             except Exception:  # noqa: BLE001 - turn grouping cannot replace native span creation.
+                pass
+            try:
+                self.structure.start(
+                    span, key(span), key(trace.get_current_span(parent_context))
+                )
+            except Exception:  # noqa: BLE001 - trace shaping cannot replace native span creation.
                 pass
             try:
                 self.policy.start(span, parent_context)
@@ -113,6 +125,10 @@ class LiveKitSpanProcessor(SpanProcessor):
             capture = False
         # Before ``voice.end`` moves a turn's span into the turn's trace.
         span_key = key(span)
+        try:
+            spoken = self.structure.end(span, span_key, dict(span.attributes or {}))
+        except Exception:  # noqa: BLE001 - trace shaping observes without replacing native values.
+            spoken = None
         try:
             grouped = self.voice.end(span, span_key, dict(span.attributes or {}))
         except Exception:  # noqa: BLE001 - turn grouping observes without replacing native values.
@@ -181,7 +197,21 @@ class LiveKitSpanProcessor(SpanProcessor):
                     and k != GenAI.GEN_AI_TOOL_CALL_ID
                 ):
                     attrs.pop(k, None)
+            if capture and span.name == TTS_NODE_SPAN and spoken:
+                # What it was given to speak; its output is the audio.
+                attrs[AI.TRACELOOP_ENTITY_INPUT] = text(spoken)
+            elif capture and span.name == AGENT_TURN_SPAN:
+                # The turn reads as what the user said and what the agent replied.
+                for field, source in (
+                    (AI.TRACELOOP_ENTITY_INPUT, trace_types.ATTR_USER_INPUT),
+                    (AI.TRACELOOP_ENTITY_OUTPUT, trace_types.ATTR_RESPONSE_TEXT),
+                ):
+                    value = original.get(source)
+                    if isinstance(value, str) and value:
+                        attrs[field] = text(value)
             if span.status.status_code is StatusCode.ERROR:
+                # An error is never left out of the trace.
+                attrs.pop(RESPAN_INTERNAL_DROP_SPAN, None)
                 attrs.pop(AI.TRACELOOP_ENTITY_OUTPUT, None)
                 for k in list(attrs):
                     if k.startswith(AI.LLM_COMPLETIONS + "."):
@@ -211,6 +241,7 @@ class LiveKitSpanProcessor(SpanProcessor):
             span._attributes = fallback
             span._events = ()
             if span.status.status_code is StatusCode.ERROR:
+                fallback.pop(RESPAN_INTERNAL_DROP_SPAN, None)
                 span._status = Status(StatusCode.ERROR)
         if self.on_drained is not None:
             self.on_drained()

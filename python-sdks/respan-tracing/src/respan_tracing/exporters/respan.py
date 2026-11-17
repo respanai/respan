@@ -431,10 +431,21 @@ def _strip_gateway_linked_metrics(attrs: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _is_marked_dropped(span: ReadableSpan) -> bool:
+    """A structural wrapper its instrumentation marked at start
+    (``RESPAN_INTERNAL_DROP_SPAN``); dropped in the semantic style only, as the
+    JS exporter does. Its children carry ``RESPAN_INTERNAL_EXPORT_PARENT``."""
+    value = (span.attributes or {}).get(RESPAN_INTERNAL_DROP_SPAN)
+    return value is True or value == "true"
+
+
 def _prepare_spans_for_export(spans: Sequence[ReadableSpan]) -> List[ReadableSpan]:
     prepared_spans: List[ReadableSpan] = []
+    is_semantic_style = _resolve_span_name_style() == _SPAN_NAME_STYLE_SEMANTIC
 
     for span in spans:
+        if is_semantic_style and _is_marked_dropped(span):
+            continue
         overrides: Dict[str, Any] = {}
 
         extra_attrs = _get_enrichment_attrs(span)
@@ -1138,6 +1149,15 @@ def _span_to_otlp_json(span: ReadableSpan) -> Dict[str, Any]:
         parent_sid = getattr(parent, "span_id", None)
         if parent_sid:
             parent_span_id = format_span_id(parent_sid)
+    # The parent a dropped wrapper hands its child: absent leaves the parent
+    # alone, "" promotes the child to a root (the wrapper was one). Per span,
+    # so export-batch boundaries cannot break the tree. Semantic style only.
+    export_parent = (span.attributes or {}).get(RESPAN_INTERNAL_EXPORT_PARENT)
+    if (
+        export_parent is not None
+        and _resolve_span_name_style() == _SPAN_NAME_STYLE_SEMANTIC
+    ):
+        parent_span_id = str(export_parent).strip()
 
     # Timestamps as nanosecond strings
     start_time_ns = str(span.start_time) if span.start_time else "0"
