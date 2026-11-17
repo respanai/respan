@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import logging
 import threading
 import weakref
 from collections import OrderedDict
+from collections.abc import AsyncIterable
 from contextvars import ContextVar
 from functools import wraps
 
@@ -62,16 +64,19 @@ def _raw_usage(values):
 
 
 class Runtime:
-    def __init__(self, provider, capture):
+    def __init__(self, provider, capture, capture_audio=False):
         self.provider = provider
         self.capture = capture
+        # Audio is content: nothing is buffered unless content may be captured.
+        self.capture_audio = capture_audio and capture
         self.active = True
         self.hooks = []
         self.calls = OrderedDict()
         self.usages = OrderedDict()
-        self.processor = LiveKitSpanProcessor(capture)
+        self.processor = LiveKitSpanProcessor(capture, self.capture_audio)
         self.processor.on_drained = self.drained
         self.tracer = provider.get_tracer("respan.instrumentation.livekit")
+        self.processor.tracer = self.tracer
         self.native = None
         self.previous = None
         self.installed = None
@@ -140,6 +145,61 @@ class Runtime:
             )
         self.permitted(span)
 
+    def install_audio(self):
+        """Tee the agent's and the user's audio frames (``capture_audio``).
+        Both hook points are LiveKit internals: when one is missing (another
+        livekit-agents version), audio capture is off and the agent runs as
+        before."""
+        audio = self.processor.audio
+        try:
+            generation = importlib.import_module("livekit.agents.voice.generation")
+            stt = importlib.import_module("livekit.agents.stt")
+            tts_inference = generation._tts_inference_task
+            push_frame = stt.RecognizeStream.push_frame
+        except (ImportError, AttributeError):
+            logger.debug("LiveKit audio hook points not found: capture_audio is off")
+            return
+
+        def observe(add, frame):
+            try:
+                add(trace.get_current_span(), frame)
+            except Exception:  # noqa: BLE001 - a dropped frame never touches the audio path.
+                pass
+
+        def teed(frames):
+            async def tee():
+                async for frame in frames:
+                    if self.active:
+                        observe(audio.add_tts_frame, frame)
+                    yield frame
+
+            return tee()
+
+        def wrap_node(node):
+            # Same contract as the node: a coroutine or an iterable of frames.
+            async def tts_node(*args, **kwargs):
+                frames = node(*args, **kwargs)
+                if asyncio.iscoroutine(frames):
+                    frames = await frames
+                return teed(frames) if isinstance(frames, AsyncIterable) else frames
+
+            return tts_node
+
+        @wraps(tts_inference)
+        def inference(node, *args, **kwargs):
+            if self.active:
+                node = wrap_node(node)
+            return tts_inference(node, *args, **kwargs)
+
+        @wraps(push_frame)
+        def push(stream, frame, *args, **kwargs):
+            if self.active:
+                observe(audio.add_user_frame, frame)
+            return push_frame(stream, frame, *args, **kwargs)
+
+        self.patch(generation, "_tts_inference_task", inference)
+        self.patch(stt.RecognizeStream, "push_frame", push)
+
     def restore(self):
         for owner, name, original, replacement in reversed(self.hooks):
             if getattr(owner, name, None) is replacement:
@@ -201,6 +261,8 @@ class Runtime:
         ]
         _add_processor(self.provider, self.processor)
         install_detach(self)
+        if self.capture_audio:
+            self.install_audio()
         original = llm.LLMStream._main_task
 
         @wraps(original)
@@ -430,8 +492,12 @@ def _remove_processor(provider, processor):
 class LiveKitInstrumentor:
     name = "livekit"
 
-    def __init__(self, *, capture_content=True):
+    def __init__(self, *, capture_content=True, capture_audio=False):
+        """``capture_audio`` (off by default) records each turn's audio, the
+        user's and the agent's, as clips Respan plays in the log panel. It
+        needs ``capture_content``: audio is content."""
         self.capture_content = capture_content
+        self.capture_audio = capture_audio
         self._is_instrumented = False
 
     def activate(self):
@@ -447,6 +513,8 @@ class LiveKitInstrumentor:
                 if (
                     _RUNTIME.provider is not provider
                     or _RUNTIME.capture != self.capture_content
+                    or _RUNTIME.capture_audio
+                    != (self.capture_audio and self.capture_content)
                 ):
                     raise ValueError(
                         "Concurrent LiveKit owners must share provider and capture configuration"
@@ -454,7 +522,7 @@ class LiveKitInstrumentor:
                 if not _RUNTIME.active:
                     raise RuntimeError("Prior LiveKit spans are still finishing")
             else:
-                runtime = Runtime(provider, self.capture_content)
+                runtime = Runtime(provider, self.capture_content, self.capture_audio)
                 try:
                     runtime.install()
                 except Exception:
