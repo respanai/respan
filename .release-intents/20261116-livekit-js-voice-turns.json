@@ -1,0 +1,8 @@
+{
+  "summary": "LiveKit voice turns in JS (DEV-14483): @respan/instrumentation-livekit exports each agent_turn as its own trace in the call's session, with wait/STT/LLM/TTS timings and interruption on the turn root (respan.metadata.voice.*). @respan/tracing honours a new internal export trace id (respan.internal.export_trace_id) that moves a span and its parent link to another trace; @respan/respan-sdk adds the constant.",
+  "packages": {
+    "@respan/respan-sdk": "minor",
+    "@respan/tracing": "minor",
+    "@respan/instrumentation-livekit": "minor"
+  }
+}

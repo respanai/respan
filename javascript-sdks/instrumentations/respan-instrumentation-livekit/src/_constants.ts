@@ -130,3 +130,15 @@ export const OFF_CONTRACT_ALIAS_KEYS = [
   "has_tool_calls",
   "parallel_tool_calls",
 ] as const;
+
+// A voice turn's timings on its root span, read by the backend's session turn
+// view (respan-backend utils/constants/traces_constants.py VOICE_* keys).
+export const VOICE_METADATA_SEGMENT = "voice";
+export const VOICE_KEYS = {
+  TURN_INDEX: "turn_index",
+  WAIT_MS: "wait_ms",
+  STT_MS: "stt_ms",
+  LLM_TTFT_MS: "llm_ttft_ms",
+  TTS_TTFA_MS: "tts_ttfa_ms",
+  INTERRUPTED: "interrupted",
+} as const;

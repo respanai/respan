@@ -38,6 +38,7 @@ import {
   translateLiveKitSpan,
   type MutableAttributes,
 } from "./_translator.js";
+import { VoiceTurns } from "./_voice.js";
 
 const LANGFUSE_COMPLETION_START_TIME =
   "langfuse.observation.completion_start_time";
@@ -61,6 +62,7 @@ export class LiveKitSpanTransformer implements RespanSpanTransformer {
   private readonly _correlatedRequests = new Map<string, OpenLLMNode>();
   private readonly _owners = new Set<CaptureOptions>();
   private _exportAttributes = new WeakMap<object, MutableAttributes>();
+  private readonly _voice = new VoiceTurns();
 
   acquire(options: CaptureOptions): () => void {
     this._owners.add(options);
@@ -81,6 +83,7 @@ export class LiveKitSpanTransformer implements RespanSpanTransformer {
 
     const policy = capture(span, parentContext, this._owners);
     guard(span, policy);
+    this._voice.start(getSpanIdentity(span), getParentKey(span), spanName);
     if (LIVEKIT_INTERNAL_ACTIVITY_SPAN_NAMES.has(spanName)) return;
     stampStartAttributes(span, getSpanAttributes(span), spanName);
 
@@ -122,6 +125,14 @@ export class LiveKitSpanTransformer implements RespanSpanTransformer {
   }
 
   onEnd(span: TransformerReadableSpan): void {
+    this._translateOnEnd(span);
+    const exported = this._exportAttributes.get(span);
+    if (exported) {
+      this._voice.end(getSpanIdentity(span), span.attributes, exported);
+    }
+  }
+
+  private _translateOnEnd(span: TransformerReadableSpan): void {
     const policy = policyFor(span);
     if (!policy) return;
     const attrs = filterAttributes(span.attributes, policy);
@@ -218,6 +229,7 @@ export class LiveKitSpanTransformer implements RespanSpanTransformer {
     this._openLLMNodes.clear();
     this._correlatedRequests.clear();
     this._exportAttributes = new WeakMap();
+    this._voice.dispose();
   }
 }
 

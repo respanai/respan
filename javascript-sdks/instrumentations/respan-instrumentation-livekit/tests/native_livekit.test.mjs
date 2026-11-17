@@ -305,11 +305,19 @@ test("real AgentSession handoff remains native and connected", async () => {
       (span) => span.attributes["respan.entity.log_type"] === "tool",
     ),
   );
-  assert.ok(
-    r.spans
-      .filter((span) => span.attributes["respan.entity.log_type"] === "agent")
-      .every((span) => span.parentSpanContext),
+  const agents = r.spans.filter(
+    (span) => span.attributes["respan.entity.log_type"] === "agent",
   );
+  const isTurn = (span) => span.attributes["traceloop.entity.path"] === "agent_turn";
+  // Every agent span stays connected, except each turn: the root of its own
+  // trace in the call's session (DEV-14483).
+  assert.ok(agents.filter((span) => !isTurn(span)).every((span) => span.parentSpanContext));
+  const turns = agents.filter(isTurn);
+  assert.ok(turns.length > 0);
+  for (const turn of turns) {
+    assert.equal(turn.parentSpanContext?.spanId, undefined);
+    assert.equal(typeof turn.attributes["respan.metadata.voice.turn_index"], "number");
+  }
 });
 
 test("native long context and 75 tools preserve aggregate input/output and available definitions", async () => {

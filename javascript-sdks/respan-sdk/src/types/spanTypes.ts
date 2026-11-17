@@ -40,6 +40,10 @@ export enum RespanSpanAttributes {
     // Set by instrumentations on children of a drop-marked span so the exporter
     // can reparent them per-span, without cross-span (batch-dependent) state.
     RESPAN_INTERNAL_EXPORT_PARENT = "respan.internal.export_parent_span_id",
+    // Set by instrumentations to export a span under another trace id (32 hex),
+    // e.g. one trace per voice turn out of a framework's one trace per call.
+    // Its parent link, if kept, moves to the same trace.
+    RESPAN_INTERNAL_EXPORT_TRACE_ID = "respan.internal.export_trace_id",
 
     // Logging
     RESPAN_LOG_METHOD = "respan.entity.log_method",

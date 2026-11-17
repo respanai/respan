@@ -16,12 +16,16 @@ const INTERNAL_KIND_ATTR = RespanSpanAttributes.RESPAN_INTERNAL_SPAN_NAME_KIND;
 const INTERNAL_DETAIL_ATTR = RespanSpanAttributes.RESPAN_INTERNAL_SPAN_NAME_DETAIL;
 const INTERNAL_DROP_ATTR = RespanSpanAttributes.RESPAN_INTERNAL_DROP_SPAN;
 const INTERNAL_EXPORT_PARENT_ATTR = RespanSpanAttributes.RESPAN_INTERNAL_EXPORT_PARENT;
+const INTERNAL_EXPORT_TRACE_ID_ATTR =
+  RespanSpanAttributes.RESPAN_INTERNAL_EXPORT_TRACE_ID;
+const TRACE_ID_PATTERN = /^[0-9a-f]{32}$/;
 
 const INTERNAL_SPAN_NAME_ATTRS = [
   INTERNAL_KIND_ATTR,
   INTERNAL_DETAIL_ATTR,
   INTERNAL_DROP_ATTR,
   INTERNAL_EXPORT_PARENT_ATTR,
+  INTERNAL_EXPORT_TRACE_ID_ATTR,
 ] as const;
 
 const SUFFIXED_OPERATIONS = new Set(["agent", "tool", "handoff", "llm"]);
@@ -72,8 +76,18 @@ export function transformReadableSpanName(
 
   // The export-parent attr distinguishes "absent" (leave the parent alone)
   // from "" (the dropped wrapper was a root span — promote the child to root).
+  // A trace move is not a naming choice: it applies in either style. A
+  // malformed id is ignored rather than exported.
+  const rawTraceId = attrs[INTERNAL_EXPORT_TRACE_ID_ATTR];
+  const retrace =
+    typeof rawTraceId === "string" && TRACE_ID_PATTERN.test(rawTraceId)
+      ? rawTraceId
+      : undefined;
+
+  // A span moved to another trace keeps its parent hint in either style too:
+  // its old parent is not in the new trace.
   let reparent: string | null | undefined;
-  if (resolvedStyle === "semantic") {
+  if (resolvedStyle === "semantic" || retrace !== undefined) {
     const raw = attrs[INTERNAL_EXPORT_PARENT_ATTR];
     if (raw !== undefined && raw !== null) {
       const text = String(raw).trim();
@@ -84,12 +98,13 @@ export function transformReadableSpanName(
   if (
     name === span.name &&
     attributes === span.attributes &&
-    reparent === undefined
+    reparent === undefined &&
+    retrace === undefined
   ) {
     return span;
   }
 
-  return cloneReadableSpan(span, name, attributes, reparent);
+  return cloneReadableSpan(span, name, attributes, reparent, retrace);
 }
 
 export function semanticSpanNameForSpan(span: ReadableSpan): string {
@@ -197,7 +212,9 @@ function cloneReadableSpan(
   name: string,
   attributes: SpanAttrs,
   // string = new parent id; null = promote to root; undefined = leave as-is
-  reparent?: string | null
+  reparent?: string | null,
+  // a 32-hex trace id to export the span (and its parent link) under
+  retrace?: string
 ): ReadableSpan {
   const clone = Object.create(Object.getPrototypeOf(span));
   Object.assign(clone, span);
@@ -226,7 +243,7 @@ function cloneReadableSpan(
     Object.defineProperty(clone, "parentSpanContext", {
       value: reparentId && ctx
         ? {
-            traceId: ctx.traceId,
+            traceId: retrace ?? ctx.traceId,
             spanId: reparentId,
             traceFlags: ctx.traceFlags,
             isRemote: false,
@@ -235,6 +252,37 @@ function cloneReadableSpan(
       enumerable: true,
       configurable: true,
     });
+  }
+  if (retrace !== undefined) {
+    const ctx =
+      typeof span.spanContext === "function" ? span.spanContext() : undefined;
+    if (ctx) {
+      const moved = { ...ctx, traceId: retrace };
+      // Enumerable, so a later copy (Object.assign) keeps the move; the SDK's
+      // own field too, for code that reads it rather than the method.
+      Object.defineProperty(clone, "spanContext", {
+        value: () => moved,
+        enumerable: true,
+        configurable: true,
+      });
+      if ("_spanContext" in clone) {
+        Object.defineProperty(clone, "_spanContext", {
+          value: moved,
+          enumerable: true,
+          configurable: true,
+        });
+      }
+    }
+    // A kept parent link moves with the span; a reparent above already did.
+    const parent = (clone as { parentSpanContext?: Record<string, unknown> })
+      .parentSpanContext;
+    if (reparent === undefined && parent) {
+      Object.defineProperty(clone, "parentSpanContext", {
+        value: { ...parent, traceId: retrace },
+        enumerable: true,
+        configurable: true,
+      });
+    }
   }
   return clone as ReadableSpan;
 }
