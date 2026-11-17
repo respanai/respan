@@ -1,0 +1,7 @@
+{
+  "summary": "LiveKit (Python): a call's trace shows the turn, what the user said, the LLM call and the speech, without LiveKit's plumbing spans (user_turn, eou_wait, llm_node, tts_request, agent_speaking, session lifecycle and similar), whose timings already land on the turn's voice metadata. tts_node's input is now the text it spoke, and agent_turn's input and output are the user's words and the reply. respan-tracing (Python) now honours the exporter's structural-wrapper drop hints, as the JS exporter does. Legacy span-name style still sends every span.",
+  "packages": {
+    "respan-instrumentation-livekit": "minor",
+    "respan-tracing": "minor"
+  }
+}

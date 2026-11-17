@@ -16,6 +16,8 @@ from opentelemetry.semconv_ai import SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY
 from opentelemetry.semconv_ai import SpanAttributes as AI
 from opentelemetry.trace import Status, StatusCode
 from respan_sdk.constants.span_attributes import (
+    RESPAN_INTERNAL_DROP_SPAN,
+    RESPAN_INTERNAL_EXPORT_PARENT,
     RESPAN_LOG_METHOD,
     RESPAN_LOG_TYPE,
     RESPAN_METADATA,
@@ -102,6 +104,9 @@ def private_attributes(attrs):
         HTTP_RESPONSE_STATUS_CODE,
         # A turn's durations and interruption flag, read at its end.
         *VOICE_SOURCE_ATTRIBUTES,
+        # Exporter hints that leave LiveKit's plumbing out (``_structure``).
+        RESPAN_INTERNAL_DROP_SPAN,
+        RESPAN_INTERNAL_EXPORT_PARENT,
     }
     markers = {
         "run_id",
