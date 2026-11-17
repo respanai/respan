@@ -1,7 +1,7 @@
 {
   "name": "@respan/tracing",
   "type": "module",
-  "version": "1.6.2",
+  "version": "1.7.0",
   "description": "TypeScript support for Respan SDK",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
