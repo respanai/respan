@@ -12,9 +12,20 @@ from opentelemetry.trace import Status, StatusCode
 from respan_sdk.constants.llm_logging import LogMethodChoices
 from respan_sdk.constants.span_attributes import RESPAN_LOG_METHOD, RESPAN_LOG_TYPE
 
+from ._audio import (
+    AGENT_SESSION_SPAN,
+    SPEECH_LOG_TYPE,
+    TRANSCRIPTION_LOG_TYPE,
+    TRUNCATED_VOICE_KEY,
+    TTS_NODE_SPAN,
+    USER_SPEECH_SPAN,
+    USER_TURN_SPAN,
+    AudioClips,
+    payload,
+)
 from ._policy import CapturePolicy, key, private_attributes
 from ._serialization import text
-from ._voice import VoiceTurns
+from ._voice import AGENT_TURN_SPAN, VOICE_METADATA_PREFIX, VoiceTurns
 from ._translator import (
     build_livekit_llm_attrs,
     build_native_tool_attrs,
@@ -23,13 +34,24 @@ from ._translator import (
 )
 
 
+# Where a clip goes on the span that carries it.
+_CLIP_TARGETS = {
+    TTS_NODE_SPAN: (SPEECH_LOG_TYPE, AI.TRACELOOP_ENTITY_OUTPUT),
+    USER_SPEECH_SPAN: (TRANSCRIPTION_LOG_TYPE, AI.TRACELOOP_ENTITY_INPUT),
+}
+
+
 class LiveKitSpanProcessor(SpanProcessor):
-    def __init__(self, capture_content=True):
+    def __init__(self, capture_content=True, capture_audio=False):
         self.policy = CapturePolicy(capture_content)
         self.active = True
         self.on_drained = None
         self.source_usage = {}
         self.voice = VoiceTurns()
+        # Only with capture_audio: frame copies and clips (see ``_audio``).
+        self.audio = AudioClips() if capture_audio else None
+        # The runtime's own tracer, for the ``user_speech`` spans.
+        self.tracer = None
 
     def on_start(self, span, parent_context=None):
         if self.active:
@@ -47,6 +69,35 @@ class LiveKitSpanProcessor(SpanProcessor):
                     False,
                     key(trace.get_current_span(parent_context)),
                 ]
+            if self.audio is not None:
+                try:
+                    self._start_audio(span)
+                except Exception:  # noqa: BLE001 - audio capture never replaces native span creation.
+                    pass
+
+    def _start_audio(self, span):
+        span_key = key(span)
+        if span_key is None:
+            return
+        if span.name == USER_TURN_SPAN:
+            self.audio.user_turn_started(span_key[0])
+            return
+        if span.name != AGENT_TURN_SPAN or self.tracer is None:
+            return
+        clip, transcript, is_turn_open = self.audio.take_user_speech(span_key[0])
+        if clip is None or not clip.samples or not self.policy.observe(span):
+            return
+        speech = self.tracer.start_span(
+            USER_SPEECH_SPAN, context=trace.set_span_in_context(span)
+        )
+        self.audio.attach(key(speech), clip)
+        if is_turn_open:
+            # Ended, with the transcript, when the user_turn ends.
+            self.audio.wait_for_turn(span_key[0], speech)
+            return
+        if transcript:
+            speech.set_attribute(AI.TRACELOOP_ENTITY_OUTPUT, transcript)
+        speech.end()
 
     def on_end(self, span):
         if key(span) not in self.policy.open:
@@ -60,10 +111,18 @@ class LiveKitSpanProcessor(SpanProcessor):
             state[1] = False
             self.policy.closed[key(span)] = state
             capture = False
+        # Before ``voice.end`` moves a turn's span into the turn's trace.
+        span_key = key(span)
         try:
-            grouped = self.voice.end(span, key(span), dict(span.attributes or {}))
+            grouped = self.voice.end(span, span_key, dict(span.attributes or {}))
         except Exception:  # noqa: BLE001 - turn grouping observes without replacing native values.
             grouped = None
+        clip = None
+        if self.audio is not None:
+            try:
+                clip = self._end_audio(span, span_key, capture)
+            except Exception:  # noqa: BLE001 - audio capture observes without replacing native values.
+                clip = None
         if not self.policy.owned(span):
             if grouped is not None:
                 span._attributes = grouped
@@ -132,6 +191,15 @@ class LiveKitSpanProcessor(SpanProcessor):
                 )
             if not capture:
                 attrs = private_attributes(attrs)
+            elif clip is not None and span.name in _CLIP_TARGETS:
+                # After the string normalization above, which rewrites URLs.
+                encoded = payload(clip)
+                if encoded is not None:
+                    log_type, field = _CLIP_TARGETS[span.name]
+                    attrs[RESPAN_LOG_TYPE] = log_type
+                    attrs[field] = encoded
+                    if clip.is_truncated:
+                        attrs[VOICE_METADATA_PREFIX + TRUNCATED_VOICE_KEY] = True
             span._attributes = attrs
             span._events = ()
         except Exception:  # noqa: BLE001 - telemetry observes without replacing native behavior.
@@ -146,6 +214,27 @@ class LiveKitSpanProcessor(SpanProcessor):
                 span._status = Status(StatusCode.ERROR)
         if self.on_drained is not None:
             self.on_drained()
+
+    def _end_audio(self, span, span_key, capture):
+        """Release the span's audio state; the clip to set on it, if any.
+        ``span_key`` is the span's key as it started."""
+        if span_key is None:
+            return None
+        if span.name == USER_TURN_SPAN:
+            transcript = (span.attributes or {}).get(trace_types.ATTR_USER_TRANSCRIPT)
+            if not (capture and isinstance(transcript, str)):
+                transcript = None
+            self.audio.user_turn_ended(span_key[0], transcript)
+            waiting = self.audio.take_waiting(span_key[0])
+            if waiting is not None:
+                if transcript:
+                    waiting.set_attribute(AI.TRACELOOP_ENTITY_OUTPUT, transcript)
+                waiting.end()
+        elif span.name == AGENT_SESSION_SPAN:
+            waiting = self.audio.end_call(span_key[0])
+            if waiting is not None:
+                waiting.end()
+        return self.audio.take_speech(span_key)
 
     def shutdown(self):
         self.policy.open.clear()

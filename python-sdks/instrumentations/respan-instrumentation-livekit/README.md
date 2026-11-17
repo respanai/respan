@@ -56,6 +56,17 @@ Sampling and OTel suppression skip owned payload serialization. Credential value
 are redacted while structural schema property names and benign URL parameters
 remain intact.
 
+`LiveKitInstrumentor(capture_audio=True)` (off by default) keeps each turn's
+audio as two clips the log panel plays: the agent's speech on `tts_node` (log
+type `speech`) and the user's speech on a `user_speech` span under the turn
+(log type `transcription`, with the transcript). Clips are 16-bit WAV, sent as
+data URLs that Respan stores as log media, and are capped at 60 s each (a longer
+clip is cut there and marked `respan.metadata.voice.audio_truncated`). Audio is
+content: it needs `capture_content` and follows the same privacy vetoes. Frames
+are copied as they pass, never held; buffers are released when their span or
+call ends. The hook points are LiveKit internals: when they are missing, audio
+capture is off (a debug log) and the agent runs unchanged.
+
 Owners with the same provider/settings share hooks; incompatible settings are
 rejected. Teardown restores only still-owned hooks/provider fields and preserves
 foreign replacements. In-flight owned streams finish under the retained privacy
