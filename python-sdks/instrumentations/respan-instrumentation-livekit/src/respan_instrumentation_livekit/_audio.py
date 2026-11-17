@@ -41,8 +41,8 @@ AUDIO_URL_KEY = "audio_url"
 SPEECH_LOG_TYPE = "speech"
 TRANSCRIPTION_LOG_TYPE = "transcription"
 TRUNCATED_VOICE_KEY = "audio_truncated"
-# 60 s of 16 kHz mono 16-bit PCM is ~1.9 MB, far under the backend's 20 MB
-# per-log cap; a longer turn is cut there and marked.
+# 60 s of 16 kHz mono 16-bit PCM is ~1.9 MB, far under Respan's per-log
+# size limit; a longer turn is cut there and marked.
 MAX_CLIP_SECONDS = 60
 PRE_ROLL_SECONDS = 0.5
 _SAMPLE_WIDTH_BYTES = 2
