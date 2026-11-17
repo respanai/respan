@@ -1,0 +1,6 @@
+{
+  "summary": "LiveKit (Python): opt-in per-turn audio clips with LiveKitInstrumentor(capture_audio=True), off by default. The agent's speech is attached to tts_node (log type speech) and the user's speech to a user_speech span under the turn, with the transcript (log type transcription), each as a WAV the Respan log panel plays. Clips are capped at 60 s and marked when cut; capture needs capture_content and turns off, with a debug log, if LiveKit's hook points are missing. DEV-14485.",
+  "packages": {
+    "respan-instrumentation-livekit": "minor"
+  }
+}
