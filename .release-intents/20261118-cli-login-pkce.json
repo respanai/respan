@@ -1,0 +1,6 @@
+{
+  "summary": "respan auth login (Browser login) now gets a one-time code with PKCE and its own session, instead of the web app's tokens; the callback must carry this login's state. RESPAN_LOGIN_URL overrides the web login page.",
+  "packages": {
+    "@respan/cli": "minor"
+  }
+}
