@@ -2,6 +2,7 @@ import { Flags } from '@oclif/core';
 import { select, input } from '@inquirer/prompts';
 import * as http from 'node:http';
 import * as open from 'node:child_process';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { BaseCommand } from '../../lib/base-command.js';
 import { setCredential, setActiveProfile } from '../../lib/config.js';
 import { printBanner, printLoginSuccess } from '../../lib/banner.js';
@@ -12,6 +13,56 @@ const CALLBACK_PATH = '/callback';
 const LOGIN_TIMEOUT_MS = 120_000;
 const LOGIN_URL_BASE = 'https://platform.respan.ai/login';
 const ENTERPRISE_LOGIN_URL_BASE = 'https://enterprise.respan.ai/login';
+// Overrides the web login page, e.g. a staging frontend. Pair it with
+// --base-url for that deployment's API.
+const LOGIN_URL_ENV = 'RESPAN_LOGIN_URL';
+const CODE_EXCHANGE_PATH = '/auth/cli/token/';
+
+// PKCE (RFC 7636): the browser sends this listener only a one-time code, and
+// the code is worthless without the verifier, which never leaves this process.
+// `state` ties the callback to this login attempt.
+interface LoginAttempt {
+  codeVerifier: string;
+  codeChallenge: string;
+  state: string;
+}
+
+function base64Url(buffer: Buffer): string {
+  return buffer.toString('base64url');
+}
+
+function newLoginAttempt(): LoginAttempt {
+  const codeVerifier = base64Url(randomBytes(32));
+  return {
+    codeVerifier,
+    codeChallenge: base64Url(createHash('sha256').update(codeVerifier).digest()),
+    state: base64Url(randomBytes(16)),
+  };
+}
+
+function isSameState(expected: string, received: string | null): boolean {
+  if (!received) return false;
+  const expectedBytes = Buffer.from(expected);
+  const receivedBytes = Buffer.from(received);
+  return expectedBytes.length === receivedBytes.length && timingSafeEqual(expectedBytes, receivedBytes);
+}
+
+async function exchangeCode(baseUrl: string, code: string, attempt: LoginAttempt, redirectUri: string): Promise<BrowserLoginResult> {
+  const origin = baseUrl.replace(/\/+$/, '').replace(/\/api$/, '');
+  const response = await fetch(`${origin}${CODE_EXCHANGE_PATH}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code, code_verifier: attempt.codeVerifier, redirect_uri: redirectUri }),
+  });
+  if (!response.ok) {
+    throw new Error('The sign-in code was rejected or expired. Please run `respan auth login` again.');
+  }
+  const body = (await response.json()) as { access?: string; refresh?: string; email?: string };
+  if (!body.access || !body.refresh) {
+    throw new Error('The sign-in response was missing a token. Please try again.');
+  }
+  return { token: body.access, refreshToken: body.refresh, email: body.email };
+}
 
 interface BrowserLoginResult {
   token: string;
@@ -42,32 +93,60 @@ function errorHtml(msg: string): string {
 <body><div class="card"><div class="icon">&#10007;</div><h2>Login failed</h2><p>${msg}</p></div></body></html>`;
 }
 
-function waitForBrowserLogin(enterprise: boolean): Promise<BrowserLoginResult> {
+function waitForBrowserLogin(enterprise: boolean, baseUrl: string): Promise<BrowserLoginResult> {
+  const attempt = newLoginAttempt();
+  const redirectUri = `http://localhost:${CALLBACK_PORT}${CALLBACK_PATH}`;
   return new Promise((resolve, reject) => {
+    let isSettled = false;
+    const fail = (res: http.ServerResponse, message: string) => {
+      res.writeHead(400, { 'Content-Type': 'text/html' });
+      res.end(errorHtml(message));
+      cleanup();
+      reject(new Error(message));
+    };
+    const succeed = (res: http.ServerResponse, result: BrowserLoginResult) => {
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(successHtml());
+      cleanup();
+      resolve(result);
+    };
+
     const server = http.createServer((req, res) => {
       const url = new URL(req.url || '/', `http://localhost:${CALLBACK_PORT}`);
-      if (url.pathname !== CALLBACK_PATH) {
+      if (url.pathname !== CALLBACK_PATH || isSettled) {
         res.writeHead(404);
         res.end('Not found');
         return;
       }
 
+      const code = url.searchParams.get('code');
+      if (code) {
+        // A callback for another login attempt (or a crafted link) is ignored
+        // without spending this attempt.
+        if (!isSameState(attempt.state, url.searchParams.get('state'))) {
+          res.writeHead(400, { 'Content-Type': 'text/html' });
+          res.end(errorHtml('This sign-in link is not from your current login. Please try again.'));
+          return;
+        }
+        isSettled = true;
+        exchangeCode(baseUrl, code, attempt, redirectUri).then(
+          (result) => succeed(res, result),
+          (error: Error) => fail(res, error.message),
+        );
+        return;
+      }
+
+      // A web app that predates the code flow sends the tokens themselves.
       const token = url.searchParams.get('token');
       const refreshToken = url.searchParams.get('refresh_token');
       const email = url.searchParams.get('email') || undefined;
 
+      isSettled = true;
       if (!token || !refreshToken) {
-        res.writeHead(400, { 'Content-Type': 'text/html' });
-        res.end(errorHtml('Missing token. Please try again.'));
-        cleanup();
-        reject(new Error('Login callback missing token or refresh_token.'));
+        fail(res, 'Missing sign-in code. Please try again.');
         return;
       }
-
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end(successHtml());
-      cleanup();
-      resolve({ token, refreshToken, email });
+      succeed(res, { token, refreshToken, email });
     });
 
     const timeout = setTimeout(() => {
@@ -89,11 +168,13 @@ function waitForBrowserLogin(enterprise: boolean): Promise<BrowserLoginResult> {
     });
 
     server.listen(CALLBACK_PORT, '127.0.0.1', () => {
-      const redirectUri = `http://localhost:${CALLBACK_PORT}${CALLBACK_PATH}`;
-      const loginUrlBase = enterprise ? ENTERPRISE_LOGIN_URL_BASE : LOGIN_URL_BASE;
+      const loginUrlBase = process.env[LOGIN_URL_ENV] || (enterprise ? ENTERPRISE_LOGIN_URL_BASE : LOGIN_URL_BASE);
       const loginUrl = new URL(loginUrlBase);
       loginUrl.searchParams.set('mode', 'cli');
       loginUrl.searchParams.set('redirect_uri', redirectUri);
+      loginUrl.searchParams.set('code_challenge', attempt.codeChallenge);
+      loginUrl.searchParams.set('code_challenge_method', 'S256');
+      loginUrl.searchParams.set('state', attempt.state);
 
       console.log('');
       console.log('  Opening browser to log in...');
@@ -157,7 +238,7 @@ export default class AuthLogin extends BaseCommand {
       return;
     }
 
-    const result = await waitForBrowserLogin(enterprise);
+    const result = await waitForBrowserLogin(enterprise, baseUrl);
 
     setCredential(profile, {
       type: 'jwt',
