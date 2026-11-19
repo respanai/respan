@@ -225,6 +225,23 @@ class TestEvaluateExportFilter:
         export_filter = {"status_code": {"operator": "", "value": ["ERROR", "CRITICAL"]}}
         assert evaluate_export_filter(span_data, export_filter) is False
 
+    def test_multi_element_list_with_not_converts_to_not_in(self):
+        export_filter = {"status_code": {"operator": "not", "value": ["ERROR", "CRITICAL"]}}
+        assert evaluate_export_filter({"status_code": "ERROR"}, export_filter) is False
+        assert evaluate_export_filter({"status_code": "OK"}, export_filter) is True
+
+    def test_multi_element_list_with_not_equal_aliases(self):
+        for operator in ("!=", "<>", "ne", "not_equal", "NOT"):
+            export_filter = {"status_code": {"operator": operator, "value": ["ERROR", "CRITICAL"]}}
+            assert evaluate_export_filter({"status_code": "ERROR"}, export_filter) is False, operator
+            assert evaluate_export_filter({"status_code": "OK"}, export_filter) is True, operator
+
+    def test_multi_element_list_with_equal_aliases(self):
+        for operator in ("equals", "EQ", "=", "=="):
+            export_filter = {"status_code": {"operator": operator, "value": ["ERROR", "CRITICAL"]}}
+            assert evaluate_export_filter({"status_code": "ERROR"}, export_filter) is True, operator
+            assert evaluate_export_filter({"status_code": "OK"}, export_filter) is False, operator
+
     def test_non_dict_condition_skipped(self):
         span_data = {"status_code": "OK"}
         export_filter = {"status_code": "not_a_dict"}
