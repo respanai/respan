@@ -2,12 +2,21 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "respan",
   "displayName": "Respan",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Respan for Claude Code: tracing, evals, prompts, datasets, and gateway routing, backed by the hosted Respan MCP server.",
   "author": { "name": "Respan", "url": "https://respan.ai" },
   "homepage": "https://respan.ai",
   "repository": "https://github.com/respanai/respan",
   "license": "Apache-2.0",
   "keywords": ["llm", "observability", "tracing", "evals", "prompts", "gateway", "mcp"],
-  "mcpServers": "./.mcp.json"
+  "mcpServers": "./.mcp.json",
+  "userConfig": {
+    "server": {
+      "type": "string",
+      "title": "Respan server",
+      "description": "The hosted MCP server to sign in to. Respan Enterprise customers pick the /mcp/enterprise address; everyone else keeps the default.",
+      "options": ["https://mcp.respan.ai/mcp", "https://mcp.respan.ai/mcp/enterprise"],
+      "default": "https://mcp.respan.ai/mcp"
+    }
+  }
 }
