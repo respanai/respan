@@ -2,12 +2,13 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "session-traces",
   "displayName": "Respan Session Traces",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Send your Claude Code sessions to Respan as traces, with a span for each model request and tool call.",
   "author": { "name": "Respan", "url": "https://respan.ai" },
   "homepage": "https://respan.ai",
   "repository": "https://github.com/respanai/respan",
   "license": "Apache-2.0",
+  "privacyPolicyUrl": "https://www.respan.ai/legal/privacy-policy",
   "keywords": ["llm", "observability", "tracing", "opentelemetry"],
   "userConfig": {
     "api_key": {
