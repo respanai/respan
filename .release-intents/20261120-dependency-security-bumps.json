@@ -1,0 +1,7 @@
+{
+  "summary": "Bump vulnerable dev/test dependencies flagged by dependency scanning (no published runtime changes)",
+  "packages": {
+    "@respan/instrumentation-stagehand": "none",
+    "@respan/instrumentation-vercel": "none"
+  }
+}
