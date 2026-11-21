@@ -59,6 +59,6 @@
     "@respan/tracing": "^1.6.1",
     "@types/node": "^22.15.29",
     "typescript": "^5.7.3",
-    "zod": "4.4.3"
+    "zod": "4.6.7"
   }
 }
