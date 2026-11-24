@@ -69,7 +69,6 @@ class PromptParam(RespanBaseModel):
 
 class EvaluationParams(RespanBaseModel):
     evaluators: Optional[List[EvaluatorToRun]] = []
-    evaluation_identifier: Union[str, int] = ""
     last_n_messages: Optional[int] = (
         1  # last n messages to consider for evaluation, 0 -> all messages
     )
@@ -232,7 +231,6 @@ class RespanParams(RespanBaseModel, PreprocessLogDataMixin):
     # region: log identifier/grouping
     load_balance_group_id: Optional[str] = None
     group_identifier: Optional[Union[str, int]] = None
-    evaluation_identifier: Optional[Union[str, int]] = None
     # endregion: log identifier/grouping
 
     # region: log input/output
@@ -646,7 +644,6 @@ class RespanTextLogParams(
             "stop",
             "n",
             "evaluation_cost",
-            "evaluation_identifier",
             "for_eval",
             "prompt_id",
             "customer_identifier",

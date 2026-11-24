@@ -22,7 +22,6 @@ ValueType = Union[str, float, int, bool, List, Dict, None]
 FilterType = Literal[
     "environment",
     "customer_identifier",
-    "evaluation_identifier",
     "prompt_id",
     "user_query",
 ]
@@ -193,7 +192,6 @@ class EvaluatorToRun(RespanBaseModel):
 
 
 class EvalParams(RespanBaseModel):
-    evaluation_identifier: str = ""
     completion_message: Message = Message(role="user", content="")
     eval_inputs: EvalInputs = {}
     prompt_messages: List[Message] = []

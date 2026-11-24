@@ -3,7 +3,6 @@ export type RespanParams = {
     customer_identifier?: string | number;
     customer_email?: string;
     customer_name?: string;
-    evaluation_identifier?: string | number;
     session_identifier?: string | number;
     thread_identifier?: string | number;
     trace_group_identifier?: string | number;

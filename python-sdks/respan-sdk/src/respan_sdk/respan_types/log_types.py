@@ -49,7 +49,6 @@ class RespanLogParams(PreprocessLogDataMixin, RespanBaseModel):
 
     # region: log identifier/grouping
     group_identifier: Optional[Union[str, int]] = None
-    evaluation_identifier: Optional[Union[str, int]] = None
     # endregion: log identifier/grouping
 
     # region: status
