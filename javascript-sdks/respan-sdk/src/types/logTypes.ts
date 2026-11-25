@@ -295,7 +295,6 @@ const EvalInputsSchema = z.record(z.string(), z.any()); // Placeholder for eval 
 
 const EvaluationParamsSchema = z.object({
   evaluators: z.array(EvaluatorToRunSchema).optional().default([]),
-  evaluation_identifier: StringOrNumberSchema.default(""),
   last_n_messages: z.number().optional().default(1),
   eval_inputs: EvalInputsSchema.optional().default({}),
   sample_percentage: z.number().optional(),
@@ -437,7 +436,6 @@ const RespanParamsSchema = z.object({
 
   //#region log identifier/grouping
   group_identifier: StringOrNumberSchema.optional(),
-  evaluation_identifier: StringOrNumberSchema.optional(),
   //#endregion log identifier/grouping
 
   //#region log input/output

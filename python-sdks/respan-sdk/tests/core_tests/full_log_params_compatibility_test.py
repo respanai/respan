@@ -134,7 +134,6 @@ class TestFullLogParamsCompatibility:
             "customer_identifier": "customer_123",
             "customer_email": "customer@example.com",
             "group_identifier": "group_123",
-            "evaluation_identifier": "eval_123",
             
             # Proxy options
             "exclude_models": ["bad_model"],

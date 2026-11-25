@@ -32,9 +32,6 @@ class RespanSpanAttributes(str, Enum):
     RESPAN_CUSTOMER_PARAMS_EMAIL = "respan.customer_params.email"
     RESPAN_CUSTOMER_PARAMS_NAME = "respan.customer_params.name"
 
-    # Evaluation params
-    RESPAN_EVALUATION_PARAMS_ID = "respan.evaluation_params.evaluation_identifier"
-
     # Threads
     RESPAN_THREADS_ID = "respan.threads.thread_identifier"
 
@@ -88,9 +85,6 @@ RESPAN_CUSTOMER_PARAMS_ID = RespanSpanAttributes.RESPAN_CUSTOMER_PARAMS_ID.value
 RESPAN_CUSTOMER_PARAMS_EMAIL = RespanSpanAttributes.RESPAN_CUSTOMER_PARAMS_EMAIL.value
 RESPAN_CUSTOMER_PARAMS_NAME = RespanSpanAttributes.RESPAN_CUSTOMER_PARAMS_NAME.value
 
-# Evaluation params
-RESPAN_EVALUATION_PARAMS_ID = RespanSpanAttributes.RESPAN_EVALUATION_PARAMS_ID.value
-
 # Threads
 RESPAN_THREADS_ID = RespanSpanAttributes.RESPAN_THREADS_ID.value
 
@@ -134,7 +128,6 @@ RESPAN_SPAN_ATTRIBUTES_MAP = {
     "customer_identifier": RESPAN_CUSTOMER_PARAMS_ID,
     "customer_email": RESPAN_CUSTOMER_PARAMS_EMAIL,
     "customer_name": RESPAN_CUSTOMER_PARAMS_NAME,
-    "evaluation_identifier": RESPAN_EVALUATION_PARAMS_ID,
     "thread_identifier": RESPAN_THREADS_ID,
     "session_identifier": RESPAN_SESSION_ID,
     "custom_identifier": RESPAN_SPAN_CUSTOM_ID,

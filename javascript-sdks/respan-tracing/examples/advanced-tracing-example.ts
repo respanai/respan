@@ -62,7 +62,6 @@ async function advancedLLMCall() {
         },
         
         // Evaluation
-        evaluation_identifier: "eval123",
         for_eval: true,
         
         // Environment
